@@ -5,9 +5,10 @@ set -euo pipefail
 BASE_DIR="/home/dwemer"
 REPO_DIR="$BASE_DIR/audio.cpp"
 REPO_URL="https://github.com/Dwemer-Dynamics/audio.cpp"
-CUDA_VERSION="${1:-12.8}"
+CUDA_VERSION="${1:-auto}"
 BUILD_PARALLEL="${BUILD_PARALLEL:-2}"
 CUDA_INSTALLER="/usr/local/bin/install_cuda_dependencies"
+CUDA_SELECTION_FILE="/var/lib/dwemerdistro/cuda-selection.env"
 
 run_as_dwemer() {
     if [ "$(id -un)" = "dwemer" ]; then
@@ -17,20 +18,34 @@ run_as_dwemer() {
     fi
 }
 
-resolve_cuda_home() {
-    if [ -d "/usr/local/cuda-$CUDA_VERSION" ]; then
-        echo "/usr/local/cuda-$CUDA_VERSION"
-        return
+read_selection_value() {
+    local key="$1"
+    sed -n "s/^${key}=//p" "$CUDA_SELECTION_FILE" | head -n 1
+}
+
+load_cuda_selection() {
+    if [ ! -r "$CUDA_SELECTION_FILE" ] || [ "$(stat -c '%U:%G' "$CUDA_SELECTION_FILE")" != "root:root" ]; then
+        echo "Trusted CUDA selection state is missing. Run $CUDA_INSTALLER and retry."
+        exit 1
     fi
-    if [ "$CUDA_VERSION" = "13" ] && [ -d "/usr/local/cuda-13.0" ]; then
-        echo "/usr/local/cuda-13.0"
-        return
+
+    CUDA_VERSION="$(read_selection_value CUDA_TOOLKIT_VERSION)"
+    CUDA_HOME="$(read_selection_value CUDA_HOME)"
+    CUDA_COMPUTE_CAPABILITY="$(read_selection_value CUDA_COMPUTE_CAPABILITY)"
+
+    case "$CUDA_VERSION:$CUDA_HOME" in
+        12.8:/usr/local/cuda-12.8|13.0:/usr/local/cuda-13.0)
+            ;;
+        *)
+            echo "Trusted CUDA selection state contains an unsupported toolkit path."
+            exit 1
+            ;;
+    esac
+    if ! [[ "$CUDA_COMPUTE_CAPABILITY" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "Trusted CUDA selection state contains an invalid compute capability."
+        exit 1
     fi
-    if [ "$CUDA_VERSION" = "12.8" ] && [ -d "/usr/local/cuda-12.8" ]; then
-        echo "/usr/local/cuda-12.8"
-        return
-    fi
-    echo "/usr/local/cuda"
+    CUDA_ARCHITECTURE="${CUDA_COMPUTE_CAPABILITY/./}"
 }
 
 write_runtime_files() {
@@ -76,12 +91,20 @@ if [ -f "/home/dwemer/.cuda_config" ]; then
     source /home/dwemer/.cuda_config
 fi
 
-if [ -d "/usr/local/cuda-12.8" ]; then
-    export CUDA_HOME="/usr/local/cuda-12.8"
-elif [ -d "/usr/local/cuda-13.0" ]; then
-    export CUDA_HOME="/usr/local/cuda-13.0"
+CUDA_SELECTION_FILE="/var/lib/dwemerdistro/cuda-selection.env"
+selected_cuda_home=""
+if [ -r "$CUDA_SELECTION_FILE" ] && [ "$(stat -c '%U:%G' "$CUDA_SELECTION_FILE")" = "root:root" ]; then
+    selected_cuda_home="$(sed -n 's|^CUDA_HOME=\(/usr/local/cuda-\(12\.8\|13\.0\)\)$|\1|p' "$CUDA_SELECTION_FILE" | head -n 1)"
+fi
+
+if [ -n "$selected_cuda_home" ] && [ -d "$selected_cuda_home" ]; then
+    export CUDA_HOME="$selected_cuda_home"
 elif [ -d "/usr/local/cuda" ]; then
     export CUDA_HOME="/usr/local/cuda"
+elif [ -d "/usr/local/cuda-13.0" ]; then
+    export CUDA_HOME="/usr/local/cuda-13.0"
+elif [ -d "/usr/local/cuda-12.8" ]; then
+    export CUDA_HOME="/usr/local/cuda-12.8"
 fi
 
 if [ -n "${CUDA_HOME:-}" ]; then
@@ -170,6 +193,7 @@ if [ ! -x "$CUDA_INSTALLER" ]; then
     exit 23
 fi
 sudo "$CUDA_INSTALLER" "$CUDA_VERSION"
+load_cuda_selection
 
 if [ ! -d "$REPO_DIR/.git" ]; then
     run_as_dwemer "cd '$BASE_DIR' && git clone --depth 1 '$REPO_URL'"
@@ -177,7 +201,6 @@ else
     run_as_dwemer "cd '$REPO_DIR' && git remote set-url origin '$REPO_URL' && git pull --ff-only"
 fi
 
-CUDA_HOME="$(resolve_cuda_home)"
 if [ ! -x "$CUDA_HOME/bin/nvcc" ]; then
     echo "CUDA compiler not found at $CUDA_HOME/bin/nvcc."
     exit 1
@@ -196,7 +219,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-run_as_dwemer "cd '$REPO_DIR' && export CUDA_HOME='$CUDA_HOME' && export CUDACXX='$CUDA_HOME/bin/nvcc' && export PATH=\"\$CUDA_HOME/bin:\$PATH\" && cmake -S . -B '$BUILD_DIR' -DENGINE_ENABLE_CUDA=ON -DCMAKE_CUDA_COMPILER=\"\$CUDACXX\" -DCUDAToolkit_ROOT=\"\$CUDA_HOME\" && cmake --build '$BUILD_DIR' --parallel '$BUILD_PARALLEL' --target audiocpp_cli --target audiocpp_server"
+run_as_dwemer "cd '$REPO_DIR' && export CUDA_HOME='$CUDA_HOME' && export CUDACXX='$CUDA_HOME/bin/nvcc' && export PATH=\"\$CUDA_HOME/bin:\$PATH\" && cmake -S . -B '$BUILD_DIR' -DENGINE_ENABLE_CUDA=ON -DCMAKE_CUDA_COMPILER=\"\$CUDACXX\" -DCUDAToolkit_ROOT=\"\$CUDA_HOME\" -DCMAKE_CUDA_ARCHITECTURES='$CUDA_ARCHITECTURE' && cmake --build '$BUILD_DIR' --parallel '$BUILD_PARALLEL' --target audiocpp_cli --target audiocpp_server"
 
 RUNTIME_STAGE="$REPO_DIR/.runtime-new.$$"
 rm -rf "$RUNTIME_STAGE"
