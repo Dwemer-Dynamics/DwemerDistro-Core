@@ -1,15 +1,14 @@
 #!/bin/bash
 
-echo "This will install the needed packages to run CUDA"
-echo "Press Enter to continue"
-read
+set -euo pipefail
 
-apt-get update 
-apt-get install -y  $(cat /etc/ddistro-full-packages.txt)
+# Preserve the legacy command used by older launchers without reinstalling the
+# historical full-distro package snapshot.
+if [ ! -x /usr/local/bin/install_cuda_dependencies ]; then
+    echo "The minimal CUDA installer is missing. Update DwemerDistro and retry."
+    exit 23
+fi
 
-apt-get clean
-find  /var/lib/apt/lists/ -type f -delete
+/usr/local/bin/install_cuda_dependencies 12.8
 
-echo "Done. You can now install the other components that require a Nvidia GPU!"
-read
-
+echo "Done. You can now install components that require an NVIDIA GPU."

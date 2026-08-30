@@ -1,2 +1,3 @@
 bin/* text eol=lf
 etc/* text eol=lf
+update.sh text eol=lf
