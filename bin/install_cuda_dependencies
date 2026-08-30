@@ -1,0 +1,70 @@
+#!/bin/bash
+
+set -euo pipefail
+
+CUDA_VERSION="${1:-12.8}"
+
+case "$CUDA_VERSION" in
+    12.8|12-8)
+        CUDA_PACKAGE_SUFFIX="12-8"
+        CUDA_HOME="/usr/local/cuda-12.8"
+        ;;
+    13|13.0|13-0)
+        CUDA_PACKAGE_SUFFIX="13-0"
+        CUDA_HOME="/usr/local/cuda-13.0"
+        ;;
+    *)
+        echo "Unsupported CUDA version '$CUDA_VERSION'. Use 12.8 or 13.0."
+        exit 1
+        ;;
+esac
+
+CUDA_PACKAGES=(
+    "cuda-nvcc-$CUDA_PACKAGE_SUFFIX"
+    "cuda-cudart-dev-$CUDA_PACKAGE_SUFFIX"
+    "cuda-driver-dev-$CUDA_PACKAGE_SUFFIX"
+    "cuda-cccl-$CUDA_PACKAGE_SUFFIX"
+    "libcublas-dev-$CUDA_PACKAGE_SUFFIX"
+    "libcufft-dev-$CUDA_PACKAGE_SUFFIX"
+)
+
+missing_packages=()
+for package in "${CUDA_PACKAGES[@]}"; do
+    if [ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]; then
+        missing_packages+=("$package")
+    fi
+done
+
+if [ "${#missing_packages[@]}" -eq 0 ] && [ -x "$CUDA_HOME/bin/nvcc" ]; then
+    echo "Minimal CUDA $CUDA_VERSION dependencies are already installed."
+    "$CUDA_HOME/bin/nvcc" --version | tail -n 1
+    exit 0
+fi
+
+if ! dpkg-query -W cuda-keyring >/dev/null 2>&1; then
+    keyring_path="$(mktemp /tmp/cuda-keyring.XXXXXX.deb)"
+    trap 'rm -f "$keyring_path"' EXIT
+    wget -qO "$keyring_path" https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+    dpkg -i "$keyring_path"
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+export DEBIAN_PRIORITY=critical
+export APT_LISTCHANGES_FRONTEND=none
+export NEEDRESTART_MODE=a
+export UCF_FORCE_CONFFOLD=1
+
+echo "Installing minimal CUDA $CUDA_VERSION build and runtime dependencies..."
+dpkg --configure -a
+apt-get update
+apt-get install -y --no-install-recommends "${CUDA_PACKAGES[@]}"
+apt-get clean
+find /var/lib/apt/lists/ -type f -delete
+
+if [ ! -x "$CUDA_HOME/bin/nvcc" ]; then
+    echo "CUDA compiler was not installed at $CUDA_HOME/bin/nvcc."
+    exit 1
+fi
+
+echo "Minimal CUDA $CUDA_VERSION dependencies installed."
+"$CUDA_HOME/bin/nvcc" --version | tail -n 1
