@@ -6,6 +6,7 @@ CUDA_VERSION="${1:-12.8}"
 
 case "$CUDA_VERSION" in
     12.8|12-8)
+        CUDA_VERSION="12.8"
         CUDA_PACKAGE_SUFFIX="12-8"
         CUDA_HOME="/usr/local/cuda-12.8"
         ;;
@@ -18,6 +19,51 @@ case "$CUDA_VERSION" in
         exit 1
         ;;
 esac
+
+if [ "$CUDA_VERSION" = "12.8" ]; then
+    NVIDIA_SMI="$(command -v nvidia-smi 2>/dev/null || true)"
+    if [ -z "$NVIDIA_SMI" ] && [ -x /usr/lib/wsl/lib/nvidia-smi ]; then
+        NVIDIA_SMI="/usr/lib/wsl/lib/nvidia-smi"
+    fi
+
+    if [ -z "$NVIDIA_SMI" ]; then
+        echo "CUDA 12.8 requires an NVIDIA GPU exposed to WSL. Use the AMD / CPU setup path instead."
+        exit 2
+    fi
+
+    gpu_inventory="$($NVIDIA_SMI --query-gpu=name,driver_version,compute_cap --format=csv,noheader,nounits 2>/dev/null || true)"
+    if [ -z "$gpu_inventory" ]; then
+        echo "Could not read the NVIDIA GPU, driver, and compute capability required by CUDA 12.8."
+        echo "Update the Windows NVIDIA driver or use the AMD / CPU setup path instead."
+        exit 2
+    fi
+
+    compatible_gpu=""
+    while IFS=',' read -r gpu_name driver_version compute_capability; do
+        gpu_name="$(xargs <<< "$gpu_name")"
+        driver_version="$(xargs <<< "$driver_version")"
+        compute_capability="$(xargs <<< "$compute_capability")"
+
+        if [ "$(printf '%s\n%s\n' '528.33' "$driver_version" | sort -V | head -n 1)" != "528.33" ]; then
+            continue
+        fi
+        if ! awk -v capability="$compute_capability" 'BEGIN { exit !(capability + 0 >= 5.0) }'; then
+            continue
+        fi
+
+        compatible_gpu="$gpu_name (driver $driver_version, compute capability $compute_capability)"
+        break
+    done <<< "$gpu_inventory"
+
+    if [ -z "$compatible_gpu" ]; then
+        echo "No NVIDIA GPU compatible with the CUDA 12.8 DwemerDistro stack was found."
+        echo "CUDA 12.8 requires compute capability 5.0 or newer and Windows NVIDIA driver 528.33 or newer."
+        echo "Update the Windows NVIDIA driver or use the AMD / CPU setup path instead."
+        exit 2
+    fi
+
+    echo "Using $compatible_gpu for CUDA 12.8."
+fi
 
 CUDA_PACKAGES=(
     "cuda-nvcc-$CUDA_PACKAGE_SUFFIX"
