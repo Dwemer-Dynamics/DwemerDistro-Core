@@ -2,67 +2,197 @@
 
 set -euo pipefail
 
-CUDA_VERSION="${1:-12.8}"
+REQUESTED_CUDA_VERSION="${1:-auto}"
+MODE="${2:-install}"
+STATE_FILE="/var/lib/dwemerdistro/cuda-selection.env"
+CUDA_CONFIG_FILE="/home/dwemer/.cuda_config"
 
-case "$CUDA_VERSION" in
+version_at_least() {
+    local actual="$1"
+    local minimum="$2"
+    [ "$(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n 1)" = "$minimum" ]
+}
+
+capability_at_least() {
+    local actual="$1"
+    local minimum="$2"
+    awk -v actual="$actual" -v minimum="$minimum" 'BEGIN { exit !(actual + 0 >= minimum + 0) }'
+}
+
+read_configured_gpu_index() {
+    local line
+
+    [ -r "$CUDA_CONFIG_FILE" ] || return 0
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*export[[:space:]]+CUDA_VISIBLE_DEVICES=([0-9]+)[[:space:]]*$ ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done < "$CUDA_CONFIG_FILE"
+    return 0
+}
+
+write_selection_state() {
+    local state_dir
+    local state_temp
+
+    state_dir="$(dirname "$STATE_FILE")"
+    install -d -o root -g root -m 0755 "$state_dir"
+    state_temp="$(mktemp "$state_dir/.cuda-selection.XXXXXX")"
+    trap 'rm -f "${state_temp:-}"' EXIT
+    cat > "$state_temp" <<EOF
+CUDA_TOOLKIT_VERSION=$CUDA_VERSION
+CUDA_HOME=$CUDA_HOME
+CUDA_COMPUTE_CAPABILITY=$GPU_COMPUTE_CAPABILITY
+CUDA_GPU_INDEX=$GPU_INDEX
+CUDA_PYTORCH_SUPPORTED=$CUDA_PYTORCH_SUPPORTED
+EOF
+    chown root:root "$state_temp"
+    chmod 0644 "$state_temp"
+    mv -f "$state_temp" "$STATE_FILE"
+    trap - EXIT
+}
+
+case "$REQUESTED_CUDA_VERSION" in
+    auto)
+        ;;
     12.8|12-8)
-        CUDA_VERSION="12.8"
-        CUDA_PACKAGE_SUFFIX="12-8"
-        CUDA_HOME="/usr/local/cuda-12.8"
+        REQUESTED_CUDA_VERSION="12.8"
         ;;
     13|13.0|13-0)
-        CUDA_PACKAGE_SUFFIX="13-0"
-        CUDA_HOME="/usr/local/cuda-13.0"
+        REQUESTED_CUDA_VERSION="13.0"
         ;;
     *)
-        echo "Unsupported CUDA version '$CUDA_VERSION'. Use 12.8 or 13.0."
+        echo "Unsupported CUDA version '$REQUESTED_CUDA_VERSION'. Use auto, 12.8, or 13.0."
         exit 1
         ;;
 esac
 
-if [ "$CUDA_VERSION" = "12.8" ]; then
-    NVIDIA_SMI="$(command -v nvidia-smi 2>/dev/null || true)"
-    if [ -z "$NVIDIA_SMI" ] && [ -x /usr/lib/wsl/lib/nvidia-smi ]; then
-        NVIDIA_SMI="/usr/lib/wsl/lib/nvidia-smi"
+if [ "$MODE" != "install" ] && [ "$MODE" != "--detect-only" ]; then
+    echo "Unsupported option '$MODE'. Use --detect-only to inspect the automatic selection without installing."
+    exit 1
+fi
+
+NVIDIA_SMI="$(command -v nvidia-smi 2>/dev/null || true)"
+if [ -z "$NVIDIA_SMI" ] && [ -x /usr/lib/wsl/lib/nvidia-smi ]; then
+    NVIDIA_SMI="/usr/lib/wsl/lib/nvidia-smi"
+fi
+
+if [ -z "$NVIDIA_SMI" ]; then
+    echo "CUDA requires an NVIDIA GPU exposed to WSL. Use the AMD / CPU setup path instead."
+    exit 2
+fi
+
+gpu_inventory="$($NVIDIA_SMI --query-gpu=index,name,driver_version,compute_cap --format=csv,noheader,nounits 2>/dev/null || true)"
+if [ -z "$gpu_inventory" ]; then
+    echo "Could not read the NVIDIA GPU, driver, and compute capability required by CUDA."
+    echo "Update the Windows NVIDIA driver or use the AMD / CPU setup path instead."
+    exit 2
+fi
+
+configured_gpu_index="$(read_configured_gpu_index)"
+GPU_INDEX=""
+GPU_NAME=""
+GPU_DRIVER_VERSION=""
+GPU_COMPUTE_CAPABILITY=""
+while IFS=',' read -r gpu_index gpu_name driver_version compute_capability; do
+    gpu_index="$(xargs <<< "$gpu_index")"
+    gpu_name="$(xargs <<< "$gpu_name")"
+    driver_version="$(xargs <<< "$driver_version")"
+    compute_capability="$(xargs <<< "$compute_capability")"
+
+    if [ -n "$configured_gpu_index" ] && [ "$gpu_index" != "$configured_gpu_index" ]; then
+        continue
     fi
 
-    if [ -z "$NVIDIA_SMI" ]; then
-        echo "CUDA 12.8 requires an NVIDIA GPU exposed to WSL. Use the AMD / CPU setup path instead."
-        exit 2
+    GPU_INDEX="$gpu_index"
+    GPU_NAME="$gpu_name"
+    GPU_DRIVER_VERSION="$driver_version"
+    GPU_COMPUTE_CAPABILITY="$compute_capability"
+    break
+done <<< "$gpu_inventory"
+
+if [ -z "$GPU_INDEX" ]; then
+    if [ -n "$configured_gpu_index" ]; then
+        echo "Configured NVIDIA GPU index $configured_gpu_index was not found. Select an available GPU in launcher Settings."
+    else
+        echo "No NVIDIA GPU was found. Use the AMD / CPU setup path instead."
     fi
+    exit 2
+fi
 
-    gpu_inventory="$($NVIDIA_SMI --query-gpu=name,driver_version,compute_cap --format=csv,noheader,nounits 2>/dev/null || true)"
-    if [ -z "$gpu_inventory" ]; then
-        echo "Could not read the NVIDIA GPU, driver, and compute capability required by CUDA 12.8."
-        echo "Update the Windows NVIDIA driver or use the AMD / CPU setup path instead."
-        exit 2
-    fi
+if ! [[ "$GPU_DRIVER_VERSION" =~ ^[0-9]+([.][0-9]+)*$ ]] ||
+   ! [[ "$GPU_COMPUTE_CAPABILITY" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "NVIDIA reported an invalid driver or compute capability for GPU $GPU_INDEX."
+    exit 2
+fi
 
-    compatible_gpu=""
-    while IFS=',' read -r gpu_name driver_version compute_capability; do
-        gpu_name="$(xargs <<< "$gpu_name")"
-        driver_version="$(xargs <<< "$driver_version")"
-        compute_capability="$(xargs <<< "$compute_capability")"
-
-        if [ "$(printf '%s\n%s\n' '528.33' "$driver_version" | sort -V | head -n 1)" != "528.33" ]; then
-            continue
+if [ "$REQUESTED_CUDA_VERSION" = "auto" ]; then
+    if capability_at_least "$GPU_COMPUTE_CAPABILITY" "10.0"; then
+        if version_at_least "$GPU_DRIVER_VERSION" "580.00"; then
+            CUDA_VERSION="13.0"
+        elif version_at_least "$GPU_DRIVER_VERSION" "570.65"; then
+            CUDA_VERSION="12.8"
+            echo "CUDA 13.0 requires NVIDIA driver 580.00 or newer; using CUDA 12.8 on this GPU."
+        else
+            echo "This NVIDIA GPU requires Windows driver 570.65 or newer for the DwemerDistro CUDA stack."
+            exit 2
         fi
-        if ! awk -v capability="$compute_capability" 'BEGIN { exit !(capability + 0 >= 5.0) }'; then
-            continue
-        fi
-
-        compatible_gpu="$gpu_name (driver $driver_version, compute capability $compute_capability)"
-        break
-    done <<< "$gpu_inventory"
-
-    if [ -z "$compatible_gpu" ]; then
-        echo "No NVIDIA GPU compatible with the CUDA 12.8 DwemerDistro stack was found."
+    elif capability_at_least "$GPU_COMPUTE_CAPABILITY" "5.0" && version_at_least "$GPU_DRIVER_VERSION" "528.33"; then
+        CUDA_VERSION="12.8"
+    else
+        echo "No compatible DwemerDistro CUDA configuration was found for $GPU_NAME."
         echo "CUDA 12.8 requires compute capability 5.0 or newer and Windows NVIDIA driver 528.33 or newer."
-        echo "Update the Windows NVIDIA driver or use the AMD / CPU setup path instead."
         exit 2
     fi
+else
+    CUDA_VERSION="$REQUESTED_CUDA_VERSION"
+fi
 
-    echo "Using $compatible_gpu for CUDA 12.8."
+case "$CUDA_VERSION" in
+    12.8)
+        CUDA_PACKAGE_SUFFIX="12-8"
+        CUDA_HOME="/usr/local/cuda-12.8"
+        if capability_at_least "$GPU_COMPUTE_CAPABILITY" "10.0"; then
+            minimum_driver="570.65"
+        else
+            minimum_driver="528.33"
+        fi
+        minimum_capability="5.0"
+        ;;
+    13.0)
+        CUDA_PACKAGE_SUFFIX="13-0"
+        CUDA_HOME="/usr/local/cuda-13.0"
+        minimum_driver="580.00"
+        minimum_capability="7.5"
+        ;;
+esac
+
+if ! version_at_least "$GPU_DRIVER_VERSION" "$minimum_driver" ||
+   ! capability_at_least "$GPU_COMPUTE_CAPABILITY" "$minimum_capability"; then
+    echo "CUDA $CUDA_VERSION is not compatible with $GPU_NAME (driver $GPU_DRIVER_VERSION, compute capability $GPU_COMPUTE_CAPABILITY)."
+    echo "CUDA $CUDA_VERSION requires driver $minimum_driver or newer and compute capability $minimum_capability or newer."
+    exit 2
+fi
+
+if capability_at_least "$GPU_COMPUTE_CAPABILITY" "7.5"; then
+    CUDA_PYTORCH_SUPPORTED=1
+else
+    CUDA_PYTORCH_SUPPORTED=0
+fi
+
+echo "Selected CUDA $CUDA_VERSION for $GPU_NAME (GPU $GPU_INDEX, driver $GPU_DRIVER_VERSION, compute capability $GPU_COMPUTE_CAPABILITY)."
+if [ "$CUDA_PYTORCH_SUPPORTED" -eq 0 ]; then
+    echo "Current PyTorch components do not support this GPU generation and will use CPU mode."
+fi
+
+if [ "$MODE" = "--detect-only" ]; then
+    printf 'CUDA_TOOLKIT_VERSION=%s\n' "$CUDA_VERSION"
+    printf 'CUDA_HOME=%s\n' "$CUDA_HOME"
+    printf 'CUDA_COMPUTE_CAPABILITY=%s\n' "$GPU_COMPUTE_CAPABILITY"
+    printf 'CUDA_GPU_INDEX=%s\n' "$GPU_INDEX"
+    printf 'CUDA_PYTORCH_SUPPORTED=%s\n' "$CUDA_PYTORCH_SUPPORTED"
+    exit 0
 fi
 
 CUDA_PACKAGES=(
@@ -82,6 +212,7 @@ for package in "${CUDA_PACKAGES[@]}"; do
 done
 
 if [ "${#missing_packages[@]}" -eq 0 ] && [ -x "$CUDA_HOME/bin/nvcc" ]; then
+    write_selection_state
     echo "Minimal CUDA $CUDA_VERSION dependencies are already installed."
     "$CUDA_HOME/bin/nvcc" --version | tail -n 1
     exit 0
@@ -112,5 +243,6 @@ if [ ! -x "$CUDA_HOME/bin/nvcc" ]; then
     exit 1
 fi
 
+write_selection_state
 echo "Minimal CUDA $CUDA_VERSION dependencies installed."
 "$CUDA_HOME/bin/nvcc" --version | tail -n 1
