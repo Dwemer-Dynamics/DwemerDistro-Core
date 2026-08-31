@@ -23,6 +23,7 @@ INSTALL_CLEANUP_ACTIVE=0
 INSTALL_DATABASE_CREATED=0
 INSTALL_ROOT_CREATED=0
 LOCK_HELD=0
+FORCE_UPDATE=0
 
 usage() {
     cat <<'EOF'
@@ -34,14 +35,15 @@ Commands:
   status [all|herika|stobe|dialectic] [--json]
   migrate-remotes [all|herika|stobe|dialectic]
   install <herika|stobe|dialectic> [--branch main|dev]
-  update <herika|stobe|dialectic> [--branch main|dev]
+  update <herika|stobe|dialectic> [--branch main|dev] [--force]
   repair <herika|stobe|dialectic> [--branch main|dev]
   uninstall <herika|stobe|dialectic> --confirm PURGE-<PRODUCT>
   startup [herika|stobe|dialectic]
 
 Install is allowed only when both the canonical server root and application
 database are absent. Repair handles legacy and partial installations. Update
-never installs a missing product.
+never installs a missing product. --force discards tracked server-file changes
+before an update, but leaves untracked files and runtime data untouched.
 EOF
 }
 
@@ -758,6 +760,11 @@ update_repository() {
     git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" fetch origin \
         "+refs/heads/$branch:refs/remotes/origin/$branch" \
         || fail "Could not fetch $PRODUCT branch $branch."
+    if [ "$FORCE_UPDATE" -eq 1 ]; then
+        info "Force update enabled; discarding tracked changes in $PRODUCT_ROOT."
+        git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" reset --hard HEAD \
+            || fail "Could not discard tracked changes for $PRODUCT."
+    fi
     git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" checkout -B "$branch" "origin/$branch" \
         || fail "Could not select $PRODUCT branch $branch."
     git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" reset --hard "origin/$branch" \
@@ -1104,6 +1111,10 @@ case "$COMMAND" in
                     [ "$#" -ge 2 ] || fail "--branch requires main or dev." 64
                     BRANCH_CHOICE="$2"
                     shift
+                    ;;
+                --force)
+                    [ "$COMMAND" = "update" ] || fail "--force is supported only for update." 64
+                    FORCE_UPDATE=1
                     ;;
                 *) fail "Unknown $COMMAND option '$1'." 64 ;;
             esac

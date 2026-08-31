@@ -12,9 +12,14 @@ Fresh distribution payloads do not include HerikaServer, StobeServer, or Dialect
 ddistro_server status all --json
 ddistro_server install herika --branch main
 ddistro_server update stobe --branch dev
+ddistro_server update herika --branch dev --force
 ddistro_server repair dialectic --branch main
 ddistro_server uninstall herika --confirm PURGE-HERIKA
 ```
+
+`update --force` discards manual changes to tracked server files before switching
+branches. It does not run `git clean`, so untracked files and runtime data remain
+untouched.
 
 Supported products are `herika`, `stobe`, and `dialectic`. Supported branch channels are `main` and `dev`; the manager maps them to each repository's actual production and development branch.
 
