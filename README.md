@@ -38,3 +38,21 @@ The legacy `.version.txt` file remains unchanged for older launchers and is not 
 ## Distribution payload rule
 
 Release payloads must report all three products as `not-installed` with no application databases. Build and validate them with the installer repository's `scripts/Prepare-EmptyDistroPayload.ps1`; do not distribute a tar exported directly from a development distro.
+
+## Component storage
+
+Report the logical size of component environments and installer caches:
+
+```bash
+sudo ddistro_storage report
+```
+
+Remove only reproducible APT/Pip downloads and abandoned audio.cpp installer
+directories after all component installers have finished:
+
+```bash
+sudo ddistro_storage safe-cleanup
+```
+
+The cleanup does not remove models, voices, databases, configuration, logs, or
+installed component environments.

@@ -1,5 +1,8 @@
 #!/bin/bash
 
+export PIP_NO_CACHE_DIR=1
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+
 check_error() {
   if [ $? -ne 0 ]; then
     echo -e "\e[41mError:\e[0m $1"
@@ -17,6 +20,6 @@ cd kakasi
 python3 -m venv kakasi_env
 source kakasi_env/bin/activate
 
-pip install pykakasi
+python -m pip install --no-cache-dir pykakasi
 check_error "Failed to install required pip packages."
 deactivate
