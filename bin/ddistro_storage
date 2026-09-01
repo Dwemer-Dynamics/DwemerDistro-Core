@@ -77,7 +77,7 @@ safe_cleanup() {
         exit 2
     fi
 
-    if pgrep -f 'install_audiocpp_pockettts|ddistro_install.sh|python(3)? -m pip install|apt-get install|dpkg --configure' >/dev/null 2>&1; then
+    if pgrep -f 'install_audiocpp_pockettts|ddistro_install.sh|python(3)? -m pip install|(^|[[:space:]/])pip(3)?[[:space:]]+install|uv([[:space:]]+pip)?[[:space:]]+install|npm[[:space:]]+(ci|install)|apt-get install|dpkg --configure' >/dev/null 2>&1; then
         echo "A component installer is active. Wait for it to finish before cleaning storage."
         exit 3
     fi
