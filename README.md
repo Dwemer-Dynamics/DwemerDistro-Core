@@ -41,7 +41,7 @@ Release payloads must report all three products as `not-installed` with no appli
 
 ## Component storage
 
-Report the logical size of component environments and installer caches:
+Report the allocated filesystem usage of component environments and installer caches:
 
 ```bash
 sudo ddistro_storage report

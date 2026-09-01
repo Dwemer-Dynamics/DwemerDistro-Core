@@ -50,6 +50,8 @@ report_storage() {
         "$(measure_paths "$DWEMER_HOME/pocket-tts")" "$DWEMER_HOME"
     printf 'component\tminime\t%s\t%s/minime-t5 %s/python-minime\n' \
         "$(measure_paths "$DWEMER_HOME/minime-t5" "$DWEMER_HOME/python-minime")" "$DWEMER_HOME" "$DWEMER_HOME"
+    printf 'component\tchimmcp\t%s\t%s/CHIM-MCP\n' \
+        "$(measure_paths "$DWEMER_HOME/CHIM-MCP")" "$DWEMER_HOME"
     printf 'component\tparakeet\t%s\t%s/parakeet-api-server\n' \
         "$(measure_paths "$DWEMER_HOME/parakeet-api-server")" "$DWEMER_HOME"
     printf 'component\tchatterbox\t%s\t%s/chatterbox\n' \
@@ -62,6 +64,8 @@ report_storage() {
         "$(measure_paths "$DWEMER_HOME/MeloTTS" "$DWEMER_HOME/python-melotts")" "$DWEMER_HOME" "$DWEMER_HOME"
     printf 'component\tpiper\t%s\t%s/piper %s/python-piper\n' \
         "$(measure_paths "$DWEMER_HOME/piper" "$DWEMER_HOME/python-piper")" "$DWEMER_HOME" "$DWEMER_HOME"
+    printf 'component\tmimic3\t%s\t%s/mimic3 %s/python-mimic3\n' \
+        "$(measure_paths "$DWEMER_HOME/mimic3" "$DWEMER_HOME/python-mimic3")" "$DWEMER_HOME" "$DWEMER_HOME"
     printf 'component\tlocalwhisper\t%s\t%s/remote-faster-whisper %s/python-stt\n' \
         "$(measure_paths "$DWEMER_HOME/remote-faster-whisper" "$DWEMER_HOME/python-stt")" "$DWEMER_HOME" "$DWEMER_HOME"
 }
