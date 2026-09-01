@@ -678,7 +678,7 @@ if [ "$MINIME_UPDATE_OK" -eq 1 ]; then
 fi
 if [ "$MINIME_UPDATE_OK" -eq 1 ] && [ -x /home/dwemer/python-minime/bin/pip ]; then
     printf ">> Updating Python dependencies...\n"
-    /home/dwemer/python-minime/bin/pip install -r requirements.txt
+    /home/dwemer/python-minime/bin/python -m pip install --no-cache-dir -r requirements.txt
 elif [ "$MINIME_UPDATE_OK" -eq 1 ]; then
     print_warning "MiniMe virtual environment not found at /home/dwemer/python-minime; run the MiniMe component installer to install dependencies."
 fi

@@ -1,0 +1,111 @@
+#!/bin/bash
+
+set -euo pipefail
+
+DWEMER_HOME="/home/dwemer"
+
+# Return the allocated byte count for one or more paths without crossing filesystems.
+measure_paths() {
+    local total=0
+    local path
+    local size
+
+    for path in "$@"; do
+        if [ ! -e "$path" ]; then
+            continue
+        fi
+        size="$(du -sx -B1 "$path" 2>/dev/null | awk '{print $1}')"
+        total=$((total + size))
+    done
+    printf '%s\n' "$total"
+}
+
+# Emit stable tab-separated records for before/after installation comparisons.
+report_storage() {
+    local root_used
+
+    root_used="$(df -B1 --output=used / | tail -n 1 | tr -d '[:space:]')"
+    printf 'category\tkey\tbytes\tpaths\n'
+    printf 'filesystem\troot_used\t%s\t/\n' "$root_used"
+    printf 'filesystem\tdwemer_home\t%s\t%s\n' "$(measure_paths "$DWEMER_HOME")" "$DWEMER_HOME"
+
+    printf 'cache\tapt\t%s\t/var/cache/apt /var/lib/apt/lists\n' \
+        "$(measure_paths /var/cache/apt /var/lib/apt/lists)"
+    printf 'cache\tpip_dwemer\t%s\t%s/.cache/pip\n' \
+        "$(measure_paths "$DWEMER_HOME/.cache/pip")" "$DWEMER_HOME"
+    printf 'cache\tpip_root\t%s\t/root/.cache/pip\n' \
+        "$(measure_paths /root/.cache/pip)"
+    printf 'cache\tnpm\t%s\t%s/.npm/_cacache /root/.npm/_cacache\n' \
+        "$(measure_paths "$DWEMER_HOME/.npm/_cacache" /root/.npm/_cacache)" "$DWEMER_HOME"
+    printf 'cache\tuv\t%s\t%s/.cache/uv /root/.cache/uv\n' \
+        "$(measure_paths "$DWEMER_HOME/.cache/uv" /root/.cache/uv)" "$DWEMER_HOME"
+    printf 'cache\thuggingface\t%s\t%s/.cache/huggingface\n' \
+        "$(measure_paths "$DWEMER_HOME/.cache/huggingface")" "$DWEMER_HOME"
+
+    printf 'component\tcuda\t%s\t/usr/local/cuda-* /opt/nvidia\n' \
+        "$(measure_paths /usr/local/cuda-* /opt/nvidia)"
+    printf 'component\taudiocpp\t%s\t%s/audio.cpp\n' \
+        "$(measure_paths "$DWEMER_HOME/audio.cpp")" "$DWEMER_HOME"
+    printf 'component\tpockettts\t%s\t%s/pocket-tts\n' \
+        "$(measure_paths "$DWEMER_HOME/pocket-tts")" "$DWEMER_HOME"
+    printf 'component\tminime\t%s\t%s/minime-t5 %s/python-minime\n' \
+        "$(measure_paths "$DWEMER_HOME/minime-t5" "$DWEMER_HOME/python-minime")" "$DWEMER_HOME" "$DWEMER_HOME"
+    printf 'component\tchimmcp\t%s\t%s/CHIM-MCP\n' \
+        "$(measure_paths "$DWEMER_HOME/CHIM-MCP")" "$DWEMER_HOME"
+    printf 'component\tparakeet\t%s\t%s/parakeet-api-server\n' \
+        "$(measure_paths "$DWEMER_HOME/parakeet-api-server")" "$DWEMER_HOME"
+    printf 'component\tchatterbox\t%s\t%s/chatterbox\n' \
+        "$(measure_paths "$DWEMER_HOME/chatterbox")" "$DWEMER_HOME"
+    printf 'component\tomnivoice\t%s\t%s/omnivoice-tts\n' \
+        "$(measure_paths "$DWEMER_HOME/omnivoice-tts")" "$DWEMER_HOME"
+    printf 'component\txtts\t%s\t%s/xtts-api-server %s/python-tts\n' \
+        "$(measure_paths "$DWEMER_HOME/xtts-api-server" "$DWEMER_HOME/python-tts")" "$DWEMER_HOME" "$DWEMER_HOME"
+    printf 'component\tmelotts\t%s\t%s/MeloTTS %s/python-melotts\n' \
+        "$(measure_paths "$DWEMER_HOME/MeloTTS" "$DWEMER_HOME/python-melotts")" "$DWEMER_HOME" "$DWEMER_HOME"
+    printf 'component\tpiper\t%s\t%s/piper %s/python-piper\n' \
+        "$(measure_paths "$DWEMER_HOME/piper" "$DWEMER_HOME/python-piper")" "$DWEMER_HOME" "$DWEMER_HOME"
+    printf 'component\tmimic3\t%s\t%s/mimic3 %s/python-mimic3\n' \
+        "$(measure_paths "$DWEMER_HOME/mimic3" "$DWEMER_HOME/python-mimic3")" "$DWEMER_HOME" "$DWEMER_HOME"
+    printf 'component\tlocalwhisper\t%s\t%s/remote-faster-whisper %s/python-stt\n' \
+        "$(measure_paths "$DWEMER_HOME/remote-faster-whisper" "$DWEMER_HOME/python-stt")" "$DWEMER_HOME" "$DWEMER_HOME"
+}
+
+# Remove only reproducible download caches and abandoned temporary installer state.
+safe_cleanup() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Safe storage cleanup must run as root."
+        exit 2
+    fi
+
+    if pgrep -f 'install_audiocpp_pockettts|ddistro_install.sh|python(3)? -m pip install|(^|[[:space:]/])pip(3)?[[:space:]]+install|uv([[:space:]]+pip)?[[:space:]]+install|npm[[:space:]]+(ci|install)|apt-get install|dpkg --configure' >/dev/null 2>&1; then
+        echo "A component installer is active. Wait for it to finish before cleaning storage."
+        exit 3
+    fi
+
+    apt-get clean
+    find /var/lib/apt/lists -mindepth 1 -maxdepth 1 -type f -delete 2>/dev/null || true
+    rm -rf "$DWEMER_HOME/.cache/pip" /root/.cache/pip
+    rm -rf "$DWEMER_HOME/.cache/uv" /root/.cache/uv
+    rm -rf "$DWEMER_HOME/.npm/_cacache" /root/.npm/_cacache
+    rm -rf "$DWEMER_HOME"/.audio.cpp-build.* "$DWEMER_HOME"/.audiocpp-model-venv.*
+
+    if [ -x "$DWEMER_HOME/audio.cpp/runtime/bin/audiocpp_server" ] &&
+       { [ -d "$DWEMER_HOME/audio.cpp/models/PocketTTS-GGUF/english" ] || [ -d "$DWEMER_HOME/audio.cpp/models/pocket-tts" ]; }; then
+        rm -rf "$DWEMER_HOME/audio.cpp/model-venv"
+    fi
+
+    echo "Safe component storage cleanup complete."
+}
+
+case "${1:-report}" in
+    report)
+        report_storage
+        ;;
+    safe-cleanup)
+        safe_cleanup
+        ;;
+    *)
+        echo "Usage: ddistro_storage [report|safe-cleanup]"
+        exit 2
+        ;;
+esac
