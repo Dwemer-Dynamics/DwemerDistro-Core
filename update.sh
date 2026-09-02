@@ -31,6 +31,19 @@ if [ ! -d "/home/dwemer/dwemerdistro/etc" ]; then
     exit 1
 fi
 
+printf ">> Checking Git credential helper configuration...\n"
+DWEMER_GIT_CONFIG="/home/dwemer/.gitconfig"
+if [ -f "$DWEMER_GIT_CONFIG" ] && ! command -v git-credential-manager >/dev/null 2>&1; then
+    if git config --file "$DWEMER_GIT_CONFIG" --get-all credential.helper 2>/dev/null | grep -Fxq "manager"; then
+        if ! git config --file "$DWEMER_GIT_CONFIG" --unset-all credential.helper '^manager$'; then
+            printf "${RED}[ERROR] Could not remove the unavailable Git credential helper.${NC}\n"
+            exit 1
+        fi
+        chown dwemer:dwemer "$DWEMER_GIT_CONFIG" || exit 1
+        printf "${GREEN}[SUCCESS] Removed unavailable Git credential helper.${NC}\n"
+    fi
+fi
+
 print_header "UPDATING SYSTEM FILES"
 
 printf ">> Copying scripts to /usr/local/bin...\n"
