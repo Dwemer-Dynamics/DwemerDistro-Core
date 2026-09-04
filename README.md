@@ -21,6 +21,21 @@ ddistro_server uninstall herika --confirm PURGE-HERIKA
 branches. It does not run `git clean`, so untracked files and runtime data remain
 untouched.
 
+CHIM installs from `abeiro/HerikaServer` receive a one-time migration to
+`Dwemer-Dynamics/HerikaServer`. Recovery also recognizes legacy Git history when
+an earlier attempt already changed the remote URL. It backs up the checkout before
+replacing source files and preserves configuration and untracked runtime files.
+Conflicting local source files remain in the backup rather than overriding the release.
+Custom repository origins do not receive this automatic recovery.
+
+The private backup is retained at
+`/var/lib/dwemerdistro/servers/herika-org-migration/checkout.tar`; it includes the
+original source edits and runtime files, so migration needs enough free space for
+a full checkout backup plus the preserved runtime files. The completion marker is
+written only after database setup succeeds. A retry after database failure does
+not force the code checkout again. Databases are updated through the existing
+bootstrap process, not replaced by the repository migration.
+
 Supported products are `herika`, `stobe`, and `dialectic`. Supported branch channels are `main` and `dev`; the manager maps them to each repository's actual production and development branch.
 
 Uninstall permanently removes only the selected server's canonical files, retained manager backups, Apache site, runtime processes, and PostgreSQL database. It does not remove shared components or another server's data.

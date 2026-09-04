@@ -52,6 +52,18 @@ detect_partial_herika_migration() {
     if git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" merge-base HEAD "origin/$branch" >/dev/null 2>&1; then
         return 0
     fi
+    # Channels may have independently imported histories. Refresh all canonical refs before
+    # deciding this is a legacy checkout; old remote-tracking refs are not trustworthy here.
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" fetch --no-tags --atomic origin \
+        '+refs/heads/aiagent:refs/remotes/origin/aiagent' \
+        '+refs/heads/dev:refs/remotes/origin/dev' \
+        '+refs/heads/unstable:refs/remotes/origin/unstable' \
+        || fail "Could not verify canonical HerikaServer history; no files were replaced."
+    for ref in aiagent dev unstable; do
+        if git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" merge-base HEAD "origin/$ref" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
     # An unrelated history alone is not permission to replace it: prove legacy ancestry.
     git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" fetch --no-tags --atomic \
         https://github.com/abeiro/HerikaServer.git \
