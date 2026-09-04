@@ -25,6 +25,116 @@ INSTALL_ROOT_CREATED=0
 LOCK_HELD=0
 FORCE_UPDATE=0
 
+# Record provenance before changing origin, so an interrupted migration can be retried.
+mark_herika_migration_pending() {
+    local migration="$STATE_ROOT/herika-org-migration"
+    [ ! -L "$STATE_ROOT" ] && [ ! -L "$migration" ] || fail "Refusing redirected migration state."
+    if [ ! -d "$migration" ]; then
+        (umask 077; mkdir -p "$migration") || fail "Could not create migration state."
+    fi
+    if [ ! -f "$migration/pending" ] && [ ! -f "$migration/complete" ]; then
+        git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" rev-parse HEAD > "$migration/pending.tmp" \
+            && mv "$migration/pending.tmp" "$migration/pending" || fail "Could not record migration provenance."
+    fi
+}
+
+# Recognize older attempts that already changed origin but left the unrelated legacy checkout.
+detect_partial_herika_migration() {
+    local branch="$1"
+    local migration="$STATE_ROOT/herika-org-migration"
+    local ref
+    [ "$PRODUCT" = herika ] || return 0
+    case "$(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" remote get-url origin)" in
+        https://github.com/Dwemer-Dynamics/HerikaServer.git|https://github.com/Dwemer-Dynamics/HerikaServer|git@github.com:Dwemer-Dynamics/HerikaServer.git) ;;
+        *) return 0 ;;
+    esac
+    [ ! -e "$migration/pending" ] && [ ! -e "$migration/complete" ] || return 0
+    if git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" merge-base HEAD "origin/$branch" >/dev/null 2>&1; then
+        return 0
+    fi
+    # An unrelated history alone is not permission to replace it: prove legacy ancestry.
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" fetch --no-tags --atomic \
+        https://github.com/abeiro/HerikaServer.git \
+        '+refs/heads/aiagent:refs/dwemerdistro/legacy-herika/aiagent' \
+        '+refs/heads/dev:refs/dwemerdistro/legacy-herika/dev' \
+        '+refs/heads/unstable:refs/dwemerdistro/legacy-herika/unstable' \
+        || fail "Could not verify the old HerikaServer history; no files were replaced."
+    for ref in aiagent dev unstable; do
+        if git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" merge-base HEAD "refs/dwemerdistro/legacy-herika/$ref" >/dev/null 2>&1; then
+            mark_herika_migration_pending
+            return 0
+        fi
+    done
+    info "Unrecognized HerikaServer history; automatic migration recovery was skipped."
+}
+
+# Keep the original checkout and runtime files before the one-time source replacement.
+recover_herika_checkout() {
+    local branch="$1"
+    local migration="$STATE_ROOT/herika-org-migration"
+    local relative
+    [ ! -L "$migration" ] && [ -f "$migration/pending" ] || fail "Invalid migration state."
+    case "$(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" remote get-url origin)" in
+        https://github.com/Dwemer-Dynamics/HerikaServer.git|https://github.com/Dwemer-Dynamics/HerikaServer|git@github.com:Dwemer-Dynamics/HerikaServer.git) ;;
+        *) fail "Migration is pending, but origin is now custom. No source files were replaced." ;;
+    esac
+    if [ -f "$migration/backup-ready" ] && [ "$(cat "$migration/branch")" != "$branch" ]; then
+        fail "Finish the pending migration on $(cat "$migration/branch") before switching branches."
+    fi
+    if [ ! -f "$migration/backup-ready" ]; then
+        info "Backing up HerikaServer before repository migration. This can take a few minutes."
+        (umask 077; tar -C "$PRODUCT_ROOT" -cpf "$migration/checkout.tar.tmp" .) \
+            && mv "$migration/checkout.tar.tmp" "$migration/checkout.tar" \
+            || fail "Could not back up HerikaServer; no source files were replaced."
+        # Preserve untracked/ignored files unless the new release owns that source path.
+        git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" ls-files --others -z > "$migration/candidates" \
+            || fail "Could not enumerate HerikaServer runtime files."
+        git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" ls-files -z \
+            'conf/conf.php' 'conf/character_map.json' 'conf/conf_*.php' 'uploads/*' 'data/voices/*' 'soundcache/*' 'log/*' \
+            >> "$migration/candidates" || fail "Could not enumerate tracked runtime files."
+        : > "$migration/runtime-files"
+        while IFS= read -r -d '' relative; do
+            [ -e "$PRODUCT_ROOT/$relative" ] || [ -L "$PRODUCT_ROOT/$relative" ] || continue
+            case "$relative" in
+                conf/conf_loader.php|conf/conf_schema.php) continue ;;
+                conf/conf.php|conf/character_map.json|conf/conf_*.php|uploads/*|data/voices/*|soundcache/*|log/*)
+                    printf '%s\0' "$relative" >> "$migration/runtime-files" ;;
+                *)
+                    if ! git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" cat-file -e "origin/$branch:$relative" 2>/dev/null; then
+                        printf '%s\0' "$relative" >> "$migration/runtime-files"
+                    else
+                        info "A local file conflicts with the new release; its original is retained in the migration backup."
+                    fi ;;
+            esac
+        done < "$migration/candidates"
+        (umask 077; tar -C "$PRODUCT_ROOT" --null -T "$migration/runtime-files" -cpf "$migration/runtime.tar.tmp") \
+            && mv "$migration/runtime.tar.tmp" "$migration/runtime.tar" \
+            || fail "Could not preserve HerikaServer runtime files."
+        printf '%s\n' "$branch" > "$migration/branch" \
+            && touch "$migration/backup-ready" || fail "Could not finalize migration backup."
+    fi
+    info "Switching HerikaServer to Dwemer Dynamics. Original files remain in $migration/checkout.tar."
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" checkout --force -B "$branch" "origin/$branch" \
+        || fail "Migration checkout failed. The original checkout is retained in $migration/checkout.tar."
+    # Tar refuses traversal through symlink parents; do not weaken that protection.
+    tar -C "$PRODUCT_ROOT" -xpf "$migration/runtime.tar" \
+        || fail "Could not restore runtime files; retain $migration and retry migration."
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" rev-parse HEAD > "$migration/checkout-ready.tmp" \
+        && mv "$migration/checkout-ready.tmp" "$migration/checkout-ready" \
+        || fail "Could not record migration checkout completion."
+}
+
+# Only commit the migration after the caller has finished database setup and installation state.
+complete_herika_migration() {
+    local migration="$STATE_ROOT/herika-org-migration"
+    [ "$PRODUCT" = herika ] && [ -f "$migration/pending" ] && [ -f "$migration/checkout-ready" ] || return 0
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" rev-parse HEAD > "$migration/complete.tmp" \
+        && mv "$migration/complete.tmp" "$migration/complete" \
+        || fail "Could not record migration completion."
+    rm -f "$migration/pending"
+    ok "HerikaServer migration completed. Original checkout retained at $migration/checkout.tar."
+}
+
 usage() {
     cat <<'EOF'
 Usage: ddistro_server <command> [product] [options]
@@ -147,6 +257,7 @@ migrate_product_repository_origin() {
                     || fail "Canonical HerikaServer branch $required_branch is unavailable; the legacy origin was retained."
             done
 
+            mark_herika_migration_pending
             git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" remote set-url origin "$PRODUCT_REPOSITORY" \
                 || fail "Could not set the canonical HerikaServer origin; the legacy origin was retained."
             if ! git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" fetch --no-tags --atomic origin \
@@ -760,6 +871,22 @@ update_repository() {
     git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" fetch origin \
         "+refs/heads/$branch:refs/remotes/origin/$branch" \
         || fail "Could not fetch $PRODUCT branch $branch."
+    detect_partial_herika_migration "$branch"
+    if [ "$PRODUCT" = herika ] && [ -f "$STATE_ROOT/herika-org-migration/pending" ]; then
+        case "$(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" remote get-url origin)" in
+            https://github.com/Dwemer-Dynamics/HerikaServer.git|https://github.com/Dwemer-Dynamics/HerikaServer|git@github.com:Dwemer-Dynamics/HerikaServer.git) ;;
+            *) fail "Migration is pending, but origin is now custom. No source files were replaced." ;;
+        esac
+        if [ ! -f "$STATE_ROOT/herika-org-migration/checkout-ready" ]; then
+            recover_herika_checkout "$branch"
+            return 0
+        fi
+        # A database failure must not cause the next attempt to discard source edits again.
+        if [ "$(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" rev-parse HEAD)" = \
+             "$(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" rev-parse "origin/$branch")" ]; then
+            return 0
+        fi
+    fi
     if [ "$FORCE_UPDATE" -eq 1 ]; then
         info "Force update enabled; discarding tracked changes in $PRODUCT_ROOT."
         git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" reset --hard HEAD \
@@ -880,6 +1007,7 @@ repair_product() {
     write_vhost
     apply_permissions
     record_install
+    complete_herika_migration
     ok "$PRODUCT repaired."
 }
 
@@ -891,6 +1019,7 @@ update_product() {
     write_vhost
     apply_permissions
     record_install
+    complete_herika_migration
     ok "$PRODUCT updated."
 }
 
