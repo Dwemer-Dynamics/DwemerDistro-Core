@@ -57,6 +57,9 @@ else
     exit 1
 fi
 
+# Repair old image keyrings before any subsequent component installation uses APT.
+/usr/local/bin/repair_github_cli_keyring || exit 1
+
 printf ">> Checking installed server repository origins...\n"
 /usr/local/bin/ddistro_server migrate-remotes all || exit 1
 

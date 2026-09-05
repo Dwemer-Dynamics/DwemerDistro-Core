@@ -185,6 +185,7 @@ ensure_hf_token() {
 }
 
 echo "Installing audio.cpp PocketTTS with CUDA $CUDA_VERSION"
+sudo /usr/local/bin/repair_github_cli_keyring
 sudo apt update
 sudo apt-get -y install --no-install-recommends git cmake build-essential ninja-build python3-venv python3-pip
 
