@@ -789,68 +789,74 @@ sudo chown -R dwemer:dwemer /home/dwemer/piper
 sudo chmod -R 755 /home/dwemer/piper
 printf "${GREEN}[SUCCESS] Piper TTS updated successfully${NC}\n"
 
-# XTTSv2 server update
-cd /home/dwemer/xtts-api-server
-BRANCH=$(git branch --show-current)
-print_header "UPDATING CHIM XTTS" "$BRANCH"
-
-XTTS_UPDATE_OK=1
-XTTS_TEMP_BACKUP=$(mktemp -d /home/dwemer/xtts-update.XXXXXX)
-if ! ensure_managed_remote \
-    /home/dwemer/xtts-api-server \
-    https://github.com/Dwemer-Dynamics/xtts-api-server.git \
-    https://github.com/abeiro/xtts-api-server.git; then
-    XTTS_UPDATE_OK=0
-fi
-
-# Backup speakers folder if it exists
-if [ -d "speakers" ]; then
-    print_warning "Backing up speakers folder..."
-    cp -a speakers "$XTTS_TEMP_BACKUP/speakers"
-fi
-
-if [ "$XTTS_UPDATE_OK" -eq 1 ]; then
-    printf ">> Resetting repository...\n"
-    git reset --hard HEAD
-    printf ">> Pulling latest changes...\n"
-    if git fetch origin "$BRANCH"; then
-        XTTS_CONFLICT_FILE="xtts_api_server/voice_management.py"
-        if [ -f "$XTTS_CONFLICT_FILE" ] \
-            && ! git ls-files --error-unmatch -- "$XTTS_CONFLICT_FILE" >/dev/null 2>&1 \
-            && git cat-file -e "origin/${BRANCH}:${XTTS_CONFLICT_FILE}" 2>/dev/null; then
-            XTTS_BACKUP_ROOT="/home/dwemer/xtts-api-server-update-backups/$(date -u '+%Y%m%d%H%M%S')"
-            mkdir -p "$XTTS_BACKUP_ROOT/$(dirname "$XTTS_CONFLICT_FILE")"
-            if mv "$XTTS_CONFLICT_FILE" "$XTTS_BACKUP_ROOT/$XTTS_CONFLICT_FILE"; then
-                print_warning "Backed up conflicting local XTTS file to $XTTS_BACKUP_ROOT/$XTTS_CONFLICT_FILE"
-            else
-                print_warning "Failed to back up conflicting XTTS file: $XTTS_CONFLICT_FILE"
-                XTTS_UPDATE_OK=0
-            fi
-        fi
-        if [ "$XTTS_UPDATE_OK" -eq 1 ] && ! git merge --ff-only "origin/$BRANCH"; then
-            XTTS_UPDATE_OK=0
-        fi
-    else
-        XTTS_UPDATE_OK=0
-    fi
-fi
-
-# Restore speakers folder after the repository update.
-if [ -d "$XTTS_TEMP_BACKUP/speakers" ]; then
-    print_warning "Restoring speakers folder..."
-    mkdir -p speakers
-    cp -a "$XTTS_TEMP_BACKUP/speakers/." speakers/ 2>/dev/null || XTTS_UPDATE_OK=0
-fi
-rm -rf -- "$XTTS_TEMP_BACKUP"
-
-# Set permissions for XTTS
-sudo chown -R dwemer:dwemer /home/dwemer/xtts-api-server
-sudo chmod -R 755 /home/dwemer/xtts-api-server
-if [ "$XTTS_UPDATE_OK" -eq 1 ]; then
-    printf "${GREEN}[SUCCESS] CHIM XTTS updated successfully${NC}\n"
-else
+# XTTS is optional; do not touch leftover files without an installed repository.
+if [ ! -d /home/dwemer/xtts-api-server/.git ]; then
+    printf "[SKIP] CHIM XTTS repository not installed; skipping update.\n"
+elif ! cd /home/dwemer/xtts-api-server; then
     COMPONENT_UPDATE_FAILED=1
     print_warning "CHIM XTTS update failed. The existing installation was retained."
+else
+    BRANCH=$(git branch --show-current)
+    print_header "UPDATING CHIM XTTS" "$BRANCH"
+
+    XTTS_UPDATE_OK=1
+    XTTS_TEMP_BACKUP=$(mktemp -d /home/dwemer/xtts-update.XXXXXX)
+    if ! ensure_managed_remote \
+        /home/dwemer/xtts-api-server \
+        https://github.com/Dwemer-Dynamics/xtts-api-server.git \
+        https://github.com/abeiro/xtts-api-server.git; then
+        XTTS_UPDATE_OK=0
+    fi
+
+    # Backup speakers folder if it exists
+    if [ -d "speakers" ]; then
+        print_warning "Backing up speakers folder..."
+        cp -a speakers "$XTTS_TEMP_BACKUP/speakers"
+    fi
+
+    if [ "$XTTS_UPDATE_OK" -eq 1 ]; then
+        printf ">> Resetting repository...\n"
+        git reset --hard HEAD
+        printf ">> Pulling latest changes...\n"
+        if git fetch origin "$BRANCH"; then
+            XTTS_CONFLICT_FILE="xtts_api_server/voice_management.py"
+            if [ -f "$XTTS_CONFLICT_FILE" ] \
+                && ! git ls-files --error-unmatch -- "$XTTS_CONFLICT_FILE" >/dev/null 2>&1 \
+                && git cat-file -e "origin/${BRANCH}:${XTTS_CONFLICT_FILE}" 2>/dev/null; then
+                XTTS_BACKUP_ROOT="/home/dwemer/xtts-api-server-update-backups/$(date -u '+%Y%m%d%H%M%S')"
+                mkdir -p "$XTTS_BACKUP_ROOT/$(dirname "$XTTS_CONFLICT_FILE")"
+                if mv "$XTTS_CONFLICT_FILE" "$XTTS_BACKUP_ROOT/$XTTS_CONFLICT_FILE"; then
+                    print_warning "Backed up conflicting local XTTS file to $XTTS_BACKUP_ROOT/$XTTS_CONFLICT_FILE"
+                else
+                    print_warning "Failed to back up conflicting XTTS file: $XTTS_CONFLICT_FILE"
+                    XTTS_UPDATE_OK=0
+                fi
+            fi
+            if [ "$XTTS_UPDATE_OK" -eq 1 ] && ! git merge --ff-only "origin/$BRANCH"; then
+                XTTS_UPDATE_OK=0
+            fi
+        else
+            XTTS_UPDATE_OK=0
+        fi
+    fi
+
+    # Restore speakers folder after the repository update.
+    if [ -d "$XTTS_TEMP_BACKUP/speakers" ]; then
+        print_warning "Restoring speakers folder..."
+        mkdir -p speakers
+        cp -a "$XTTS_TEMP_BACKUP/speakers/." speakers/ 2>/dev/null || XTTS_UPDATE_OK=0
+    fi
+    rm -rf -- "$XTTS_TEMP_BACKUP"
+
+    # Set permissions for XTTS
+    sudo chown -R dwemer:dwemer /home/dwemer/xtts-api-server
+    sudo chmod -R 755 /home/dwemer/xtts-api-server
+    if [ "$XTTS_UPDATE_OK" -eq 1 ]; then
+        printf "${GREEN}[SUCCESS] CHIM XTTS updated successfully${NC}\n"
+    else
+        COMPONENT_UPDATE_FAILED=1
+        print_warning "CHIM XTTS update failed. The existing installation was retained."
+    fi
 fi
 
 # Parakeet update
