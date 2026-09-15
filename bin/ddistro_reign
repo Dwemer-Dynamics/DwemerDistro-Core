@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# Reign's Linux runtime lifecycle; ddistro_server owns repository and database operations.
+set -euo pipefail
+root=/opt/dwemerdistro/reign
+data=/var/lib/dwemerdistro/reign
+source_root=/var/www/html/ReignServer
+pidfile=/run/dwemerdistro-reign/server.pid
+command=${1:-status}
+if [ "$(id -u)" != 0 ]; then exec sudo "$0" "$@"; fi
+case "$command" in
+    prepare|configure-web|activate|start|stop)
+        exec 8>/run/lock/dwemerdistro-reign-runtime.lock
+        flock -w 30 8 || { echo 'Another Reign runtime operation is running.' >&2; exit 75; }
+        ;;
+esac
+
+running() {
+    [ -s "$pidfile" ] || return 1
+    pid=$(cat "$pidfile")
+    [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || return 1
+    local executable
+    executable=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || return 1
+    case "$executable" in "$root"/versions/*/ReignBetaServer) return 0 ;; *) return 1 ;; esac
+}
+
+stop() {
+    if running; then
+        # setsid creates an owned session, so only this server and its worker group receive signals.
+        [ "$(ps -o sid= -p "$pid" | tr -d ' ')" = "$pid" ] || { echo 'Reign process ownership mismatch.' >&2; exit 1; }
+        kill -TERM -- "-$pid"
+        for attempt in $(seq 1 30); do running || break; sleep 1; done
+        if running; then echo 'Reign did not stop cleanly; files were not replaced.' >&2; exit 1; fi
+    fi
+    rm -f "$pidfile"
+}
+
+start() {
+    running && return 0
+    [ -x "$root/current/ReignBetaServer" ] || { echo 'Reign runtime needs installation or repair.' >&2; exit 1; }
+    install -d -o dwemer -g dwemer -m 700 "$data" "$data/logs" /run/dwemerdistro-reign
+    # Do not attach to or kill an unmanaged process already using Reign's port.
+    if ss -ltnH 'sport = :5101' | grep -q .; then echo 'Reign internal port 5101 is already in use.' >&2; return 1; fi
+    local python_root="$root/venv" model_root="$root/models"
+    if [ -f "$root/current/embedding-model.lock.json" ]; then
+        python_root="$root/venvs/$(sha256sum "$root/current/VectorWorker/requirements-linux.txt" | cut -d ' ' -f 1)"
+        model_root="$root/model-versions/$(sha256sum "$root/current/embedding-model.lock.json" | cut -d ' ' -f 1)"
+        [ -f "$python_root/.complete" ] && [ -d "$model_root" ] || { echo 'Reign dependencies need preparation.' >&2; return 1; }
+    fi
+    runuser -u dwemer -- env REIGN_DATA_ROOT="$data" REIGN_DB_NAME=Reign \
+        REIGN_VECTOR_PYTHON="$python_root/bin/python" REIGN_VECTOR_MODEL_DIR="$model_root" \
+        sh -c 'umask 077; setsid "$1" --port 5101 --no-browser >> "$3/logs/server.log" 2>&1 < /dev/null & echo $! > "$2"' \
+        sh "$root/current/ReignBetaServer" "$pidfile" "$data" 8>&-
+    for attempt in $(seq 1 45); do
+        if curl -fsS --max-time 2 http://127.0.0.1:5101/health | python3 -c 'import json,sys; r=json.load(sys.stdin); sys.exit(not(r.get("ok") and r.get("service")=="BannerlordReignServer" and r.get("protocolVersion")==1))' 2>/dev/null; then return 0; fi
+        running || break
+        sleep 1
+    done
+    echo "Reign startup failed. See $data/logs/server.log." >&2
+    stop
+    return 1
+}
+
+case "$command" in
+    configure-web)
+        a2enmod proxy proxy_http >/dev/null
+        if ! grep -Eq '^[[:space:]]*Listen[[:space:]]+([^:[:space:]]+:)?8089([[:space:]]|$)' /etc/apache2/ports.conf; then
+            printf 'Listen 0.0.0.0:8089\n' >> /etc/apache2/ports.conf
+        fi
+        cat > /etc/apache2/conf-available/reign-source.conf <<'EOF'
+# Reign is a compiled application; never serve its source through another site's document root.
+<Directory /var/www/html/ReignServer>
+    Require all denied
+</Directory>
+EOF
+        cat > /etc/apache2/sites-available/reign.conf <<'EOF'
+<VirtualHost *:8089>
+    ProxyRequests Off
+    ProxyPass / http://127.0.0.1:5101/ timeout=300
+    ProxyPassReverse / http://127.0.0.1:5101/
+    ErrorLog ${APACHE_LOG_DIR}/reign_error.log
+    CustomLog ${APACHE_LOG_DIR}/reign_access.log combined
+</VirtualHost>
+EOF
+        a2enconf reign-source >/dev/null
+        a2ensite reign >/dev/null
+        apache2ctl configtest
+        if pgrep -x apache2 >/dev/null; then service apache2 reload; fi
+        ;;
+    start) start ;;
+    stop) stop ;;
+    status) if running; then echo running; else echo stopped; fi ;;
+    prepare)
+        [ -f "$source_root/ReignBetaServer/ReignBetaServer.csproj" ] || exit 1
+        [ ! -L "$root" ] && [ ! -L "$data" ] || { echo 'Redirected runtime roots are not supported.' >&2; exit 1; }
+        install -d -m 755 "$root" "$root/versions"
+        install -d -o dwemer -g dwemer -m 700 "$data"
+        apt-get update -qq
+        apt-get install -y --no-install-recommends python3-venv libicu72 libgssapi-krb5-2 ca-certificates curl
+        requirements="$source_root/ReignBetaServer/VectorWorker/requirements-linux.txt"
+        python_root="$root/venvs/$(sha256sum "$requirements" | cut -d ' ' -f 1)"
+        model_root="$root/model-versions/$(sha256sum "$source_root/ReignRelease/embedding-model.lock.json" | cut -d ' ' -f 1)"
+        # Dependencies are immutable per source lock, so a failed update cannot change the running worker.
+        if [ ! -f "$python_root/.complete" ]; then
+            [ -x "$python_root/bin/python" ] || python3 -m venv "$python_root"
+            "$python_root/bin/python" -m pip install --disable-pip-version-check -r "$requirements"
+            "$python_root/bin/python" -m pip check
+            touch "$python_root/.complete"
+        fi
+        "$python_root/bin/python" "$source_root/ReignRelease/Prepare-LinuxRuntime.py" --model-directory "$model_root"
+        ;;
+    build)
+        if ! command -v dotnet >/dev/null 2>&1 || ! dotnet --list-sdks | grep -q '^10\.'; then
+            . /etc/os-release
+            [ "$ID" = debian ] && [ "$VERSION_ID" = 12 ] || { echo 'Reign currently supports Debian 12.' >&2; exit 1; }
+            feed=$(mktemp /tmp/reign-microsoft-feed-XXXXXX.deb)
+            curl --fail --location --proto '=https' https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb --output "$feed"
+            dpkg -i "$feed"
+            rm -f "$feed"
+            apt-get update -qq
+            apt-get install -y --no-install-recommends dotnet-sdk-10.0
+        fi
+        build_parent=$(mktemp -d /var/tmp/reign-build-XXXXXXXX)
+        chown dwemer:dwemer "$build_parent"
+        candidate="$build_parent/publish"
+        runuser -u dwemer -- python3 "$source_root/ReignRelease/Build-Linux.py" --output "$candidate"
+        "$0" activate "$candidate"
+        ;;
+    activate)
+        package=${2:?Supply an absolute validated Linux publish directory}
+        [ "${package:0:1}" = / ] && [ -f "$package/ReignBetaServer" ] && [ -f "$package/reign-linux-artifact.json" ] || exit 64
+        python3 - "$package" <<'PY'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1]).resolve()
+manifest=json.loads((root/'reign-linux-artifact.json').read_text())
+if manifest.get('schema')!='reign-linux-artifact-v1' or manifest.get('protocolVersion')!=1:
+    raise ValueError('Unsupported artifact manifest or protocol')
+files=manifest.get('files', {})
+actual={p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file() and p.relative_to(root).as_posix()!='reign-linux-artifact.json'}
+if not files or set(files)!=actual or 'ReignBetaServer' not in files:
+    raise ValueError('Artifact file inventory mismatch')
+if any(p.is_symlink() for p in root.rglob('*')):
+    raise ValueError('Artifact symlinks are not supported')
+for name,digest in manifest['files'].items():
+    path=(root/name).resolve()
+    if not path.is_relative_to(root) or hashlib.sha256(path.read_bytes()).hexdigest()!=digest:
+        raise ValueError('Artifact checksum mismatch')
+PY
+        version=$(date -u +%Y%m%d%H%M%S)-$$
+        install -d "$root/versions/$version"
+        cp -a "$package/." "$root/versions/$version/"
+        chmod +x "$root/versions/$version/ReignBetaServer"
+        old=$(readlink "$root/current" 2>/dev/null || true)
+        was_running=0
+        if running; then was_running=1; fi
+        stop
+        ln -s "versions/$version" "$root/current.next"
+        mv -Tf "$root/current.next" "$root/current"
+        if ! start; then
+            if [ -n "$old" ]; then ln -s "$old" "$root/current.recover"; mv -Tf "$root/current.recover" "$root/current"; [ "$was_running" = 0 ] || start; fi
+            if [ -z "$old" ]; then rm -f "$root/current"; fi
+            exit 1
+        fi
+        [ "$was_running" = 1 ] || stop
+        echo 'Reign runtime activated and health checked; prior version retained.'
+        ;;
+    *) echo 'Usage: ddistro_reign prepare|build|activate <validated-package>|start|stop|status' >&2; exit 64 ;;
+esac

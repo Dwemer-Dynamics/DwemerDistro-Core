@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Make future databases UTF-8 without converting or replacing application data.
+set -euo pipefail
+port="${DDISTRO_POSTGRES_PORT:-5432}"
+[[ "$port" =~ ^[0-9]+$ ]] && ((port > 0 && port < 65536)) || exit 64
+if [ "$(id -u)" != 0 ]; then exec sudo "$0" "$@"; fi
+exec 9>/run/lock/dwemerdistro-postgres-utf8.lock
+flock -w 30 9 || { echo 'PostgreSQL template maintenance is already running.' >&2; exit 75; }
+psql_admin() { sudo -u postgres psql -X -p "$port" -d postgres -v ON_ERROR_STOP=1 -At "$@"; }
+pending="/var/lib/dwemerdistro/postgres-template-$port.pending"
+if [ -f "$pending" ]; then
+    mapfile -t checkpoint < "$pending"
+    retained=${checkpoint[0]:-}
+    retained_acl=${checkpoint[1]:-}
+    [[ "$retained" =~ ^ddistro_template1_before_utf8_[0-9]{14}$ ]] && [[ "$retained_acl" =~ ^[01]$ ]] \
+        || { echo 'Invalid retained-template checkpoint; no database was changed.' >&2; exit 1; }
+    current=$(psql_admin -c "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='template1'")
+    if [ -z "$current" ]; then
+        # Interrupted between rename and creation: put the retained original back first.
+        psql_admin -c "ALTER DATABASE $retained RENAME TO template1; ALTER DATABASE template1 IS_TEMPLATE true; ALTER DATABASE template1 ALLOW_CONNECTIONS true" >/dev/null
+    elif [ "$current" = UTF8 ]; then
+        psql_admin -c 'ALTER DATABASE template1 IS_TEMPLATE true; ALTER DATABASE template1 ALLOW_CONNECTIONS true' >/dev/null
+        if [ "$retained_acl" = 1 ]; then psql_admin -c 'REVOKE TEMPORARY ON DATABASE template1 FROM PUBLIC' >/dev/null; fi
+    else
+        psql_admin -c 'ALTER DATABASE template1 IS_TEMPLATE true; ALTER DATABASE template1 ALLOW_CONNECTIONS true' >/dev/null
+    fi
+    rm -f "$pending"
+fi
+encoding=$(psql_admin -c "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='template1'")
+if [ "$encoding" = UTF8 ]; then exit 0; fi
+[ -n "$encoding" ] || { echo 'template1 is missing; recover the retained template before retrying.' >&2; exit 1; }
+custom=$(sudo -u postgres psql -X -p "$port" -d template1 -v ON_ERROR_STOP=1 -Atc "
+SELECT (SELECT count(*) FROM pg_namespace WHERE nspname NOT IN ('public','pg_catalog','information_schema') AND nspname NOT LIKE 'pg_toast%' AND nspname NOT LIKE 'pg_temp_%')
+ + (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public')
+ + (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public')
+ + (SELECT count(*) FROM pg_extension WHERE extname <> 'plpgsql')")
+[ "$custom" = 0 ] || { echo 'template1 contains custom objects; retained unchanged. New managed databases explicitly use UTF8/template0.' >&2; exit 1; }
+settings=$(psql_admin -c "SELECT (SELECT count(*) FROM pg_db_role_setting WHERE setdatabase=(SELECT oid FROM pg_database WHERE datname='template1')) + (SELECT count(*) FROM pg_database WHERE datname='template1' AND ((datacl IS NOT NULL AND datacl::text NOT IN ('{=c/postgres,postgres=CTc/postgres}','{postgres=CTc/postgres,=c/postgres}')) OR datdba<>(SELECT oid FROM pg_roles WHERE rolname='postgres')))")
+[ "$settings" = 0 ] || { echo 'template1 has custom settings, ownership, or grants; retained unchanged.' >&2; exit 1; }
+original_acl=$(psql_admin -c "SELECT COALESCE(datacl::text, '') FROM pg_database WHERE datname='template1'")
+backup="ddistro_template1_before_utf8_$(date -u +%Y%m%d%H%M%S)"
+install -d -m 755 /var/lib/dwemerdistro
+retained_acl=0
+[ -z "$original_acl" ] || retained_acl=1
+(umask 077; printf '%s\n%s\n' "$backup" "$retained_acl" > "$pending")
+# Stop new connections first; never terminate someone else's template session.
+psql_admin -c 'ALTER DATABASE template1 ALLOW_CONNECTIONS false' >/dev/null
+sessions=$(psql_admin -c "SELECT count(*) FROM pg_stat_activity WHERE datname='template1'")
+if [ "$sessions" != 0 ]; then
+    psql_admin -c 'ALTER DATABASE template1 ALLOW_CONNECTIONS true' >/dev/null
+    rm -f "$pending"
+    echo 'template1 is in use; retry UTF8 setup when idle.' >&2
+    exit 75
+fi
+psql_admin -c "ALTER DATABASE template1 IS_TEMPLATE false; ALTER DATABASE template1 RENAME TO $backup" >/dev/null
+if ! sudo -u postgres createdb -p "$port" --owner=postgres --template=template0 --encoding=UTF8 --locale=C.UTF-8 template1; then
+    psql_admin -c "ALTER DATABASE $backup RENAME TO template1; ALTER DATABASE template1 IS_TEMPLATE true; ALTER DATABASE template1 ALLOW_CONNECTIONS true" >/dev/null
+    rm -f "$pending"
+    echo 'UTF8 template creation failed; original default restored.' >&2
+    exit 1
+fi
+psql_admin -c 'ALTER DATABASE template1 IS_TEMPLATE true' >/dev/null
+if [ -n "$original_acl" ]; then psql_admin -c 'REVOKE TEMPORARY ON DATABASE template1 FROM PUBLIC' >/dev/null; fi
+rm -f "$pending"
+echo "PostgreSQL now defaults to UTF8. Original empty template retained as $backup; application databases unchanged."

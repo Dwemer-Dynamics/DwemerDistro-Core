@@ -576,7 +576,7 @@ fi
 
 DIALECTIC_DATABASE_READY=0
 if [ -x "$SERVER_MANAGER" ]; then
-    for managed_product in herika stobe dialectic; do
+    for managed_product in herika stobe dialectic reign; do
         if "$SERVER_MANAGER" startup "$managed_product"; then
             if [ "$managed_product" = "dialectic" ]; then
                 DIALECTIC_DATABASE_READY=1
@@ -593,6 +593,10 @@ fi
 echo "Starting Apache/PHP/PGSQL Server"
 /etc/init.d/apache2 restart &>/dev/null
 /etc/init.d/postgresql restart
+
+if [ -x /opt/dwemerdistro/reign/current/ReignBetaServer ]; then
+    /usr/local/bin/ddistro_reign start || echo "WARNING: Reign failed to start; check its log."
+fi
 
 if [ "$DIALECTIC_DATABASE_READY" -eq 1 ] && [ -d "/var/www/html/DialecticServer" ]; then
     ensure_dialectic_runtime
@@ -868,6 +872,7 @@ fi
 echo "Press Enter to shutdown DwemerDistro"
 read
 
+if [ -x /usr/local/bin/ddistro_reign ]; then /usr/local/bin/ddistro_reign stop; fi
 killall -15 -u dwemer
 
 /etc/init.d/apache2 stop
