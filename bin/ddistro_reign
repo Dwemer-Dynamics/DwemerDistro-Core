@@ -51,7 +51,8 @@ start() {
         sh -c 'umask 077; setsid "$1" --port 5101 --no-browser >> "$3/logs/server.log" 2>&1 < /dev/null & echo $! > "$2"' \
         sh "$root/current/ReignBetaServer" "$pidfile" "$data" 8>&-
     for attempt in $(seq 1 45); do
-        if curl -fsS --max-time 2 http://127.0.0.1:5101/health | python3 -c 'import json,sys; r=json.load(sys.stdin); sys.exit(not(r.get("ok") and r.get("service")=="BannerlordReignServer" and r.get("protocolVersion")==1))' 2>/dev/null; then return 0; fi
+        # Retained older builds lack schema fields; reported schema mismatches must fail activation.
+        if curl -fsS --max-time 2 http://127.0.0.1:5101/health | python3 -c 'import json,sys; r=json.load(sys.stdin); version=r.get("databaseSchemaVersion"); legacy=not any(k in r for k in ("databaseSchemaVersion","requiredDatabaseSchemaVersion","databaseSchemaUpToDate")); schema_ok=legacy or (type(version) is int and version>0 and version==r.get("requiredDatabaseSchemaVersion") and r.get("databaseSchemaUpToDate") is True); ok=r.get("ok") and r.get("service")=="BannerlordReignServer" and r.get("protocolVersion")==1 and schema_ok; print("ReignServer database versioning check completed. Schema version %s." % version if not legacy else "ReignServer uses an older build without database version reporting.") if ok else None; sys.exit(0 if ok else 1)' 2>/dev/null; then return 0; fi
         running || break
         sleep 1
     done
