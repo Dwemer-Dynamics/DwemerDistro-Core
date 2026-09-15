@@ -15,7 +15,7 @@ ID = re.compile(r'[0-9]{14}-[0-9]+')
 
 def database_version():
     result = subprocess.run(['runuser', '-u', 'postgres', '--', 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1',
-        '-d', 'Reign', '-c', "SELECT version FROM reign_meta.storage_version WHERE component='reign_postgresql';"],
+        '-d', 'reign', '-c', "SELECT version FROM reign_meta.storage_version WHERE component='reign_postgresql';"],
         check=True, capture_output=True, text=True, timeout=10)
     return int(result.stdout.strip())
 
@@ -42,6 +42,7 @@ def record_current():
             return
         schema = health.get('databaseSchemaVersion')
         if not (health.get('ok') is True and health.get('service') == 'BannerlordReignServer'
+                and health.get('databaseName') == 'reign'
                 and type(schema) is int and schema > 0 and schema == health.get('requiredDatabaseSchemaVersion')
                 and health.get('databaseSchemaUpToDate') is True and schema == database_version()):
             return
@@ -51,7 +52,7 @@ def record_current():
     manifest = path / 'reign-linux-artifact.json'
     release = json.loads(manifest.read_text())
     metadata = dict(id=current.name, manifestSha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
-        databaseSchemaVersion=schema, version=release.get('version', health.get('serverVersion', 'unknown')))
+        databaseName='reign', databaseSchemaVersion=schema, version=release.get('version', health.get('serverVersion', 'unknown')))
     destination = ROOT / 'rollback-metadata' / (current.name + '.json')
     temporary = destination.with_suffix('.tmp')
     temporary.write_text(json.dumps(metadata))
@@ -64,7 +65,7 @@ def compatible(version_id, schema):
     digest = hashlib.sha256((path / 'reign-linux-artifact.json').read_bytes()).hexdigest()
     if metadata.get('id') != version_id or metadata.get('manifestSha256') != digest:
         raise ValueError('Retained artifact does not match its verified metadata')
-    if metadata.get('databaseSchemaVersion') != schema:
+    if metadata.get('databaseName') != 'reign' or metadata.get('databaseSchemaVersion') != schema:
         raise ValueError('Retained server is incompatible with the current database schema')
     return metadata
 

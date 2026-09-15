@@ -218,7 +218,7 @@ select_product() {
             ;;
         reign)
             PRODUCT_ROOT="$WEB_ROOT/ReignServer"
-            PRODUCT_DATABASE="Reign"
+            PRODUCT_DATABASE="reign"
             PRODUCT_REPOSITORY="https://github.com/Dwemer-Dynamics/ReignServer.git"
             PRODUCT_PRODUCTION_BRANCH="reign"
             PRODUCT_VHOST="reign.conf"

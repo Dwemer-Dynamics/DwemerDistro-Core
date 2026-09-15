@@ -58,7 +58,7 @@ start() {
         model_root="$root/model-versions/$(sha256sum "$root/current/embedding-model.lock.json" | cut -d ' ' -f 1)"
         [ -f "$python_root/.complete" ] && [ -d "$model_root" ] || { echo 'Reign dependencies need preparation.' >&2; return 1; }
     fi
-    runuser -u dwemer -- env REIGN_DATA_ROOT="$data" REIGN_DB_NAME=Reign \
+    runuser -u dwemer -- env REIGN_DATA_ROOT="$data" REIGN_DB_NAME=reign \
         REIGN_VECTOR_PYTHON="$python_root/bin/python" REIGN_VECTOR_MODEL_DIR="$model_root" \
         sh -c 'umask 077; setsid "$1" --port 5101 --no-browser >> "$3/logs/server.log" 2>&1 < /dev/null & echo $! > "$2"' \
         sh "$root/current/ReignBetaServer" "$pidfile" "$data" 8>&-
