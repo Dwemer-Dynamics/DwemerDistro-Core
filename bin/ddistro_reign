@@ -8,7 +8,7 @@ pidfile=/run/dwemerdistro-reign/server.pid
 command=${1:-status}
 if [ "$(id -u)" != 0 ]; then exec sudo "$0" "$@"; fi
 case "$command" in
-    prepare|configure-web|activate|start|stop|rollback|rollback-list)
+    prepare|configure-web|activate|start|stop|rollback|rollback-list|repair-permissions)
         exec 8>/run/lock/dwemerdistro-reign-runtime.lock
         flock -w 30 8 || { echo 'Another Reign runtime operation is running.' >&2; exit 75; }
         ;;
@@ -34,7 +34,19 @@ stop() {
     rm -f "$pidfile"
 }
 
+# Windows UNC clients can create root-owned campaign files; keep server access inherited.
+repair_permissions() {
+    [ ! -L "$data" ] && [ ! -L "$data/campaigns" ] || { echo 'Redirected campaign roots are not supported.' >&2; return 1; }
+    command -v setfacl >/dev/null || { echo 'Reign permissions need preparation (acl package missing).' >&2; return 1; }
+    install -d -o dwemer -g dwemer -m 700 "$data" "$data/campaigns" || return 1
+    # Do not traverse symlinks or other mounts, or change any campaign contents.
+    find -P "$data/campaigns" -xdev \( -type d -o -type f \) -exec chown --no-dereference dwemer:dwemer {} + || return 1
+    find -P "$data/campaigns" -xdev -type d -exec setfacl -m u::rwx,u:dwemer:rwx,g::---,o::---,d:u::rwx,d:u:dwemer:rwx,d:g::---,d:o::--- {} + || return 1
+    find -P "$data/campaigns" -xdev -type f -exec setfacl -m u::rw,u:dwemer:rw,g::---,o::--- {} +
+}
+
 start() {
+    repair_permissions || return 1
     running && return 0
     [ -x "$root/current/ReignBetaServer" ] || { echo 'Reign runtime needs installation or repair.' >&2; exit 1; }
     install -d -o dwemer -g dwemer -m 700 "$data" "$data/logs" /run/dwemerdistro-reign
@@ -91,6 +103,7 @@ EOF
         ;;
     start) start ;;
     stop) stop ;;
+    repair-permissions) repair_permissions ;;
     status) if running; then echo running; else echo stopped; fi ;;
     rollback-list) python3 /usr/local/bin/ddistro_reign_versions.py list ;;
     prepare)
@@ -99,7 +112,8 @@ EOF
         install -d -m 755 "$root" "$root/versions"
         install -d -o dwemer -g dwemer -m 700 "$data"
         apt-get update -qq
-        apt-get install -y --no-install-recommends python3-venv libicu72 libgssapi-krb5-2 ca-certificates curl
+        apt-get install -y --no-install-recommends python3-venv libicu72 libgssapi-krb5-2 ca-certificates curl acl
+        repair_permissions
         requirements="$source_root/ReignBetaServer/VectorWorker/requirements-linux.txt"
         python_root="$root/venvs/$(sha256sum "$requirements" | cut -d ' ' -f 1)"
         model_root="$root/model-versions/$(sha256sum "$source_root/ReignRelease/embedding-model.lock.json" | cut -d ' ' -f 1)"
@@ -179,5 +193,5 @@ PY
         [ "$was_running" = 1 ] || stop
         echo 'Reign runtime activated and health checked; prior version retained.'
         ;;
-    *) echo 'Usage: ddistro_reign prepare|build|activate <validated-package>|rollback-list|rollback <version-id>|start|stop|status' >&2; exit 64 ;;
+    *) echo 'Usage: ddistro_reign prepare|build|activate <validated-package>|rollback-list|rollback <version-id>|repair-permissions|start|stop|status' >&2; exit 64 ;;
 esac
