@@ -8,7 +8,7 @@ pidfile=/run/dwemerdistro-reign/server.pid
 command=${1:-status}
 if [ "$(id -u)" != 0 ]; then exec sudo "$0" "$@"; fi
 case "$command" in
-    prepare|configure-web|activate|start|stop)
+    prepare|configure-web|activate|start|stop|rollback|rollback-list)
         exec 8>/run/lock/dwemerdistro-reign-runtime.lock
         flock -w 30 8 || { echo 'Another Reign runtime operation is running.' >&2; exit 75; }
         ;;
@@ -90,6 +90,7 @@ EOF
     start) start ;;
     stop) stop ;;
     status) if running; then echo running; else echo stopped; fi ;;
+    rollback-list) python3 /usr/local/bin/ddistro_reign_versions.py list ;;
     prepare)
         [ -f "$source_root/ReignBetaServer/ReignBetaServer.csproj" ] || exit 1
         [ ! -L "$root" ] && [ ! -L "$data" ] || { echo 'Redirected runtime roots are not supported.' >&2; exit 1; }
@@ -126,8 +127,14 @@ EOF
         runuser -u dwemer -- python3 "$source_root/ReignRelease/Build-Linux.py" --output "$candidate"
         "$0" activate "$candidate"
         ;;
-    activate)
-        package=${2:?Supply an absolute validated Linux publish directory}
+    activate|rollback)
+        if [ "$command" = rollback ]; then
+            target=${2:?Supply a retained version ID}
+            python3 /usr/local/bin/ddistro_reign_versions.py check "$target"
+            package="$root/versions/$target"
+        else
+            package=${2:?Supply an absolute validated Linux publish directory}
+        fi
         [ "${package:0:1}" = / ] && [ -f "$package/ReignBetaServer" ] && [ -f "$package/reign-linux-artifact.json" ] || exit 64
         python3 - "$package" <<'PY'
 import hashlib,json,pathlib,sys
@@ -146,9 +153,14 @@ for name,digest in manifest['files'].items():
     if not path.is_relative_to(root) or hashlib.sha256(path.read_bytes()).hexdigest()!=digest:
         raise ValueError('Artifact checksum mismatch')
 PY
-        version=$(date -u +%Y%m%d%H%M%S)-$$
-        install -d "$root/versions/$version"
-        cp -a "$package/." "$root/versions/$version/"
+        python3 /usr/local/bin/ddistro_reign_versions.py record
+        if [ "$command" = rollback ]; then
+            version=$target
+        else
+            version=$(date -u +%Y%m%d%H%M%S)-$$
+            install -d "$root/versions/$version"
+            cp -a "$package/." "$root/versions/$version/"
+        fi
         chmod +x "$root/versions/$version/ReignBetaServer"
         old=$(readlink "$root/current" 2>/dev/null || true)
         was_running=0
@@ -161,8 +173,9 @@ PY
             if [ -z "$old" ]; then rm -f "$root/current"; fi
             exit 1
         fi
+        python3 /usr/local/bin/ddistro_reign_versions.py record || echo 'Could not record rollback compatibility for this build.' >&2
         [ "$was_running" = 1 ] || stop
         echo 'Reign runtime activated and health checked; prior version retained.'
         ;;
-    *) echo 'Usage: ddistro_reign prepare|build|activate <validated-package>|start|stop|status' >&2; exit 64 ;;
+    *) echo 'Usage: ddistro_reign prepare|build|activate <validated-package>|rollback-list|rollback <version-id>|start|stop|status' >&2; exit 64 ;;
 esac
