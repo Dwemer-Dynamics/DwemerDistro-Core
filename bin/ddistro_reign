@@ -76,6 +76,8 @@ EOF
         cat > /etc/apache2/sites-available/reign.conf <<'EOF'
 <VirtualHost *:8089>
     ProxyRequests Off
+    # Reign's HTTP listener reads bodies directly; Apache must acknowledge Expect first.
+    Proxy100Continue Off
     ProxyPass / http://127.0.0.1:5101/ timeout=300
     ProxyPassReverse / http://127.0.0.1:5101/
     ErrorLog ${APACHE_LOG_DIR}/reign_error.log
