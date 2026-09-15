@@ -154,13 +154,16 @@ Usage: ddistro_server <command> [product] [options]
 Manage optional DwemerDistro application servers.
 
 Commands:
-  status [all|herika|stobe|dialectic] [--json]
-  migrate-remotes [all|herika|stobe|dialectic]
-  install <herika|stobe|dialectic> [--branch main|dev]
-  update <herika|stobe|dialectic> [--branch main|dev] [--force]
-  repair <herika|stobe|dialectic> [--branch main|dev]
-  uninstall <herika|stobe|dialectic> --confirm PURGE-<PRODUCT>
-  startup [herika|stobe|dialectic]
+  status [all|herika|stobe|dialectic|reign] [--json]
+  migrate-remotes [all|herika|stobe|dialectic|reign]
+  install <herika|stobe|dialectic|reign> [--branch main|dev|reign|unstable]
+  update <herika|stobe|dialectic|reign> [--branch main|dev|reign|unstable] [--force]
+  repair <herika|stobe|dialectic|reign> [--branch main|dev|reign|unstable]
+  uninstall <herika|stobe|dialectic|reign> --confirm PURGE-<PRODUCT>
+  startup [herika|stobe|dialectic|reign]
+
+Reign production is reign; it also exposes dev and unstable. Other products keep main/dev choices.
+Reign uninstall retains its database and data; repair reinstalls it.
 
 Install is allowed only when both the canonical server root and application
 database are absent. Repair handles legacy and partial installations. Update
@@ -213,6 +216,14 @@ select_product() {
             PRODUCT_VHOST=""
             PRODUCT_PORT="8081"
             ;;
+        reign)
+            PRODUCT_ROOT="$WEB_ROOT/ReignServer"
+            PRODUCT_DATABASE="Reign"
+            PRODUCT_REPOSITORY="https://github.com/Dwemer-Dynamics/ReignServer.git"
+            PRODUCT_PRODUCTION_BRANCH="reign"
+            PRODUCT_VHOST="reign.conf"
+            PRODUCT_PORT="8089"
+            ;;
         stobe)
             PRODUCT_ROOT="$WEB_ROOT/StobeServer"
             PRODUCT_DATABASE="stobe"
@@ -230,7 +241,7 @@ select_product() {
             PRODUCT_PORT="8088"
             ;;
         *)
-            fail "Unknown product '$PRODUCT'. Expected herika, stobe, or dialectic." 64
+            fail "Unknown product '$PRODUCT'. Expected herika, stobe, dialectic, or reign." 64
             ;;
     esac
 }
@@ -300,6 +311,7 @@ migrate_product_repository_origin() {
 resolve_branch() {
     case "$1" in
         main|"") printf '%s\n' "$PRODUCT_PRODUCTION_BRANCH" ;;
+        unstable) [ "$PRODUCT" = reign ] || fail "Unstable is only exposed for Reign." 64; printf '%s\n' unstable ;;
         dev) printf '%s\n' "$PRODUCT_DEV_BRANCH" ;;
         "$PRODUCT_PRODUCTION_BRANCH"|"$PRODUCT_DEV_BRANCH") printf '%s\n' "$1" ;;
         *) fail "Invalid branch '$1' for $PRODUCT. Expected main or dev." 64 ;;
@@ -408,7 +420,9 @@ install_state() {
     repo_state="$(repository_state)"
     db_state="$(database_state)"
 
-    if [ "$repo_state" = "managed" ] && [ "$db_state" != "absent" ]; then
+    if [ "$PRODUCT" = reign ] && [ "$repo_state" = managed ] && [ ! -x /opt/dwemerdistro/reign/current/ReignBetaServer ]; then
+        printf 'needs-repair\n'
+    elif [ "$repo_state" = "managed" ] && [ "$db_state" != "absent" ]; then
         printf 'installed\n'
     elif [ "$repo_state" = "absent" ] && [ "$db_state" != "present" ]; then
         printf 'not-installed\n'
@@ -425,6 +439,10 @@ current_branch() {
 }
 
 current_version() {
+    if [ "$PRODUCT" = reign ] && [ -f /opt/dwemerdistro/reign/current/reign-linux-artifact.json ]; then
+        python3 -c 'import json; print(json.load(open("/opt/dwemerdistro/reign/current/reign-linux-artifact.json"))["version"])'
+        return
+    fi
     local candidate
     for candidate in .version_number.txt versionnumber.txt .version.txt; do
         if [ -s "$PRODUCT_ROOT/$candidate" ]; then
@@ -488,7 +506,7 @@ show_status() {
         printf '{"schema_version":1,"servers":['
     fi
 
-    for key in herika stobe dialectic; do
+    for key in herika stobe dialectic reign; do
         select_product "$key"
         if [ "$JSON_OUTPUT" -eq 1 ]; then
             if [ "$first" -eq 0 ]; then
@@ -694,6 +712,9 @@ bootstrap_dialectic() {
 
 bootstrap_database() {
     start_postgres
+    local utf8_helper="/usr/local/bin/ensure_postgres_utf8"
+    [ -x "$utf8_helper" ] || utf8_helper="$(dirname "$0")/ensure_postgres_utf8"
+    "$utf8_helper" || fail "PostgreSQL UTF-8 default setup needs attention."
     ensure_pgvector
     ensure_database_role
     create_database_if_missing
@@ -702,6 +723,7 @@ bootstrap_database() {
         herika) bootstrap_herika ;;
         stobe) bootstrap_stobe ;;
         dialectic) bootstrap_dialectic ;;
+        reign) : ;;
     esac
 }
 
@@ -710,6 +732,10 @@ write_vhost() {
     local vhost_path
 
     case "$PRODUCT" in
+        reign)
+            /usr/local/bin/ddistro_reign configure-web
+            return 0
+            ;;
         stobe)
             vhost_path="/etc/apache2/sites-available/stobe.conf"
             if ! grep -Eq '^[[:space:]]*Listen[[:space:]]+([^:[:space:]]+:)?8083([[:space:]]|$)' "$ports_conf"; then
@@ -837,7 +863,8 @@ safe_remove_temp() {
 }
 
 safe_remove_product_root() {
-    [ "$PRODUCT_ROOT" = "$WEB_ROOT/HerikaServer" ] \
+    [ "$PRODUCT_ROOT" = "$WEB_ROOT/ReignServer" ] \
+        || [ "$PRODUCT_ROOT" = "$WEB_ROOT/HerikaServer" ] \
         || [ "$PRODUCT_ROOT" = "$WEB_ROOT/StobeServer" ] \
         || [ "$PRODUCT_ROOT" = "$WEB_ROOT/DialecticServer" ] \
         || fail "Refusing to remove unexpected product root: $PRODUCT_ROOT"
@@ -996,6 +1023,10 @@ install_product() {
 
     write_vhost
     apply_permissions
+    if [ "$PRODUCT" = reign ]; then
+        /usr/local/bin/ddistro_reign prepare || fail "Reign runtime preparation failed."
+        /usr/local/bin/ddistro_reign build || fail "Reign build or activation failed."
+    fi
     record_install
     INSTALL_CLEANUP_ACTIVE=0
     ok "$PRODUCT installed."
@@ -1018,6 +1049,10 @@ repair_product() {
     bootstrap_database
     write_vhost
     apply_permissions
+    if [ "$PRODUCT" = reign ]; then
+        /usr/local/bin/ddistro_reign prepare || fail "Reign runtime preparation failed."
+        /usr/local/bin/ddistro_reign build || fail "Reign build or activation failed; previous runtime retained."
+    fi
     record_install
     complete_herika_migration
     ok "$PRODUCT repaired."
@@ -1030,6 +1065,10 @@ update_product() {
     bootstrap_database
     write_vhost
     apply_permissions
+    if [ "$PRODUCT" = reign ]; then
+        /usr/local/bin/ddistro_reign prepare || fail "Reign runtime preparation failed."
+        /usr/local/bin/ddistro_reign build || fail "Reign build or activation failed; previous runtime retained."
+    fi
     record_install
     complete_herika_migration
     ok "$PRODUCT updated."
@@ -1037,6 +1076,7 @@ update_product() {
 
 stop_product_processes() {
     case "$PRODUCT" in
+        reign) /usr/local/bin/ddistro_reign stop ;;
         herika)
             pkill -f "$PRODUCT_ROOT/service/start.sh" >/dev/null 2>&1 || true
             pkill -f "$PRODUCT_ROOT/service/manager.php" >/dev/null 2>&1 || true
@@ -1141,7 +1181,12 @@ uninstall_product() {
     purge_dialectic_migration_backups --check
     stop_product_processes
     remove_vhost
-    drop_product_database
+    if [ "$PRODUCT" = reign ]; then
+        rm -f /opt/dwemerdistro/reign/current
+        info "Reign database, campaigns, credentials, portraits and previous runtimes were retained."
+    else
+        drop_product_database
+    fi
     safe_remove_product_root
     remove_managed_backups
     purge_dialectic_migration_backups
@@ -1184,7 +1229,7 @@ startup_installed_products() {
 
     # Keep products independent: a broken migration in one server must not prevent healthy
     # installed servers from preparing their databases, vhosts, and runtime permissions.
-    for key in herika stobe dialectic; do
+    for key in herika stobe dialectic reign; do
         if ! (startup_product "$key"); then
             info "$key startup preparation failed; continuing with the remaining products."
             failed=1
@@ -1237,7 +1282,7 @@ case "$COMMAND" in
                 select_product herika
                 migrate_product_repository_origin
                 ;;
-            stobe|dialectic)
+            stobe|dialectic|reign)
                 ;;
         esac
         ;;
