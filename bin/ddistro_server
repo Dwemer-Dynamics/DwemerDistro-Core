@@ -420,7 +420,7 @@ install_state() {
     repo_state="$(repository_state)"
     db_state="$(database_state)"
 
-    if [ "$PRODUCT" = reign ] && [ "$repo_state" = managed ] && [ ! -x /var/www/html/ReignServer/runtime/current/ReignBetaServer ]; then
+    if [ "$PRODUCT" = reign ] && [ "$repo_state" = managed ] && [ ! -x /var/www/html/ReignServer/runtime/current/ReignServer ] && [ ! -x /var/www/html/ReignServer/runtime/current/ReignBetaServer ]; then
         printf 'needs-repair\n'
     elif [ "$repo_state" = "managed" ] && [ "$db_state" != "absent" ]; then
         printf 'installed\n'
