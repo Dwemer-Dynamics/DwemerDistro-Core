@@ -63,6 +63,11 @@ fi
 printf ">> Checking installed server repository origins...\n"
 /usr/local/bin/ddistro_server migrate-remotes all || exit 1
 
+printf ">> Ensuring UTF-8 is the PostgreSQL default...\n"
+update-locale LANG=C.UTF-8 LC_ALL=C.UTF-8
+service postgresql start >/dev/null || exit 1
+/usr/local/bin/ensure_postgres_utf8 || exit 1
+
 printf ">> Copying configuration files to /etc...\n"
 find /home/dwemer/dwemerdistro/etc/ -type f ! -name "php.ini" -exec cp {} /etc/ \; 2>/dev/null
 if [ $? -eq 0 ]; then

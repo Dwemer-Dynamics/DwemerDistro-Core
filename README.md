@@ -2,7 +2,15 @@
 
 DwemerDistro provides the shared WSL runtime used by the Dwemer Dynamics game servers and optional voice, speech, and utility components.
 
-Fresh distribution payloads do not include HerikaServer, StobeServer, or DialecticServer. Users choose the servers they want in the launcher Quickstart or install them later from Mods.
+Fresh distribution payloads do not include HerikaServer, StobeServer, DialecticServer, or ReignServer. Users choose the servers they want in the launcher Quickstart or install them later from Mods.
+
+## Reign and UTF-8
+
+The launcher's **Rollback ReignServer** action uses `ddistro_reign rollback-list` and `ddistro_reign rollback <retained-version-id>`. Only retained builds whose manifest, lowercase database name, and schema compatibility were verified while running are offered. `rollback-metadata` lives beside the retained runtime directories. Every activation records the previous/current compatible builds; older builds without database-name/schema reporting are excluded. Rollback validates the artifact inventory and checks the current database schema again, preserves campaigns/settings/databases, and restores the prior runtime if startup fails. The source checkout and update channel stay unchanged.
+
+Reign 0.1.0 uses `ddistro_server install|update|repair reign --branch reign|dev|unstable`. Its production/default branch is `reign`, with promotion through `unstable -> dev -> reign`. `ddistro_reign` owns compiled runtime activation, health checks, and process-group startup/shutdown. Apache port 8089 proxies to Reign on loopback 5101; its vector worker uses 5102. PostgreSQL database `reign` and `/var/www/html/ReignServer/data` survive application replacement and uninstall. Previous code and lock-specific dependency/model directories are retained; code rollback does not undo database migrations.
+
+The distro's default locale is `C.UTF-8`. `ensure_postgres_utf8` makes new PostgreSQL databases UTF-8 through template1. It retains the original empty template and refuses customized templates or active template sessions. Existing application databases are not converted by this operation. Managed database creation continues to specify UTF-8/template0 explicitly.
 
 ## Optional server manager
 

@@ -11,6 +11,7 @@ PASSWORD="dwemer"
 UPDATE_HERIKA=1
 UPDATE_STOBE=1
 UPDATE_DIALECTIC=1
+UPDATE_REIGN=1
 DIALECTIC_UPDATE_FAILED=0
 COMPONENT_UPDATE_FAILED=0
 
@@ -543,6 +544,9 @@ while [ $# -gt 0 ]; do
         --skip-dialectic)
             UPDATE_DIALECTIC=0
             ;;
+        --skip-reign)
+            UPDATE_REIGN=0
+            ;;
         *)
             print_warning "Unknown option '$1' ignored"
             ;;
@@ -592,6 +596,7 @@ update_installed_server() {
     case "$current_branch" in
         dev|unstable) branch_choice="dev" ;;
     esac
+    if [ "$product" = reign ] && [ "$current_branch" = unstable ]; then branch_choice="unstable"; fi
 
     if printf '%s' "$status_json" | grep -q '"state":"needs-repair"' \
         && printf '%s' "$status_json" | grep -q '"repository_state":"legacy"'; then
@@ -632,6 +637,7 @@ update_installed_server() {
 
 update_installed_server herika "$UPDATE_HERIKA" /var/www/html/HerikaServer || COMPONENT_UPDATE_FAILED=1
 update_installed_server stobe "$UPDATE_STOBE" /var/www/html/StobeServer || COMPONENT_UPDATE_FAILED=1
+update_installed_server reign "$UPDATE_REIGN" /var/www/html/ReignServer || COMPONENT_UPDATE_FAILED=1
 if ! update_installed_server dialectic "$UPDATE_DIALECTIC" /var/www/html/DialecticServer; then
     DIALECTIC_UPDATE_FAILED=1
 fi
