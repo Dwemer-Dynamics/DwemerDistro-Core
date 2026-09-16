@@ -56,7 +56,10 @@ start() {
     if ss -ltnH 'sport = :5101' | grep -q .; then echo 'Reign internal port 5101 is already in use.' >&2; return 1; fi
     local python_root="$root/venv" model_root="$root/models"
     if [ -f "$root/current/embedding-model.lock.json" ]; then
-        python_root="$root/venvs/$(sha256sum "$root/current/VectorWorker/requirements-linux.txt" | cut -d ' ' -f 1)"
+        local requirements="$root/current/services/vector-worker/requirements-linux.txt"
+        [ -f "$requirements" ] || requirements="$root/current/VectorWorker/requirements-linux.txt"
+        [ -f "$requirements" ] || { echo 'Reign worker requirements are missing.' >&2; return 1; }
+        python_root="$root/venvs/$(sha256sum "$requirements" | cut -d ' ' -f 1)"
         model_root="$root/model-versions/$(sha256sum "$root/current/embedding-model.lock.json" | cut -d ' ' -f 1)"
         [ -f "$python_root/.complete" ] && [ -d "$model_root" ] || { echo 'Reign dependencies need preparation.' >&2; return 1; }
     fi
