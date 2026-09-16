@@ -594,7 +594,7 @@ echo "Starting Apache/PHP/PGSQL Server"
 /etc/init.d/apache2 restart &>/dev/null
 /etc/init.d/postgresql restart
 
-if [ -x /opt/dwemerdistro/reign/current/ReignBetaServer ]; then
+if [ -x /var/www/html/ReignServer/runtime/current/ReignBetaServer ]; then
     /usr/local/bin/ddistro_reign start || echo "WARNING: Reign failed to start; check its log."
 fi
 

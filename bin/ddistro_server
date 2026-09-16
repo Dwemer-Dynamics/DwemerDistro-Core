@@ -420,7 +420,7 @@ install_state() {
     repo_state="$(repository_state)"
     db_state="$(database_state)"
 
-    if [ "$PRODUCT" = reign ] && [ "$repo_state" = managed ] && [ ! -x /opt/dwemerdistro/reign/current/ReignBetaServer ]; then
+    if [ "$PRODUCT" = reign ] && [ "$repo_state" = managed ] && [ ! -x /var/www/html/ReignServer/runtime/current/ReignBetaServer ]; then
         printf 'needs-repair\n'
     elif [ "$repo_state" = "managed" ] && [ "$db_state" != "absent" ]; then
         printf 'installed\n'
@@ -439,8 +439,8 @@ current_branch() {
 }
 
 current_version() {
-    if [ "$PRODUCT" = reign ] && [ -f /opt/dwemerdistro/reign/current/reign-linux-artifact.json ]; then
-        python3 -c 'import json; print(json.load(open("/opt/dwemerdistro/reign/current/reign-linux-artifact.json"))["version"])'
+    if [ "$PRODUCT" = reign ] && [ -f /var/www/html/ReignServer/runtime/current/reign-linux-artifact.json ]; then
+        python3 -c 'import json; print(json.load(open("/var/www/html/ReignServer/runtime/current/reign-linux-artifact.json"))["version"])'
         return
     fi
     local candidate
@@ -817,6 +817,14 @@ remove_vhost() {
 }
 
 apply_permissions() {
+    if [ "$PRODUCT" = reign ]; then
+        # Source updates must not broaden access to private data or retained executables.
+        find -P "$PRODUCT_ROOT" \( -path "$PRODUCT_ROOT/data" -o -path "$PRODUCT_ROOT/runtime" \) -prune -o \
+            -exec chown -h "$APP_USER:$WEB_GROUP" {} +
+        find -P "$PRODUCT_ROOT" \( -path "$PRODUCT_ROOT/data" -o -path "$PRODUCT_ROOT/runtime" \) -prune -o \
+            -type d -exec chmod ug+rwx,g+s,o-rwx {} + -o -type f -exec chmod ug+rw,o-rwx {} +
+        return
+    fi
     mkdir -p "$PRODUCT_ROOT/log"
     chown -R "$APP_USER:$WEB_GROUP" "$PRODUCT_ROOT"
     chmod -R ug+rwX,o-rwx "$PRODUCT_ROOT"
@@ -1182,13 +1190,13 @@ uninstall_product() {
     stop_product_processes
     remove_vhost
     if [ "$PRODUCT" = reign ]; then
-        rm -f /opt/dwemerdistro/reign/current
-        info "Reign database, campaigns, credentials, portraits and previous runtimes were retained."
+        rm -f /var/www/html/ReignServer/runtime/current
+        info "Reign checkout, database, campaigns, credentials, portraits and previous runtimes were retained. Use Repair to reactivate."
     else
         drop_product_database
+        safe_remove_product_root
+        remove_managed_backups
     fi
-    safe_remove_product_root
-    remove_managed_backups
     purge_dialectic_migration_backups
     rm -f "$STATE_ROOT/$PRODUCT.state"
     printf '1\n' > "/home/dwemer/.update_include_$PRODUCT"

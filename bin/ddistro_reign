@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Reign's Linux runtime lifecycle; ddistro_server owns repository and database operations.
 set -euo pipefail
-root=/opt/dwemerdistro/reign
-data=/var/lib/dwemerdistro/reign
+root=/var/www/html/ReignServer/runtime
+data=/var/www/html/ReignServer/data
 source_root=/var/www/html/ReignServer
 pidfile=/run/dwemerdistro-reign/server.pid
 command=${1:-status}

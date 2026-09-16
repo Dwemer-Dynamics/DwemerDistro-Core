@@ -9,7 +9,7 @@ import subprocess
 import sys
 import urllib.request
 
-ROOT = pathlib.Path('/opt/dwemerdistro/reign')
+ROOT = pathlib.Path('/var/www/html/ReignServer/runtime')
 ID = re.compile(r'[0-9]{14}-[0-9]+')
 
 
