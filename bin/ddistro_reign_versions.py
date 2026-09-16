@@ -38,7 +38,7 @@ def record_current():
         with urllib.request.urlopen('http://127.0.0.1:5101/health', timeout=2) as response:
             health = json.loads(response.read(16384))
         pid = int(pathlib.Path('/run/dwemerdistro-reign/server.pid').read_text())
-        if pathlib.Path(f'/proc/{pid}/exe').resolve() != current / 'ReignBetaServer' or health.get('processId') != pid:
+        if pathlib.Path(f'/proc/{pid}/exe').resolve() not in {current / 'ReignServer', current / 'ReignBetaServer'} or health.get('processId') != pid:
             return
         schema = health.get('databaseSchemaVersion')
         if not (health.get('ok') is True and health.get('service') == 'BannerlordReignServer'
