@@ -725,6 +725,11 @@ else
 	L_XTTSV2=1
 fi
 
+# Higgs is opt-in and uses a dedicated runtime and port.
+if [ -f /home/dwemer/higgs-tts/.enabled ] && [ -x /home/dwemer/higgs-tts/service.sh ]; then
+    /home/dwemer/higgs-tts/service.sh start || echo 'Higgs startup failed; see /home/dwemer/higgs-tts/server.log'
+fi
+
 if [ -f "/home/dwemer/omnivoice-tts/start-gpu.sh" ]; then
 	echo -ne  "Starting OmniVoice TTS "
 	su dwemer -c "/home/dwemer/omnivoice-tts/start-gpu.sh"
@@ -873,6 +878,7 @@ echo "Press Enter to shutdown DwemerDistro"
 read
 
 if [ -x /usr/local/bin/ddistro_reign ]; then /usr/local/bin/ddistro_reign stop; fi
+if [ -x /home/dwemer/higgs-tts/service.sh ]; then /home/dwemer/higgs-tts/service.sh stop; fi
 killall -15 -u dwemer
 
 /etc/init.d/apache2 stop
