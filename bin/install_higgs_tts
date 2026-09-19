@@ -1,0 +1,35 @@
+#!/bin/bash
+# Install the optional isolated service; selection remains a separate user action.
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo 'Run as root.' >&2; exit 1; }
+export GIT_TERMINAL_PROMPT=0
+exec 9>/var/lock/dwemerdistro-higgs-install.lock
+flock -n 9 || { echo 'Higgs installation is already running.' >&2; exit 1; }
+repo=/home/dwemer/higgs-tts
+revision=bb2d502e2e16eb48748c196469a83aed84164a9d
+if [ ! -e "$repo" ]; then
+    runuser -u dwemer -- git clone --no-checkout https://github.com/Dwemer-Dynamics/Higgs-TTS.git "$repo" || {
+        echo 'Unable to download Higgs-TTS from GitHub. Check connectivity and retry.' >&2
+        exit 1
+    }
+elif [ ! -d "$repo/.git" ]; then
+    echo 'Existing Higgs directory is not a Git checkout; preserved without changes.' >&2
+    exit 1
+else
+    [ -z "$(runuser -u dwemer -- git -C "$repo" status --porcelain)" ] || {
+        echo 'Higgs source has local changes; preserved without updating.' >&2; exit 1;
+    }
+fi
+# Use the reviewed service revision, independently of the repository default branch.
+if [ -f "$repo/server.pid" ] && start-stop-daemon --status --pidfile "$repo/server.pid" >/dev/null; then
+    echo 'Stop Higgs before reinstalling. Existing source and runtime were preserved.' >&2
+    exit 1
+fi
+runuser -u dwemer -- git -C "$repo" fetch --depth 1 https://github.com/Dwemer-Dynamics/Higgs-TTS.git "$revision"
+runuser -u dwemer -- git -C "$repo" checkout --detach "$revision"
+[ -f "$repo/install.sh" ] || { echo 'This checkout does not contain the Higgs installer yet.' >&2; exit 1; }
+/usr/local/bin/install_cuda_dependencies "${1:-auto}"
+export DEBIAN_FRONTEND=noninteractive
+apt-get install -y git cmake build-essential python3 curl util-linux
+runuser -u dwemer -- bash "$repo/install.sh"
+echo 'Higgs is installed. Enable/start it under service controls, then select it in your mod.'
