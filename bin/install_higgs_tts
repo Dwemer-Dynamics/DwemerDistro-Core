@@ -12,7 +12,7 @@ case "$model_variant" in keep|full|q8|ask) ;; *) echo 'Usage: install_higgs_tts 
 exec 9>/var/lock/dwemerdistro-higgs-install.lock
 flock -n 9 || { echo 'Higgs installation is already running.' >&2; exit 1; }
 repo=/home/dwemer/higgs-tts
-revision=d4a812aa63d33cbb33fd0312e4bca09a298fd78f
+revision=d1c0bbe9d5a797697833aa40714d23a276c6be13
 if [ ! -e "$repo" ]; then
     runuser -u dwemer -- git clone --no-checkout https://github.com/Dwemer-Dynamics/Higgs-TTS.git "$repo" || {
         echo 'Unable to download Higgs-TTS from GitHub. Check connectivity and retry.' >&2
