@@ -1,12 +1,18 @@
 #!/bin/bash
 # Install the optional isolated service; selection remains a separate user action.
 set -euo pipefail
+if [ "${1:-}" = '--model-options' ]; then
+    printf '%s\n' keep full q8 ask
+    exit 0
+fi
 [ "$(id -u)" -eq 0 ] || { echo 'Run as root.' >&2; exit 1; }
 export GIT_TERMINAL_PROMPT=0
+model_variant=${2:-keep}
+case "$model_variant" in keep|full|q8|ask) ;; *) echo 'Usage: install_higgs_tts [auto|CUDA selection] [keep|full|q8|ask]' >&2; exit 2;; esac
 exec 9>/var/lock/dwemerdistro-higgs-install.lock
 flock -n 9 || { echo 'Higgs installation is already running.' >&2; exit 1; }
 repo=/home/dwemer/higgs-tts
-revision=bb2d502e2e16eb48748c196469a83aed84164a9d
+revision=d4a812aa63d33cbb33fd0312e4bca09a298fd78f
 if [ ! -e "$repo" ]; then
     runuser -u dwemer -- git clone --no-checkout https://github.com/Dwemer-Dynamics/Higgs-TTS.git "$repo" || {
         echo 'Unable to download Higgs-TTS from GitHub. Check connectivity and retry.' >&2
@@ -31,5 +37,5 @@ runuser -u dwemer -- git -C "$repo" checkout --detach "$revision"
 /usr/local/bin/install_cuda_dependencies "${1:-auto}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get install -y git cmake build-essential python3 curl util-linux
-runuser -u dwemer -- bash "$repo/install.sh"
+runuser -u dwemer -- bash "$repo/install.sh" "$model_variant"
 echo 'Higgs is installed. Enable/start it under service controls, then select it in your mod.'
