@@ -154,13 +154,13 @@ Usage: ddistro_server <command> [product] [options]
 Manage optional DwemerDistro application servers.
 
 Commands:
-  status [all|herika|stobe|dialectic|reign] [--json]
-  migrate-remotes [all|herika|stobe|dialectic|reign]
-  install <herika|stobe|dialectic|reign> [--branch main|dev|reign|unstable]
-  update <herika|stobe|dialectic|reign> [--branch main|dev|reign|unstable] [--force]
-  repair <herika|stobe|dialectic|reign> [--branch main|dev|reign|unstable]
-  uninstall <herika|stobe|dialectic|reign> --confirm PURGE-<PRODUCT>
-  startup [herika|stobe|dialectic|reign]
+  status [all|herika|lorkhan|stobe|dialectic|reign] [--json]
+  migrate-remotes [all|herika|lorkhan|stobe|dialectic|reign]
+  install <herika|lorkhan|stobe|dialectic|reign> [--branch main|dev|lorkhan|reign|unstable]
+  update <herika|lorkhan|stobe|dialectic|reign> [--branch main|dev|lorkhan|reign|unstable] [--force]
+  repair <herika|lorkhan|stobe|dialectic|reign> [--branch main|dev|lorkhan|reign|unstable]
+  uninstall <herika|lorkhan|stobe|dialectic|reign> --confirm PURGE-<PRODUCT>
+  startup [herika|lorkhan|stobe|dialectic|reign]
 
 Reign production is reign; it also exposes dev and unstable. Other products keep main/dev choices.
 Reign uninstall retains its database and data; repair reinstalls it.
@@ -216,6 +216,15 @@ select_product() {
             PRODUCT_VHOST=""
             PRODUCT_PORT="8081"
             ;;
+        lorkhan)
+            # Keep source separate: Lorkhan's allowlisted runtime deploy must not delete its checkout.
+            PRODUCT_ROOT="/opt/dwemerdistro/sources/LorkhanServer"
+            PRODUCT_DATABASE="lorkhan"
+            PRODUCT_REPOSITORY="https://github.com/Dwemer-Dynamics/LorkhanServer.git"
+            PRODUCT_PRODUCTION_BRANCH="lorkhan"
+            PRODUCT_VHOST="lorkhanserver.conf"
+            PRODUCT_PORT="8090"
+            ;;
         reign)
             PRODUCT_ROOT="$WEB_ROOT/ReignServer"
             PRODUCT_DATABASE="reign"
@@ -241,7 +250,7 @@ select_product() {
             PRODUCT_PORT="8088"
             ;;
         *)
-            fail "Unknown product '$PRODUCT'. Expected herika, stobe, dialectic, or reign." 64
+            fail "Unknown product '$PRODUCT'. Expected herika, lorkhan, stobe, dialectic, or reign." 64
             ;;
     esac
 }
@@ -311,7 +320,7 @@ migrate_product_repository_origin() {
 resolve_branch() {
     case "$1" in
         main|"") printf '%s\n' "$PRODUCT_PRODUCTION_BRANCH" ;;
-        unstable) [ "$PRODUCT" = reign ] || fail "Unstable is only exposed for Reign." 64; printf '%s\n' unstable ;;
+        unstable) [[ "$PRODUCT" = reign || "$PRODUCT" = lorkhan ]] || fail "Unstable is only exposed for Reign and LORKHAN." 64; printf '%s\n' unstable ;;
         dev) printf '%s\n' "$PRODUCT_DEV_BRANCH" ;;
         "$PRODUCT_PRODUCTION_BRANCH"|"$PRODUCT_DEV_BRANCH") printf '%s\n' "$1" ;;
         *) fail "Invalid branch '$1' for $PRODUCT. Expected main or dev." 64 ;;
@@ -404,6 +413,10 @@ database_state() {
 }
 
 repository_state() {
+    if [ "$PRODUCT" = lorkhan ] && [ ! -e "$PRODUCT_ROOT" ] && [ -e "$WEB_ROOT/LorkhanServer" ]; then
+        printf 'legacy\n'
+        return
+    fi
     if [ -d "$PRODUCT_ROOT/.git" ]; then
         printf 'managed\n'
     elif [ -e "$PRODUCT_ROOT" ]; then
@@ -420,7 +433,9 @@ install_state() {
     repo_state="$(repository_state)"
     db_state="$(database_state)"
 
-    if [ "$PRODUCT" = reign ] && [ "$repo_state" = managed ] && [ ! -x /var/www/html/ReignServer/runtime/current/ReignServer ] && [ ! -x /var/www/html/ReignServer/runtime/current/ReignBetaServer ]; then
+    if [ "$PRODUCT" = lorkhan ] && [ "$repo_state" = managed ] && { [ ! -f "$WEB_ROOT/LorkhanServer/index.php" ] || [ ! -e /etc/apache2/sites-enabled/lorkhanserver.conf ]; }; then
+        printf 'needs-repair\n'
+    elif [ "$PRODUCT" = reign ] && [ "$repo_state" = managed ] && [ ! -x /var/www/html/ReignServer/runtime/current/ReignServer ] && [ ! -x /var/www/html/ReignServer/runtime/current/ReignBetaServer ]; then
         printf 'needs-repair\n'
     elif [ "$repo_state" = "managed" ] && [ "$db_state" != "absent" ]; then
         printf 'installed\n'
@@ -444,7 +459,7 @@ current_version() {
         return
     fi
     local candidate
-    for candidate in .version_number.txt versionnumber.txt .version.txt; do
+    for candidate in .version_number.txt versionnumber.txt .version.txt version.txt; do
         if [ -s "$PRODUCT_ROOT/$candidate" ]; then
             sed -n '1p' "$PRODUCT_ROOT/$candidate" | tr -d '\r'
             return 0
@@ -506,7 +521,7 @@ show_status() {
         printf '{"schema_version":1,"servers":['
     fi
 
-    for key in herika stobe dialectic reign; do
+    for key in herika lorkhan stobe dialectic reign; do
         select_product "$key"
         if [ "$JSON_OUTPUT" -eq 1 ]; then
             if [ "$first" -eq 0 ]; then
@@ -712,6 +727,12 @@ bootstrap_dialectic() {
 
 bootstrap_database() {
     start_postgres
+    if [ "$PRODUCT" = lorkhan ]; then
+        [ "$POSTGRES_PORT" = 5432 ] || fail 'LORKHAN bootstrap currently requires PostgreSQL port 5432.'
+        LORKHAN_HTTP_PORT=8090 bash "$PRODUCT_ROOT/scripts/deploy-wsl.sh" "$PRODUCT_ROOT" \
+            || fail 'LORKHAN bootstrap/deployment failed; configuration and player data were retained. Use Repair.'
+        return
+    fi
     local utf8_helper="/usr/local/bin/ensure_postgres_utf8"
     [ -x "$utf8_helper" ] || utf8_helper="$(dirname "$0")/ensure_postgres_utf8"
     "$utf8_helper" || fail "PostgreSQL UTF-8 default setup needs attention."
@@ -728,6 +749,7 @@ bootstrap_database() {
 }
 
 write_vhost() {
+    [ "$PRODUCT" != lorkhan ] || return 0 # The server deploy owns its authenticated Apache configuration.
     local ports_conf="/etc/apache2/ports.conf"
     local vhost_path
 
@@ -817,6 +839,7 @@ remove_vhost() {
 }
 
 apply_permissions() {
+    [ "$PRODUCT" != lorkhan ] || return 0 # Preserve the server's separate runtime/config/media permissions.
     if [ "$PRODUCT" = reign ]; then
         # Source updates must not broaden access to private data or retained executables.
         find -P "$PRODUCT_ROOT" \( -path "$PRODUCT_ROOT/data" -o -path "$PRODUCT_ROOT/runtime" \) -prune -o \
@@ -872,6 +895,7 @@ safe_remove_temp() {
 
 safe_remove_product_root() {
     [ "$PRODUCT_ROOT" = "$WEB_ROOT/ReignServer" ] \
+        || [ "$PRODUCT_ROOT" = /opt/dwemerdistro/sources/LorkhanServer ] \
         || [ "$PRODUCT_ROOT" = "$WEB_ROOT/HerikaServer" ] \
         || [ "$PRODUCT_ROOT" = "$WEB_ROOT/StobeServer" ] \
         || [ "$PRODUCT_ROOT" = "$WEB_ROOT/DialecticServer" ] \
@@ -882,6 +906,10 @@ safe_remove_product_root() {
 clone_repository() {
     local branch="$1"
     local temp_root="$WEB_ROOT/.ddistro-$PRODUCT-$$"
+    if [ "$PRODUCT" = lorkhan ]; then
+        mkdir -p /opt/dwemerdistro/sources || return 1
+        [ "$(realpath /opt/dwemerdistro/sources)" = /opt/dwemerdistro/sources ] || return 1
+    fi
 
     [ ! -e "$temp_root" ] || safe_remove_temp "$temp_root"
     info "Cloning $PRODUCT from $branch."
@@ -1050,7 +1078,12 @@ repair_product() {
     repo_state="$(repository_state)"
     case "$repo_state" in
         absent) clone_repository "$branch" || fail "Could not restore the $PRODUCT repository." ;;
-        legacy) adopt_legacy_repository "$branch" ;;
+        legacy)
+            if [ "$PRODUCT" = lorkhan ] && [ ! -e "$PRODUCT_ROOT" ]; then
+                clone_repository "$branch" || fail 'Could not prepare LORKHAN source; existing runtime retained.'
+            else
+                adopt_legacy_repository "$branch"
+            fi ;;
         managed) update_repository "$branch" ;;
     esac
 
@@ -1084,6 +1117,7 @@ update_product() {
 
 stop_product_processes() {
     case "$PRODUCT" in
+        lorkhan) service lorkhanserver-worker stop || fail 'Could not stop LORKHAN worker.' ;;
         reign) /usr/local/bin/ddistro_reign stop ;;
         herika)
             pkill -f "$PRODUCT_ROOT/service/start.sh" >/dev/null 2>&1 || true
@@ -1189,7 +1223,9 @@ uninstall_product() {
     purge_dialectic_migration_backups --check
     stop_product_processes
     remove_vhost
-    if [ "$PRODUCT" = reign ]; then
+    if [ "$PRODUCT" = lorkhan ]; then
+        info 'LORKHAN was disabled. Source, runtime, database, credentials, voices and playthroughs were retained. Use Repair to reactivate.'
+    elif [ "$PRODUCT" = reign ]; then
         rm -f /var/www/html/ReignServer/runtime/current
         info "Reign checkout, database, campaigns, credentials, portraits and previous runtimes were retained. Use Repair to reactivate."
     else
@@ -1213,6 +1249,14 @@ startup_product() {
     local state
 
     select_product "$key"
+    if [ "$PRODUCT" = lorkhan ]; then
+        if [ -f "$WEB_ROOT/LorkhanServer/index.php" ] && [ -e /etc/apache2/sites-enabled/lorkhanserver.conf ] && [ -x /etc/init.d/lorkhanserver-worker ]; then
+            service lorkhanserver-worker start || fail 'LORKHAN worker failed to start.'
+        else
+            info 'LORKHAN is absent or disabled; startup skipped.'
+        fi
+        return
+    fi
     state="$(repository_state)"
     if [ "$state" = "absent" ]; then
         if [ "$(database_state)" = "present" ]; then
@@ -1237,7 +1281,7 @@ startup_installed_products() {
 
     # Keep products independent: a broken migration in one server must not prevent healthy
     # installed servers from preparing their databases, vhosts, and runtime permissions.
-    for key in herika stobe dialectic reign; do
+    for key in herika lorkhan stobe dialectic reign; do
         if ! (startup_product "$key"); then
             info "$key startup preparation failed; continuing with the remaining products."
             failed=1
