@@ -12,6 +12,7 @@ UPDATE_HERIKA=1
 UPDATE_STOBE=1
 UPDATE_DIALECTIC=1
 UPDATE_REIGN=1
+UPDATE_LORKHAN=1
 DIALECTIC_UPDATE_FAILED=0
 COMPONENT_UPDATE_FAILED=0
 
@@ -544,6 +545,9 @@ while [ $# -gt 0 ]; do
         --skip-dialectic)
             UPDATE_DIALECTIC=0
             ;;
+        --skip-lorkhan)
+            UPDATE_LORKHAN=0
+            ;;
         --skip-reign)
             UPDATE_REIGN=0
             ;;
@@ -592,11 +596,16 @@ update_installed_server() {
         print_warning "Could not inspect $product; update skipped."
         return 1
     fi
+    # LORKHAN disable retains its source and database. Only explicit Repair re-enables it.
+    if [ "$product" = lorkhan ] && printf '%s' "$status_json" | grep -q '"state":"needs-repair"'; then
+        print_warning "LORKHAN is disabled or needs repair; use Repair in the launcher."
+        return 0
+    fi
     current_branch=$(git -c safe.directory="$root" -C "$root" branch --show-current 2>/dev/null || true)
     case "$current_branch" in
         dev|unstable) branch_choice="dev" ;;
     esac
-    if [ "$product" = reign ] && [ "$current_branch" = unstable ]; then branch_choice="unstable"; fi
+    if { [ "$product" = reign ] || [ "$product" = lorkhan ]; } && [ "$current_branch" = unstable ]; then branch_choice="unstable"; fi
 
     if printf '%s' "$status_json" | grep -q '"state":"needs-repair"' \
         && printf '%s' "$status_json" | grep -q '"repository_state":"legacy"'; then
@@ -636,6 +645,7 @@ update_installed_server() {
 }
 
 update_installed_server herika "$UPDATE_HERIKA" /var/www/html/HerikaServer || COMPONENT_UPDATE_FAILED=1
+update_installed_server lorkhan "$UPDATE_LORKHAN" /opt/dwemerdistro/sources/LorkhanServer || COMPONENT_UPDATE_FAILED=1
 update_installed_server stobe "$UPDATE_STOBE" /var/www/html/StobeServer || COMPONENT_UPDATE_FAILED=1
 update_installed_server reign "$UPDATE_REIGN" /var/www/html/ReignServer || COMPONENT_UPDATE_FAILED=1
 if ! update_installed_server dialectic "$UPDATE_DIALECTIC" /var/www/html/DialecticServer; then
