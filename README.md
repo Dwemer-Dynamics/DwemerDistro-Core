@@ -10,7 +10,7 @@ The launcher's **Rollback ReignServer** action uses `ddistro_reign rollback-list
 
 Reign 0.1.0 uses `ddistro_server install|update|repair reign --branch reign|dev|unstable`. Its production/default branch is `reign`, with promotion through `unstable -> dev -> reign`. `ddistro_reign` owns compiled runtime activation, health checks, and process-group startup/shutdown. Apache port 8089 proxies to Reign on loopback 5101; its vector worker uses 5102. PostgreSQL database `reign` and `/var/www/html/ReignServer/data` survive application replacement and uninstall. Previous code and lock-specific dependency/model directories are retained; code rollback does not undo database migrations.
 
-The distro's default locale is `C.UTF-8`. `ensure_postgres_utf8` makes new PostgreSQL databases UTF-8 through template1. It retains the original empty template and refuses customized templates or active template sessions. Existing application databases are not converted by this operation. Managed database creation continues to specify UTF-8/template0 explicitly.
+The distro's default locale is `C.UTF-8`. `ensure_postgres_utf8` makes new PostgreSQL databases UTF-8 through template1 when the template is uncustomized. It retains the original empty template. Customized templates are preserved with a successful skip so system updates and managed database bootstrap can continue. Active template sessions and maintenance failures still return an error. Existing application databases are not converted by this operation. Managed database creation continues to specify UTF-8/template0 explicitly.
 
 ## Optional server manager
 
