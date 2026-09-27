@@ -5,6 +5,7 @@ import errno
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -22,7 +23,16 @@ STATE = HOME / '.config/dwemerdistro/lmstudio'
 LMS = HOME / '.lmstudio/bin/lms'
 API = 'http://127.0.0.1:1234'
 CATALOG = Path('/etc/dwemerdistro-lmstudio.json')
-MUTATIONS = {'start', 'stop', 'restart', 'settings', 'download', 'load', 'unload', 'test'}
+MUTATIONS = {'start', 'stop', 'restart', 'settings', 'download', 'load', 'unload', 'test', 'model-defaults', 'test-preset'}
+SDK_PYTHON = '/opt/dwemerdistro-lmstudio/bin/python'
+# Only documented SDK load settings are accepted; omitted values keep engine defaults.
+LOAD_NUMBERS = {'evalBatchSize': (1, 2048, int), 'seed': (0, 4294967295, int),
+                'ropeFrequencyBase': (0, 10000000, float), 'ropeFrequencyScale': (0.01, 100, float)}
+LOAD_BOOLEANS = {'flashAttention', 'offloadKVCacheToGpu', 'keepModelInMemory', 'tryMmap', 'gpuStrictVramCap'}
+CACHE_TYPES = {'f32', 'f16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1'}
+TEST_NUMBERS = {'temperature': (0, 1, float), 'max_output_tokens': (1, 4096, int),
+                'top_p': (0, 1, float), 'top_k': (1, 1000, int), 'min_p': (0, 1, float),
+                'repeat_penalty': (0.1, 2, float)}
 os.umask(0o077)
 
 
@@ -115,18 +125,23 @@ def status():
             running = True
     except (OSError, ValueError, KeyError):
         pass
-    job = read_json(STATE / 'job.json', {})
     # A killed worker must not leave the UI waiting forever after a distro restart.
     with (STATE / 'job.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            job = read_json(STATE / 'job.json', {})
             if job.get('state') == 'running':
                 job.update(state='failed', message='Operation interrupted. Retry to resume a preset download.')
         except BlockingIOError:
-            pass
+            job = read_json(STATE / 'job.json', {})
     return {'installed': LMS.is_file(), 'running': running, 'models': models, 'job': job,
             'endpoint': API + '/v1', 'chatUrl': API + '/v1/chat/completions',
             'settings': read_json(STATE / 'settings.json', {'autostart': False}),
+            'modelDefaults': read_json(STATE / 'model-defaults.json', {}),
+            'testPresets': read_json(STATE / 'test-presets.json', {}),
+            'advancedAvailable': Path(SDK_PYTHON).is_file(),
+            'lastTest': read_json(STATE / 'last-test.json', {}),
+            'lastLoad': read_json(STATE / 'last-load.json', {}),
             'resources': resources()}
 
 
@@ -142,20 +157,61 @@ def number(data, key, minimum, maximum, default):
     return value
 
 
+# Validate optional settings before they reach the engine or persistent defaults.
+def configuration(value, kind):
+    if not isinstance(value, dict):
+        raise ValueError('Settings must be an object.')
+    numbers = LOAD_NUMBERS if kind == 'load' else TEST_NUMBERS
+    allowed = set(numbers) | (LOAD_BOOLEANS | {'llamaKCacheQuantizationType', 'llamaVCacheQuantizationType'}
+                              if kind == 'load' else {'system_prompt', 'reasoning'})
+    if set(value) - allowed:
+        raise ValueError('Unknown settings: ' + ', '.join(sorted(set(value) - allowed)))
+    for key, item in value.items():
+        if key in numbers:
+            low, high, numeric = numbers[key]
+            if type(item) not in ((int,) if numeric is int else (int, float)) or not math.isfinite(item) or not low <= item <= high:
+                raise ValueError(f'{key} must be between {low} and {high}.')
+        elif key in LOAD_BOOLEANS:
+            if type(item) is not bool:
+                raise ValueError(f'{key} must be true or false.')
+        elif key.startswith('llama'):
+            if not isinstance(item, str) or item not in CACHE_TYPES:
+                raise ValueError('Invalid KV cache type.')
+        elif key == 'system_prompt':
+            if not isinstance(item, str) or len(item) > 4000:
+                raise ValueError('System prompt must be at most 4000 characters.')
+        elif key == 'reasoning' and item not in {'default', 'off', 'on', 'low', 'medium', 'high'}:
+            raise ValueError('Invalid reasoning setting.')
+    if kind == 'load' and value.get('llamaVCacheQuantizationType', 'f16') not in {'f16', 'f32'} and value.get('flashAttention') is not True:
+        raise ValueError('Quantized V cache requires Flash Attention enabled.')
+    return value
+
+
 def validate(data):
     action = data.get('action')
     if action not in MUTATIONS:
         raise ValueError('Unknown action.')
     if action == 'settings' and type(data.get('autostart')) is not bool:
         raise ValueError('autostart must be true or false.')
-    if action in {'load', 'unload', 'test'}:
+    if action in {'load', 'unload', 'test', 'model-defaults'}:
         model = data.get('model', '')
         if not isinstance(model, str) or not 1 <= len(model) <= 512 or model.startswith('-') or '\x00' in model:
             raise ValueError('Choose a model first.')
-    if action == 'load':
+    if action in {'load', 'model-defaults'}:
         number(data, 'context', 512, 131072, 4096)
         number(data, 'ttl', 60, 86400, 600)
         number(data, 'gpu', 0, 100, 100)
+        configuration(data.get('advanced', {}), 'load')
+    if action == 'settings':
+        startup = data.get('startupModel', '')
+        if not isinstance(startup, str) or len(startup) > 512 or startup.startswith('-') or '\x00' in startup:
+            raise ValueError('Invalid startup model.')
+    if action == 'test-preset':
+        if not isinstance(data.get('name'), str) or not re.fullmatch(r'[\w .-]{1,60}', data['name']):
+            raise ValueError('Preset name must be 1–60 letters, numbers, spaces, dots or hyphens.')
+        if type(data.get('delete', False)) is not bool:
+            raise ValueError('Invalid preset action.')
+        configuration(data.get('generation', {}), 'test')
     if action == 'download':
         if data.get('preset'):
             if data['preset'] not in {m['id'] for m in read_json(CATALOG, {})['models']}:
@@ -167,6 +223,7 @@ def validate(data):
                     r'(?:https://huggingface\.co/)?[\w.-]+/[\w./@-]+', source) or '..' in source:
                 raise ValueError('Enter a Hugging Face model URL or owner/model catalog identifier.')
     if action == 'test':
+        configuration(data.get('generation', {}), 'test')
         if data.get('reasoning', 'default') not in {'default', 'off', 'on', 'low', 'medium', 'high'}:
             raise ValueError('Invalid reasoning setting.')
         if not isinstance(data.get('prompt'), str) or not 1 <= len(data['prompt']) <= 4000:
@@ -233,7 +290,27 @@ def execute(data, job):
     if action in {'start', 'restart'}:
         start()
     elif action == 'settings':
-        write_json(STATE / 'settings.json', {'autostart': data['autostart']})
+        settings = read_json(STATE / 'settings.json', {})
+        settings.update(autostart=data['autostart'])
+        if 'startupModel' in data:
+            settings['startupModel'] = data['startupModel']
+        write_json(STATE / 'settings.json', settings)
+    elif action == 'model-defaults':
+        defaults = read_json(STATE / 'model-defaults.json', {})
+        if data['model'] not in defaults and len(defaults) >= 50:
+            raise ValueError('At most 50 model defaults can be saved.')
+        defaults[data['model']] = {key: data.get(key, default) for key, default in
+                                   [('context', 4096), ('gpu', 100), ('ttl', 600), ('advanced', {})]}
+        write_json(STATE / 'model-defaults.json', defaults)
+    elif action == 'test-preset':
+        presets = read_json(STATE / 'test-presets.json', {})
+        if data.get('delete'):
+            presets.pop(data['name'], None)
+        else:
+            if data['name'] not in presets and len(presets) >= 10:
+                raise ValueError('At most 10 test presets can be saved.')
+            presets[data['name']] = data.get('generation', {})
+        write_json(STATE / 'test-presets.json', presets)
     elif action == 'download':
         if data.get('preset'):
             download_preset(data, job)
@@ -254,8 +331,28 @@ def execute(data, job):
             raise ValueError('Insufficient available RAM/VRAM for this model plus 2 GB headroom. Choose a smaller model or free memory.')
         if any(m.get('loaded_instances') for m in models):
             raise ValueError('Unload the current model before loading another. This avoids unexpected memory pressure.')
-        progress(job, command('load', data['model'], '--context-length', str(data.get('context', 4096)),
-                              '--gpu', str(data.get('gpu', 100) / 100), '--ttl', str(data.get('ttl', 600)), '--yes'))
+        advanced = data.get('advanced', {})
+        if advanced:
+            if not Path(SDK_PYTHON).is_file():
+                raise ValueError('Reinstall the LM Studio component to enable advanced settings.')
+            config = {**advanced, 'contextLength': data.get('context', 4096), 'gpu': {'ratio': data.get('gpu', 100) / 100}}
+            # The official SDK exposes loading options not available in lms or REST.
+            script = '''import json,sys,lmstudio
+d=json.load(sys.stdin)
+with lmstudio.Client("127.0.0.1:1234") as client:
+    model=client.llm.load_new_instance(d["model"], ttl=d["ttl"], config=d["config"])
+    print(json.dumps(model.get_load_config().to_dict()))
+'''
+            result = subprocess.run([SDK_PYTHON, '-c', script], input=json.dumps({'model': data['model'],
+                                    'ttl': data.get('ttl', 600), 'config': config}), capture_output=True, text=True, timeout=300)
+            if result.returncode:
+                raise ValueError(result.stderr[-4000:] or 'Advanced model loading failed.')
+            applied = {'model': data['model'], 'appliedConfig': json.loads(result.stdout)}
+            write_json(STATE / 'last-load.json', applied)
+            progress(job, 'Model loaded.', **applied)
+        else:
+            progress(job, command('load', data['model'], '--context-length', str(data.get('context', 4096)),
+                                  '--gpu', str(data.get('gpu', 100) / 100), '--ttl', str(data.get('ttl', 600)), '--yes'))
     elif action == 'unload':
         command('unload', data['model'])
     elif action == 'test':
@@ -265,9 +362,12 @@ def execute(data, job):
             raise ValueError('Load the model first. A test never loads a model automatically.')
         payload = {'model': data['model'], 'input': data['prompt'], 'stream': True,
                    'store': False, 'max_output_tokens': 192, 'temperature': 0.2}
-        if data.get('reasoning', 'default') != 'default':
-            payload['reasoning'] = data['reasoning']
-        text, last = '', 0
+        payload.update(data.get('generation', {}))
+        reasoning = payload.pop('reasoning', data.get('reasoning', 'default'))
+        if reasoning != 'default':
+            payload['reasoning'] = reasoning
+        text, last, stats, finished = '', 0, {}, False
+        started = time.monotonic()
         with request('/api/v1/chat', payload, timeout=120) as response:
             for raw in response:
                 if not raw.startswith(b'data: '):
@@ -275,12 +375,21 @@ def execute(data, job):
                 event = json.loads(raw[6:])
                 if event.get('type') == 'error':
                     raise ValueError(str(event.get('error', event)))
+                if event.get('type') == 'chat.end':
+                    finished = True
+                    stats = event.get('result', {}).get('stats', {})
                 if event.get('type') in {'message.delta', 'reasoning.delta'}:
                     text = (text + event.get('content', ''))[-12000:]
                     if time.monotonic() - last > .3:
                         progress(job, 'Generating...', output=text)
                         last = time.monotonic()
-        progress(job, 'Test finished.', output=text)
+        if not finished:
+            raise ValueError('The model stream ended before completion. Retry the test.')
+        result = {'output': text, 'stats': stats, 'elapsedSeconds': round(time.monotonic() - started, 2),
+                  'model': data['model'], 'generation': {key: value for key, value in payload.items()
+                  if key not in {'model', 'input', 'stream', 'store'}}, 'updated': time.time()}
+        write_json(STATE / 'last-test.json', result)
+        progress(job, 'Test finished.', **{key: value for key, value in result.items() if key != 'updated'})
 
 
 def main():
@@ -300,8 +409,17 @@ def main():
         data = json.loads(sys.stdin.read(16384))
         return {'authorized': hmac.compare_digest(str(data.get('token', '')), (STATE / 'access').read_text())}
     if action == 'autostart':
-        if read_json(STATE / 'settings.json', {}).get('autostart') and LMS.is_file():
+        settings = read_json(STATE / 'settings.json', {})
+        if settings.get('autostart') and LMS.is_file():
             start()
+            if settings.get('startupModel'):
+                model = settings['startupModel']
+                defaults = read_json(STATE / 'model-defaults.json', {}).get(model, {})
+                # Use the same job lock and validation as manual loads.
+                result = subprocess.run([sys.executable, __file__, 'submit'], input=json.dumps(
+                    {**defaults, 'action': 'load', 'model': model}), capture_output=True, text=True, timeout=10)
+                if result.returncode:
+                    raise ValueError(result.stdout)
         return {'ok': True}
     if action == 'shutdown':
         if LMS.is_file():
