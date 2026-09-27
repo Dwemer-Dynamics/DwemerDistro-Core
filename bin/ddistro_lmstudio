@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Restricted, per-user LM Studio control shared by the launcher and Dashboard."""
 import fcntl
+import errno
 import hashlib
 import hmac
 import json
@@ -58,9 +59,18 @@ def request(path, payload=None, timeout=3):
 
 def command(*arguments, timeout=300, job=None):
     output, last = '', 0
-    with subprocess.Popen([str(LMS), *arguments], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          env={**os.environ, 'HOME': str(HOME),
-                          'PATH': '/usr/lib/wsl/lib:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}) as process:
+    # llmster refreshes lms during daemon startup. A concurrent exec can briefly return ETXTBSY.
+    for attempt in range(30):
+        try:
+            process = subprocess.Popen([str(LMS), *arguments], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       env={**os.environ, 'HOME': str(HOME),
+                                       'PATH': '/usr/lib/wsl/lib:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'})
+            break
+        except OSError as error:
+            if error.errno != errno.ETXTBSY or attempt == 29:
+                raise
+            time.sleep(.2)
+    with process:
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
             deadline = time.monotonic() + timeout
