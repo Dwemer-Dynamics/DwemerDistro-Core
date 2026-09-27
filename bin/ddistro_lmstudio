@@ -1,0 +1,462 @@
+#!/usr/bin/python3
+"""Restricted, per-user LM Studio control shared by the launcher and Dashboard."""
+import fcntl
+import errno
+import hashlib
+import hmac
+import json
+import math
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import selectors
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+HOME = Path('/home/dwemer')
+STATE = HOME / '.config/dwemerdistro/lmstudio'
+LMS = HOME / '.lmstudio/bin/lms'
+API = 'http://127.0.0.1:1234'
+CATALOG = Path('/etc/dwemerdistro-lmstudio.json')
+MUTATIONS = {'start', 'stop', 'restart', 'settings', 'download', 'load', 'unload', 'test', 'model-defaults', 'test-preset'}
+SDK_PYTHON = '/opt/dwemerdistro-lmstudio/bin/python'
+# Only documented SDK load settings are accepted; omitted values keep engine defaults.
+LOAD_NUMBERS = {'evalBatchSize': (1, 2048, int), 'seed': (0, 4294967295, int),
+                'ropeFrequencyBase': (0, 10000000, float), 'ropeFrequencyScale': (0.01, 100, float)}
+LOAD_BOOLEANS = {'flashAttention', 'offloadKVCacheToGpu', 'keepModelInMemory', 'tryMmap', 'gpuStrictVramCap'}
+CACHE_TYPES = {'f32', 'f16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1'}
+TEST_NUMBERS = {'temperature': (0, 1, float), 'max_output_tokens': (1, 4096, int),
+                'top_p': (0, 1, float), 'top_k': (1, 1000, int), 'min_p': (0, 1, float),
+                'repeat_penalty': (0.1, 2, float)}
+os.umask(0o077)
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+
+
+def write_json(path, value):
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(value))
+    temporary.replace(path)
+
+
+def initialize():
+    if os.getuid() != pwd.getpwnam('dwemer').pw_uid:
+        raise ValueError('Run this helper as dwemer.')
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(STATE, 0o700)
+    try:
+        with (STATE / 'access').open('x') as token:
+            token.write(secrets.token_urlsafe(32))
+    except FileExistsError:
+        pass
+
+
+def request(path, payload=None, timeout=3):
+    data = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(API + path, data=data, headers={'Content-Type': 'application/json'})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def command(*arguments, timeout=300, job=None):
+    output, last = '', 0
+    # llmster refreshes lms during daemon startup. A concurrent exec can briefly return ETXTBSY.
+    for attempt in range(30):
+        try:
+            process = subprocess.Popen([str(LMS), *arguments], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       env={**os.environ, 'HOME': str(HOME),
+                                       'PATH': '/usr/lib/wsl/lib:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'})
+            break
+        except OSError as error:
+            if error.errno != errno.ETXTBSY or attempt == 29:
+                raise
+            time.sleep(.2)
+    with process:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            deadline = time.monotonic() + timeout
+            while selector.get_map():
+                if time.monotonic() > deadline:
+                    process.kill()
+                    raise ValueError('LM Studio command timed out. Check the manager before retrying.')
+                for key, _ in selector.select(1):
+                    chunk = os.read(key.fd, 8192)
+                    if not chunk:
+                        selector.unregister(key.fd)
+                        continue
+                    output = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', output + chunk.decode(errors='replace'))[-12000:]
+                    if job is not None and time.monotonic() - last > 1:
+                        progress(job, '\n'.join(output.splitlines()[-8:]))
+                        last = time.monotonic()
+        process.wait(timeout=5)
+    if process.returncode:
+        raise ValueError(output or 'LM Studio command failed.')
+    return output.strip()
+
+
+def resources():
+    memory = dict(re.findall(r'^(MemAvailable|MemTotal):\s+(\d+)', Path('/proc/meminfo').read_text(), re.M))
+    vram = 0
+    try:
+        result = subprocess.run(['/usr/lib/wsl/lib/nvidia-smi', '--query-gpu=memory.free',
+                                 '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=3)
+        vram = max([int(n) for n in result.stdout.split() if n.isdigit()] or [0]) * 1024**2
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return {'ramAvailable': int(memory.get('MemAvailable', 0)) * 1024,
+            'ramTotal': int(memory.get('MemTotal', 0)) * 1024, 'vramFree': vram,
+            'diskFree': shutil.disk_usage(STATE).free}
+
+
+def status():
+    models, running = [], False
+    try:
+        with request('/api/v1/models') as response:
+            models = json.load(response)['models']
+            running = True
+    except (OSError, ValueError, KeyError):
+        pass
+    # A killed worker must not leave the UI waiting forever after a distro restart.
+    with (STATE / 'job.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            job = read_json(STATE / 'job.json', {})
+            if job.get('state') == 'running':
+                job.update(state='failed', message='Operation interrupted. Retry to resume a preset download.')
+        except BlockingIOError:
+            job = read_json(STATE / 'job.json', {})
+    return {'installed': LMS.is_file(), 'running': running, 'models': models, 'job': job,
+            'endpoint': API + '/v1', 'chatUrl': API + '/v1/chat/completions',
+            'settings': read_json(STATE / 'settings.json', {'autostart': False}),
+            'modelDefaults': read_json(STATE / 'model-defaults.json', {}),
+            'testPresets': read_json(STATE / 'test-presets.json', {}),
+            'advancedAvailable': Path(SDK_PYTHON).is_file(),
+            'lastTest': read_json(STATE / 'last-test.json', {}),
+            'lastLoad': read_json(STATE / 'last-load.json', {}),
+            'resources': resources()}
+
+
+def progress(job, message, **extra):
+    job.update(message=message[-12000:], updated=time.time(), **extra)
+    write_json(STATE / 'job.json', job)
+
+
+def number(data, key, minimum, maximum, default):
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f'{key} must be between {minimum} and {maximum}.')
+    return value
+
+
+# Validate optional settings before they reach the engine or persistent defaults.
+def configuration(value, kind):
+    if not isinstance(value, dict):
+        raise ValueError('Settings must be an object.')
+    numbers = LOAD_NUMBERS if kind == 'load' else TEST_NUMBERS
+    allowed = set(numbers) | (LOAD_BOOLEANS | {'llamaKCacheQuantizationType', 'llamaVCacheQuantizationType'}
+                              if kind == 'load' else {'system_prompt', 'reasoning'})
+    if set(value) - allowed:
+        raise ValueError('Unknown settings: ' + ', '.join(sorted(set(value) - allowed)))
+    for key, item in value.items():
+        if key in numbers:
+            low, high, numeric = numbers[key]
+            if type(item) not in ((int,) if numeric is int else (int, float)) or not math.isfinite(item) or not low <= item <= high:
+                raise ValueError(f'{key} must be between {low} and {high}.')
+        elif key in LOAD_BOOLEANS:
+            if type(item) is not bool:
+                raise ValueError(f'{key} must be true or false.')
+        elif key.startswith('llama'):
+            if not isinstance(item, str) or item not in CACHE_TYPES:
+                raise ValueError('Invalid KV cache type.')
+        elif key == 'system_prompt':
+            if not isinstance(item, str) or len(item) > 4000:
+                raise ValueError('System prompt must be at most 4000 characters.')
+        elif key == 'reasoning' and item not in {'default', 'off', 'on', 'low', 'medium', 'high'}:
+            raise ValueError('Invalid reasoning setting.')
+    if kind == 'load' and value.get('llamaVCacheQuantizationType', 'f16') not in {'f16', 'f32'} and value.get('flashAttention') is not True:
+        raise ValueError('Quantized V cache requires Flash Attention enabled.')
+    return value
+
+
+def validate(data):
+    action = data.get('action')
+    if action not in MUTATIONS:
+        raise ValueError('Unknown action.')
+    if action == 'settings' and type(data.get('autostart')) is not bool:
+        raise ValueError('autostart must be true or false.')
+    if action in {'load', 'unload', 'test', 'model-defaults'}:
+        model = data.get('model', '')
+        if not isinstance(model, str) or not 1 <= len(model) <= 512 or model.startswith('-') or '\x00' in model:
+            raise ValueError('Choose a model first.')
+    if action in {'load', 'model-defaults'}:
+        number(data, 'context', 512, 131072, 4096)
+        number(data, 'ttl', 60, 86400, 600)
+        number(data, 'gpu', 0, 100, 100)
+        configuration(data.get('advanced', {}), 'load')
+    if action == 'settings':
+        startup = data.get('startupModel', '')
+        if not isinstance(startup, str) or len(startup) > 512 or startup.startswith('-') or '\x00' in startup:
+            raise ValueError('Invalid startup model.')
+    if action == 'test-preset':
+        if not isinstance(data.get('name'), str) or not re.fullmatch(r'[\w .-]{1,60}', data['name']):
+            raise ValueError('Preset name must be 1–60 letters, numbers, spaces, dots or hyphens.')
+        if type(data.get('delete', False)) is not bool:
+            raise ValueError('Invalid preset action.')
+        configuration(data.get('generation', {}), 'test')
+    if action == 'download':
+        if data.get('preset'):
+            if data['preset'] not in {m['id'] for m in read_json(CATALOG, {})['models']}:
+                raise ValueError('Unknown preset.')
+        else:
+            source = data.get('source', '')
+            # lms accepts HF URLs or a catalog identifier; flags, local paths and other hosts do not pass.
+            if not isinstance(source, str) or not re.fullmatch(
+                    r'(?:https://huggingface\.co/)?[\w.-]+/[\w./@-]+', source) or '..' in source:
+                raise ValueError('Enter a Hugging Face model URL or owner/model catalog identifier.')
+    if action == 'test':
+        configuration(data.get('generation', {}), 'test')
+        if data.get('reasoning', 'default') not in {'default', 'off', 'on', 'low', 'medium', 'high'}:
+            raise ValueError('Invalid reasoning setting.')
+        if not isinstance(data.get('prompt'), str) or not 1 <= len(data['prompt']) <= 4000:
+            raise ValueError('Enter a prompt up to 4000 characters.')
+
+
+def start():
+    if not LMS.is_file():
+        raise ValueError('Install LM Studio from the launcher first.')
+    command('daemon', 'up')
+    command('server', 'start', '--bind', '127.0.0.1', '--port', '1234')
+    with request('/api/v1/models', timeout=10) as response:
+        json.load(response)
+
+
+def download_preset(data, job):
+    model = next(m for m in read_json(CATALOG, {})['models'] if m['id'] == data['preset'])
+    command('daemon', 'up')
+    installed = json.loads(command('ls', '--json'))
+    if any(m.get('path') == model['repo'] + '/' + model['file'] and m.get('sizeBytes') == model['bytes'] for m in installed):
+        progress(job, 'This preset is already installed.')
+        return
+    folder = STATE / 'downloads'
+    folder.mkdir(exist_ok=True)
+    target = folder / model['file']
+    partial = target.with_suffix('.part')
+    offset = partial.stat().st_size if partial.exists() else 0
+    if shutil.disk_usage(folder).free < model['bytes'] - offset + 1024**3:
+        raise ValueError('Not enough disk space for this model plus 1 GB working space.')
+    url = f"https://huggingface.co/{model['repo']}/resolve/{model['revision']}/{model['file']}"
+    if offset < model['bytes']:
+        req = urllib.request.Request(url, headers={'Range': f'bytes={offset}-'} if offset else {})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            if offset and (response.status != 206 or not response.headers.get('Content-Range', '').startswith(f'bytes {offset}-')):
+                offset = 0
+            with partial.open('ab' if offset else 'wb') as output:
+                last = 0
+                while chunk := response.read(1024**2):
+                    output.write(chunk)
+                    offset += len(chunk)
+                    if offset > model['bytes']:
+                        raise ValueError('Download exceeded the catalog file size.')
+                    if time.monotonic() - last > 1:
+                        progress(job, f"Downloading {model['name']}", downloaded=offset, total=model['bytes'])
+                        last = time.monotonic()
+    progress(job, 'Verifying SHA-256 checksum...', downloaded=offset, total=model['bytes'])
+    digest = hashlib.sha256()
+    with partial.open('rb') as source:
+        while chunk := source.read(8 * 1024**2):
+            digest.update(chunk)
+    if offset != model['bytes'] or digest.hexdigest() != model['sha256']:
+        partial.unlink(missing_ok=True)
+        raise ValueError('Model checksum failed. Retry to download a clean copy.')
+    partial.replace(target)
+    progress(job, 'Importing verified model...')
+    command('daemon', 'up')
+    command('import', str(target), '--user-repo', model['repo'], '--yes')
+
+
+def execute(data, job):
+    action = data['action']
+    if action in {'stop', 'restart'}:
+        command('daemon', 'down')
+    if action in {'start', 'restart'}:
+        start()
+    elif action == 'settings':
+        settings = read_json(STATE / 'settings.json', {})
+        settings.update(autostart=data['autostart'])
+        if 'startupModel' in data:
+            settings['startupModel'] = data['startupModel']
+        write_json(STATE / 'settings.json', settings)
+    elif action == 'model-defaults':
+        defaults = read_json(STATE / 'model-defaults.json', {})
+        if data['model'] not in defaults and len(defaults) >= 50:
+            raise ValueError('At most 50 model defaults can be saved.')
+        defaults[data['model']] = {key: data.get(key, default) for key, default in
+                                   [('context', 4096), ('gpu', 100), ('ttl', 600), ('advanced', {})]}
+        write_json(STATE / 'model-defaults.json', defaults)
+    elif action == 'test-preset':
+        presets = read_json(STATE / 'test-presets.json', {})
+        if data.get('delete'):
+            presets.pop(data['name'], None)
+        else:
+            if data['name'] not in presets and len(presets) >= 10:
+                raise ValueError('At most 10 test presets can be saved.')
+            presets[data['name']] = data.get('generation', {})
+        write_json(STATE / 'test-presets.json', presets)
+    elif action == 'download':
+        if data.get('preset'):
+            download_preset(data, job)
+        else:
+            command('daemon', 'up')
+            progress(job, 'Downloading custom model. LM Studio is selecting the requested file/quantization.')
+            command('get', data['source'], '--gguf', '--yes', timeout=14400, job=job)
+    elif action == 'load':
+        with request('/api/v1/models') as response:
+            models = json.load(response)['models']
+        model = next((m for m in models if m['key'] == data['model'] and m['type'] == 'llm'), None)
+        if not model:
+            raise ValueError('Choose an installed language model. Start the API first.')
+        available = resources()
+        # Leave space for the desktop and KV cache. LM Studio also applies its own load guardrails.
+        budget = available['ramAvailable'] + (available['vramFree'] if data.get('gpu', 100) else 0) - 2 * 1024**3
+        if model['size_bytes'] > budget:
+            raise ValueError('Insufficient available RAM/VRAM for this model plus 2 GB headroom. Choose a smaller model or free memory.')
+        if any(m.get('loaded_instances') for m in models):
+            raise ValueError('Unload the current model before loading another. This avoids unexpected memory pressure.')
+        advanced = data.get('advanced', {})
+        if advanced:
+            if not Path(SDK_PYTHON).is_file():
+                raise ValueError('Reinstall the LM Studio component to enable advanced settings.')
+            config = {**advanced, 'contextLength': data.get('context', 4096), 'gpu': {'ratio': data.get('gpu', 100) / 100}}
+            # The official SDK exposes loading options not available in lms or REST.
+            script = '''import json,sys,lmstudio
+d=json.load(sys.stdin)
+with lmstudio.Client("127.0.0.1:1234") as client:
+    model=client.llm.load_new_instance(d["model"], ttl=d["ttl"], config=d["config"])
+    print(json.dumps(model.get_load_config().to_dict()))
+'''
+            result = subprocess.run([SDK_PYTHON, '-c', script], input=json.dumps({'model': data['model'],
+                                    'ttl': data.get('ttl', 600), 'config': config}), capture_output=True, text=True, timeout=300)
+            if result.returncode:
+                raise ValueError(result.stderr[-4000:] or 'Advanced model loading failed.')
+            applied = {'model': data['model'], 'appliedConfig': json.loads(result.stdout)}
+            write_json(STATE / 'last-load.json', applied)
+            progress(job, 'Model loaded.', **applied)
+        else:
+            progress(job, command('load', data['model'], '--context-length', str(data.get('context', 4096)),
+                                  '--gpu', str(data.get('gpu', 100) / 100), '--ttl', str(data.get('ttl', 600)), '--yes'))
+    elif action == 'unload':
+        command('unload', data['model'])
+    elif action == 'test':
+        with request('/api/v1/models') as response:
+            loaded = [i['id'] for m in json.load(response)['models'] for i in m.get('loaded_instances', [])]
+        if data['model'] not in loaded:
+            raise ValueError('Load the model first. A test never loads a model automatically.')
+        payload = {'model': data['model'], 'input': data['prompt'], 'stream': True,
+                   'store': False, 'max_output_tokens': 192, 'temperature': 0.2}
+        payload.update(data.get('generation', {}))
+        reasoning = payload.pop('reasoning', data.get('reasoning', 'default'))
+        if reasoning != 'default':
+            payload['reasoning'] = reasoning
+        text, last, stats, finished = '', 0, {}, False
+        started = time.monotonic()
+        with request('/api/v1/chat', payload, timeout=120) as response:
+            for raw in response:
+                if not raw.startswith(b'data: '):
+                    continue
+                event = json.loads(raw[6:])
+                if event.get('type') == 'error':
+                    raise ValueError(str(event.get('error', event)))
+                if event.get('type') == 'chat.end':
+                    finished = True
+                    stats = event.get('result', {}).get('stats', {})
+                if event.get('type') in {'message.delta', 'reasoning.delta'}:
+                    text = (text + event.get('content', ''))[-12000:]
+                    if time.monotonic() - last > .3:
+                        progress(job, 'Generating...', output=text)
+                        last = time.monotonic()
+        if not finished:
+            raise ValueError('The model stream ended before completion. Retry the test.')
+        result = {'output': text, 'stats': stats, 'elapsedSeconds': round(time.monotonic() - started, 2),
+                  'model': data['model'], 'generation': {key: value for key, value in payload.items()
+                  if key not in {'model', 'input', 'stream', 'store'}}, 'updated': time.time()}
+        write_json(STATE / 'last-test.json', result)
+        progress(job, 'Test finished.', **{key: value for key, value in result.items() if key != 'updated'})
+
+
+def main():
+    initialize()
+    action = sys.argv[1] if len(sys.argv) == 2 else ''
+    if action == 'init':
+        return {'ok': True}
+    if action == 'catalog':
+        return read_json(CATALOG, {'models': []})
+    if action == 'status':
+        return status()
+    if action == 'access':
+        if os.environ.get('SUDO_USER') == 'www-data':
+            raise ValueError('Open the manager from the launcher to obtain access.')
+        return {'token': (STATE / 'access').read_text()}
+    if action == 'authorize':
+        data = json.loads(sys.stdin.read(16384))
+        return {'authorized': hmac.compare_digest(str(data.get('token', '')), (STATE / 'access').read_text())}
+    if action == 'autostart':
+        settings = read_json(STATE / 'settings.json', {})
+        if settings.get('autostart') and LMS.is_file():
+            start()
+            if settings.get('startupModel'):
+                model = settings['startupModel']
+                defaults = read_json(STATE / 'model-defaults.json', {}).get(model, {})
+                # Use the same job lock and validation as manual loads.
+                result = subprocess.run([sys.executable, __file__, 'submit'], input=json.dumps(
+                    {**defaults, 'action': 'load', 'model': model}), capture_output=True, text=True, timeout=10)
+                if result.returncode:
+                    raise ValueError(result.stdout)
+        return {'ok': True}
+    if action == 'shutdown':
+        if LMS.is_file():
+            command('daemon', 'down')
+        return {'ok': True}
+    if action != 'submit':
+        raise ValueError('Unknown command.')
+    data = json.loads(sys.stdin.read(16384))
+    validate(data)
+    lock = (STATE / 'job.lock').open('a')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise ValueError('Another operation is running. Wait for it to finish.')
+    job = {'id': secrets.token_hex(8), 'action': data['action'], 'state': 'running', 'message': 'Starting...', 'updated': time.time()}
+    write_json(STATE / 'job.json', job)
+    if os.fork():
+        lock.close()
+        return job
+    # Keep the inherited lock for the complete job; close the web/launcher pipes before returning.
+    os.setsid()
+    with open(os.devnull, 'r+') as null:
+        for fd in (0, 1, 2):
+            os.dup2(null.fileno(), fd)
+    try:
+        execute(data, job)
+        progress(job, job.get('message', 'Done') if data['action'] == 'test' else 'Done.', state='completed')
+    except Exception as error:
+        progress(job, str(error), state='failed')
+    finally:
+        lock.close()
+    os._exit(0)
+
+
+if __name__ == '__main__':
+    try:
+        print(json.dumps(main()), flush=True)
+    except Exception as error:
+        print(json.dumps({'error': str(error)}), flush=True)
+        sys.exit(1)

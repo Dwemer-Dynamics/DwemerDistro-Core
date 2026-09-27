@@ -725,6 +725,11 @@ else
 	L_XTTSV2=1
 fi
 
+# LM Studio starts only after the user enables it in its manager.
+if [ -x /usr/local/bin/ddistro_lmstudio ]; then
+    runuser -u dwemer -- /usr/local/bin/ddistro_lmstudio autostart || echo 'LM Studio startup failed; open its manager for details.'
+fi
+
 # Higgs is opt-in and uses a dedicated runtime and port.
 if [ -f /home/dwemer/higgs-tts/.enabled ] && [ -x /home/dwemer/higgs-tts/service.sh ]; then
     /home/dwemer/higgs-tts/service.sh start || echo 'Higgs startup failed; see /home/dwemer/higgs-tts/server.log'
@@ -877,6 +882,7 @@ fi
 echo "Press Enter to shutdown DwemerDistro"
 read
 
+if [ -x /usr/local/bin/ddistro_lmstudio ]; then runuser -u dwemer -- /usr/local/bin/ddistro_lmstudio shutdown; fi
 if [ -x /usr/local/bin/ddistro_reign ]; then /usr/local/bin/ddistro_reign stop; fi
 if [ -x /home/dwemer/higgs-tts/service.sh ]; then /home/dwemer/higgs-tts/service.sh stop; fi
 killall -15 -u dwemer

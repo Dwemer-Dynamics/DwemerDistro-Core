@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "models": [
+    {"id":"orion-standard","name":"Orion Standard · Q4_K_M · 17.0 GB","repo":"bartowski/TheDrummer_Orion-26B-A4B-v1-GGUF","revision":"5a12f5b78e5a9018b1721fd9ceed1fdb7c5543dc","file":"TheDrummer_Orion-26B-A4B-v1-Q4_K_M.gguf","bytes":17035039776,"sha256":"036c70d3a8ff448ee66d3e177b6682eecc439bd41937dc12c7bb30091cc682fc"},
+    {"id":"orion-apex","name":"Orion APEX · Q6_K · 18.5 GB","repo":"K4r14/Orion-26B-A4B-v1-APEX.i-Quality.Q6_K-GGUF","revision":"f17d1df9c8d8e113eb2d4098b14cc38f8ec11acd","file":"TheDrummer_Orion-26B-A4B-v1-APEX-i-Quality-Q6_K.gguf","bytes":18522000384,"sha256":"98518fd167af35e58283adf342fa9a1ca030d5dab5b194b53c2a11952a9fb901"},
+    {"id":"chimera","name":"Chimera alternative · PRISM DQ-I · 18.7 GB","repo":"KaviarLabs/Gemma-4-26B-A4B-Chimera-X-Heretic-PRISM-DQ-I","revision":"57fb5d5521c9b7887d329d3d69237e123d8ce357","file":"Gemma-4-26B-A4B-Chimera-X-Heretic-PRISM-DQ-I.gguf","bytes":18697448352,"sha256":"be7f9c57aed22bb00a0aea39ffe35f94224a6d9890adfb4fbb392af5b7218779"}
+  ]
+}
