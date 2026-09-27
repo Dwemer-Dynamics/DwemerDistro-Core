@@ -114,7 +114,7 @@ ensure_portable_pgvector() {
         return 1
     fi
 
-    if ! echo "$PASSWORD" | sudo -S "$helper"; then
+    if ! echo "$PASSWORD" | sudo -S -p '' "$helper"; then
         print_warning "Portable pgvector repair failed."
         return 1
     fi
@@ -221,7 +221,7 @@ ensure_stobe_database() {
 
     if ! pg_isready -d template1 -q; then
         printf ">> PostgreSQL is not running; starting it now...\n"
-        echo "$PASSWORD" | sudo -S /etc/init.d/postgresql start >"$bootstrap_output" 2>&1 || true
+        echo "$PASSWORD" | sudo -S -p '' /etc/init.d/postgresql start >"$bootstrap_output" 2>&1 || true
         local postgres_ready=0
         local attempt
         for attempt in {1..15}; do
@@ -243,7 +243,7 @@ ensure_stobe_database() {
     : > "$bootstrap_output"
     if ! db_exists=$(psql -h localhost -U dwemer -d dwemer -X -tAc "SELECT 1 FROM pg_database WHERE datname = 'stobe' LIMIT 1" 2>>"$bootstrap_output"); then
         printf '\nApplication database catalog probe failed; trying the PostgreSQL service account.\n' >> "$bootstrap_output"
-        if ! db_exists=$(echo "$PASSWORD" | sudo -S -u postgres psql -d template1 -X -tAc "SELECT 1 FROM pg_database WHERE datname = 'stobe' LIMIT 1" 2>>"$bootstrap_output"); then
+        if ! db_exists=$(echo "$PASSWORD" | sudo -S -p '' -u postgres psql -d template1 -X -tAc "SELECT 1 FROM pg_database WHERE datname = 'stobe' LIMIT 1" 2>>"$bootstrap_output"); then
             cp "$bootstrap_output" "$bootstrap_log" 2>/dev/null || true
             print_warning "Failed to inspect the Stobe database. See $bootstrap_log"
             tail -n 8 "$bootstrap_output" | sed 's/^/  /'
@@ -254,7 +254,7 @@ ensure_stobe_database() {
     db_exists=$(printf '%s' "$db_exists" | tr -d '[:space:]')
     if [ "$db_exists" != "1" ]; then
         printf ">> Creating stobe database...\n"
-        if ! echo "$PASSWORD" | sudo -S -u postgres createdb --maintenance-db=template1 --owner=dwemer --encoding=UTF8 --locale=C --template=template0 stobe >"$bootstrap_output" 2>&1; then
+        if ! echo "$PASSWORD" | sudo -S -p '' -u postgres createdb --maintenance-db=template1 --owner=dwemer --encoding=UTF8 --locale=C --template=template0 stobe >"$bootstrap_output" 2>&1; then
             cp "$bootstrap_output" "$bootstrap_log" 2>/dev/null || true
             print_warning "Failed to create stobe database. See $bootstrap_log"
             tail -n 8 "$bootstrap_output" | sed 's/^/  /'
@@ -273,7 +273,7 @@ ensure_stobe_database() {
     fi
 
     : > "$bootstrap_output"
-    if ! echo "$PASSWORD" | sudo -S -u postgres psql -d stobe -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS vector; ALTER DATABASE stobe OWNER TO dwemer;" >"$bootstrap_output" 2>&1; then
+    if ! echo "$PASSWORD" | sudo -S -p '' -u postgres psql -d stobe -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS vector; ALTER DATABASE stobe OWNER TO dwemer;" >"$bootstrap_output" 2>&1; then
         cp "$bootstrap_output" "$bootstrap_log" 2>/dev/null || true
         print_warning "Failed to provision Stobe PostgreSQL extensions. See $bootstrap_log"
         tail -n 8 "$bootstrap_output" | sed 's/^/  /'
@@ -362,7 +362,7 @@ ensure_dialectic_runtime_permissions() {
         return 1
     fi
 
-    if ! echo "$PASSWORD" | sudo -S "$helper" /var/www/html/DialecticServer; then
+    if ! echo "$PASSWORD" | sudo -S -p '' "$helper" /var/www/html/DialecticServer; then
         print_warning "DialecticServer runtime permission repair failed."
         return 1
     fi
@@ -431,7 +431,7 @@ ensure_dialectic_database() {
 
     if ! pg_isready -d template1 -q; then
         printf ">> PostgreSQL is not running; starting it now...\n"
-        echo "$PASSWORD" | sudo -S /etc/init.d/postgresql start >"$bootstrap_output" 2>&1 || true
+        echo "$PASSWORD" | sudo -S -p '' /etc/init.d/postgresql start >"$bootstrap_output" 2>&1 || true
         local postgres_ready=0
         local attempt
         for attempt in {1..15}; do
@@ -453,7 +453,7 @@ ensure_dialectic_database() {
     : > "$bootstrap_output"
     if ! db_exists=$(psql -h localhost -U dwemer -d dwemer -X -tAc "SELECT 1 FROM pg_database WHERE datname = 'dialectic' LIMIT 1" 2>>"$bootstrap_output"); then
         printf '\nApplication database catalog probe failed; trying the PostgreSQL service account.\n' >> "$bootstrap_output"
-        if ! db_exists=$(echo "$PASSWORD" | sudo -S -u postgres psql -d template1 -X -tAc "SELECT 1 FROM pg_database WHERE datname = 'dialectic' LIMIT 1" 2>>"$bootstrap_output"); then
+        if ! db_exists=$(echo "$PASSWORD" | sudo -S -p '' -u postgres psql -d template1 -X -tAc "SELECT 1 FROM pg_database WHERE datname = 'dialectic' LIMIT 1" 2>>"$bootstrap_output"); then
             mkdir -p "$server_root/log" >/dev/null 2>&1 || true
             cp "$bootstrap_output" "$server_root/log/db_update_runner.log" 2>/dev/null || true
             print_warning "Failed to inspect the Dialectic database. See $server_root/log/db_update_runner.log"
@@ -465,7 +465,7 @@ ensure_dialectic_database() {
     db_exists=$(printf '%s' "$db_exists" | tr -d '[:space:]')
     if [ "$db_exists" != "1" ]; then
         printf ">> Creating dialectic database...\n"
-        if ! echo "$PASSWORD" | sudo -S -u postgres createdb --maintenance-db=template1 --owner=dwemer --encoding=UTF8 --locale=C --template=template0 dialectic >"$bootstrap_output" 2>&1; then
+        if ! echo "$PASSWORD" | sudo -S -p '' -u postgres createdb --maintenance-db=template1 --owner=dwemer --encoding=UTF8 --locale=C --template=template0 dialectic >"$bootstrap_output" 2>&1; then
             mkdir -p "$server_root/log" >/dev/null 2>&1 || true
             cp "$bootstrap_output" "$server_root/log/db_update_runner.log" 2>/dev/null || true
             print_warning "Failed to create dialectic database. See $server_root/log/db_update_runner.log"
@@ -477,7 +477,7 @@ ensure_dialectic_database() {
     : > "$bootstrap_output"
     if ! db_encoding=$(psql -h localhost -U dwemer -d dwemer -X -tAc "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = 'dialectic'" 2>>"$bootstrap_output"); then
         printf '\nApplication database encoding probe failed; trying the PostgreSQL service account.\n' >> "$bootstrap_output"
-        if ! db_encoding=$(echo "$PASSWORD" | sudo -S -u postgres psql -d template1 -X -tAc "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = 'dialectic'" 2>>"$bootstrap_output"); then
+        if ! db_encoding=$(echo "$PASSWORD" | sudo -S -p '' -u postgres psql -d template1 -X -tAc "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = 'dialectic'" 2>>"$bootstrap_output"); then
             mkdir -p "$server_root/log" >/dev/null 2>&1 || true
             cp "$bootstrap_output" "$server_root/log/db_update_runner.log" 2>/dev/null || true
             print_warning "Failed to inspect the Dialectic database encoding. See $server_root/log/db_update_runner.log"
@@ -495,7 +495,7 @@ ensure_dialectic_database() {
         fi
 
         printf ">> Migrating the existing Dialectic database from SQL_ASCII to UTF8...\n"
-        if ! echo "$PASSWORD" | sudo -S bash "$utf8_migration" >"$bootstrap_output" 2>&1; then
+        if ! echo "$PASSWORD" | sudo -S -p '' bash "$utf8_migration" >"$bootstrap_output" 2>&1; then
             mkdir -p "$server_root/log" >/dev/null 2>&1 || true
             cp "$bootstrap_output" "$server_root/log/db_utf8_migration.log" 2>/dev/null || true
             print_warning "Dialectic UTF-8 migration failed. The original database was retained. See $server_root/log/db_utf8_migration.log"
@@ -503,7 +503,7 @@ ensure_dialectic_database() {
             return 1
         fi
 
-        db_encoding=$(echo "$PASSWORD" | sudo -S -u postgres psql -d template1 -X -tAc "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = 'dialectic'" 2>/dev/null | tr -d '[:space:]')
+        db_encoding=$(echo "$PASSWORD" | sudo -S -p '' -u postgres psql -d template1 -X -tAc "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = 'dialectic'" 2>/dev/null | tr -d '[:space:]')
         if [ "$db_encoding" != "UTF8" ]; then
             print_warning "Dialectic database migration completed without producing UTF8 (reported encoding: ${db_encoding:-unknown})."
             unset PGPASSWORD
@@ -518,7 +518,7 @@ ensure_dialectic_database() {
         return 1
     fi
 
-    if ! echo "$PASSWORD" | sudo -S -u postgres psql -d dialectic -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS vector; ALTER DATABASE dialectic OWNER TO dwemer;" >/dev/null 2>&1; then
+    if ! echo "$PASSWORD" | sudo -S -p '' -u postgres psql -d dialectic -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS vector; ALTER DATABASE dialectic OWNER TO dwemer;" >/dev/null 2>&1; then
         print_warning "Failed to provision Dialectic PostgreSQL extensions."
         unset PGPASSWORD
         return 1
@@ -631,7 +631,7 @@ update_installed_server() {
     if printf '%s' "$status_json" | grep -q '"state":"needs-repair"' \
         && printf '%s' "$status_json" | grep -q '"repository_state":"legacy"'; then
         print_warning "$product uses a legacy deployment; adopting it with a retained backup before updating."
-        if echo "$PASSWORD" | sudo -S "$SERVER_MANAGER" repair "$product" --branch "$branch_choice"; then
+        if echo "$PASSWORD" | sudo -S -p '' "$SERVER_MANAGER" repair "$product" --branch "$branch_choice"; then
             print_success "$product legacy deployment adopted and updated successfully"
             return 0
         fi
@@ -642,7 +642,7 @@ update_installed_server() {
     # Finish those installations without installing a product whose files are absent.
     if printf '%s' "$status_json" | grep -q '"state":"needs-repair"' \
         && printf '%s' "$status_json" | grep -q '"repository_state":"managed"'; then
-        if echo "$PASSWORD" | sudo -S "$SERVER_MANAGER" repair "$product" --branch "$branch_choice"; then
+        if echo "$PASSWORD" | sudo -S -p '' "$SERVER_MANAGER" repair "$product" --branch "$branch_choice"; then
             print_success "$product updated successfully"
             return 0
         fi
@@ -656,7 +656,7 @@ update_installed_server() {
 
     print_header "UPDATING ${product^^} SERVER" "$current_branch"
     # Legacy launchers run this script as dwemer without a visible sudo prompt.
-    if echo "$PASSWORD" | sudo -S "$SERVER_MANAGER" update "$product" --branch "$branch_choice"; then
+    if echo "$PASSWORD" | sudo -S -p '' "$SERVER_MANAGER" update "$product" --branch "$branch_choice"; then
         print_success "$product updated successfully"
         return 0
     fi
@@ -688,8 +688,8 @@ if (
         git -c core.filemode=false pull --ff-only || exit 1
     fi
 
-    echo "$PASSWORD" | sudo -S chown -R dwemer:www-data /var/www/html/Dwemer-Dashboard || exit 1
-    echo "$PASSWORD" | sudo -S chmod -R 775 /var/www/html/Dwemer-Dashboard || exit 1
+    echo "$PASSWORD" | sudo -S -p '' chown -R dwemer:www-data /var/www/html/Dwemer-Dashboard || exit 1
+    echo "$PASSWORD" | sudo -S -p '' chmod -R 775 /var/www/html/Dwemer-Dashboard || exit 1
 ); then
     printf "${GREEN}[SUCCESS] Dwemer Dashboard updated successfully${NC}\n"
 else
