@@ -8,6 +8,27 @@ NC='\033[0m' # No Color
 
 # Store password for sudo commands
 PASSWORD="dwemer"
+# Never read a password from an invisible terminal during launcher updates.
+# A bad credential must fail the update instead of hanging or reporting success.
+run_privileged() {
+    if [ "$EUID" -eq 0 ]; then
+        "$@" || exit $?
+    else
+        printf '%s\n' "$PASSWORD" | sudo -S -p '' "$@" || exit $?
+    fi
+}
+
+# Keep separate launchers and direct invocations from updating shared files together.
+if [ "${DWEMER_COMPONENT_UPDATE_LOCKED:-0}" != 1 ]; then
+    flock -n -E 75 --close /home/dwemer/.dwemerdistro-components-update.lock \
+        env DWEMER_COMPONENT_UPDATE_LOCKED=1 bash "$0" "$@"
+    result=$?
+    if [ "$result" -eq 75 ]; then
+        printf 'Another shared components update is already running.\n' >&2
+    fi
+    exit "$result"
+fi
+
 UPDATE_HERIKA=1
 UPDATE_STOBE=1
 UPDATE_DIALECTIC=1
@@ -702,8 +723,8 @@ elif [ "$MINIME_UPDATE_OK" -eq 1 ]; then
 fi
 
 # Set permissions for minime-t5
-sudo chown -R dwemer:dwemer /home/dwemer/minime-t5
-sudo chmod -R 755 /home/dwemer/minime-t5
+run_privileged chown -R dwemer:dwemer /home/dwemer/minime-t5
+run_privileged chmod -R 755 /home/dwemer/minime-t5
 if [ "$MINIME_UPDATE_OK" -eq 1 ]; then
     printf "${GREEN}[SUCCESS] MiniMe & TXT2VEC updated successfully${NC}\n"
 else
@@ -731,8 +752,8 @@ if [ "$MELO_UPDATE_OK" -eq 1 ]; then
 fi
 
 # Set permissions for MeloTTS
-sudo chown -R dwemer:dwemer /home/dwemer/MeloTTS
-sudo chmod -R 755 /home/dwemer/MeloTTS
+run_privileged chown -R dwemer:dwemer /home/dwemer/MeloTTS
+run_privileged chmod -R 755 /home/dwemer/MeloTTS
 if [ "$MELO_UPDATE_OK" -eq 1 ]; then
     printf "${GREEN}[SUCCESS] MeloTTS updated successfully${NC}\n"
 else
@@ -760,8 +781,8 @@ if [ "$WHISPER_UPDATE_OK" -eq 1 ]; then
 fi
 
 # Set permissions for LocalWhisper
-sudo chown -R dwemer:dwemer /home/dwemer/remote-faster-whisper
-sudo chmod -R 755 /home/dwemer/remote-faster-whisper
+run_privileged chown -R dwemer:dwemer /home/dwemer/remote-faster-whisper
+run_privileged chmod -R 755 /home/dwemer/remote-faster-whisper
 if [ "$WHISPER_UPDATE_OK" -eq 1 ]; then
     printf "${GREEN}[SUCCESS] LocalWhisper updated successfully${NC}\n"
 else
@@ -803,8 +824,8 @@ else
 fi
 
 # Set permissions for Piper TTS
-sudo chown -R dwemer:dwemer /home/dwemer/piper
-sudo chmod -R 755 /home/dwemer/piper
+run_privileged chown -R dwemer:dwemer /home/dwemer/piper
+run_privileged chmod -R 755 /home/dwemer/piper
 printf "${GREEN}[SUCCESS] Piper TTS updated successfully${NC}\n"
 
 # XTTS is optional; do not touch leftover files without an installed repository.
@@ -867,8 +888,8 @@ else
     rm -rf -- "$XTTS_TEMP_BACKUP"
 
     # Set permissions for XTTS
-    sudo chown -R dwemer:dwemer /home/dwemer/xtts-api-server
-    sudo chmod -R 755 /home/dwemer/xtts-api-server
+    run_privileged chown -R dwemer:dwemer /home/dwemer/xtts-api-server
+    run_privileged chmod -R 755 /home/dwemer/xtts-api-server
     if [ "$XTTS_UPDATE_OK" -eq 1 ]; then
         printf "${GREEN}[SUCCESS] CHIM XTTS updated successfully${NC}\n"
     else
@@ -902,8 +923,8 @@ printf ">> Pulling latest changes...\n"
 git pull
 
 # Set permissions for Parakeet
-sudo chown -R dwemer:dwemer /home/dwemer/parakeet-api-server
-sudo chmod -R 755 /home/dwemer/parakeet-api-server
+run_privileged chown -R dwemer:dwemer /home/dwemer/parakeet-api-server
+run_privileged chmod -R 755 /home/dwemer/parakeet-api-server
 printf "${GREEN}[SUCCESS] Parakeet updated successfully${NC}\n"
 
 # Preserve explicit legacy ports before service repositories gain dedicated
@@ -915,9 +936,9 @@ preserve_legacy_tts_port() {
     local port_file="$service_root/.dwemerdistro-port"
 
     if [ -e "$installed_path" ] && [ ! -f "$port_file" ]; then
-        printf '8020\n' | sudo tee "$port_file" >/dev/null
-        sudo chown dwemer:dwemer "$port_file"
-        sudo chmod 600 "$port_file"
+        run_privileged bash -c 'printf "8020\n" > "$1"' _ "$port_file"
+        run_privileged chown dwemer:dwemer "$port_file"
+        run_privileged chmod 600 "$port_file"
         print_success "Preserved legacy port 8020 for $(basename "$service_root")."
     fi
 }
@@ -950,8 +971,8 @@ printf ">> Pulling latest changes...\n"
 git pull
 
 # Set permissions for CHATTERBOX
-sudo chown -R dwemer:dwemer /home/dwemer/chatterbox
-sudo chmod -R 755 /home/dwemer/chatterbox
+run_privileged chown -R dwemer:dwemer /home/dwemer/chatterbox
+run_privileged chmod -R 755 /home/dwemer/chatterbox
 printf "${GREEN}[SUCCESS] Chatterbox updated successfully${NC}\n"
 
 # audio.cpp update. This only updates an existing install; CUDA/model setup is handled by install_audiocpp_pockettts.
@@ -974,8 +995,8 @@ if [ -d /home/dwemer/audio.cpp/.git ]; then
         git pull --ff-only || AUDIOCPP_UPDATE_OK=0
     fi
 
-    sudo chown -R dwemer:dwemer /home/dwemer/audio.cpp
-    sudo chmod -R 755 /home/dwemer/audio.cpp
+    run_privileged chown -R dwemer:dwemer /home/dwemer/audio.cpp
+    run_privileged chmod -R 755 /home/dwemer/audio.cpp
     if [ "$AUDIOCPP_UPDATE_OK" -eq 1 ]; then
         printf "${GREEN}[SUCCESS] audio.cpp updated successfully${NC}\n"
     else
@@ -1009,8 +1030,8 @@ printf ">> Pulling latest changes...\n"
 git pull
 
 # Set permissions for PocketTTS
-sudo chown -R dwemer:dwemer /home/dwemer/pocket-tts
-sudo chmod -R 755 /home/dwemer/pocket-tts
+run_privileged chown -R dwemer:dwemer /home/dwemer/pocket-tts
+run_privileged chmod -R 755 /home/dwemer/pocket-tts
 printf "${GREEN}[SUCCESS] PocketTTS updated successfully${NC}\n"
 
 # OmniVoice TTS update. Install remains an explicit launcher component action.
@@ -1038,8 +1059,8 @@ if [ -d /home/dwemer/omnivoice-tts ]; then
         OMNIVOICE_SKIP_DOCTOR=1 /home/dwemer/omnivoice-tts/ddistro_install.sh
     fi
 
-    sudo chown -R dwemer:dwemer /home/dwemer/omnivoice-tts
-    sudo chmod -R 755 /home/dwemer/omnivoice-tts
+    run_privileged chown -R dwemer:dwemer /home/dwemer/omnivoice-tts
+    run_privileged chmod -R 755 /home/dwemer/omnivoice-tts
     printf "${GREEN}[SUCCESS] OmniVoice TTS updated successfully${NC}\n"
 else
     printf "${YELLOW}[SKIP] OmniVoice TTS not installed; install it from DwemerDistro Installed Components.${NC}\n"
@@ -1056,12 +1077,12 @@ print_warning "Skipping DwemerDistro MCP update for now."
 # System permission updates
 print_header "RUNNING SYSTEM PERMISSION UPDATES"
 
-sudo /usr/local/bin/update_perms
+run_privileged /usr/local/bin/update_perms
 printf "${GREEN}[SUCCESS] System permissions updated${NC}\n"
 
 # Install netcat only when missing; apt is slow and should not run on every update.
 if ! command -v nc >/dev/null 2>&1; then
-    sudo apt-get update && sudo apt-get -y install netcat-openbsd
+    run_privileged apt-get update && run_privileged apt-get -y install netcat-openbsd
 else
     printf "${GREEN}[SUCCESS] netcat already installed${NC}\n"
 fi
