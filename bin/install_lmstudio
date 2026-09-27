@@ -1,0 +1,30 @@
+#!/bin/bash
+# Install the optional LM Studio engine without downloading or loading a model.
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo 'Run as root.' >&2; exit 1; }
+exec 9>/var/lock/dwemerdistro-lmstudio-install.lock
+flock -n 9 || { echo 'LM Studio installation is already running.' >&2; exit 1; }
+export DEBIAN_FRONTEND=noninteractive
+apt-get install -y curl ca-certificates libatomic1 libgomp1 python3 sudo util-linux
+helper=/usr/local/bin/ddistro_lmstudio
+[ -x "$helper" ] || { echo 'Update DwemerDistro before installing LM Studio.' >&2; exit 1; }
+if [ ! -x /home/dwemer/.lmstudio/bin/lms ]; then
+    installer=$(mktemp)
+    trap 'rm -f "$installer"' EXIT
+    curl --fail --location --proto '=https' --tlsv1.2 https://lmstudio.ai/install.sh -o "$installer"
+    # Fail closed if the reviewed upstream bootstrap changes. Refresh this hash after review.
+    echo "bfa37ffc1d9ee88c58355e01bc5b19381ab36e7368a4ab2fdcc0338b04c3d71d  $installer" | sha256sum -c - || {
+        echo 'The upstream installer changed. Update DwemerDistro for a reviewed installer.' >&2; exit 1;
+    }
+    chmod 644 "$installer"
+    runuser -u dwemer -- env HOME=/home/dwemer PATH=/usr/lib/wsl/lib:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin sh "$installer" --no-modify-path
+fi
+chown root:root "$helper"
+chmod 755 "$helper"
+runuser -u dwemer -- "$helper" init
+rule=$(mktemp)
+trap 'rm -f "${installer:-}" "$rule"' EXIT
+printf '%s\n' 'www-data ALL=(dwemer) NOPASSWD: /usr/local/bin/ddistro_lmstudio' > "$rule"
+visudo -cf "$rule"
+install -o root -g root -m 440 "$rule" /etc/sudoers.d/dwemerdistro-lmstudio
+echo 'LM Studio installed. Open LM Studio Manager to download and load a model.'
