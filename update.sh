@@ -51,6 +51,8 @@ cp /home/dwemer/dwemerdistro/bin/* /usr/local/bin/ 2>/dev/null
 if [ $? -eq 0 ]; then
     # Set executable permissions for all scripts
     chmod +x /usr/local/bin/* 2>/dev/null
+    # LM Studio runs as dwemer, so do not inherit root-only modes or the updater's umask.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_lmstudio /usr/local/bin/ddistro_lmstudio || exit 1
     printf "${GREEN}[SUCCESS] Scripts successfully copied to /usr/local/bin/${NC}\n"
 else
     printf "${RED}[ERROR] Error copying scripts to /usr/local/bin/${NC}\n"
