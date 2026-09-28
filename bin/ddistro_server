@@ -1252,6 +1252,9 @@ startup_product() {
     if [ "$PRODUCT" = lorkhan ]; then
         if [ -f "$WEB_ROOT/LorkhanServer/index.php" ] && [ -e /etc/apache2/sites-enabled/lorkhanserver.conf ] && [ -x /etc/init.d/lorkhanserver-worker ]; then
             service lorkhanserver-worker start || fail 'LORKHAN worker failed to start.'
+            # The init script backgrounds the worker; verify it survives startup.
+            sleep 1
+            service lorkhanserver-worker status >/dev/null 2>&1 || fail 'LORKHAN worker exited during startup.'
         else
             info 'LORKHAN is absent or disabled; startup skipped.'
         fi

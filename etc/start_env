@@ -594,6 +594,11 @@ echo "Starting Apache/PHP/PGSQL Server"
 /etc/init.d/apache2 restart &>/dev/null
 /etc/init.d/postgresql restart
 
+# Start the queue worker after the database restart so it can claim dialogue jobs.
+if [ -x "$SERVER_MANAGER" ]; then
+    "$SERVER_MANAGER" startup lorkhan || echo "WARNING: LORKHAN worker failed to start; check its log."
+fi
+
 if [ -x /var/www/html/ReignServer/runtime/current/ReignBetaServer ]; then
     /usr/local/bin/ddistro_reign start || echo "WARNING: Reign failed to start; check its log."
 fi
@@ -884,6 +889,7 @@ read
 
 if [ -x /usr/local/bin/ddistro_lmstudio ]; then runuser -u dwemer -- /usr/local/bin/ddistro_lmstudio shutdown; fi
 if [ -x /usr/local/bin/ddistro_reign ]; then /usr/local/bin/ddistro_reign stop; fi
+if [ -x /etc/init.d/lorkhanserver-worker ]; then service lorkhanserver-worker stop; fi
 if [ -x /home/dwemer/higgs-tts/service.sh ]; then /home/dwemer/higgs-tts/service.sh stop; fi
 killall -15 -u dwemer
 
