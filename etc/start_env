@@ -731,8 +731,11 @@ else
 fi
 
 # LM Studio starts only after the user enables it in its manager.
-if [ -x /usr/local/bin/ddistro_lmstudio ]; then
-    runuser -u dwemer -- /usr/local/bin/ddistro_lmstudio autostart || echo 'LM Studio startup failed; open its manager for details.'
+if [ -e /usr/local/bin/ddistro_lmstudio ]; then
+    # Check access as the account that reads and executes the Python helper.
+    { runuser -u dwemer -- test -r /usr/local/bin/ddistro_lmstudio &&
+      runuser -u dwemer -- test -x /usr/local/bin/ddistro_lmstudio &&
+      runuser -u dwemer -- /usr/local/bin/ddistro_lmstudio autostart; } || echo 'LM Studio startup failed; open its manager for details.'
 fi
 
 # Higgs is opt-in and uses a dedicated runtime and port.
@@ -887,7 +890,10 @@ fi
 echo "Press Enter to shutdown DwemerDistro"
 read
 
-if [ -x /usr/local/bin/ddistro_lmstudio ]; then runuser -u dwemer -- /usr/local/bin/ddistro_lmstudio shutdown; fi
+if runuser -u dwemer -- test -r /usr/local/bin/ddistro_lmstudio &&
+   runuser -u dwemer -- test -x /usr/local/bin/ddistro_lmstudio; then
+    runuser -u dwemer -- /usr/local/bin/ddistro_lmstudio shutdown
+fi
 if [ -x /usr/local/bin/ddistro_reign ]; then /usr/local/bin/ddistro_reign stop; fi
 if [ -x /etc/init.d/lorkhanserver-worker ]; then service lorkhanserver-worker stop; fi
 if [ -x /home/dwemer/higgs-tts/service.sh ]; then /home/dwemer/higgs-tts/service.sh stop; fi
