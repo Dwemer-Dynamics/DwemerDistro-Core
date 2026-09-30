@@ -8,6 +8,14 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get install -y curl ca-certificates libatomic1 libgomp1 python3 python3-venv sudo util-linux
 helper=/usr/local/bin/ddistro_lmstudio
 [ -x "$helper" ] || { echo 'Update DwemerDistro before installing LM Studio.' >&2; exit 1; }
+# The helper runs as dwemer; repair the public model catalog without changing its contents.
+catalog=/etc/dwemerdistro-lmstudio.json
+[ -f "$catalog" ] && [ ! -L "$catalog" ] || { echo "Missing $catalog. Update DwemerDistro before installing LM Studio." >&2; exit 1; }
+chown root:root "$catalog"
+chmod 644 "$catalog"
+runuser -u dwemer -- python3 -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1]))["models"], list))' "$catalog" || {
+    echo "$catalog is unreadable or invalid. Update DwemerDistro before installing LM Studio." >&2; exit 1;
+}
 if [ ! -x /home/dwemer/.lmstudio/bin/lms ]; then
     installer=$(mktemp)
     trap 'rm -f "$installer"' EXIT
