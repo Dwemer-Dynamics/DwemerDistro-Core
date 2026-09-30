@@ -73,6 +73,12 @@ service postgresql start >/dev/null || exit 1
 printf ">> Copying configuration files to /etc...\n"
 find /home/dwemer/dwemerdistro/etc/ -type f ! -name "php.ini" -exec cp {} /etc/ \; 2>/dev/null
 if [ $? -eq 0 ]; then
+    # The LM Studio helper runs as dwemer and must read the public model catalog.
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/dwemerdistro-lmstudio.json /etc/dwemerdistro-lmstudio.json || exit 1
+    if ! runuser -u dwemer -- python3 -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1]))["models"], list))' /etc/dwemerdistro-lmstudio.json; then
+        printf "${RED}[ERROR] LM Studio model catalog is not readable by dwemer${NC}\n"
+        exit 1
+    fi
     printf "${GREEN}[SUCCESS] Configuration files successfully copied to /etc/${NC}\n"
 else
     printf "${RED}[ERROR] Error copying configuration files to /etc/${NC}\n"
