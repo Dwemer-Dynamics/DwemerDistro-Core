@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""Keep DwemerDistro-managed PocketTTS connectors on the enabled local backend.
+
+Only connector rows that DwemerDistro created are changed: the PocketTTS
+provider, a DwemerDistro label, and a plain loopback URL on a known or
+configured PocketTTS port (URL aliases in its settings must match too, and are
+kept in step). Remote and custom URLs, other providers, profile and
+player assignments, default flags, and unrelated settings are never changed.
+Nothing is written unless the enabled backend identifies itself as PocketTTS.
+--resolve-only reports that verified backend (endpoint and model) for the
+launcher's first Quickstart setup without touching any database or backup.
+
+Output contract (version 1) is one JSON object; see build_result().
+Exit codes: 0 done, 3 waiting on the service or a backend choice (no writes;
+with --resolve-only, any state but ok), 4 a database needs attention, 2 usage error.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from urllib.parse import urlsplit
+
+CONTRACT_VERSION = 1
+RESULT_PREFIX = "DDISTRO_POCKETTTS_CONNECTORS="
+AUDIO_CPP_PATH = "/v1/audio/speech"
+AUDIO_CPP_DEFAULT_PORT = 8086
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
+# Labels written by the launcher quickstart and the legacy port migration.
+MANAGED_LABELS = ("ddistro pockettts", "pocket tts default", "pocket tts audio.cpp")
+# Connector settings keys that some server versions use for the same service URL.
+URL_ALIAS_KEYS = ("endpoint", "url", "URL", "base_url")
+PRODUCTS = (("chim", "CHIM", "dwemer"), ("stobe", "STOBE", "stobe"), ("dialectic", "Dialectic", "dialectic"))
+SCHEMAS = {
+    # HerikaServer and DialecticServer.
+    "herika": {"provider_col": "driver", "provider": "pockettts", "label_col": "label",
+               "url_col": "url", "settings_col": "metadata"},
+    # StobeServer.
+    "stobe": {"provider_col": "connector_type", "provider": "pocket_tts", "label_col": "name",
+              "url_col": "base_url", "settings_col": "config"},
+}
+BACKEND_NAMES = {"audiocpp": "Pocket-TTS audio.cpp", "python": "Pocket-TTS"}
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="Align DwemerDistro-managed PocketTTS connectors with the enabled backend.")
+    parser.add_argument("--backend", default="auto", help="auto, audiocpp, or python (pockettts)")
+    parser.add_argument("--json", action="store_true", help="print only the JSON result")
+    parser.add_argument("--startup", action="store_true", help="print summary lines plus one machine-readable result line")
+    parser.add_argument("--dry-run", action="store_true", help="report planned changes without writing")
+    parser.add_argument("--resolve-only", action="store_true",
+                        help="only report the verified backend, endpoint, and model; no database access")
+    parser.add_argument("--root", default="/home/dwemer", help="directory containing audio.cpp and pocket-tts")
+    parser.add_argument("--services-conf", default="/etc/dwemerdistro_services.conf")
+    parser.add_argument("--database", action="append", default=[], metavar="PRODUCT=DBNAME",
+                        help="override a product database (chim, stobe, dialectic); repeatable")
+    parser.add_argument("--backup-root", default=os.environ.get("DWEMER_TTS_PORT_BACKUP_ROOT"),
+                        help="default: ROOT/.local/state/dwemerdistro/connector-backups, owned by the ROOT owner")
+    parser.add_argument("--timeout", type=float, default=3.0, help="per-request service probe timeout")
+    args = parser.parse_args(argv)
+    backend = args.backend.strip().lower()
+    aliases = {"auto": "auto", "audiocpp": "audiocpp", "audio_cpp": "audiocpp", "audio.cpp": "audiocpp",
+               "python": "python", "pockettts": "python", "pocket_tts": "python", "pocket-tts": "python"}
+    if backend not in aliases:
+        parser.error("--backend must be auto, audiocpp, or python")
+    args.backend = aliases[backend]
+    databases = {key: db for key, _, db in PRODUCTS}
+    for item in args.database:
+        key, _, name = item.partition("=")
+        if key not in databases or not re.fullmatch(r"[A-Za-z0-9_]{1,63}", name):
+            parser.error("--database must be chim|stobe|dialectic=NAME")
+        databases[key] = name
+    args.databases = databases
+    if not args.backup_root:
+        # Per-owner location: /home/dwemer/deploy-backups may be root-owned and unwritable for dwemer.
+        args.backup_root = os.path.join(args.root, ".local", "state", "dwemerdistro", "connector-backups")
+    args.backup_dir = None
+    return args
+
+
+def valid_port(value):
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def read_services_conf(path):
+    ports = {"POCKETTTS_LEGACY_PORT": 8020, "POCKETTTS_DEDICATED_PORT": 8024}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                match = re.match(r"\s*(POCKETTTS_(?:LEGACY|DEDICATED)_PORT)=[\"']?(\d+)", line)
+                if match and valid_port(match.group(2)):
+                    ports[match.group(1)] = int(match.group(2))
+    except OSError:
+        pass
+    return ports
+
+
+def read_audio_cpp_config(root):
+    """Return the configured audio.cpp port and PocketTTS model id from server.json."""
+    port, model = AUDIO_CPP_DEFAULT_PORT, "pocket-tts"
+    try:
+        with open(os.path.join(root, "audio.cpp", "server.json"), encoding="utf-8") as handle:
+            config = json.load(handle)
+        port = valid_port(config.get("port")) or AUDIO_CPP_DEFAULT_PORT
+        for entry in config.get("models") or []:
+            if isinstance(entry, dict) and entry.get("family") == "pocket_tts" and str(entry.get("id") or "").strip():
+                model = str(entry["id"]).strip()
+                break
+    except (OSError, ValueError, AttributeError):
+        pass
+    return port, model
+
+
+def read_python_port(root, legacy_port):
+    try:
+        with open(os.path.join(root, "pocket-tts", ".dwemerdistro-port"), encoding="utf-8") as handle:
+            return valid_port(handle.read()) or legacy_port
+    except OSError:
+        return legacy_port
+
+
+class Prober:
+    def __init__(self, timeout):
+        self.timeout = timeout
+        self.requests = 0
+
+    def get_json(self, port, path):
+        """Return (status, document); status is ok, http_error, or unreachable."""
+        self.requests += 1
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=self.timeout) as response:
+                return "ok", json.loads(response.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError:
+            return "http_error", None
+        except (urllib.error.URLError, OSError, ValueError):
+            return "unreachable", None
+
+
+def identify_python(prober, port):
+    """Return (state, detail) for the Python PocketTTS service on port."""
+    status, info = prober.get_json(port, "/provider_info")
+    if status == "unreachable":
+        return "service_unavailable", f"Pocket-TTS is not answering on port {port}."
+    if status == "ok" and isinstance(info, dict) and str(info.get("provider") or "").strip():
+        provider = str(info.get("provider")).strip().lower().replace("-", "_")
+        if provider in ("pockettts", "pocket_tts"):
+            return "ok", None
+        return "wrong_provider", f"Port {port} is used by {provider}, not Pocket-TTS."
+    # Older PocketTTS builds have no /provider_info; identify them by their API.
+    status, document = prober.get_json(port, "/openapi.json")
+    if status != "ok" or not isinstance(document, dict):
+        return "wrong_provider", f"The service on port {port} did not identify as Pocket-TTS."
+    paths = set((document.get("paths") or {}).keys())
+    if "/languages" in paths or "/get_models_list" in paths:
+        return "wrong_provider", f"Port {port} is used by XTTS, not Pocket-TTS."
+    if "/tts_to_audio_form" in paths or {"/tts_to_audio", "/voices/{voice_id}"} <= paths:
+        return "ok", None
+    return "wrong_provider", f"The service on port {port} did not identify as Pocket-TTS."
+
+
+def identify_audio_cpp(prober, port, model):
+    """Return (state, detail, model id) for audio.cpp on port."""
+    status, health = prober.get_json(port, "/health")
+    if status != "ok":
+        return "service_unavailable", f"Pocket-TTS audio.cpp is not healthy on port {port}.", model
+    if isinstance(health, dict) and str(health.get("status", "ok")).lower() not in ("ok", "healthy", "ready"):
+        return "service_unavailable", f"Pocket-TTS audio.cpp is still starting on port {port}.", model
+    status, listing = prober.get_json(port, "/v1/models")
+    entries = listing.get("data") if status == "ok" and isinstance(listing, dict) else None
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str(entry.get("id") or "").strip()
+        if entry_id and (entry_id == model or entry.get("family") == "pocket_tts"):
+            return "ok", None, entry_id
+    return "wrong_provider", f"The audio.cpp service on port {port} does not serve a Pocket-TTS model.", model
+
+
+def resolve_target(args, prober):
+    """Pick the enabled backend, its configured port, and verify its identity."""
+    conf = read_services_conf(args.services_conf)
+    legacy_port = conf["POCKETTTS_LEGACY_PORT"]
+    python_port = read_python_port(args.root, legacy_port)
+    audio_port, audio_model = read_audio_cpp_config(args.root)
+    target = {
+        "backend": None, "port": None, "endpoint": None, "model": None,
+        # Every port a DwemerDistro-managed PocketTTS row could legitimately point at.
+        "managed_ports": sorted({legacy_port, conf["POCKETTTS_DEDICATED_PORT"], AUDIO_CPP_DEFAULT_PORT, python_port, audio_port}),
+    }
+    enabled = [name for name, folder in (("audiocpp", "audio.cpp"), ("python", "pocket-tts"))
+               if os.path.isfile(os.path.join(args.root, folder, "start.sh"))]
+    if len(enabled) > 1:
+        return "ambiguous", "Both Pocket-TTS backends are enabled. Use Configure to keep only one.", target
+    if not enabled:
+        return "not_enabled", "No Pocket-TTS backend is enabled.", target
+    if args.backend != "auto" and args.backend != enabled[0]:
+        return "not_enabled", f"{BACKEND_NAMES[args.backend]} is not the enabled Pocket-TTS backend.", target
+
+    backend = enabled[0]
+    target["backend"] = backend
+    if backend == "audiocpp":
+        target["port"] = audio_port
+        target["endpoint"] = f"http://127.0.0.1:{audio_port}{AUDIO_CPP_PATH}"
+        state, detail, target["model"] = identify_audio_cpp(prober, audio_port, audio_model)
+    else:
+        target["port"] = python_port
+        target["endpoint"] = f"http://127.0.0.1:{python_port}"
+        state, detail = identify_python(prober, python_port)
+    if state == "ok":
+        detail = f"{BACKEND_NAMES[backend]} is ready on port {target['port']}."
+    return state, detail, target
+
+
+def parse_managed_url(url, managed_ports):
+    """Return (host, port, path) for a plain DwemerDistro loopback URL, else None."""
+    try:
+        parts = urlsplit((url or "").strip())
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme.lower() != "http" or parts.username or parts.password or parts.query or parts.fragment:
+        return None
+    host = (parts.hostname or "").lower()
+    path = parts.path.rstrip("/")
+    if host not in LOOPBACK_HOSTS or port not in managed_ports or path not in ("", AUDIO_CPP_PATH):
+        return None
+    return host, port, path
+
+
+def url_aliases(settings):
+    """Return (key, value) for URL aliases present in the settings; absent keys are never added."""
+    settings = settings or {}
+    return [(key, settings[key]) for key in URL_ALIAS_KEYS
+            if isinstance(settings.get(key), str) and settings[key].strip()]
+
+
+def managed_url(row, managed_ports):
+    """Return the parsed URL of a DwemerDistro-managed row, else None (custom row)."""
+    if str(row.get("label") or "").strip().lower() not in MANAGED_LABELS:
+        return None
+    if not isinstance(row.get("settings"), (dict, type(None))):
+        return None
+    # A URL alias pointing anywhere custom or remote makes the whole row the user's.
+    if any(parse_managed_url(value, managed_ports) is None for _, value in url_aliases(row.get("settings"))):
+        return None
+    return parse_managed_url(row.get("url"), managed_ports)
+
+
+def target_url(parsed, target):
+    """Return (aligned, URL on the target backend) for a parsed managed URL, keeping its host."""
+    host, port, path = parsed
+    if target["backend"] == "audiocpp":
+        # Servers detect audio.cpp from :8086 or the explicit speech path.
+        aligned = port == target["port"] and (path == AUDIO_CPP_PATH or target["port"] == AUDIO_CPP_DEFAULT_PORT)
+        return aligned, f"http://{host}:{target['port']}{AUDIO_CPP_PATH}"
+    return port == target["port"] and path == "", f"http://{host}:{target['port']}"
+
+
+def plan_row(row, target):
+    """Return ("already"|"preserved"|"update", new_url or None, settings patch)."""
+    parsed = managed_url(row, target["managed_ports"])
+    if parsed is None:
+        return "preserved", None, {}
+    settings = row.get("settings") or {}
+    aligned, new_url = target_url(parsed, target)
+    patch = {}
+    for key, value in url_aliases(settings):
+        alias_aligned, alias_url = target_url(parse_managed_url(value, target["managed_ports"]), target)
+        if not alias_aligned:
+            patch[key] = alias_url
+    api_format = str(settings.get("api_format") or "").strip().lower()
+    if target["backend"] == "audiocpp":
+        if api_format != "audio_cpp":
+            patch["api_format"] = "audio_cpp"
+        if settings.get("model") != target["model"]:
+            patch["model"] = target["model"]
+    elif api_format in ("audio_cpp", "audiocpp"):
+        patch["api_format"] = "legacy"
+    if aligned and not patch:
+        return "already", None, {}
+    return "update", None if aligned else new_url, patch
+
+
+class Database:
+    def __init__(self, name):
+        self.name = name
+        self.env = dict(os.environ)
+        self.env.setdefault("PGPASSWORD", "dwemer")
+
+    def run(self, sql, variables=None):
+        command = ["psql", "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1",
+                   "-h", self.env.get("PGHOST", "127.0.0.1"), "-p", self.env.get("PGPORT", "5432"),
+                   "-U", self.env.get("PGUSER", "dwemer"), "-d", self.name, "-f", "-"]
+        for key, value in (variables or {}).items():
+            command += ["-v", f"{key}={value}"]
+        try:
+            result = subprocess.run(command, input=sql, text=True, capture_output=True, timeout=30, env=self.env)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return False, str(error)
+        if result.returncode != 0:
+            return False, (result.stderr or result.stdout).strip()
+        return True, result.stdout
+
+
+def row_hash_sql(schema):
+    # Fingerprint of every column this helper reads, so concurrent edits are not overwritten.
+    return ("md5(concat_ws(chr(31), id::text, {provider_col}, {label_col}, coalesce({url_col}, '<null>'), "
+            "coalesce({settings_col}::text, '<null>')))").format(**schema)
+
+
+def load_rows(db):
+    ok, output = db.run("SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'core_tts_connector';")
+    if not ok:
+        if re.search(r'database "[^"]+" does not exist', output):
+            return "missing", "Not installed.", None, []
+        if re.search(r"Connection refused|No such file or directory|could not connect", output):
+            # PostgreSQL is stopped (DwemerDistro not started); the next startup check updates it.
+            return "pending", "Waiting for the database to start.", None, []
+        return "failed", "Database unavailable.", None, []
+    columns = set(output.split())
+    schema = next((s for s in SCHEMAS.values() if {s["provider_col"], s["label_col"], s["url_col"], s["settings_col"]} <= columns), None)
+    if schema is None:
+        return "missing", "No supported TTS connector table.", None, []
+    sql = ("SELECT json_build_object('id', id, 'label', {label_col}, 'url', {url_col}, 'settings', {settings_col}, "
+           "'hash', {hash}) FROM public.core_tts_connector WHERE {provider_col} = :'provider' ORDER BY id;"
+           ).format(hash=row_hash_sql(schema), **schema)
+    ok, output = db.run(sql, {"provider": schema["provider"]})
+    if not ok:
+        return "failed", "Could not read TTS connectors.", None, []
+    return None, None, schema, [json.loads(line) for line in output.splitlines() if line.strip()]
+
+
+def backup_owner(args):
+    """Return (uid, gid) of the --root owner when running as root, else None (files stay ours)."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        info = os.stat(args.root)
+        return info.st_uid, info.st_gid
+    return None
+
+
+def make_backup_parents(path, owner):
+    """Create missing directories up to path. Only directories created here are handed to owner;
+    existing ones are never chmod-ed or chown-ed, so an unwritable parent fails loudly."""
+    missing, current = [], os.path.abspath(path)
+    while not os.path.isdir(current) and os.path.dirname(current) != current:
+        missing.append(current)
+        current = os.path.dirname(current)
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            continue  # created concurrently by another run; not ours to change
+        if owner:
+            os.chown(directory, *owner)
+
+
+def write_backup(args, product, db, changes):
+    owner = backup_owner(args)
+    if args.backup_dir is None:
+        make_backup_parents(args.backup_root, owner)
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        # Unique per run, so runs in the same second never share or overwrite files.
+        args.backup_dir = tempfile.mkdtemp(prefix=f"pockettts-connectors-{stamp}-", dir=args.backup_root)
+        if owner:
+            os.chown(args.backup_dir, *owner)
+    path = os.path.join(args.backup_dir, f"{product}-{db.name}-core_tts_connector.jsonl")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with open(descriptor, "w", encoding="utf-8") as handle:
+        for row, new_url, patch in changes:
+            handle.write(json.dumps({"before": {k: row.get(k) for k in ("id", "label", "url", "settings")},
+                                     "new_url": new_url, "settings_patch": patch}) + "\n")
+    if owner:
+        os.chown(path, *owner)
+    return args.backup_dir
+
+
+def apply_changes(db, schema, changes):
+    """Update planned rows in one transaction; return (updated ids, error)."""
+    statements, variables = ["BEGIN;", "SET LOCAL lock_timeout = '5s';"], {}
+    for index, (row, new_url, patch) in enumerate(changes):
+        assignments = []
+        if new_url is not None:
+            assignments.append(f"{schema['url_col']} = :'url_{index}'")
+            variables[f"url_{index}"] = new_url
+        if patch:
+            assignments.append(f"{schema['settings_col']} = coalesce({schema['settings_col']}, '{{}}'::jsonb) || :'patch_{index}'::jsonb")
+            variables[f"patch_{index}"] = json.dumps(patch, sort_keys=True)
+        variables[f"id_{index}"] = int(row["id"])
+        variables[f"hash_{index}"] = row["hash"]
+        statements.append(f"UPDATE public.core_tts_connector SET {', '.join(assignments)} "
+                          f"WHERE id = :id_{index} AND {row_hash_sql(schema)} = :'hash_{index}' RETURNING id;")
+    statements.append("COMMIT;")
+    ok, output = db.run("\n".join(statements) + "\n", variables)
+    if not ok:
+        return [], output
+    return [int(line) for line in output.split() if line.strip().isdigit()], None
+
+
+def pending_message(state, dry_run):
+    if dry_run:
+        return "Would be updated."
+    messages = {
+        "ok": "Changed by someone else while updating; left as is.",
+        "service_unavailable": "Waiting for Pocket-TTS to start.",
+        "wrong_provider": "Not changed: another service is using the Pocket-TTS port.",
+        "ambiguous": "Not changed: both Pocket-TTS backends are enabled.",
+    }
+    return messages.get(state, "Not changed.")
+
+
+def reconcile_product(args, key, name, db_name, state, target):
+    entry = {"product": key, "name": name, "database": db_name, "status": "none",
+             "updated": 0, "already": 0, "preserved": 0, "pending": 0, "message": "No Pocket-TTS connector."}
+    db = Database(db_name)
+    problem, message, schema, rows = load_rows(db)
+    if problem:
+        entry.update(status=problem, message=message)
+        return entry, None
+    changes = []
+    for row in rows:
+        if target["backend"] is None:
+            # No backend chosen: managed rows wait, custom rows are kept.
+            decision = "preserved" if managed_url(row, target["managed_ports"]) is None else "update"
+            new_url, patch = None, {}
+        else:
+            decision, new_url, patch = plan_row(row, target)
+        if decision == "update":
+            changes.append((row, new_url, patch))
+        else:
+            entry[decision] += 1
+    backup = None
+    if changes and (state != "ok" or args.dry_run):
+        entry["pending"] = len(changes)
+    elif changes:
+        try:
+            backup = write_backup(args, key, db, changes)
+        except OSError as error:
+            entry.update(status="failed", pending=len(changes), message=f"Could not save a connector backup: {error.strerror}.")
+            return entry, None
+        updated, error = apply_changes(db, schema, changes)
+        if error:
+            entry.update(status="failed", pending=len(changes), message="Database update failed; nothing was changed.", error=error[-300:])
+            return entry, backup
+        entry["updated"] = len(updated)
+        # Rows edited by someone else since they were read are left for the next run.
+        entry["pending"] = len(changes) - len(updated)
+    if entry["pending"]:
+        entry.update(status="pending", message=pending_message(state, args.dry_run))
+    elif entry["updated"]:
+        entry.update(status="updated", message=f"Connected to {BACKEND_NAMES[target['backend']]} on port {target['port']}.")
+    elif entry["already"]:
+        entry.update(status="already", message="Already connected.")
+    elif entry["preserved"]:
+        entry.update(status="preserved", message="Custom connector kept.")
+    return entry, backup
+
+
+def build_result(args, state, detail, target, products, backup, prober):
+    return {
+        "contract": CONTRACT_VERSION,
+        "state": state,  # ok, ambiguous, not_enabled, service_unavailable, wrong_provider
+        "backend": target["backend"],
+        "requested_backend": args.backend,
+        "port": target["port"],
+        "endpoint": target["endpoint"],
+        "model": target["model"],  # audio.cpp model id; null for the Python backend
+        "resolve_only": args.resolve_only,
+        "message": detail,
+        "dry_run": args.dry_run,
+        "probe_requests": prober.requests,
+        "backup": backup,
+        # Per product: status is updated, already, preserved, pending, none, missing, or failed.
+        "products": products,
+    }
+
+
+def main(argv):
+    args = parse_args(argv)
+    prober = Prober(args.timeout)
+    state, detail, target = resolve_target(args, prober)
+    products, backup = [], None
+    if state != "not_enabled" and not args.resolve_only:
+        for key, name, _ in PRODUCTS:
+            entry, product_backup = reconcile_product(args, key, name, args.databases[key], state, target)
+            products.append(entry)
+            backup = backup or product_backup
+    result = build_result(args, state, detail, target, products, backup, prober)
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print(f"PocketTTS connectors: {detail}")
+        for entry in products:
+            print(f"  {entry['name']}: {entry['message']}")
+        if backup:
+            print(f"  Connector backup: {backup}")
+        if args.startup:
+            print(RESULT_PREFIX + json.dumps(result, separators=(",", ":")))
+    if any(entry["status"] == "failed" for entry in products):
+        return 4
+    if state != "ok" and (state != "not_enabled" or args.resolve_only):
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

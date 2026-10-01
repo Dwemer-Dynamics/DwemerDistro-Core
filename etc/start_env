@@ -50,6 +50,20 @@ read_tts_service_port() {
 CHATTERBOX_ACTIVE_PORT="$(read_tts_service_port /home/dwemer/chatterbox/.dwemerdistro-port "$CHATTERBOX_LEGACY_PORT")"
 POCKETTTS_ACTIVE_PORT="$(read_tts_service_port /home/dwemer/pocket-tts/.dwemerdistro-port "$POCKETTTS_LEGACY_PORT")"
 
+# audio.cpp listens on the port in its server.json, the same file sync_pockettts_connectors reads.
+read_audiocpp_port() {
+    local value=""
+
+    value="$(python3 -c 'import json, sys; port = int(str(json.load(open(sys.argv[1]))["port"]).strip()); print(port if 1 <= port <= 65535 else "")' \
+        /home/dwemer/audio.cpp/server.json 2>/dev/null)"
+    case "$value" in
+        ''|*[!0-9]*) value="$1" ;;
+    esac
+    printf '%s\n' "$value"
+}
+
+POCKETTTS_AUDIOCPP_PORT="$(read_audiocpp_port "$POCKETTTS_AUDIOCPP_PORT")"
+
 # Clean tmp
 find /tmp -type f -mtime +7 -delete 
 find /tmp/ -type d -mtime +7 -exec \rm -fr {} \; &>/dev/null
@@ -695,6 +709,13 @@ elif [ -f /home/dwemer/pocket-tts/start.sh ];then
 else
 	echo "Skipping pocket-tts (not enabled)"
 	L_POCKETTTS=1
+fi
+
+# Keep DwemerDistro-managed PocketTTS connectors on the backend that just started.
+# One bounded check; it never blocks the rest of startup.
+if [ -x /usr/local/bin/sync_pockettts_connectors ]; then
+	runuser -u dwemer -- /usr/local/bin/sync_pockettts_connectors --startup ||
+		echo "PocketTTS connector check is incomplete; see the details above. Continuing startup."
 fi
 
 if [ -f "/home/dwemer/piper/cuda-keyring_1.1-1_all.deb" ]; then 
