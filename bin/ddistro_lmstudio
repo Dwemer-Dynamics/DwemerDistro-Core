@@ -72,8 +72,9 @@ def command(*arguments, timeout=300, job=None):
     # llmster refreshes lms during daemon startup. A concurrent exec can briefly return ETXTBSY.
     for attempt in range(30):
         try:
-            process = subprocess.Popen([str(LMS), *arguments], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       env={**os.environ, 'HOME': str(HOME),
+            # lms must never wait for an answer; a prompt fails or times out with its text visible.
+            process = subprocess.Popen([str(LMS), *arguments], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, env={**os.environ, 'HOME': str(HOME),
                                        'PATH': '/usr/lib/wsl/lib:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'})
             break
         except OSError as error:
@@ -87,7 +88,9 @@ def command(*arguments, timeout=300, job=None):
             while selector.get_map():
                 if time.monotonic() > deadline:
                     process.kill()
-                    raise ValueError('LM Studio command timed out. Check the manager before retrying.')
+                    tail = '\n'.join(output.splitlines()[-8:])
+                    raise ValueError(f'lms {arguments[0]} did not finish within {timeout} seconds.' + (
+                        '\nLast output:\n' + tail if tail else ''))
                 for key, _ in selector.select(1):
                     chunk = os.read(key.fd, 8192)
                     if not chunk:
@@ -239,17 +242,40 @@ def start():
         json.load(response)
 
 
+def sha256(path, job, size):
+    digest, done, last = hashlib.sha256(), 0, 0
+    with path.open('rb') as source:
+        while chunk := source.read(8 * 1024**2):
+            digest.update(chunk)
+            done += len(chunk)
+            if time.monotonic() - last > 1:
+                progress(job, 'Step 2 of 3: Verifying SHA-256 checksum...', phase='verify', downloaded=done, total=size)
+                last = time.monotonic()
+    return digest.hexdigest()
+
+
+def preset_installed(model):
+    installed = json.loads(command('ls', '--json'))
+    return any(m.get('path') == model['repo'] + '/' + model['file'] and m.get('sizeBytes') == model['bytes'] for m in installed)
+
+
 def download_preset(data, job):
     model = next(m for m in read_json(CATALOG, {})['models'] if m['id'] == data['preset'])
     command('daemon', 'up')
-    installed = json.loads(command('ls', '--json'))
-    if any(m.get('path') == model['repo'] + '/' + model['file'] and m.get('sizeBytes') == model['bytes'] for m in installed):
+    if preset_installed(model):
         progress(job, 'This preset is already installed.')
         return
     folder = STATE / 'downloads'
     folder.mkdir(exist_ok=True)
     target = folder / model['file']
     partial = target.with_suffix('.part')
+    # A file verified by an earlier attempt that failed to import is reused after re-verification.
+    if target.exists():
+        if target.stat().st_size == model['bytes'] and sha256(target, job, model['bytes']) == model['sha256']:
+            partial.unlink(missing_ok=True)
+            import_preset(model, target, job)
+            return
+        target.unlink()
     offset = partial.stat().st_size if partial.exists() else 0
     if shutil.disk_usage(folder).free < model['bytes'] - offset + 1024**3:
         raise ValueError('Not enough disk space for this model plus 1 GB working space.')
@@ -267,20 +293,34 @@ def download_preset(data, job):
                     if offset > model['bytes']:
                         raise ValueError('Download exceeded the catalog file size.')
                     if time.monotonic() - last > 1:
-                        progress(job, f"Downloading {model['name']}", downloaded=offset, total=model['bytes'])
+                        progress(job, f"Step 1 of 3: Downloading {model['name']}", phase='download',
+                                 downloaded=offset, total=model['bytes'])
                         last = time.monotonic()
-    progress(job, 'Verifying SHA-256 checksum...', downloaded=offset, total=model['bytes'])
-    digest = hashlib.sha256()
-    with partial.open('rb') as source:
-        while chunk := source.read(8 * 1024**2):
-            digest.update(chunk)
-    if offset != model['bytes'] or digest.hexdigest() != model['sha256']:
+    progress(job, 'Step 2 of 3: Verifying SHA-256 checksum...', phase='verify', downloaded=0, total=model['bytes'])
+    if offset != model['bytes'] or sha256(partial, job, model['bytes']) != model['sha256']:
         partial.unlink(missing_ok=True)
         raise ValueError('Model checksum failed. Retry to download a clean copy.')
     partial.replace(target)
-    progress(job, 'Importing verified model...')
-    command('daemon', 'up')
-    command('import', str(target), '--user-repo', model['repo'], '--yes')
+    import_preset(model, target, job)
+
+
+def import_preset(model, target, job):
+    job.pop('downloaded', None)
+    job.pop('total', None)
+    progress(job, 'Step 3 of 3: Importing verified model into LM Studio...', phase='import')
+    try:
+        command('daemon', 'up')
+        # Moving triggers a one-time confirmation that --yes does not skip. A hard link needs no prompt or extra space.
+        command('import', str(target), '--user-repo', model['repo'], '--yes', '--hard-link', timeout=120)
+    except ValueError as error:
+        raise ValueError(f'Import failed. The verified download is kept; retry to import it without downloading again.\n{error}')
+    if target.stat().st_nlink < 2:
+        raise ValueError('Import reported success but no model link was created. The verified download is kept; retry to import it.')
+    target.unlink()
+    if preset_installed(model):
+        progress(job, f"{model['name']} is installed.")
+    else:
+        progress(job, f"{model['name']} was imported. Restart the engine if it is not listed yet.")
 
 
 def execute(data, job):
@@ -446,7 +486,8 @@ def main():
             os.dup2(null.fileno(), fd)
     try:
         execute(data, job)
-        progress(job, job.get('message', 'Done') if data['action'] == 'test' else 'Done.', state='completed')
+        keep = data['action'] == 'test' or (data['action'] == 'download' and data.get('preset'))
+        progress(job, job.get('message', 'Done') if keep else 'Done.', state='completed')
     except Exception as error:
         progress(job, str(error), state='failed')
     finally:
