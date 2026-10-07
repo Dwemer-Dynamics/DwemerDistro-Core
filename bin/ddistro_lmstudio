@@ -120,32 +120,70 @@ def resources():
             'diskFree': shutil.disk_usage(STATE).free}
 
 
+def model_changed():
+    # Tests and load reports describe one loaded instance; any load or unload turns them into history.
+    for name in ('last-test.json', 'last-load.json'):
+        (STATE / name).unlink(missing_ok=True)
+    previous = read_json(STATE / 'model-state.json', {}).get('changedAt', 0)
+    write_json(STATE / 'model-state.json', {'changedAt': max(time.time(), previous + .001)})
+
+
+def memlock_limit():
+    # The engine's soft RLIMIT_MEMLOCK in bytes; None when unlimited or the engine is not running.
+    for proc in Path('/proc').iterdir():
+        try:
+            if proc.name.isdigit() and proc.stat().st_uid == os.getuid() and (proc / 'comm').read_text().strip() == 'llmster':
+                limit = re.search(r'^Max locked memory\s+(\S+)', (proc / 'limits').read_text(), re.M)
+                return int(limit.group(1)) if limit and limit.group(1).isdigit() else None
+        except OSError:
+            continue
+    return None
+
+
 def status():
     models, running = [], False
+    changed = read_json(STATE / 'model-state.json', {}).get('changedAt')
     try:
         with request('/api/v1/models') as response:
             models = json.load(response)['models']
             running = True
     except (OSError, ValueError, KeyError):
         pass
+    keys = {m.get('key') for m in models if m.get('loaded_instances')}
+    instances = {i.get('id') for m in models for i in m.get('loaded_instances') or []}
     # A killed worker must not leave the UI waiting forever after a distro restart.
     with (STATE / 'job.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             job = read_json(STATE / 'job.json', {})
             if job.get('state') == 'running':
-                job.update(state='failed', message='Operation interrupted. Retry to resume a preset download.')
+                message = 'Operation interrupted. Check the model state and retry.'
+                if job.get('preset'):
+                    message = 'Operation interrupted. Retry to resume a preset download.'
+                job.update(state='failed', message=message)
+            # LM Studio unloads idle models itself (TTL). Forget results for instances that are gone, unless a
+            # job changed the model state after the list above was read.
+            tested = read_json(STATE / 'last-test.json', {}).get('model')
+            loaded = read_json(STATE / 'last-load.json', {}).get('model')
+            gone = (tested is not None and tested not in instances) or (loaded is not None and loaded not in keys)
+            if running and gone and changed == read_json(STATE / 'model-state.json', {}).get('changedAt'):
+                model_changed()
         except BlockingIOError:
             job = read_json(STATE / 'job.json', {})
-    return {'installed': LMS.is_file(), 'running': running, 'models': models, 'job': job,
-            'endpoint': API + '/v1', 'chatUrl': API + '/v1/chat/completions',
-            'settings': read_json(STATE / 'settings.json', {'autostart': False}),
-            'modelDefaults': read_json(STATE / 'model-defaults.json', {}),
-            'testPresets': read_json(STATE / 'test-presets.json', {}),
-            'advancedAvailable': Path(SDK_PYTHON).is_file(),
-            'lastTest': read_json(STATE / 'last-test.json', {}),
-            'lastLoad': read_json(STATE / 'last-load.json', {}),
-            'resources': resources()}
+    last_test, last_load = read_json(STATE / 'last-test.json', {}), read_json(STATE / 'last-load.json', {})
+    result = {'installed': LMS.is_file(), 'running': running, 'models': models, 'job': job,
+              'endpoint': API + '/v1', 'chatUrl': API + '/v1/chat/completions',
+              'settings': read_json(STATE / 'settings.json', {'autostart': False}),
+              'modelDefaults': read_json(STATE / 'model-defaults.json', {}),
+              'testPresets': read_json(STATE / 'test-presets.json', {}),
+              'advancedAvailable': Path(SDK_PYTHON).is_file(),
+              'lastTest': last_test if last_test.get('model') in instances else {},
+              'lastLoad': last_load if last_load.get('model') in keys else {},
+              'memoryLockLimit': memlock_limit(), 'resources': resources()}
+    changed = read_json(STATE / 'model-state.json', {}).get('changedAt')
+    if changed is not None:
+        result['modelStateChangedAt'] = changed
+    return result
 
 
 def progress(job, message, **extra):
@@ -328,6 +366,7 @@ def execute(data, job):
     action = data['action']
     if action in {'stop', 'restart'}:
         command('daemon', 'down')
+        model_changed()
     if action in {'start', 'restart'}:
         start()
     elif action == 'settings':
@@ -384,18 +423,35 @@ with lmstudio.Client("127.0.0.1:1234") as client:
     model=client.llm.load_new_instance(d["model"], ttl=d["ttl"], config=d["config"])
     print(json.dumps(model.get_load_config().to_dict()))
 '''
-            result = subprocess.run([SDK_PYTHON, '-c', script], input=json.dumps({'model': data['model'],
-                                    'ttl': data.get('ttl', 600), 'config': config}), capture_output=True, text=True, timeout=300)
+            try:
+                result = subprocess.run([SDK_PYTHON, '-c', script], input=json.dumps({'model': data['model'],
+                                        'ttl': data.get('ttl', 600), 'config': config}), capture_output=True, text=True, timeout=300)
+            except subprocess.TimeoutExpired:
+                # The exception text repeats the whole inline script; report the outcome instead.
+                raise ValueError('Advanced loading did not finish within 300 seconds. LM Studio may still be loading '
+                                 'the model; check the model list before retrying.')
             if result.returncode:
                 raise ValueError(result.stderr[-4000:] or 'Advanced model loading failed.')
             applied = {'model': data['model'], 'appliedConfig': json.loads(result.stdout)}
-            write_json(STATE / 'last-load.json', applied)
-            progress(job, 'Model loaded.', **applied)
+            message, locking = 'Model loaded.', applied['appliedConfig'].get('keepModelInMemory', True)
         else:
-            progress(job, command('load', data['model'], '--context-length', str(data.get('context', 4096)),
-                                  '--gpu', str(data.get('gpu', 100) / 100), '--ttl', str(data.get('ttl', 600)), '--yes'))
+            message = command('load', data['model'], '--context-length', str(data.get('context', 4096)),
+                              '--gpu', str(data.get('gpu', 100) / 100), '--ttl', str(data.get('ttl', 600)), '--yes')
+            # The engine default keeps models in memory.
+            applied, locking = {}, True
+        model_changed()
+        limit = memlock_limit()
+        # llama.cpp only warns when mlock fails, so the reported setting alone would overstate it.
+        if locking and limit is not None and limit < model['size_bytes']:
+            applied['memoryLockWarning'] = (f'Keep model in memory is limited: this system lets the engine lock only '
+                                            f'{limit // 1024**2} MiB, so the model can still be paged out.')
+        if advanced:
+            applied['modelStateChangedAt'] = read_json(STATE / 'model-state.json', {})['changedAt']
+            write_json(STATE / 'last-load.json', applied)
+        progress(job, message, **applied)
     elif action == 'unload':
         command('unload', data['model'])
+        model_changed()
     elif action == 'test':
         with request('/api/v1/models') as response:
             models = json.load(response)['models']
@@ -445,6 +501,8 @@ with lmstudio.Client("127.0.0.1:1234") as client:
         result = {'output': text, 'stats': stats, 'elapsedSeconds': round(time.monotonic() - started, 2),
                   'model': data['model'], 'generation': {key: value for key, value in payload.items()
                   if key not in {'model', 'input', 'stream', 'store'}}, 'updated': time.time()}
+        if 'changedAt' in read_json(STATE / 'model-state.json', {}):
+            result['modelStateChangedAt'] = read_json(STATE / 'model-state.json', {})['changedAt']
         write_json(STATE / 'last-test.json', result)
         progress(job, message, **{key: value for key, value in result.items() if key != 'updated'})
 
@@ -481,6 +539,7 @@ def main():
     if action == 'shutdown':
         if LMS.is_file():
             command('daemon', 'down')
+            model_changed()
         return {'ok': True}
     if action != 'submit':
         raise ValueError('Unknown command.')
@@ -492,6 +551,8 @@ def main():
     except BlockingIOError:
         raise ValueError('Another operation is running. Wait for it to finish.')
     job = {'id': secrets.token_hex(8), 'action': data['action'], 'state': 'running', 'message': 'Starting...', 'updated': time.time()}
+    if data['action'] == 'download' and data.get('preset'):
+        job['preset'] = data['preset']
     write_json(STATE / 'job.json', job)
     if os.fork():
         lock.close()
