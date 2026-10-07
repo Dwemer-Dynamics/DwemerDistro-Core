@@ -320,7 +320,8 @@ def import_preset(model, target, job):
     if preset_installed(model):
         progress(job, f"{model['name']} is installed.")
     else:
-        progress(job, f"{model['name']} was imported. Restart the engine if it is not listed yet.")
+        # LM Studio indexes imports asynchronously; the hard link above already proves the import.
+        progress(job, f"{model['name']} was imported. LM Studio may take a moment to list it.")
 
 
 def execute(data, job):
@@ -397,39 +398,55 @@ with lmstudio.Client("127.0.0.1:1234") as client:
         command('unload', data['model'])
     elif action == 'test':
         with request('/api/v1/models') as response:
-            loaded = [i['id'] for m in json.load(response)['models'] for i in m.get('loaded_instances', [])]
-        if data['model'] not in loaded:
+            models = json.load(response)['models']
+        owner = next((m for m in models for i in m.get('loaded_instances', []) if i['id'] == data['model']), None)
+        if not owner:
             raise ValueError('Load the model first. A test never loads a model automatically.')
         payload = {'model': data['model'], 'input': data['prompt'], 'stream': True,
                    'store': False, 'max_output_tokens': 192, 'temperature': 0.2}
         payload.update(data.get('generation', {}))
         reasoning = payload.pop('reasoning', data.get('reasoning', 'default'))
+        capability = (owner.get('capabilities') or {}).get('reasoning')
+        # A connection test only needs the answer, so skip thinking when the model allows it. Explicit choices win.
+        if reasoning == 'default' and isinstance(capability, dict) and 'off' in (capability.get('allowed_options') or []):
+            reasoning = 'off'
         if reasoning != 'default':
             payload['reasoning'] = reasoning
-        text, last, stats, finished = '', 0, {}, False
+        text, last, stats, finished, reasoned = '', 0, {}, False, False
         started = time.monotonic()
         with request('/api/v1/chat', payload, timeout=120) as response:
             for raw in response:
                 if not raw.startswith(b'data: '):
                     continue
-                event = json.loads(raw[6:])
+                try:
+                    event = json.loads(raw[6:])
+                except ValueError:
+                    raise ValueError('The model stream was interrupted or malformed. Retry the test.')
                 if event.get('type') == 'error':
                     raise ValueError(str(event.get('error', event)))
                 if event.get('type') == 'chat.end':
                     finished = True
                     stats = event.get('result', {}).get('stats', {})
-                if event.get('type') in {'message.delta', 'reasoning.delta'}:
+                # Reasoning text is internal; only the answer is shown or stored.
+                if event.get('type') == 'reasoning.delta':
+                    reasoned = True
+                if event.get('type') == 'message.delta':
                     text = (text + event.get('content', ''))[-12000:]
-                    if time.monotonic() - last > .3:
-                        progress(job, 'Generating...', output=text)
-                        last = time.monotonic()
+                if event.get('type') in {'message.delta', 'reasoning.delta'} and time.monotonic() - last > .3:
+                    progress(job, 'Generating...' if text else 'Reasoning...', output=text)
+                    last = time.monotonic()
         if not finished:
             raise ValueError('The model stream ended before completion. Retry the test.')
+        message = 'Test finished.'
+        if not text.strip():
+            message = 'Test finished, but the model returned no answer text.' + (
+                ' It may have spent the output limit on reasoning; turn reasoning off or raise max output tokens.'
+                if reasoned else '')
         result = {'output': text, 'stats': stats, 'elapsedSeconds': round(time.monotonic() - started, 2),
                   'model': data['model'], 'generation': {key: value for key, value in payload.items()
                   if key not in {'model', 'input', 'stream', 'store'}}, 'updated': time.time()}
         write_json(STATE / 'last-test.json', result)
-        progress(job, 'Test finished.', **{key: value for key, value in result.items() if key != 'updated'})
+        progress(job, message, **{key: value for key, value in result.items() if key != 'updated'})
 
 
 def main():
