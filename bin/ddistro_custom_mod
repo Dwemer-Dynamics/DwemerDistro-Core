@@ -1,0 +1,1179 @@
+#!/usr/bin/env python3
+"""Distro-owned manager for user-added ("custom") PHP/PostgreSQL mod servers.
+
+The launcher only ever calls this tool with argument vectors. This tool owns the
+registry, the scoped folders and databases, and every lifecycle operation. See
+CUSTOM_MODS.md for the version 1 manifest contract.
+
+Privilege split:
+  * root only creates the scoped folder and database, fixes ownership, takes
+    backups, and writes registry entries. root never runs repository code,
+    never runs git inside a checkout, and never requires repository PHP.
+  * git, config syntax checks, and the repository migration run as dwemer.
+"""
+import datetime
+import grp
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+APP_USER = "dwemer"
+WEB_GROUP = "www-data"
+DATABASE_ROLE = "dwemer"
+MOD_ROOT = "/var/www/html/custom-mods"
+ROUTE_BASE = "http://127.0.0.1:8081/custom-mods"
+STATE_ROOT = "/var/lib/dwemerdistro-custom-mods"
+REGISTRY_ROOT = STATE_ROOT + "/registry"
+BACKUP_ROOT = STATE_ROOT + "/backups"
+# Same lock protocol and path as ddistro_server, so official and custom
+# operations never run at the same time.
+LOCK_PATH = "/run/lock/dwemerdistro-server-manager.d"
+MANIFEST_NAME = "dwemer-mod.json"
+SCHEMA_VERSION = 1
+STATUS_SCHEMA_VERSION = 1
+# A root-owned tombstone: hidden from status, and the only proof that lets Add reattach the
+# exact folder and database this manager created. Nothing else is ever adopted.
+UNREGISTERED = "unregistered"
+POSTGRES_PORT = "5432"
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,30}[a-z0-9]\Z")
+SHA_PATTERN = re.compile(r"^[0-9a-f]{40}\Z")
+BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}\Z")
+REL_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*\Z")
+HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+URL_PATH = re.compile(r"^(/[A-Za-z0-9._~-]+)+/?\Z")
+# IDs that name official products, their folders, or distro internals.
+RESERVED_IDS = {
+    "herika", "herikaserver", "chim", "stobe", "stobeserver", "dialectic", "dialecticserver",
+    "reign", "reignserver", "lorkhan", "lorkhanserver", "dwemer", "dwemerdistro", "postgres",
+    "template", "custom-mods", "html", "admin", "root", "www-data",
+}
+MANIFEST_KEYS = {"schema_version", "id", "name", "description", "project_url", "dashboard_path",
+                 "health_path", "requirements", "setup"}
+REQUIREMENT_KEYS = {"php", "postgresql"}
+SETUP_KEYS = {"config_template", "config_path", "token_placeholder", "database_placeholder",
+              "migrate_script"}
+PLACEHOLDER_PATTERN = re.compile(r"^[A-Za-z0-9_]{6,64}\Z")
+MAX_MANIFEST_BYTES = 16 * 1024
+MAX_TEMPLATE_BYTES = 256 * 1024
+CHECK_TIMEOUT = 300
+CLONE_TIMEOUT = 900
+MIGRATE_TIMEOUT = 600
+
+
+class ModError(Exception):
+    """A safe, user-facing failure. Messages never contain secrets."""
+
+
+# --- Output ---------------------------------------------------------------------------
+
+SECRETS_TO_REDACT = []
+
+
+def redact(text):
+    for value in SECRETS_TO_REDACT:
+        if value:
+            text = text.replace(value, "[redacted]")
+    return re.sub(r"(?i)(password|token|secret|api_key)(\s*[=:]\s*)\S+", r"\1\2[redacted]", text)
+
+
+def info(message):
+    print("[INFO] " + redact(message), file=sys.stderr, flush=True)
+
+
+def ok(message):
+    print("[OK] " + redact(message), file=sys.stderr, flush=True)
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# --- Validation (pure functions; covered by tests/test_ddistro_custom_mod.py) ------------
+
+def validate_repository_url(url):
+    """Accept only a plain public https://host/path Git URL."""
+    if not isinstance(url, str) or not url or len(url) > 300:
+        raise ModError("Enter a repository URL of at most 300 characters.")
+    if any(ord(c) < 0x21 or ord(c) > 0x7E for c in url):
+        raise ModError("The repository URL contains spaces or unsupported characters.")
+    if not url.startswith("https://"):
+        raise ModError("Only public https:// repository URLs are supported.")
+    rest = url[len("https://"):]
+    host, slash, path = rest.partition("/")
+    if not slash:
+        raise ModError("The repository URL must include the repository path.")
+    if any(c in url for c in "@?#%\\") or ";" in url:
+        raise ModError("The repository URL must not contain credentials, a query, a fragment, or escapes.")
+    if ":" in host:
+        raise ModError("The repository URL must not set a port.")
+    if len(host) > 253 or "." not in host:
+        raise ModError("The repository host is not a public host name.")
+    labels = host.split(".")
+    if not all(HOST_LABEL.match(label) for label in labels) or labels[-1].isdigit():
+        raise ModError("The repository host is not a public host name.")
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".lan", ".home")):
+        raise ModError("Local network repository hosts are not supported.")
+    path = "/" + path
+    if not URL_PATH.match(path) or "/../" in path + "/" or "/./" in path + "/":
+        raise ModError("The repository path contains unsupported characters.")
+    return url
+
+
+def validate_relative_path(value, label, allow_trailing_slash=False):
+    """A bounded relative path inside the mod folder; no traversal, hidden, or odd segments."""
+    if not isinstance(value, str) or not value or len(value) > 200:
+        raise ModError(f"Manifest {label} must be a relative path of at most 200 characters.")
+    path = value
+    if allow_trailing_slash and path.endswith("/"):
+        path = path[:-1]
+        if not path:
+            return value
+    if path.startswith("/") or "\\" in path or "//" in path:
+        raise ModError(f"Manifest {label} must be a relative path inside the mod folder.")
+    for segment in path.split("/"):
+        if segment in ("", ".", "..") or not REL_PATH_SEGMENT.match(segment):
+            raise ModError(f"Manifest {label} contains an unsupported path segment.")
+    return value
+
+
+def text_field(manifest, key, maximum, required=True):
+    value = manifest.get(key)
+    if value is None and not required:
+        return ""
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise ModError(f"Manifest {key} must be text of at most {maximum} characters.")
+    if any(ord(c) < 0x20 for c in value):
+        raise ModError(f"Manifest {key} contains control characters.")
+    return value.strip()
+
+
+def database_name_for(mod_id):
+    return "custom_" + mod_id.replace("-", "_")
+
+
+def validate_mod_id(mod_id):
+    if not isinstance(mod_id, str) or not ID_PATTERN.match(mod_id) or "--" in mod_id:
+        raise ModError("Manifest id must be 3-32 lowercase letters, digits, or single hyphens, "
+                       "starting with a letter.")
+    if mod_id in RESERVED_IDS:
+        raise ModError("Manifest id is reserved by DwemerDistro.")
+    return mod_id
+
+
+def parse_manifest(raw):
+    """Parse and fully validate a version 1 manifest. Unknown keys are rejected."""
+    if len(raw) > MAX_MANIFEST_BYTES:
+        raise ModError(f"{MANIFEST_NAME} is larger than {MAX_MANIFEST_BYTES} bytes.")
+    try:
+        manifest = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+    except (ValueError, UnicodeDecodeError):
+        raise ModError(f"{MANIFEST_NAME} is not valid UTF-8 JSON.")
+    if not isinstance(manifest, dict):
+        raise ModError(f"{MANIFEST_NAME} must be a JSON object.")
+    if manifest.get("schema_version") != SCHEMA_VERSION or isinstance(manifest.get("schema_version"), bool):
+        raise ModError(f"Unsupported manifest schema_version. This distro supports version {SCHEMA_VERSION}.")
+    unknown = set(manifest) - MANIFEST_KEYS
+    if unknown:
+        raise ModError("Manifest has unsupported fields: " + ", ".join(sorted(unknown)[:5]))
+
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "id": validate_mod_id(manifest.get("id")),
+        "name": text_field(manifest, "name", 60),
+        "description": text_field(manifest, "description", 300, required=False),
+        "project_url": "",
+        "dashboard_path": validate_relative_path(manifest.get("dashboard_path"), "dashboard_path", True),
+        "health_path": validate_relative_path(manifest.get("health_path"), "health_path"),
+    }
+    if manifest.get("project_url") is not None:
+        result["project_url"] = validate_repository_url(manifest.get("project_url"))
+
+    requirements = manifest.get("requirements")
+    if not isinstance(requirements, dict) or set(requirements) != REQUIREMENT_KEYS:
+        raise ModError("Manifest requirements must list exactly php and postgresql.")
+    if requirements.get("php") != "8.2" or requirements.get("postgresql") is not True:
+        raise ModError("Manifest requirements must be {\"php\": \"8.2\", \"postgresql\": true}.")
+    result["requirements"] = {"php": "8.2", "postgresql": True}
+
+    setup = manifest.get("setup")
+    if not isinstance(setup, dict) or set(setup) != SETUP_KEYS:
+        raise ModError("Manifest setup must contain exactly: " + ", ".join(sorted(SETUP_KEYS)))
+    clean_setup = {}
+    for key in ("config_template", "config_path", "migrate_script"):
+        clean_setup[key] = validate_relative_path(setup.get(key), "setup." + key)
+        if not clean_setup[key].endswith(".php"):
+            raise ModError(f"Manifest setup.{key} must be a .php file.")
+    for key in ("token_placeholder", "database_placeholder"):
+        value = setup.get(key)
+        if not isinstance(value, str) or not PLACEHOLDER_PATTERN.match(value):
+            raise ModError(f"Manifest setup.{key} must be 6-64 letters, digits, or underscores.")
+        clean_setup[key] = value
+    if clean_setup["config_template"] == clean_setup["config_path"]:
+        raise ModError("Manifest setup.config_path must differ from setup.config_template.")
+    if clean_setup["token_placeholder"] == clean_setup["database_placeholder"]:
+        raise ModError("Manifest placeholders must differ.")
+    result["setup"] = clean_setup
+    return result
+
+
+def validate_tree(entries, manifest):
+    """Validate a `git ls-tree -r -z` listing (mode, type, path) before checkout.
+
+    Symlinks, submodules, and tracked private config paths are rejected, so an
+    incoming commit can never place a link or overwrite the generated config.
+    """
+    paths = set()
+    for mode, kind, path in entries:
+        if mode == "120000":
+            raise ModError(f"The repository contains a symbolic link ({path}); links are not supported.")
+        if kind != "blob" or mode not in ("100644", "100755"):
+            raise ModError(f"The repository contains an unsupported entry ({path}).")
+        segments = path.split("/")
+        if any(s in ("", ".", "..") for s in segments) or any(ord(c) < 0x20 for c in path) or "\\" in path:
+            raise ModError("The repository contains an unsupported file path.")
+        if any(s.lower() == ".git" for s in segments):
+            raise ModError("The repository contains an unsupported .git path.")
+        paths.add(path)
+    setup = manifest["setup"]
+    private = setup["config_path"]
+    for path in paths:
+        if path == private or path.startswith(private + "/") or private.startswith(path + "/"):
+            raise ModError(f"The repository tracks the private config path {private}.")
+    for key in ("config_template", "migrate_script"):
+        if setup[key] not in paths:
+            raise ModError(f"The repository does not contain setup.{key} ({setup[key]}).")
+    if manifest["health_path"] not in paths:
+        raise ModError("The repository does not contain the manifest health_path file.")
+    if MANIFEST_NAME not in paths:
+        raise ModError(f"The repository does not contain {MANIFEST_NAME}.")
+    return paths
+
+
+def render_config(template, setup, token, database):
+    """Fill the template's quoted placeholders. Each must appear exactly once as a PHP string."""
+    if len(template) > MAX_TEMPLATE_BYTES:
+        raise ModError("The config template is too large.")
+    text = template.decode("utf-8") if isinstance(template, bytes) else template
+    for placeholder, value in ((setup["token_placeholder"], token), (setup["database_placeholder"], database)):
+        quoted = "'" + placeholder + "'"
+        if text.count(placeholder) != 1 or text.count(quoted) != 1:
+            raise ModError("The config template must contain each placeholder exactly once as a quoted PHP string.")
+        text = text.replace(quoted, "'" + value + "'")
+    if not text.lstrip().startswith("<?php"):
+        raise ModError("The config template must be a PHP file.")
+    return text
+
+
+def parse_ls_tree(output):
+    entries = []
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        meta, _, path = record.partition(b"\t")
+        parts = meta.split(b" ")
+        if len(parts) != 3:
+            raise ModError("Could not read the repository file list.")
+        try:
+            entries.append((parts[0].decode(), parts[1].decode(), path.decode("utf-8")))
+        except UnicodeDecodeError:
+            raise ModError("The repository contains a file name that is not UTF-8.")
+    return entries
+
+
+def parse_default_branch(ls_remote_output):
+    """Read the remote HEAD symref from `git ls-remote --symref <url> HEAD`."""
+    for line in ls_remote_output.splitlines():
+        match = re.match(r"^ref: refs/heads/(\S+)\tHEAD$", line)
+        if match:
+            branch = match.group(1)
+            if not BRANCH_PATTERN.match(branch) or ".." in branch or branch.endswith((".lock", "/")):
+                raise ModError("The repository default branch name is not supported.")
+            return branch
+    raise ModError("Could not discover the repository default branch.")
+
+
+def mod_urls(mod_id, manifest):
+    base = f"{ROUTE_BASE}/{mod_id}/"
+    return base + manifest["dashboard_path"], base + manifest["health_path"]
+
+
+# --- Process helpers ------------------------------------------------------------------
+
+def run(args, *, user=None, cwd=None, timeout=120, input_bytes=None, env_extra=None):
+    env = {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+    if user:
+        env["HOME"] = "/home/" + user if user == APP_USER else "/"
+    if env_extra:
+        env.update(env_extra)
+    command = list(args)
+    if user and os.geteuid() == 0:
+        command = ["runuser", "-u", user, "--"] + command
+    try:
+        return subprocess.run(command, cwd=cwd or "/", env=env, input=input_bytes,
+                              capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise ModError(f"{os.path.basename(args[0])} timed out.")
+
+
+# No user or system Git config: no credential helpers, no stored credentials, no prompts.
+GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false", "SSH_ASKPASS": "/bin/false",
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+
+def git_args(local_source):
+    allow = ["-c", "protocol.allow=never", "-c", "protocol.https.allow=always"]
+    if local_source:
+        allow += ["-c", "protocol.file.allow=always"]
+    return ["git", "-c", "credential.helper=", "-c", "core.hooksPath=/dev/null",
+            "-c", "core.symlinks=false", "-c", "submodule.recurse=false"] + allow
+
+
+def git(args, *, cwd=None, local_source=False, timeout=120, check=True, message="Git failed."):
+    result = run(git_args(local_source) + list(args), user=APP_USER, cwd=cwd, timeout=timeout,
+                 env_extra=GIT_ENV)
+    if check and result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
+        raise ModError(message + (" " + redact(detail[0])[:200] if detail[0] else ""))
+    return result
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise ModError("This command must run as root.")
+
+
+def validate_local_source(path):
+    """Admin-only fixture input: an absolute local Git repository path."""
+    if not isinstance(path, str) or not path.startswith("/") or ".." in path.split("/"):
+        raise ModError("--local-source must be an absolute path.")
+    if any(ord(c) < 0x21 or ord(c) > 0x7E for c in path):
+        raise ModError("--local-source contains unsupported characters.")
+    if not os.path.exists(path):
+        raise ModError("--local-source does not exist.")
+    return path
+
+
+# --- Lock (same protocol as ddistro_server acquire_operation_lock) ----------------------
+
+LOCK_HELD = False
+
+
+def acquire_lock():
+    global LOCK_HELD
+    os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+    for _ in range(2):
+        try:
+            os.mkdir(LOCK_PATH)
+            with open(LOCK_PATH + "/pid", "w") as handle:
+                handle.write(f"{os.getpid()}\n")
+            LOCK_HELD = True
+            return
+        except FileExistsError:
+            if lock_owner_alive():
+                raise ModError("Another server install, update, repair, or uninstall operation is running.")
+            try:
+                os.unlink(LOCK_PATH + "/pid")
+            except OSError:
+                pass
+            try:
+                os.rmdir(LOCK_PATH)
+            except OSError:
+                pass
+    raise ModError("Another server install, update, repair, or uninstall operation is running.")
+
+
+def lock_pid():
+    try:
+        with open(LOCK_PATH + "/pid") as handle:
+            pid = handle.readline().strip()
+    except OSError:
+        return None
+    return int(pid) if pid.isdigit() else None
+
+
+def lock_owner_alive():
+    pid = lock_pid()
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def release_lock():
+    global LOCK_HELD
+    if LOCK_HELD:
+        try:
+            os.unlink(LOCK_PATH + "/pid")
+            os.rmdir(LOCK_PATH)
+        except OSError:
+            pass
+        LOCK_HELD = False
+
+
+# --- Registry -------------------------------------------------------------------------
+
+def ensure_state_dirs():
+    # Explicit modes: root's 0077 umask must not hide the registry from dwemer status reads.
+    for path, mode in ((STATE_ROOT, 0o755), (REGISTRY_ROOT, 0o755), (BACKUP_ROOT, 0o700)):
+        if os.path.islink(path):
+            raise ModError(f"Refusing to use linked state path {path}.")
+        os.makedirs(path, exist_ok=True)
+        os.chown(path, 0, 0)
+        os.chmod(path, mode)
+
+
+def registry_path(mod_id):
+    return f"{REGISTRY_ROOT}/{validate_mod_id(mod_id)}.json"
+
+
+def read_entry(mod_id, include_unregistered=False):
+    try:
+        with open(registry_path(mod_id), encoding="utf-8") as handle:
+            entry = json.load(handle)
+    except FileNotFoundError:
+        raise ModError(f"Custom mod {mod_id} is not registered.")
+    except ValueError:
+        raise ModError(f"Registry entry for {mod_id} is unreadable.")
+    if not isinstance(entry, dict) or entry.get("id") != mod_id:
+        raise ModError(f"Registry entry for {mod_id} is unreadable.")
+    if entry.get("state") == UNREGISTERED and not include_unregistered:
+        raise ModError(f"Custom mod {mod_id} is not registered.")
+    return entry
+
+
+def write_entry(entry):
+    """Atomic, world-readable (no secrets), root-owned registry write."""
+    ensure_state_dirs()
+    path = registry_path(entry["id"])
+    fd, temp = tempfile.mkstemp(dir=REGISTRY_ROOT, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(entry, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.chmod(temp, 0o644)
+        os.replace(temp, path)
+    except BaseException:
+        if os.path.exists(temp):
+            os.unlink(temp)
+        raise
+
+
+def list_entries():
+    entries = []
+    try:
+        names = sorted(os.listdir(REGISTRY_ROOT))
+    except FileNotFoundError:
+        return entries
+    for name in names:
+        if not name.endswith(".json") or name.startswith("."):
+            continue
+        try:
+            entries.append(read_entry(name[:-5]))
+        except ModError:
+            # Unreadable entries and unregistered tombstones stay out of the list.
+            continue
+    return entries
+
+
+# --- Repository inspection ------------------------------------------------------------
+
+def discover_default_branch(source, local_source):
+    result = git(["ls-remote", "--symref", source, "HEAD"], local_source=local_source,
+                 timeout=60, message="Could not reach the repository.")
+    return parse_default_branch(result.stdout.decode("utf-8", "replace"))
+
+
+def read_commit_manifest(checkout, ref):
+    """Read and validate the manifest and tree from a commit, never from the worktree."""
+    raw = git(["show", f"{ref}:{MANIFEST_NAME}"], cwd=checkout,
+              message=f"The repository has no {MANIFEST_NAME} at its root.").stdout
+    manifest = parse_manifest(raw)
+    tree = git(["ls-tree", "-r", "-z", "--full-tree", ref], cwd=checkout,
+               message="Could not list repository files.").stdout
+    paths = validate_tree(parse_ls_tree(tree), manifest)
+    template = git(["show", f"{ref}:{manifest['setup']['config_template']}"], cwd=checkout,
+                   message="Could not read the config template.").stdout
+    render_config(template, manifest["setup"], "x" * 48, database_name_for(manifest["id"]))
+    commit = git(["rev-parse", "--verify", ref + "^{commit}"], cwd=checkout).stdout.decode().strip()
+    if not SHA_PATTERN.match(commit):
+        raise ModError("Could not read the repository commit.")
+    return manifest, paths, template, commit
+
+
+def inspect_repository(source, local_source):
+    """Shallow, bounded, no-checkout clone into a private dwemer temp dir."""
+    branch = discover_default_branch(source, local_source)
+    temp = run(["mktemp", "-d", "/tmp/ddistro-custom-mod-check.XXXXXXXX"], user=APP_USER)
+    if temp.returncode != 0:
+        raise ModError("Could not create a temporary folder.")
+    temp_root = temp.stdout.decode().strip()
+    if not temp_root.startswith("/tmp/ddistro-custom-mod-check."):
+        raise ModError("Unexpected temporary folder.")
+    try:
+        clone = ["clone", "--quiet", "--no-checkout", "--single-branch", "--no-tags",
+                 "--branch", branch]
+        if not local_source:
+            clone += ["--depth", "1"]
+        git(clone + ["--", source, temp_root + "/repo"], local_source=local_source,
+            timeout=CHECK_TIMEOUT, message="Could not download the repository.")
+        manifest, _, _, commit = read_commit_manifest(temp_root + "/repo", "HEAD")
+        return manifest, branch, commit
+    finally:
+        run(["rm", "-rf", "--", temp_root], user=APP_USER, timeout=120)
+
+
+def registry_state(mod_id, source, local):
+    """'none', 'registered', 'restorable' (own tombstone, same source) or 'conflict'."""
+    if not os.path.lexists(registry_path(mod_id)):
+        return "none", None
+    entry = read_entry(mod_id, include_unregistered=True)
+    if entry.get("state") != UNREGISTERED:
+        return "registered", entry
+    if entry.get("repository") == source and bool(entry.get("local_source")) == local:
+        return "restorable", entry
+    return "conflict", entry
+
+
+def preview_document(manifest, branch, commit, source, local):
+    dashboard_url, health_url = mod_urls(manifest["id"], manifest)
+    state, entry = registry_state(manifest["id"], source, local)
+    return {
+        "schema_version": STATUS_SCHEMA_VERSION,
+        "id": manifest["id"],
+        "name": manifest["name"],
+        "description": manifest["description"],
+        "project_url": manifest["project_url"],
+        "repository": source,
+        "branch": branch,
+        "commit": commit,
+        "requirements": manifest["requirements"],
+        "folder": f"{MOD_ROOT}/{manifest['id']}",
+        "database": database_name_for(manifest["id"]),
+        "dashboard_url": dashboard_url,
+        "health_url": health_url,
+        "registered": state == "registered",
+        # Add reattaches the kept installation as it is; it never installs this newer commit.
+        "restorable": state == "restorable",
+        "installed_commit": entry.get("commit", "") if state == "restorable" else "",
+    }
+
+
+# --- PostgreSQL (root, as the postgres superuser; names are validated custom_* only) -----
+
+def psql_value(sql):
+    result = run(["psql", "-p", POSTGRES_PORT, "-d", "template1", "-XAtq", "-v", "ON_ERROR_STOP=1",
+                  "-c", sql], user="postgres", timeout=30)
+    if result.returncode != 0:
+        raise ModError("PostgreSQL is not available.")
+    return result.stdout.decode().strip()
+
+
+def database_exists(name):
+    assert re.match(r"^custom_[a-z0-9_]+\Z", name)
+    return psql_value(f"SELECT 1 FROM pg_database WHERE datname = '{name}'") == "1"
+
+
+def require_existing_role():
+    # The role is shared with official servers: never create, alter, or re-password it here.
+    if psql_value(f"SELECT 1 FROM pg_roles WHERE rolname = '{DATABASE_ROLE}' AND rolcanlogin") != "1":
+        raise ModError("The shared dwemer database role is missing. Run Update Distro first.")
+
+
+def create_database(name):
+    assert re.match(r"^custom_[a-z0-9_]+\Z", name)
+    result = run(["createdb", "-p", POSTGRES_PORT, "--maintenance-db=template1", "--owner=" + DATABASE_ROLE,
+                  "--encoding=UTF8", "--locale=C", "--template=template0", name], user="postgres", timeout=60)
+    if result.returncode != 0:
+        raise ModError(f"Could not create database {name}.")
+
+
+def database_owner(name):
+    assert re.match(r"^custom_[a-z0-9_]+\Z", name)
+    return psql_value("SELECT pg_get_userbyid(datdba) FROM pg_database "
+                      f"WHERE datname = '{name}'")
+
+
+# --- Filesystem -----------------------------------------------------------------------
+
+def ensure_mod_root():
+    """Root-owned parent so dwemer cannot plant links or folders between mod folders."""
+    if os.path.islink(MOD_ROOT):
+        raise ModError(f"Refusing to use linked folder {MOD_ROOT}.")
+    os.makedirs(MOD_ROOT, exist_ok=True)
+    os.chown(MOD_ROOT, 0, 0)
+    os.chmod(MOD_ROOT, 0o755)
+
+
+def mod_folder(mod_id):
+    return f"{MOD_ROOT}/{validate_mod_id(mod_id)}"
+
+
+def checked_folder(entry):
+    folder = mod_folder(entry["id"])
+    if entry.get("folder") != folder or os.path.islink(folder) or not os.path.isdir(folder):
+        raise ModError("The custom mod folder is missing or not a plain folder.")
+    if os.path.realpath(folder) != folder:
+        raise ModError("The custom mod folder path resolves through a link.")
+    return folder
+
+
+def path_has_linked_part(path):
+    """True if the path or any parent is a link, so recursion could land outside the scoped folder."""
+    current = path
+    while True:
+        if os.path.islink(current):
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
+def apply_permissions(folder):
+    # Same contract as official servers: dwemer:www-data, group-readable, no world access.
+    # find -P never follows links; validate_tree already rejected tracked links.
+    if folder != mod_folder(os.path.basename(folder)) or path_has_linked_part(folder) or not os.path.isdir(folder):
+        raise ModError("Refusing to set permissions outside a custom mod folder.")
+    for command in (["find", "-P", folder, "-exec", "chown", "-h", f"{APP_USER}:{WEB_GROUP}", "{}", "+"],
+                    ["find", "-P", folder, "-type", "d", "-exec", "chmod", "u+rwx,g+rxs,g-w,o-rwx", "{}", "+"],
+                    ["find", "-P", folder, "-type", "f", "-exec", "chmod", "u+rw,g+r,g-w,o-rwx", "{}", "+"],
+                    ["chmod", "u+rwx,g+rxs,o-rwx", "--", folder]):
+        if run(command, timeout=300).returncode != 0:
+            raise ModError("Could not set the mod folder's owner and permissions.")
+
+
+def path_has_links(folder, relative):
+    current = folder
+    for segment in relative.split("/"):
+        current = current + "/" + segment
+        if os.path.islink(current):
+            return True
+        if not os.path.exists(current):
+            return False
+    return False
+
+
+def write_config_if_missing(folder, manifest, template, mod_id):
+    """Generate the private config once, as dwemer, with a fresh random token."""
+    setup = manifest["setup"]
+    config_path = folder + "/" + setup["config_path"]
+    if path_has_links(folder, setup["config_path"]):
+        raise ModError("The private config path goes through a link.")
+    if os.path.lexists(config_path):
+        info("Keeping the existing private config.")
+        return
+    token = secrets.token_hex(24)
+    SECRETS_TO_REDACT.append(token)
+    text = render_config(template, setup, token, database_name_for(mod_id))
+    parent = os.path.dirname(config_path)
+    if not os.path.isdir(parent):
+        result = run(["mkdir", "-p", "--", parent], user=APP_USER)
+        if result.returncode != 0 or path_has_links(folder, setup["config_path"]):
+            raise ModError("Could not create the private config folder.")
+    # noclobber (set -C) refuses to replace anything that appeared in the meantime.
+    result = run(["sh", "-c", 'umask 027 && set -C && cat > "$1"', "sh", config_path], user=APP_USER,
+                 input_bytes=text.encode("utf-8"))
+    if result.returncode != 0:
+        raise ModError("Could not write the private config.")
+    if os.path.islink(config_path) or not os.path.isfile(config_path):
+        raise ModError("The private config is not a regular file.")
+    os.chown(config_path, -1, group_id(WEB_GROUP), follow_symlinks=False)
+    os.chmod(config_path, 0o640)
+    ok("Created the private config with a new random token.")
+
+
+def group_id(name):
+    return grp.getgrnam(name).gr_gid
+
+
+def run_setup_checks(folder, manifest):
+    """Config syntax and migration run as dwemer; root never loads repository PHP."""
+    setup = manifest["setup"]
+    config_path = folder + "/" + setup["config_path"]
+    for user in (APP_USER, WEB_GROUP):
+        if run(["test", "-r", config_path], user=user).returncode != 0:
+            raise ModError(f"{user} cannot read the private config.")
+    if run(["php", "-l", config_path], user=APP_USER, cwd=folder).returncode != 0:
+        raise ModError("The private config has a PHP syntax error.")
+    info("Applying database migrations as dwemer.")
+    result = run(["php", setup["migrate_script"]], user=APP_USER, cwd=folder, timeout=MIGRATE_TIMEOUT)
+    for line in result.stdout.decode("utf-8", "replace").splitlines()[-20:]:
+        info(line[:300])
+    if result.returncode != 0:
+        for line in result.stderr.decode("utf-8", "replace").splitlines()[-5:]:
+            info(line[:300])
+        raise ModError("The mod's database migration failed.")
+
+
+def check_health(mod_id, manifest):
+    _, url = mod_urls(mod_id, manifest)
+    request = urllib.request.Request(url, method="GET", headers={"User-Agent": "ddistro_custom_mod"})
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        with opener.open(request, timeout=10) as response:
+            if response.status == 200:
+                return True, "Healthy."
+            return False, f"Health check returned HTTP {response.status}."
+    except urllib.error.HTTPError as error:
+        return False, f"Health check returned HTTP {error.code}."
+    except (urllib.error.URLError, OSError):
+        return False, "The web server is not reachable. Start the server, then choose Update to finish."
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+# --- Backup ---------------------------------------------------------------------------
+
+def backup(entry):
+    """Private root-only copy of the generated config plus a dump of the mod's own database."""
+    folder = checked_folder(entry)
+    ensure_state_dirs()
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+    target = f"{BACKUP_ROOT}/{entry['id']}/{stamp}-{os.getpid()}"
+    os.makedirs(target, mode=0o700)
+    os.chmod(os.path.dirname(target), 0o700)
+    os.chmod(target, 0o700)
+    config_rel = entry["setup"]["config_path"]
+    config_path = folder + "/" + config_rel
+    if os.path.lexists(config_path):
+        if path_has_links(folder, config_rel) or not os.path.isfile(config_path):
+            raise ModError("The private config is not a regular file; backup stopped.")
+        with open(config_path, "rb") as source, \
+                os.fdopen(os.open(target + "/config.php", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as dest:
+            shutil.copyfileobj(source, dest)
+    database = entry["database"]
+    if database_exists(database):
+        dump = target + "/database.dump"
+        with os.fdopen(os.open(dump, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as handle:
+            result = subprocess.run(["runuser", "-u", "postgres", "--", "pg_dump", "-p", POSTGRES_PORT,
+                                     "-Fc", database], stdout=handle, stderr=subprocess.PIPE,
+                                    env={"PATH": SAFE_PATH}, cwd="/", timeout=1800)
+        if result.returncode != 0:
+            raise ModError("The database backup failed; nothing was changed.")
+    ok("Backup saved in " + target)
+    return target
+
+
+# --- Commands -------------------------------------------------------------------------
+
+def resolve_source(args):
+    if args.get("local_source"):
+        require_root()
+        return validate_local_source(args["local_source"]), True
+    if not args.get("url"):
+        raise ModError("A repository URL is required.")
+    return validate_repository_url(args["url"]), False
+
+
+def command_check(args):
+    source, local = resolve_source(args)
+    info("Checking the repository.")
+    manifest, branch, commit = inspect_repository(source, local)
+    print(json.dumps(preview_document(manifest, branch, commit, source, local)))
+
+
+def command_install(args):
+    require_root()
+    source, local = resolve_source(args)
+    expected = args.get("expect_commit")
+    if expected is not None and not SHA_PATTERN.match(expected):
+        raise ModError("--expect-commit must be a full commit id.")
+    if not local and expected is None:
+        raise ModError("Check the repository first; install needs the checked commit.")
+    acquire_lock()
+    manifest, branch, commit = inspect_repository(source, local)
+    if expected and commit != expected:
+        raise ModError("The repository changed after it was checked. Check it again.")
+    mod_id = manifest["id"]
+    folder = mod_folder(mod_id)
+    database = database_name_for(mod_id)
+    state, previous = registry_state(mod_id, source, local)
+    if state == "registered":
+        raise ModError(f"A custom mod with id {mod_id} is already registered.")
+    if state == "conflict":
+        raise ModError(f"A removed custom mod with id {mod_id} came from a different repository. Its folder "
+                       "and database were kept and are not adopted.")
+    if state == "restorable":
+        restore_entry(previous, manifest, commit)
+        return
+    ensure_mod_root()
+    if os.path.lexists(folder):
+        raise ModError(f"{folder} already exists. It was kept; remove or rename it before installing.")
+    require_existing_role()
+    if database_exists(database):
+        raise ModError(f"Database {database} already exists. It was kept and is not adopted.")
+
+    entry = {
+        "schema_version": STATUS_SCHEMA_VERSION, "id": mod_id, "name": manifest["name"],
+        "description": manifest["description"], "project_url": manifest["project_url"],
+        "repository": source, "local_source": local, "branch": branch, "commit": commit,
+        "folder": folder, "database": database, "dashboard_path": manifest["dashboard_path"],
+        "health_path": manifest["health_path"], "setup": manifest["setup"],
+        "state": "installing", "message": "Installing.", "installed_at": now_utc(), "updated_at": now_utc(),
+        "operation_pid": os.getpid(),
+    }
+
+    os.mkdir(folder, 0o750)
+    os.chown(folder, pwd_uid(APP_USER), group_id(WEB_GROUP))
+    info(f"Downloading {manifest['name']} from branch {branch}.")
+    clone = git(["clone", "--quiet", "--no-checkout", "--single-branch", "--no-tags", "--branch", branch,
+                 "--", source, folder], local_source=local, timeout=CLONE_TIMEOUT, check=False)
+    if clone.returncode != 0:
+        # Only the folder this run just created, holding only the partial download, is removed.
+        run(["rm", "-rf", "--", folder], timeout=300)
+        raise ModError("Could not download the repository. Nothing was installed.")
+    try:
+        manifest2, _, template, commit2 = read_commit_manifest(folder, "HEAD")
+        if manifest2 != manifest or commit2 != commit:
+            raise ModError("The repository changed during install. Check it again.")
+        git(["checkout", "--quiet", "HEAD", "--", "."], cwd=folder, message="Could not unpack the repository.")
+    except ModError:
+        run(["rm", "-rf", "--", folder], timeout=300)
+        raise
+
+    # From here the folder is registered so the user can retry with Update or unregister.
+    write_entry(entry)
+    try:
+        apply_permissions(folder)
+        create_database(database)
+        write_config_if_missing(folder, manifest, template, mod_id)
+        run_setup_checks(folder, manifest)
+        healthy, message = check_health(mod_id, manifest)
+        if not healthy:
+            raise ModError(message)
+    except ModError as error:
+        entry.pop("operation_pid", None)
+        entry.update(state="failed", message=str(error), updated_at=now_utc())
+        write_entry(entry)
+        raise
+    entry.pop("operation_pid", None)
+    entry.update(state="ready", message="Installed.", updated_at=now_utc())
+    write_entry(entry)
+    ok(f"{manifest['name']} is installed.")
+
+
+def pwd_uid(name):
+    return pwd.getpwnam(name).pw_uid
+
+
+def command_update(args):
+    require_root()
+    acquire_lock()
+    entry = read_entry(args["id"])
+    folder = checked_folder(entry)
+    local = bool(entry.get("local_source"))
+    source = validate_local_source(entry["repository"]) if local else validate_repository_url(entry["repository"])
+    branch = entry["branch"]
+    if not BRANCH_PATTERN.match(branch):
+        raise ModError("The registered branch is invalid.")
+    previous_state = entry.get("state")
+    entry.update(state="updating", message="Updating.", updated_at=now_utc(), operation_pid=os.getpid())
+    write_entry(entry)
+    progress = {"changed": False}
+    try:
+        update_checkout(entry, folder, source, local, branch, progress)
+    except ModError as error:
+        # A refusal before any change keeps a ready mod ready; a failure after it is visible.
+        if previous_state == "ready" and not progress["changed"]:
+            entry.update(state="ready", message="Last update was refused: " + str(error))
+        else:
+            entry.update(state="failed", message="Update failed: " + str(error))
+        entry.pop("operation_pid", None)
+        entry["updated_at"] = now_utc()
+        write_entry(entry)
+        raise
+    entry.pop("operation_pid", None)
+    entry.update(state="ready", message="Up to date.", updated_at=now_utc())
+    write_entry(entry)
+    ok(f"{entry['name']} is up to date.")
+
+
+def incoming_collisions(folder, new_paths):
+    """Paths an update would add over existing untracked (possibly git-ignored) files or links."""
+    collisions = []
+    for path in sorted(new_paths):
+        current = folder
+        segments = path.split("/")
+        for index, segment in enumerate(segments):
+            current += "/" + segment
+            last = index == len(segments) - 1
+            if os.path.islink(current) or (os.path.lexists(current) and (last or not os.path.isdir(current))):
+                collisions.append(path)
+                break
+    return collisions
+
+
+def update_checkout(entry, folder, source, local, branch, progress):
+    # Custom mods never discard edits: there is no force option here.
+    status = git(["status", "--porcelain", "--untracked-files=no"], cwd=folder,
+                 message="Could not read the mod folder status.")
+    if status.stdout.strip():
+        raise ModError("Files tracked by the mod were changed locally. Nothing was updated.")
+    backup(entry)
+    git(["fetch", "--quiet", "--no-tags", source, f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+        cwd=folder, local_source=local, timeout=CLONE_TIMEOUT, message="Could not download the update.")
+    incoming = f"refs/remotes/origin/{branch}"
+    manifest, new_paths, template, commit = read_commit_manifest(folder, incoming)
+    if manifest["id"] != entry["id"]:
+        raise ModError("The update changes the mod id. Nothing was updated.")
+    if manifest["setup"]["config_path"] != entry["setup"]["config_path"]:
+        raise ModError("The update moves the private config path. Nothing was updated.")
+    if git(["merge-base", "--is-ancestor", "HEAD", incoming], cwd=folder, check=False).returncode != 0:
+        raise ModError("The update is not a fast-forward of the installed version. Nothing was updated.")
+    old_paths = set(git(["ls-tree", "-r", "-z", "--name-only", "--full-tree", "HEAD"], cwd=folder)
+                    .stdout.decode("utf-8", "replace").split(chr(0))) - {""}
+    # Git may silently replace ignored files, so .gitignore alone is not protection.
+    collisions = incoming_collisions(folder, new_paths - old_paths)
+    if collisions:
+        raise ModError(f"The update would replace local file {collisions[0]}. Nothing was updated.")
+    progress["changed"] = True
+    git(["merge", "--ff-only", "--quiet", incoming], cwd=folder, message="Fast-forward update failed.")
+    apply_permissions(folder)
+    write_config_if_missing(folder, manifest, template, entry["id"])
+    if not database_exists(entry["database"]):
+        require_existing_role()
+        create_database(entry["database"])
+    elif database_owner(entry["database"]) != DATABASE_ROLE:
+        raise ModError("The mod database is not owned by the dwemer role.")
+    run_setup_checks(folder, manifest)
+    healthy, message = check_health(entry["id"], manifest)
+    entry.update(name=manifest["name"], description=manifest["description"],
+                 project_url=manifest["project_url"], dashboard_path=manifest["dashboard_path"],
+                 health_path=manifest["health_path"], setup=manifest["setup"], commit=commit)
+    if not healthy:
+        raise ModError(message)
+
+
+def command_backup(args):
+    require_root()
+    acquire_lock()
+    backup(read_entry(args["id"]))
+
+
+def unregistered_entry(entry):
+    """The tombstone kept in place of a listed entry; files and database are not touched."""
+    tombstone = dict(entry)
+    tombstone.pop("operation_pid", None)
+    # The lock is held, so an installing/updating entry was interrupted.
+    tombstone.update(state=UNREGISTERED, unregistered_from="ready" if entry.get("state") == "ready" else "failed",
+                     message="Removed from the list. Add the same repository again to restore it.",
+                     updated_at=now_utc())
+    return tombstone
+
+
+def command_unregister(args):
+    require_root()
+    acquire_lock()
+    entry = read_entry(args["id"])
+    write_entry(unregistered_entry(entry))
+    ok(f"{entry['name']} was removed from the list. Its folder {entry['folder']} and database "
+       f"{entry['database']} were kept; add the same repository again to restore it.")
+
+
+def tombstone_problem(entry, mod_id):
+    """Pure checks that a tombstone still names exactly what this manager created for mod_id."""
+    if entry.get("state") != UNREGISTERED or entry.get("id") != mod_id:
+        return "The removed custom mod record does not match this repository."
+    if entry.get("folder") != mod_folder(mod_id) or entry.get("database") != database_name_for(mod_id):
+        return "The removed custom mod record names an unexpected folder or database."
+    branch = entry.get("branch") or ""
+    if (not SHA_PATTERN.match(entry.get("commit") or "") or entry.get("unregistered_from") not in ("ready", "failed")
+            or not BRANCH_PATTERN.match(branch) or ".." in branch):
+        return "The removed custom mod record is incomplete."
+    setup = entry.get("setup")
+    try:
+        if not isinstance(setup, dict) or set(setup) != SETUP_KEYS:
+            raise ModError("")
+        validate_relative_path(setup.get("config_path"), "setup.config_path")
+    except ModError:
+        return "The removed custom mod record is incomplete."
+    return None
+
+
+def restore_entry(entry, remote_manifest, remote_commit):
+    """Put a removed mod back in the list without touching its files, config, or database.
+
+    Only the exact folder and database named by our own root-owned tombstone are accepted,
+    after the kept checkout's manifest is validated again. The checkout is never reset and
+    nothing is migrated; a newer repository commit stays an explicit Update.
+    """
+    mod_id = remote_manifest["id"]
+    problem = tombstone_problem(entry, mod_id)
+    if problem:
+        raise ModError(problem + " Nothing was changed.")
+    folder = checked_folder(entry)
+    if os.lstat(folder).st_uid != pwd_uid(APP_USER):
+        raise ModError("The kept mod folder is not owned by dwemer. Nothing was changed.")
+    head = git(["rev-parse", "--verify", "HEAD^{commit}"], cwd=folder,
+               message="The kept mod folder is not a readable checkout. Nothing was changed.").stdout.decode().strip()
+    commit = entry["commit"]
+    if head != commit:
+        # Only a failed Update of our own may have fast-forwarded past the recorded commit.
+        fetched = git(["rev-parse", "--verify", f"refs/remotes/origin/{entry['branch']}^{{commit}}"], cwd=folder,
+                      check=False).stdout.decode().strip()
+        if (entry["unregistered_from"] != "failed" or head != fetched or
+                git(["merge-base", "--is-ancestor", commit, head], cwd=folder, check=False).returncode != 0):
+            raise ModError("The kept mod folder is at an unexpected commit. Nothing was changed.")
+    manifest, _, _, _ = read_commit_manifest(folder, "HEAD")
+    if manifest["id"] != mod_id or manifest["setup"]["config_path"] != entry["setup"]["config_path"]:
+        raise ModError("The kept checkout's manifest does not match its record. Nothing was changed.")
+    config_rel = entry["setup"]["config_path"]
+    config_path = folder + "/" + config_rel
+    if path_has_links(folder, config_rel) or (os.path.lexists(config_path) and not os.path.isfile(config_path)):
+        raise ModError("The kept private config is not a regular file. Nothing was changed.")
+    database = entry["database"]
+    has_database = database_exists(database)
+    if has_database and database_owner(database) != DATABASE_ROLE:
+        raise ModError("The kept database is not owned by the dwemer role. Nothing was changed.")
+    write_entry(restored_entry(entry, head, remote_commit, has_database and os.path.isfile(config_path)))
+    ok(f"{entry['name']} is back in the list. Its files, private config, and database were kept as they were.")
+
+
+def restored_entry(entry, head, remote_commit, setup_present):
+    """A ready mod returns ready at its installed commit; anything unfinished needs Update."""
+    restored = dict(entry)
+    previous = restored.pop("unregistered_from", None)
+    if previous == "ready" and head == entry["commit"] and setup_present:
+        message = "Restored with the installed version."
+        if remote_commit != head:
+            message += " A newer version is available; choose Update to install it."
+        restored.update(state="ready", message=message)
+    else:
+        restored.update(state="failed", commit=head, message="Restored. Setup is not finished; choose Update to retry.")
+    restored["updated_at"] = now_utc()
+    return restored
+
+
+def status_entry(entry, check):
+    state = entry.get("state", "failed")
+    message = entry.get("message", "")
+    if state in ("installing", "updating") and not operation_running(entry):
+        state, message = "failed", "The last operation was interrupted. Choose Update to retry."
+    manifest = {"dashboard_path": entry.get("dashboard_path", ""), "health_path": entry.get("health_path", "")}
+    dashboard_url, health_url = mod_urls(entry["id"], manifest)
+    document = {
+        "id": entry["id"], "name": entry.get("name", entry["id"]), "description": entry.get("description", ""),
+        "project_url": entry.get("project_url", ""), "repository": entry.get("repository", ""),
+        "branch": entry.get("branch", ""), "commit": entry.get("commit", ""), "state": state,
+        "message": message, "folder": entry.get("folder", ""), "database": entry.get("database", ""),
+        "dashboard_url": dashboard_url, "health_url": health_url, "updated_at": entry.get("updated_at", ""),
+    }
+    if check:
+        healthy, health_message = check_health(entry["id"], manifest)
+        document["health"] = "ok" if healthy else "failed"
+        document["health_message"] = health_message
+    return document
+
+
+def operation_running(entry):
+    """Busy only while the manager run that wrote this entry still holds the shared lock."""
+    pid = entry.get("operation_pid")
+    return isinstance(pid, int) and pid == lock_pid() and lock_owner_alive()
+
+
+def command_status(args):
+    if args.get("id"):
+        entries = [read_entry(args["id"])]
+    else:
+        entries = list_entries()
+    mods = []
+    for entry in entries:
+        try:
+            validate_mod_id(entry.get("id"))
+        except ModError:
+            continue
+        mods.append(status_entry(entry, args.get("check_health", False)))
+    print(json.dumps({"schema_version": STATUS_SCHEMA_VERSION, "mods": mods}))
+
+
+USAGE = """Usage: ddistro_custom_mod <command> [options]
+
+  status [<id>] [--check-health] --json
+  check <https-url> --json             Preview a repository's manifest (no changes).
+  install <https-url> --expect-commit <sha>
+  update <id>                          Back up, then fast-forward and migrate.
+  backup <id>                          Back up the private config and database.
+  unregister <id>                      Remove from the list; files and database are kept,
+                                       and adding the same repository again restores it.
+
+Admin/test only: check|install --local-source </absolute/path/repo.git> (root).
+For a bundle, first: git clone --bare /path/example.bundle /path/example.git
+"""
+
+
+def parse_args(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        sys.exit(0 if argv else 64)
+    command, rest = argv[0], argv[1:]
+    args = {"command": command}
+    positional = []
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token == "--json":
+            args["json"] = True
+        elif token == "--check-health" and command == "status":
+            args["check_health"] = True
+        elif token in ("--expect-commit", "--local-source") and index + 1 < len(rest):
+            if (token == "--expect-commit" and command != "install") or command not in ("check", "install"):
+                raise ModError(f"{token} is not supported for {command}.")
+            args[token[2:].replace("-", "_")] = rest[index + 1]
+            index += 1
+        elif token.startswith("-"):
+            raise ModError(f"Unknown option {token[:40]}.")
+        else:
+            positional.append(token)
+        index += 1
+    if command in ("check", "install"):
+        if len(positional) > 1 or (positional and args.get("local_source")):
+            raise ModError(f"{command} takes one repository URL.")
+        args["url"] = positional[0] if positional else None
+    elif command in ("update", "backup", "unregister", "status"):
+        if len(positional) > 1 or (command != "status" and len(positional) != 1):
+            raise ModError(f"{command} takes one custom mod id.")
+        args["id"] = validate_mod_id(positional[0]) if positional else None
+    else:
+        raise ModError(f"Unknown command {command[:40]}.")
+    return args
+
+
+COMMANDS = {"status": command_status, "check": command_check, "install": command_install,
+            "update": command_update, "backup": command_backup, "unregister": command_unregister}
+
+
+def main(argv):
+    os.umask(0o022)
+    try:
+        args = parse_args(argv)
+        COMMANDS[args["command"]](args)
+        return 0
+    except ModError as error:
+        print("[FAIL] " + redact(str(error)), file=sys.stderr, flush=True)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        release_lock()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
