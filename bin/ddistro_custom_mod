@@ -19,9 +19,12 @@ import pwd
 import re
 import secrets
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -29,7 +32,15 @@ APP_USER = "dwemer"
 WEB_GROUP = "www-data"
 DATABASE_ROLE = "dwemer"
 MOD_ROOT = "/var/www/html/custom-mods"
-ROUTE_BASE = "http://127.0.0.1:8081/custom-mods"
+# The shared loopback Apache listener for every custom mod (and a manual ExampleServer).
+# Official server ports are never touched; see setup_web.
+SERVICES_CONF = "/etc/dwemerdistro_services.conf"
+CUSTOM_PORT_DEFAULT = 19000
+CUSTOM_PORT_MIN, CUSTOM_PORT_MAX = 19000, 19999
+CUSTOM_PORT_LINE = re.compile(r'^CUSTOM_MODS_PORT=("?)([0-9]{1,5})\1\Z')
+APACHE_DIR = "/etc/apache2"
+WEB_SITE = "dwemerdistro-custom-mods"
+WEB_MARKER = "# Managed by ddistro_custom_mod setup-web; do not edit."
 STATE_ROOT = "/var/lib/dwemerdistro-custom-mods"
 REGISTRY_ROOT = STATE_ROOT + "/registry"
 BACKUP_ROOT = STATE_ROOT + "/backups"
@@ -58,7 +69,11 @@ RESERVED_IDS = {
     "template", "custom-mods", "html", "admin", "root", "www-data",
 }
 MANIFEST_KEYS = {"schema_version", "id", "name", "description", "project_url", "dashboard_path",
-                 "health_path", "requirements", "setup"}
+                 "health_path", "requirements", "setup", "assets", "branches"}
+BRANCH_KEYS = {"default", "allowed"}
+MAX_BRANCHES = 10
+ASSET_KEYS = ("icon", "banner")
+ASSET_EXTENSIONS = (".png", ".jpg", ".jpeg")
 REQUIREMENT_KEYS = {"php", "postgresql"}
 SETUP_KEYS = {"config_template", "config_path", "token_placeholder", "database_placeholder",
               "migrate_script"}
@@ -223,7 +238,54 @@ def parse_manifest(raw):
     if clean_setup["token_placeholder"] == clean_setup["database_placeholder"]:
         raise ModError("Manifest placeholders must differ.")
     result["setup"] = clean_setup
+    result["assets"] = parse_assets(manifest.get("assets"))
+    result["branches"] = parse_branches(manifest.get("branches"))
     return result
+
+
+def validate_branch_name(branch, message="The repository default branch name is not supported."):
+    if (not isinstance(branch, str) or not BRANCH_PATTERN.match(branch) or ".." in branch or "//" in branch
+            or branch.endswith((".lock", "/", "."))):
+        raise ModError(message)
+    return branch
+
+
+def parse_branches(branches):
+    """Optional {"default", "allowed"} branch policy; None means the repository default branch alone.
+
+    Only the manifest on the repository's default branch (remote HEAD) is authoritative; see
+    branch_policy. Branch existence is checked against the remote there, not here.
+    """
+    if branches is None:
+        return None
+    if not isinstance(branches, dict) or set(branches) != BRANCH_KEYS:
+        raise ModError("Manifest branches must contain exactly default and allowed.")
+    allowed = branches.get("allowed")
+    if not isinstance(allowed, list) or not 1 <= len(allowed) <= MAX_BRANCHES:
+        raise ModError(f"Manifest branches.allowed must list 1-{MAX_BRANCHES} branch names.")
+    clean = [validate_branch_name(name, "Manifest branches.allowed contains an unsupported branch name.")
+             for name in allowed]
+    if len(set(clean)) != len(clean):
+        raise ModError("Manifest branches.allowed lists a branch twice.")
+    if branches.get("default") not in clean:
+        raise ModError("Manifest branches.default must be one of branches.allowed.")
+    return {"default": branches["default"], "allowed": clean}
+
+
+def parse_assets(assets):
+    """Optional {"icon", "banner"} image paths; missing means none. Files are checked in validate_tree."""
+    if assets is None:
+        return {}
+    if not isinstance(assets, dict) or set(assets) - set(ASSET_KEYS):
+        raise ModError("Manifest assets may only contain: " + ", ".join(ASSET_KEYS))
+    clean = {}
+    for key in ASSET_KEYS:
+        if key in assets:
+            path = validate_relative_path(assets[key], "assets." + key)
+            if not path.lower().endswith(ASSET_EXTENSIONS):
+                raise ModError(f"Manifest assets.{key} must be a .png, .jpg, or .jpeg file.")
+            clean[key] = path
+    return clean
 
 
 def validate_tree(entries, manifest):
@@ -254,6 +316,9 @@ def validate_tree(entries, manifest):
             raise ModError(f"The repository does not contain setup.{key} ({setup[key]}).")
     if manifest["health_path"] not in paths:
         raise ModError("The repository does not contain the manifest health_path file.")
+    for key, path in manifest["assets"].items():
+        if path not in paths:
+            raise ModError(f"The repository does not contain the manifest assets.{key} file.")
     if MANIFEST_NAME not in paths:
         raise ModError(f"The repository does not contain {MANIFEST_NAME}.")
     return paths
@@ -295,16 +360,102 @@ def parse_default_branch(ls_remote_output):
     for line in ls_remote_output.splitlines():
         match = re.match(r"^ref: refs/heads/(\S+)\tHEAD$", line)
         if match:
-            branch = match.group(1)
-            if not BRANCH_PATTERN.match(branch) or ".." in branch or branch.endswith((".lock", "/")):
-                raise ModError("The repository default branch name is not supported.")
-            return branch
+            return validate_branch_name(match.group(1))
     raise ModError("Could not discover the repository default branch.")
 
 
+def parse_remote_refs(ls_remote_output):
+    """Default branch and {branch: commit} from `git ls-remote --symref <url> HEAD refs/heads/*`."""
+    heads = {}
+    for line in ls_remote_output.splitlines():
+        commit, _, ref = line.partition("\t")
+        if ref.startswith("refs/heads/") and SHA_PATTERN.match(commit):
+            heads[ref[len("refs/heads/"):]] = commit
+    return parse_default_branch(ls_remote_output), heads
+
+
+def branch_policy(head_manifest, head_branch, heads):
+    """The author's policy from the default branch's manifest; without one, that branch alone.
+
+    The installed branch's manifest is never consulted, so a branch cannot widen its own offer.
+    """
+    policy = head_manifest["branches"] or {"default": head_branch, "allowed": [head_branch]}
+    for branch in policy["allowed"]:
+        if branch not in heads:
+            raise ModError(f"The manifest offers branch {branch}, which the repository does not have.")
+    return {"default": policy["default"], "allowed": list(policy["allowed"])}
+
+
+def stored_policy(entry):
+    """The last checked policy from the registry (no network); old entries offer their branch alone."""
+    try:
+        policy = parse_branches(entry.get("branches"))
+    except ModError:
+        policy = None
+    branch = entry.get("branch", "")
+    return policy or {"default": branch, "allowed": [branch] if branch else []}
+
+
+def parse_custom_port(text):
+    """CUSTOM_MODS_PORT from the services file, read as data and never sourced; the last line wins."""
+    port = CUSTOM_PORT_DEFAULT
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#") or "CUSTOM_MODS_PORT" not in line:
+            continue
+        match = CUSTOM_PORT_LINE.match(line)
+        if not match or not CUSTOM_PORT_MIN <= int(match.group(2)) <= CUSTOM_PORT_MAX:
+            raise ModError(f"CUSTOM_MODS_PORT in {SERVICES_CONF} must be a whole number from "
+                           f"{CUSTOM_PORT_MIN} to {CUSTOM_PORT_MAX}.")
+        port = int(match.group(2))
+    return port
+
+
+CUSTOM_PORT = None
+
+
+def custom_port():
+    """The configured shared port; the default when the root-owned services file does not set it."""
+    global CUSTOM_PORT
+    if CUSTOM_PORT is None:
+        try:
+            info_ = os.lstat(SERVICES_CONF)
+        except FileNotFoundError:
+            CUSTOM_PORT = CUSTOM_PORT_DEFAULT
+            return CUSTOM_PORT
+        if not stat.S_ISREG(info_.st_mode) or info_.st_uid != 0 or info_.st_mode & 0o022:
+            raise ModError(f"{SERVICES_CONF} must be a plain root-owned file that only root can change.")
+        try:
+            with open(SERVICES_CONF, encoding="utf-8") as handle:
+                text = handle.read(64 * 1024)
+        except (OSError, UnicodeDecodeError):
+            raise ModError(f"Could not read {SERVICES_CONF}.")
+        CUSTOM_PORT = parse_custom_port(text)
+    return CUSTOM_PORT
+
+
+def route_base():
+    return f"http://127.0.0.1:{custom_port()}/custom-mods"
+
+
 def mod_urls(mod_id, manifest):
-    base = f"{ROUTE_BASE}/{mod_id}/"
+    base = f"{route_base()}/{mod_id}/"
     return base + manifest["dashboard_path"], base + manifest["health_path"]
+
+
+def asset_urls(entry):
+    """Fixed-route icon/banner URLs for the installed revision; empty when absent, invalid, or not a plain file."""
+    try:
+        assets = parse_assets(entry.get("assets"))
+    except ModError:
+        return {"icon_url": "", "banner_url": ""}
+    folder = mod_folder(entry["id"])
+    urls = {}
+    for key in ASSET_KEYS:
+        path = assets.get(key, "")
+        usable = path and not path_has_links(folder, path) and os.path.isfile(folder + "/" + path)
+        urls[key + "_url"] = f"{route_base()}/{entry['id']}/{path}" if usable else ""
+    return urls
 
 
 # --- Process helpers ------------------------------------------------------------------
@@ -492,10 +643,10 @@ def list_entries():
 
 # --- Repository inspection ------------------------------------------------------------
 
-def discover_default_branch(source, local_source):
-    result = git(["ls-remote", "--symref", source, "HEAD"], local_source=local_source,
+def discover_remote_refs(source, local_source):
+    result = git(["ls-remote", "--symref", source, "HEAD", "refs/heads/*"], local_source=local_source,
                  timeout=60, message="Could not reach the repository.")
-    return parse_default_branch(result.stdout.decode("utf-8", "replace"))
+    return parse_remote_refs(result.stdout.decode("utf-8", "replace"))
 
 
 def read_commit_manifest(checkout, ref):
@@ -515,9 +666,14 @@ def read_commit_manifest(checkout, ref):
     return manifest, paths, template, commit
 
 
-def inspect_repository(source, local_source):
-    """Shallow, bounded, no-checkout clone into a private dwemer temp dir."""
-    branch = discover_default_branch(source, local_source)
+def inspect_repository(source, local_source, branch=None, policy_only=False):
+    """Shallow, bounded, no-checkout clone into a private dwemer temp dir.
+
+    The branch policy is read from the remote default branch's manifest. The target branch
+    (the authored default unless given) must be offered and must keep the same mod id.
+    Returns (manifest, branch, commit, policy); policy_only skips the target branch.
+    """
+    head_branch, heads = discover_remote_refs(source, local_source)
     temp = run(["mktemp", "-d", "/tmp/ddistro-custom-mod-check.XXXXXXXX"], user=APP_USER)
     if temp.returncode != 0:
         raise ModError("Could not create a temporary folder.")
@@ -525,14 +681,27 @@ def inspect_repository(source, local_source):
     if not temp_root.startswith("/tmp/ddistro-custom-mod-check."):
         raise ModError("Unexpected temporary folder.")
     try:
-        clone = ["clone", "--quiet", "--no-checkout", "--single-branch", "--no-tags",
-                 "--branch", branch]
-        if not local_source:
-            clone += ["--depth", "1"]
-        git(clone + ["--", source, temp_root + "/repo"], local_source=local_source,
+        repo = temp_root + "/repo"
+        depth = [] if local_source else ["--depth", "1"]
+        git(["clone", "--quiet", "--no-checkout", "--single-branch", "--no-tags", "--branch", head_branch]
+            + depth + ["--", source, repo], local_source=local_source,
             timeout=CHECK_TIMEOUT, message="Could not download the repository.")
-        manifest, _, _, commit = read_commit_manifest(temp_root + "/repo", "HEAD")
-        return manifest, branch, commit
+        manifest, _, _, commit = read_commit_manifest(repo, "HEAD")
+        policy = branch_policy(manifest, head_branch, heads)
+        if policy_only:
+            return manifest, head_branch, commit, policy
+        target = branch or policy["default"]
+        if target not in policy["allowed"]:
+            raise ModError(f"Branch {target} is not offered by this mod. Offered: " + ", ".join(policy["allowed"]))
+        if target != head_branch:
+            head_id = manifest["id"]
+            git(["fetch", "--quiet", "--no-tags"] + depth + [source, f"+refs/heads/{target}:refs/remotes/origin/{target}"],
+                cwd=repo, local_source=local_source, timeout=CHECK_TIMEOUT,
+                message=f"Could not download branch {target}.")
+            manifest, _, _, commit = read_commit_manifest(repo, f"refs/remotes/origin/{target}")
+            if manifest["id"] != head_id:
+                raise ModError(f"Branch {target} declares a different mod id. It is not offered.")
+        return manifest, target, commit, policy
     finally:
         run(["rm", "-rf", "--", temp_root], user=APP_USER, timeout=120)
 
@@ -549,10 +718,11 @@ def registry_state(mod_id, source, local):
     return "conflict", entry
 
 
-def preview_document(manifest, branch, commit, source, local):
+def preview_document(manifest, branch, commit, source, local, policy):
     dashboard_url, health_url = mod_urls(manifest["id"], manifest)
     state, entry = registry_state(manifest["id"], source, local)
     return {
+        "branches": policy,
         "schema_version": STATUS_SCHEMA_VERSION,
         "id": manifest["id"],
         "name": manifest["name"],
@@ -740,6 +910,153 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# --- Shared web listener (root; Apache config only, never repository code) -------------
+
+def web_site_text(port):
+    """This manager's own Apache site: one loopback listener serving only the custom mod paths."""
+    return f"""{WEB_MARKER} To change the port, set
+# CUSTOM_MODS_PORT ({CUSTOM_PORT_MIN}-{CUSTOM_PORT_MAX}) in {SERVICES_CONF}, then run:
+#   sudo ddistro_custom_mod setup-web
+Listen 127.0.0.1:{port}
+<VirtualHost 127.0.0.1:{port}>
+\tDocumentRoot /var/www/html
+\t<Location "/">
+\t\tRequire all denied
+\t</Location>
+\t<LocationMatch "^/(ExampleServer|custom-mods/[^/]+)(/|$)">
+\t\tRequire all granted
+\t</LocationMatch>
+\tErrorLog ${{APACHE_LOG_DIR}}/custom_mods_error.log
+\tCustomLog ${{APACHE_LOG_DIR}}/custom_mods_access.log combined
+</VirtualHost>
+"""
+
+
+def config_uses_port(text, port):
+    """True if Apache config text listens on, or declares a virtual host for, the port."""
+    return bool(re.search(rf"^\s*Listen\s+(?:\S*:)?{port}(?:\s|$)", text, re.M | re.I)
+                or re.search(rf"<VirtualHost\s[^>]*:{port}[\s>]", text, re.I))
+
+
+def apache_conflict(port, own_site):
+    """The first other enabled Apache config file that uses the port, or None."""
+    paths = [APACHE_DIR + "/apache2.conf", APACHE_DIR + "/ports.conf"]
+    for folder in ("sites-enabled", "conf-enabled"):
+        try:
+            paths += [f"{APACHE_DIR}/{folder}/{name}" for name in sorted(os.listdir(f"{APACHE_DIR}/{folder}"))]
+        except FileNotFoundError:
+            pass
+    for path in paths:
+        if os.path.realpath(path) == own_site or not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            if config_uses_port(handle.read(), port):
+                return path
+    return None
+
+
+def port_free(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def apache_running():
+    return run(["/etc/init.d/apache2", "status"], timeout=30).returncode == 0
+
+
+def write_root_file(path, text):
+    fd, temp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(temp, 0o644)
+        os.replace(temp, path)
+    except BaseException:
+        if os.path.exists(temp):
+            os.unlink(temp)
+        raise
+
+
+def apply_apache(reload, port):
+    result = run(["apache2ctl", "configtest"], timeout=60)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()[:1] or [""]
+        raise ModError(f"Apache rejected the custom mod listener on port {port}. {detail[0][:200]}".strip())
+    if reload and (run(["/etc/init.d/apache2", "reload"], timeout=120).returncode != 0 or not apache_running()):
+        raise ModError(f"Apache could not reload with the custom mod listener on port {port}.")
+    deadline = time.monotonic() + 5
+    while reload:  # a reload returns before the new listener accepts; wait briefly so health checks see it
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise ModError(f"Apache reloaded but nothing answered on 127.0.0.1:{port} within 5 seconds.")
+            time.sleep(0.2)
+
+
+def setup_web():
+    """Create or move this manager's own loopback listener; repeatable, needs root and the lock.
+
+    Official sites and ports.conf are never edited. Moving the port rewrites only this
+    file, so only the old custom listener goes away. On failure the previous file returns.
+    """
+    port = custom_port()
+    available, enabled = APACHE_DIR + "/sites-available", APACHE_DIR + "/sites-enabled"
+    site, link = f"{available}/{WEB_SITE}.conf", f"{enabled}/{WEB_SITE}.conf"
+    for path in (APACHE_DIR, available, enabled):
+        if os.path.islink(path) or not os.path.isdir(path):
+            raise ModError(f"{path} is missing or a link. The custom mod listener was not set up.")
+    if os.path.lexists(link) and (not os.path.islink(link) or os.path.realpath(link) != site):
+        raise ModError(f"{link} is not this manager's site link. Nothing was changed.")
+    previous = None
+    if os.path.lexists(site):
+        info_ = os.lstat(site)
+        if not stat.S_ISREG(info_.st_mode) or info_.st_uid != 0 or info_.st_mode & 0o022:
+            raise ModError(f"{site} is not a plain root-owned file that only root can change. Nothing was changed.")
+        with open(site, encoding="utf-8", errors="replace") as handle:
+            previous = handle.read(64 * 1024)
+        if not previous.startswith(WEB_MARKER):
+            raise ModError(f"{site} was not written by this manager. Nothing was changed.")
+    was_enabled = os.path.lexists(link)
+    text = web_site_text(port)
+    conflict = apache_conflict(port, site)
+    retry = f"Choose another CUSTOM_MODS_PORT ({CUSTOM_PORT_MIN}-{CUSTOM_PORT_MAX}) in {SERVICES_CONF}, then run " \
+            "ddistro_custom_mod setup-web again. Nothing was changed."
+    if conflict:
+        raise ModError(f"Apache already uses port {port} in {conflict}. " + retry)
+    running = apache_running()
+    ours_live = running and was_enabled and previous is not None and config_uses_port(previous, port)
+    if not ours_live and not port_free(port):
+        raise ModError(f"Port {port} is already in use by another program. " + retry)
+    if previous == text and was_enabled:
+        apply_apache(False, port)
+        ok(f"Custom mods are served on http://127.0.0.1:{port}/.")
+        return port
+    write_root_file(site, text)
+    try:
+        if not was_enabled and run(["a2ensite", "-q", WEB_SITE], timeout=60).returncode != 0:
+            raise ModError("Could not enable the custom mod listener site.")
+        apply_apache(running, port)
+    except ModError:
+        if previous is None:
+            os.unlink(site)
+        else:
+            write_root_file(site, previous)
+        if not was_enabled and os.path.islink(link):
+            os.unlink(link)
+        if running:
+            run(["/etc/init.d/apache2", "reload" if apache_running() else "start"], timeout=120)
+        raise
+    ok(f"Custom mods are served on http://127.0.0.1:{port}/.")
+    return port
+
+
 # --- Backup ---------------------------------------------------------------------------
 
 def backup(entry):
@@ -786,8 +1103,8 @@ def resolve_source(args):
 def command_check(args):
     source, local = resolve_source(args)
     info("Checking the repository.")
-    manifest, branch, commit = inspect_repository(source, local)
-    print(json.dumps(preview_document(manifest, branch, commit, source, local)))
+    manifest, branch, commit, policy = inspect_repository(source, local)
+    print(json.dumps(preview_document(manifest, branch, commit, source, local, policy)))
 
 
 def command_install(args):
@@ -799,7 +1116,7 @@ def command_install(args):
     if not local and expected is None:
         raise ModError("Check the repository first; install needs the checked commit.")
     acquire_lock()
-    manifest, branch, commit = inspect_repository(source, local)
+    manifest, branch, commit, policy = inspect_repository(source, local)
     if expected and commit != expected:
         raise ModError("The repository changed after it was checked. Check it again.")
     mod_id = manifest["id"]
@@ -812,7 +1129,9 @@ def command_install(args):
         raise ModError(f"A removed custom mod with id {mod_id} came from a different repository. Its folder "
                        "and database were kept and are not adopted.")
     if state == "restorable":
-        restore_entry(previous, manifest, commit)
+        # The kept checkout stays on its own branch; a newer commit is only reported for that branch.
+        same_branch = previous.get("branch") == branch
+        restore_entry(previous, manifest, commit if same_branch else None, policy)
         return
     ensure_mod_root()
     if os.path.lexists(folder):
@@ -826,7 +1145,8 @@ def command_install(args):
         "description": manifest["description"], "project_url": manifest["project_url"],
         "repository": source, "local_source": local, "branch": branch, "commit": commit,
         "folder": folder, "database": database, "dashboard_path": manifest["dashboard_path"],
-        "health_path": manifest["health_path"], "setup": manifest["setup"],
+        "health_path": manifest["health_path"], "setup": manifest["setup"], "assets": manifest["assets"],
+        "branches": policy, "branches_checked_at": now_utc(),
         "state": "installing", "message": "Installing.", "installed_at": now_utc(), "updated_at": now_utc(),
         "operation_pid": os.getpid(),
     }
@@ -856,6 +1176,7 @@ def command_install(args):
         create_database(database)
         write_config_if_missing(folder, manifest, template, mod_id)
         run_setup_checks(folder, manifest)
+        setup_web()
         healthy, message = check_health(mod_id, manifest)
         if not healthy:
             raise ModError(message)
@@ -874,16 +1195,36 @@ def pwd_uid(name):
     return pwd.getpwnam(name).pw_uid
 
 
+def entry_source(entry):
+    local = bool(entry.get("local_source"))
+    source = validate_local_source(entry["repository"]) if local else validate_repository_url(entry["repository"])
+    return source, local
+
+
+def refresh_policy(entry, source, local):
+    """Store the author's current branch policy; an update still runs if it cannot be read."""
+    try:
+        manifest, _, _, policy = inspect_repository(source, local, policy_only=True)
+        if manifest["id"] != entry["id"]:
+            raise ModError("the repository now declares a different mod id.")
+    except ModError as error:
+        info("Could not refresh the offered branches: " + str(error))
+        return
+    entry.update(branches=policy, branches_checked_at=now_utc())
+    if entry.get("branch") not in policy["allowed"]:
+        info(f"Branch {entry.get('branch')} is no longer offered by the author. Update keeps it; "
+             "switch branches to move.")
+
+
 def command_update(args):
     require_root()
     acquire_lock()
     entry = read_entry(args["id"])
     folder = checked_folder(entry)
-    local = bool(entry.get("local_source"))
-    source = validate_local_source(entry["repository"]) if local else validate_repository_url(entry["repository"])
-    branch = entry["branch"]
-    if not BRANCH_PATTERN.match(branch):
-        raise ModError("The registered branch is invalid.")
+    source, local = entry_source(entry)
+    # Update always stays on the installed branch, even when the author changed the default.
+    branch = validate_branch_name(entry["branch"], "The registered branch is invalid.")
+    refresh_policy(entry, source, local)
     previous_state = entry.get("state")
     entry.update(state="updating", message="Updating.", updated_at=now_utc(), operation_pid=os.getpid())
     write_entry(entry)
@@ -906,6 +1247,99 @@ def command_update(args):
     ok(f"{entry['name']} is up to date.")
 
 
+def branch_target(args, entry):
+    target = validate_branch_name(args.get("branch"), "Choose a supported branch name.")
+    if target == entry.get("branch"):
+        raise ModError(f"{entry['name']} is already on branch {target}. Use Update instead.")
+    return target
+
+
+def command_branches(args):
+    """Explicit refresh of the offered branches, optionally previewing one target's exact commit."""
+    require_root()
+    acquire_lock()
+    entry = read_entry(args["id"])
+    source, local = entry_source(entry)
+    target = branch_target(args, entry) if args.get("branch") else None
+    manifest, branch, commit, policy = inspect_repository(source, local, target, policy_only=target is None)
+    if manifest["id"] != entry["id"]:
+        raise ModError("The repository now declares a different mod id. Nothing was changed.")
+    entry.update(branches=policy, branches_checked_at=now_utc())
+    write_entry(entry)
+    document = {"schema_version": STATUS_SCHEMA_VERSION, "id": entry["id"], "name": entry.get("name", entry["id"]),
+                "current_branch": entry.get("branch", ""), "current_commit": entry.get("commit", ""),
+                "branches": policy, "branch": "", "commit": ""}
+    if target:
+        if manifest["setup"]["config_path"] != entry["setup"]["config_path"]:
+            raise ModError(f"Branch {target} moves the private config path. Nothing was changed.")
+        document.update(branch=branch, commit=commit)
+    print(json.dumps(document))
+
+
+def command_switch(args):
+    """Move an installed mod to another offered branch at the reviewed commit.
+
+    Same backup, config preservation, migration, and health steps as Update, but the
+    target may diverge from the installed history. A failure returns the code to the
+    previous branch and commit; database changes made by a migration are not rolled back.
+    """
+    require_root()
+    expected = args.get("expect_commit")
+    if not expected or not SHA_PATTERN.match(expected):
+        raise ModError("Review the branch first; switch needs the reviewed commit.")
+    acquire_lock()
+    entry = read_entry(args["id"])
+    folder = checked_folder(entry)
+    source, local = entry_source(entry)
+    target = branch_target(args, entry)
+    _, _, commit, policy = inspect_repository(source, local, target)
+    entry.update(branches=policy, branches_checked_at=now_utc())
+    before = dict(entry)
+    if commit != expected:
+        write_entry(entry)
+        raise ModError(f"Branch {target} changed after it was reviewed. Review it again.")
+    old_branch = validate_branch_name(entry["branch"], "The registered branch is invalid.")
+    old_commit = entry["commit"]
+    entry.update(state="updating", message=f"Switching to branch {target}.", updated_at=now_utc(),
+                 operation_pid=os.getpid())
+    write_entry(entry)
+    progress = {"changed": False}
+    try:
+        update_checkout(entry, folder, source, local, target, progress, expect_commit=expected)
+    except ModError as error:
+        entry.clear()
+        entry.update(before)
+        if not progress["changed"]:
+            entry["message"] = "Last branch switch was refused: " + str(error)
+        else:
+            entry.update(switch_rollback(entry, folder, old_branch, old_commit, target, error, progress))
+        entry["updated_at"] = now_utc()
+        write_entry(entry)
+        raise
+    entry.pop("operation_pid", None)
+    entry.update(state="ready", message=f"Switched to branch {target}.", updated_at=now_utc())
+    write_entry(entry)
+    ok(f"{entry['name']} is now on branch {target}.")
+
+
+def switch_rollback(entry, folder, old_branch, old_commit, target, error, progress):
+    """Return the code to the previous branch and commit; never claims a database rollback."""
+    database_note = (f" Database changes made by the {target} migration were not rolled back; the backup "
+                     "taken before the switch is in the distro's custom mod backups.") if progress.get("migrated") else ""
+    try:
+        git(["checkout", "--quiet", "-B", old_branch, old_commit], cwd=folder,
+            message="Could not return the code to the previous branch.")
+        apply_permissions(folder)
+    except ModError as rollback_error:
+        return {"state": "failed", "message": f"Switch to {target} failed: {error} {rollback_error} "
+                                              "Choose Update to retry." + database_note}
+    healthy, _ = check_health(entry["id"], {"dashboard_path": entry.get("dashboard_path", ""),
+                                            "health_path": entry.get("health_path", "")})
+    state = "ready" if healthy and entry.get("state") == "ready" else "failed"
+    return {"state": state, "message": f"Switch to {target} failed: {error} The code was returned to branch "
+                                       f"{old_branch} at {old_commit[:7]}." + database_note}
+
+
 def incoming_collisions(folder, new_paths):
     """Paths an update would add over existing untracked (possibly git-ignored) files or links."""
     collisions = []
@@ -921,31 +1355,51 @@ def incoming_collisions(folder, new_paths):
     return collisions
 
 
-def update_checkout(entry, folder, source, local, branch, progress):
+def update_checkout(entry, folder, source, local, branch, progress, expect_commit=None):
+    """Update fast-forwards the installed branch; a branch switch (expect_commit) may diverge."""
     # Custom mods never discard edits: there is no force option here.
     status = git(["status", "--porcelain", "--untracked-files=no"], cwd=folder,
                  message="Could not read the mod folder status.")
     if status.stdout.strip():
         raise ModError("Files tracked by the mod were changed locally. Nothing was updated.")
+    if expect_commit:
+        # Rollback recreates the registered branch at the registered commit, so both must be what is installed.
+        head = git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], cwd=folder, check=False)
+        current = git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=folder, check=False)
+        if (head.stdout.decode().strip() != entry["commit"]
+                or current.stdout.decode().strip() != entry["branch"]):
+            raise ModError("The mod folder is not at its registered branch and commit. Nothing was changed.")
     backup(entry)
     git(["fetch", "--quiet", "--no-tags", source, f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
         cwd=folder, local_source=local, timeout=CLONE_TIMEOUT, message="Could not download the update.")
     incoming = f"refs/remotes/origin/{branch}"
     manifest, new_paths, template, commit = read_commit_manifest(folder, incoming)
+    if expect_commit and commit != expect_commit:
+        raise ModError(f"Branch {branch} changed after it was reviewed. Nothing was changed.")
     if manifest["id"] != entry["id"]:
         raise ModError("The update changes the mod id. Nothing was updated.")
     if manifest["setup"]["config_path"] != entry["setup"]["config_path"]:
         raise ModError("The update moves the private config path. Nothing was updated.")
-    if git(["merge-base", "--is-ancestor", "HEAD", incoming], cwd=folder, check=False).returncode != 0:
+    if not expect_commit and git(["merge-base", "--is-ancestor", "HEAD", incoming], cwd=folder,
+                                 check=False).returncode != 0:
         raise ModError("The update is not a fast-forward of the installed version. Nothing was updated.")
+    local_ref = f"refs/heads/{branch}"
+    if expect_commit and git(["show-ref", "--verify", "--quiet", local_ref], cwd=folder, check=False).returncode == 0 \
+            and git(["merge-base", "--is-ancestor", local_ref, expect_commit], cwd=folder,
+                    check=False).returncode != 0:
+        # checkout -B would discard local commits on an existing destination branch.
+        raise ModError(f"The mod folder has local commits on branch {branch}. Nothing was changed.")
     old_paths = set(git(["ls-tree", "-r", "-z", "--name-only", "--full-tree", "HEAD"], cwd=folder)
                     .stdout.decode("utf-8", "replace").split(chr(0))) - {""}
     # Git may silently replace ignored files, so .gitignore alone is not protection.
     collisions = incoming_collisions(folder, new_paths - old_paths)
     if collisions:
         raise ModError(f"The update would replace local file {collisions[0]}. Nothing was updated.")
+    if expect_commit:
+        git(["checkout", "--quiet", "-B", branch, expect_commit], cwd=folder, message="Could not switch branches.")
+    else:
+        git(["merge", "--ff-only", "--quiet", incoming], cwd=folder, message="Fast-forward update failed.")
     progress["changed"] = True
-    git(["merge", "--ff-only", "--quiet", incoming], cwd=folder, message="Fast-forward update failed.")
     apply_permissions(folder)
     write_config_if_missing(folder, manifest, template, entry["id"])
     if not database_exists(entry["database"]):
@@ -953,11 +1407,14 @@ def update_checkout(entry, folder, source, local, branch, progress):
         create_database(entry["database"])
     elif database_owner(entry["database"]) != DATABASE_ROLE:
         raise ModError("The mod database is not owned by the dwemer role.")
+    progress["migrated"] = True
     run_setup_checks(folder, manifest)
+    setup_web()
     healthy, message = check_health(entry["id"], manifest)
     entry.update(name=manifest["name"], description=manifest["description"],
                  project_url=manifest["project_url"], dashboard_path=manifest["dashboard_path"],
-                 health_path=manifest["health_path"], setup=manifest["setup"], commit=commit)
+                 health_path=manifest["health_path"], setup=manifest["setup"], assets=manifest["assets"],
+                 commit=commit, branch=branch)
     if not healthy:
         raise ModError(message)
 
@@ -1008,7 +1465,7 @@ def tombstone_problem(entry, mod_id):
     return None
 
 
-def restore_entry(entry, remote_manifest, remote_commit):
+def restore_entry(entry, remote_manifest, remote_commit, policy=None):
     """Put a removed mod back in the list without touching its files, config, or database.
 
     Only the exact folder and database named by our own root-owned tombstone are accepted,
@@ -1043,7 +1500,12 @@ def restore_entry(entry, remote_manifest, remote_commit):
     has_database = database_exists(database)
     if has_database and database_owner(database) != DATABASE_ROLE:
         raise ModError("The kept database is not owned by the dwemer role. Nothing was changed.")
-    write_entry(restored_entry(entry, head, remote_commit, has_database and os.path.isfile(config_path)))
+    restored = restored_entry(entry, head, remote_commit, has_database and os.path.isfile(config_path))
+    restored["assets"] = manifest["assets"]
+    if policy:
+        restored.update(branches=policy, branches_checked_at=now_utc())
+    setup_web()
+    write_entry(restored)
     ok(f"{entry['name']} is back in the list. Its files, private config, and database were kept as they were.")
 
 
@@ -1053,7 +1515,7 @@ def restored_entry(entry, head, remote_commit, setup_present):
     previous = restored.pop("unregistered_from", None)
     if previous == "ready" and head == entry["commit"] and setup_present:
         message = "Restored with the installed version."
-        if remote_commit != head:
+        if remote_commit and remote_commit != head:
             message += " A newer version is available; choose Update to install it."
         restored.update(state="ready", message=message)
     else:
@@ -1076,6 +1538,10 @@ def status_entry(entry, check):
         "message": message, "folder": entry.get("folder", ""), "database": entry.get("database", ""),
         "dashboard_url": dashboard_url, "health_url": health_url, "updated_at": entry.get("updated_at", ""),
     }
+    document.update(asset_urls(entry))
+    # The last checked author policy, read from the registry only: status never contacts the remote.
+    document["branches"] = stored_policy(entry)
+    document["branches_checked_at"] = entry.get("branches_checked_at", "")
     if check:
         healthy, health_message = check_health(entry["id"], manifest)
         document["health"] = "ok" if healthy else "failed"
@@ -1087,6 +1553,12 @@ def operation_running(entry):
     """Busy only while the manager run that wrote this entry still holds the shared lock."""
     pid = entry.get("operation_pid")
     return isinstance(pid, int) and pid == lock_pid() and lock_owner_alive()
+
+
+def command_setup_web(args):
+    require_root()
+    acquire_lock()
+    setup_web()
 
 
 def command_status(args):
@@ -1109,10 +1581,16 @@ USAGE = """Usage: ddistro_custom_mod <command> [options]
   status [<id>] [--check-health] --json
   check <https-url> --json             Preview a repository's manifest (no changes).
   install <https-url> --expect-commit <sha>
-  update <id>                          Back up, then fast-forward and migrate.
+  update <id>                          Back up, then fast-forward and migrate (same branch).
+  branches <id> [--branch <name>] --json
+                                       Refresh the offered branches; with --branch, preview its commit.
+  switch <id> --branch <name> --expect-commit <sha>
+                                       Back up, then move to another offered branch and migrate.
   backup <id>                          Back up the private config and database.
   unregister <id>                      Remove from the list; files and database are kept,
                                        and adding the same repository again restores it.
+  setup-web                            Create or move the shared loopback listener on
+                                       CUSTOM_MODS_PORT from /etc/dwemerdistro_services.conf.
 
 Admin/test only: check|install --local-source </absolute/path/repo.git> (root).
 For a bundle, first: git clone --bare /path/example.bundle /path/example.git
@@ -1133,8 +1611,10 @@ def parse_args(argv):
             args["json"] = True
         elif token == "--check-health" and command == "status":
             args["check_health"] = True
-        elif token in ("--expect-commit", "--local-source") and index + 1 < len(rest):
-            if (token == "--expect-commit" and command != "install") or command not in ("check", "install"):
+        elif token in ("--expect-commit", "--local-source", "--branch") and index + 1 < len(rest):
+            allowed = {"--expect-commit": ("install", "switch"), "--local-source": ("check", "install"),
+                       "--branch": ("branches", "switch")}[token]
+            if command not in allowed:
                 raise ModError(f"{token} is not supported for {command}.")
             args[token[2:].replace("-", "_")] = rest[index + 1]
             index += 1
@@ -1147,17 +1627,23 @@ def parse_args(argv):
         if len(positional) > 1 or (positional and args.get("local_source")):
             raise ModError(f"{command} takes one repository URL.")
         args["url"] = positional[0] if positional else None
-    elif command in ("update", "backup", "unregister", "status"):
+    elif command in ("update", "backup", "unregister", "status", "branches", "switch"):
         if len(positional) > 1 or (command != "status" and len(positional) != 1):
             raise ModError(f"{command} takes one custom mod id.")
         args["id"] = validate_mod_id(positional[0]) if positional else None
+        if command == "switch" and not (args.get("branch") and args.get("expect_commit")):
+            raise ModError("switch needs --branch and --expect-commit.")
+    elif command == "setup-web":
+        if positional:
+            raise ModError("setup-web takes no arguments.")
     else:
         raise ModError(f"Unknown command {command[:40]}.")
     return args
 
 
 COMMANDS = {"status": command_status, "check": command_check, "install": command_install,
-            "update": command_update, "backup": command_backup, "unregister": command_unregister}
+            "update": command_update, "backup": command_backup, "unregister": command_unregister,
+            "branches": command_branches, "switch": command_switch, "setup-web": command_setup_web}
 
 
 def main(argv):

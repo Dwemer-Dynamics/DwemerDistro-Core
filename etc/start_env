@@ -605,6 +605,8 @@ fi
 
 # Start Apache/PHP server
 echo "Starting Apache/PHP/PGSQL Server"
+# Shared loopback listener for custom mods on CUSTOM_MODS_PORT; official sites are not touched.
+/usr/local/bin/ddistro_custom_mod setup-web || echo "WARNING: The custom mod listener needs attention; official servers are unaffected."
 /etc/init.d/apache2 restart &>/dev/null
 /etc/init.d/postgresql restart
 
