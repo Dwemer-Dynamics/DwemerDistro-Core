@@ -50,6 +50,10 @@ Uninstall permanently removes only the selected server's canonical files, retain
 
 `update_gws` updates only servers that are already installed. A missing server is skipped and is never installed as an update side effect. `start_env` similarly starts and reports only installed servers.
 
+## Custom mods
+
+`bin/ddistro_custom_mod` installs user-added PHP/PostgreSQL mod servers from public HTTPS repositories that ship a version 1 `dwemer-mod.json`. See [CUSTOM_MODS.md](CUSTOM_MODS.md) for the manifest contract and safety rules.
+
 ## System release version
 
 `system-release.json` is the release signal for DwemerDistro core and shared components. Increment its semantic version whenever users need to run **Update System** for a core or shared-component release.
