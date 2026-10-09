@@ -73,10 +73,20 @@ service postgresql start >/dev/null || exit 1
 /usr/local/bin/ensure_postgres_utf8 || exit 1
 
 printf ">> Copying configuration files to /etc...\n"
-find /home/dwemer/dwemerdistro/etc/ -type f ! -name "php.ini" -exec cp {} /etc/ \; 2>/dev/null
+find /home/dwemer/dwemerdistro/etc/ -type f ! -name "php.ini" ! -name "dwemerdistro_services.conf" -exec cp {} /etc/ \; 2>/dev/null
 if [ $? -eq 0 ]; then
     # The LM Studio helper runs as dwemer and must read the public model catalog.
     install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/dwemerdistro-lmstudio.json /etc/dwemerdistro-lmstudio.json || exit 1
+    # Keep the existing service ports, including CUSTOM_MODS_PORT; only a missing file gets the defaults.
+    # start_env sources it as root, so an existing file must be a plain root-owned file only root can change.
+    SERVICES_CONF=/etc/dwemerdistro_services.conf
+    if [ ! -e "$SERVICES_CONF" ] && [ ! -L "$SERVICES_CONF" ]; then
+        install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/dwemerdistro_services.conf "$SERVICES_CONF" || exit 1
+    elif [ -L "$SERVICES_CONF" ] || [ ! -f "$SERVICES_CONF" ] || [ "$(stat -c '%u' "$SERVICES_CONF")" != 0 ] \
+        || [ $(( 0$(stat -c '%a' "$SERVICES_CONF") & 022 )) -ne 0 ]; then
+        printf "${RED}[ERROR] $SERVICES_CONF must be a plain root-owned file that only root can change. It was not changed.${NC}\n"
+        exit 1
+    fi
     if ! runuser -u dwemer -- python3 -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1]))["models"], list))' /etc/dwemerdistro-lmstudio.json; then
         printf "${RED}[ERROR] LM Studio model catalog is not readable by dwemer${NC}\n"
         exit 1
