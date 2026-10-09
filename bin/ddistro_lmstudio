@@ -13,6 +13,8 @@ import re
 import secrets
 import selectors
 import shutil
+import stat
+import struct
 import subprocess
 import sys
 import time
@@ -23,7 +25,15 @@ STATE = HOME / '.config/dwemerdistro/lmstudio'
 LMS = HOME / '.lmstudio/bin/lms'
 API = 'http://127.0.0.1:1234'
 CATALOG = Path('/etc/dwemerdistro-lmstudio.json')
-MUTATIONS = {'start', 'stop', 'restart', 'settings', 'download', 'load', 'unload', 'test', 'model-defaults', 'test-preset'}
+MUTATIONS = {'start', 'stop', 'restart', 'settings', 'download', 'import', 'load', 'unload', 'test', 'model-defaults', 'test-preset'}
+IMPORTS = STATE / 'imports'
+IMPORT_TARGET = STATE / 'import-target.json'
+# Byte sizes of fixed-width GGUF metadata value types (enum gguf_type in ggml's gguf.h).
+GGUF_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+GGUF_UINT16, GGUF_STRING, GGUF_ARRAY = 2, 8, 9
+# Metadata bounds. Real models, including 250k+ token vocabularies with merges, use a few tens of MB and
+# well under a million strings; these stop a crafted file from allocating memory or holding the worker.
+GGUF_KEY_BYTES, GGUF_METADATA_BYTES, GGUF_ITEMS, GGUF_SECONDS = 65535, 512 * 1024**2, 4 * 1024**2, 60
 SDK_PYTHON = '/opt/dwemerdistro-lmstudio/bin/python'
 # Only documented SDK load settings are accepted; omitted values keep engine defaults.
 LOAD_NUMBERS = {'evalBatchSize': (1, 2048, int), 'seed': (0, 4294967295, int),
@@ -160,6 +170,12 @@ def status():
                 message = 'Operation interrupted. Check the model state and retry.'
                 if job.get('preset'):
                     message = 'Operation interrupted. Retry to resume a preset download.'
+                if job.get('action') == 'import':
+                    retained = clear_imports()
+                    message = ('Import interrupted. Private staging was cleared and your original file is '
+                               'unchanged. Retry the import.')
+                    if retained:
+                        message += f' A registration file was preserved at {retained}. Check it before retrying.'
                 job.update(state='failed', message=message)
             # LM Studio unloads idle models itself (TTL). Forget results for instances that are gone, unless a
             # job changed the model state after the list above was read.
@@ -263,6 +279,8 @@ def validate(data):
             if not isinstance(source, str) or not re.fullmatch(
                     r'(?:https://huggingface\.co/)?[\w.-]+/[\w./@-]+', source) or '..' in source:
                 raise ValueError('Enter a Hugging Face model URL or owner/model catalog identifier.')
+    if action == 'import':
+        import_parts(data.get('source'))
     if action == 'test':
         configuration(data.get('generation', {}), 'test')
         if data.get('reasoning', 'default') not in {'default', 'off', 'on', 'low', 'medium', 'high'}:
@@ -362,6 +380,295 @@ def import_preset(model, target, job):
         progress(job, f"{model['name']} was imported. LM Studio may take a moment to list it.")
 
 
+# Map a pasted Windows path or /mnt/<drive> path to (drive letter, path components). Only shape is checked here.
+def import_parts(source):
+    if not isinstance(source, str) or len(source) > 1024 or any(ord(c) < 32 for c in source):
+        raise ValueError('Enter the full path of a .gguf file on this PC.')
+    # Explorer's "Copy as path" wraps the path in quotes.
+    source = source.strip().strip('"').strip()
+    windows = re.fullmatch(r'([A-Za-z]):[\\/](.+)', source)
+    mounted = re.fullmatch(r'/mnt/([a-z])/(.+)', source)
+    if windows:
+        letter, parts = windows.group(1).lower(), re.split(r'[\\/]', windows.group(2))
+    elif mounted:
+        letter, parts = mounted.group(1), mounted.group(2).split('/')
+    else:
+        raise ValueError(r'Enter a full path on a Windows drive of this PC, such as C:\Models\model.gguf.')
+    parts = [part for part in parts if part]
+    if not parts or any(part in {'.', '..'} for part in parts):
+        raise ValueError('The path must not contain . or .. folders.')
+    split = re.search(r'-\d{5}-of-(\d{5})\.gguf$', parts[-1], re.I)
+    if not parts[-1].lower().endswith('.gguf') or len(parts[-1]) > 200:
+        raise ValueError('Choose a single .gguf model file.')
+    if split and int(split.group(1)) > 1:
+        raise ValueError('Split GGUF models (-00001-of-0000N) are not supported. Merge them into one .gguf file first.')
+    return letter, parts
+
+
+# Open the source one component at a time without following links, starting from a Windows drive mount and
+# staying on it. A link anywhere in the path is refused, and the descriptor checked is the one copied.
+def open_import_source(letter, parts):
+    mount = f'/mnt/{letter}'
+    drives = []
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        left, _, right = line.partition(' - ')
+        fields, kind = left.split(), right.split()
+        if len(fields) > 4 and kind and (kind[0] == 'drvfs' or (kind[0] == '9p' and 'aname=drvfs' in right)):
+            drives.append(fields[4])
+    if mount not in drives:
+        raise ValueError(f'Drive {letter.upper()}: is not available inside DwemerDistro.')
+    shown = letter.upper() + ':\\' + '\\'.join(parts)
+    directory = os.open('/', os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        device = None
+        for index, name in enumerate(['mnt', letter, *parts[:-1]]):
+            following = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            os.close(directory)
+            directory = following
+            if index == 1:
+                device = os.fstat(directory).st_dev
+            elif index > 1 and os.fstat(directory).st_dev != device:
+                raise ValueError(f'{shown} is not stored directly on drive {letter.upper()}:.')
+        source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+    except FileNotFoundError:
+        raise ValueError(f'{shown} was not found. Check the path on this PC.')
+    except PermissionError:
+        raise ValueError(f'DwemerDistro cannot read {shown}. Check its Windows permissions.')
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ValueError(f'{shown} goes through a shortcut, link or junction, or a part of it is not a folder. '
+                             'Enter the real location of the file.')
+        raise
+    finally:
+        os.close(directory)
+    info = os.fstat(source)
+    if not stat.S_ISREG(info.st_mode) or info.st_dev != device:
+        os.close(source)
+        raise ValueError(f'{shown} is not a regular file on drive {letter.upper()}:.')
+    return source, info
+
+
+# Read the GGUF header and metadata without loading tensors. Rejects other formats, malformed headers and
+# split sets, so the extension alone is never trusted.
+def check_gguf(stream, size):
+    deadline, items = time.monotonic() + GGUF_SECONDS, 0
+
+    def invalid(reason):
+        return ValueError(f'The file is not a valid GGUF model: {reason}.')
+
+    # Every read and skip is checked against the file size and the metadata budget before it happens.
+    def jump(length):
+        if length > size - stream.tell():
+            raise invalid('its metadata is truncated or malformed')
+        if length > GGUF_METADATA_BYTES - stream.tell():
+            raise invalid('its metadata is larger than DwemerDistro accepts')
+        return stream.tell() + length
+
+    def take(length):
+        jump(length)
+        return stream.read(length)
+
+    def tick():
+        nonlocal items
+        items += 1
+        if items > GGUF_ITEMS:
+            raise invalid('its metadata has more entries than DwemerDistro accepts')
+        if time.monotonic() > deadline:
+            raise invalid('its metadata took too long to read')
+
+    def skip(kind):
+        if kind in GGUF_SIZES:
+            stream.seek(jump(GGUF_SIZES[kind]))
+        elif kind == GGUF_STRING:
+            stream.seek(jump(struct.unpack('<Q', take(8))[0]))
+        elif kind == GGUF_ARRAY:
+            inner, count = struct.unpack('<IQ', take(12))
+            if inner in GGUF_SIZES:
+                stream.seek(jump(count * GGUF_SIZES[inner]))
+            elif inner == GGUF_STRING:
+                # Each string needs at least its 8-byte length, so a huge count fails the size check first.
+                jump(count * 8)
+                for _ in range(count):
+                    tick()
+                    skip(GGUF_STRING)
+            else:
+                raise invalid('unsupported metadata')
+        else:
+            raise invalid('unknown metadata type')
+
+    header = stream.read(24) if size >= 24 else b''
+    if header[:4] != b'GGUF':
+        raise ValueError('This is not a GGUF model file. Only standalone .gguf files can be imported.')
+    version, _, count = struct.unpack('<IQQ', header[4:])
+    if version not in {2, 3}:
+        raise ValueError('This GGUF version is not supported. Use a current GGUF (version 2 or 3) file.')
+    # Each entry needs at least a key length, one key byte and a type.
+    jump(count * 13)
+    for _ in range(count):
+        tick()
+        length = struct.unpack('<Q', take(8))[0]
+        if length > GGUF_KEY_BYTES:
+            raise invalid('a metadata key is too long')
+        key = take(length)
+        kind = struct.unpack('<I', take(4))[0]
+        if key != b'split.count':
+            skip(kind)
+        elif kind != GGUF_UINT16:
+            raise invalid('its split.count metadata has the wrong type')
+        # gguf-split writes the shard count; a merged model keeps split.count = 0.
+        elif struct.unpack('<H', take(2))[0] > 1:
+            raise ValueError('This file is one part of a split GGUF model. Split models are not supported; '
+                             'merge them into one .gguf file first.')
+
+
+# LM Studio's model folder, resolved as lms import does: the home named by ~/.lmstudio-home-pointer (lms writes it
+# on first run), then settings.json downloadsFolder, else <home>/models.
+def models_folder():
+    pointer = HOME / '.lmstudio-home-pointer'
+    home = Path(pointer.read_text().strip()) if pointer.is_file() else HOME / '.lmstudio'
+    try:
+        folder = read_json(home / 'settings.json', {}).get('downloadsFolder')
+    except (ValueError, AttributeError):
+        folder = None
+    if not isinstance(folder, str):
+        return home / 'models'
+    if not folder.startswith('/'):
+        raise ValueError("LM Studio's model folder setting is not a full path, so the import destination is unclear.")
+    return Path(folder)
+
+
+# Undo only a registration whose identity proves it is our staged file. Cross-filesystem copies cannot be
+# identified safely after lms creates them; preserve those files and return their path for recovery feedback.
+def discard_import_target():
+    retained = None
+    owned = read_json(IMPORT_TARGET, None)
+    if owned:
+        target = Path(owned['target'])
+        try:
+            info = target.lstat()
+        except FileNotFoundError:
+            info = None
+        if info:
+            ours = (owned['linked'] and stat.S_ISREG(info.st_mode)
+                    and [info.st_dev, info.st_ino] == owned['file'] and info.st_size == owned['size'])
+            if ours:
+                target.unlink(missing_ok=True)
+            else:
+                retained = str(target)
+    IMPORT_TARGET.unlink(missing_ok=True)
+    return retained
+
+
+# Imports run one at a time under the job lock, so leftover private staging belongs to an interrupted import.
+def clear_imports():
+    retained = discard_import_target()
+    IMPORTS.mkdir(mode=0o700, exist_ok=True)
+    for item in IMPORTS.iterdir():
+        if not item.is_dir() or item.is_symlink():
+            item.unlink(missing_ok=True)
+    return retained
+
+
+def gigabytes(size):
+    return f'{size / 1024**3:.1f} GB'
+
+
+# Copy a validated Windows GGUF file into private staging, then register it with lms. The original is only read.
+def import_local(data, job):
+    letter, parts = import_parts(data['source'])
+    name = parts[-1]
+    progress(job, f'Checking {name}...')
+    source, before = open_import_source(letter, parts)
+    try:
+        # A large buffer keeps metadata reads over the Windows drive mount few and quick.
+        with os.fdopen(os.dup(source), 'rb', buffering=1024**2) as stream:
+            check_gguf(stream, before.st_size)
+        command('daemon', 'up')
+        # Finish any interrupted import first, so its unconfirmed registration does not block this one.
+        clear_imports()
+        repo = 'local/' + (re.sub(r'[^\w.-]+', '-', name[:-5]).strip('.-') or 'model')[:100]
+        models = models_folder()
+        # lms import registers the file as <model folder>/<user>/<repo>/<file name>.
+        target = models / repo / name
+        if os.path.lexists(target):
+            raise ValueError(f'{repo}/{name} is already imported. Rename the file to import another copy.')
+        existing = models
+        while not existing.exists():
+            existing = existing.parent
+        # A hard link registers without a second copy; another filesystem needs lms to copy it again.
+        linked = existing.stat().st_dev == IMPORTS.stat().st_dev
+        size, headroom = before.st_size, 1024**3
+        for place, label in [(IMPORTS, 'DwemerDistro')] + ([] if linked else [(existing, "LM Studio's model folder")]):
+            free = shutil.disk_usage(place).free
+            if free < size + headroom:
+                raise ValueError(f'Not enough disk space in {label}: importing needs {gigabytes(size)} plus 1 GB '
+                                 f'working space, but only {gigabytes(free)} is free.')
+        partial, staged = IMPORTS / (name + '.part'), IMPORTS / name
+        done, last = 0, 0
+        try:
+            with open(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600), 'wb') as output:
+                while done < size:
+                    chunk = os.pread(source, min(8 * 1024**2, size - done), done)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    done += len(chunk)
+                    if time.monotonic() - last > 1:
+                        progress(job, f'Step 1 of 2: Copying {name}', phase='copy', downloaded=done, total=size)
+                        last = time.monotonic()
+                output.flush()
+                os.fsync(output.fileno())
+        except OSError as error:
+            if error.errno == errno.ENOSPC:
+                raise ValueError('DwemerDistro ran out of disk space while copying. The partial copy was removed.')
+            raise ValueError(f'Copying stopped: {error.strerror}. The partial copy was removed; your original file is unchanged.')
+        after = os.fstat(source)
+        if done != size or (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+            raise ValueError(f'{name} changed while it was being copied. Close programs using it and retry.')
+        partial.replace(staged)
+        # Check the copy itself, since that is what LM Studio receives.
+        with staged.open('rb', buffering=1024**2) as stream:
+            check_gguf(stream, size)
+        job.pop('downloaded', None)
+        job.pop('total', None)
+        progress(job, f'Step 2 of 2: Registering {name} with LM Studio...', phase='import')
+        # Record the destination before lms creates it, so a failed or interrupted registration can be undone.
+        file = staged.stat()
+        write_json(IMPORT_TARGET, {'target': str(target), 'size': size, 'linked': linked,
+                                   'file': [file.st_dev, file.st_ino]})
+        if os.path.lexists(target):
+            IMPORT_TARGET.unlink()
+            raise ValueError(f'{repo}/{name} appeared in LM Studio during the import. Rename the file and retry.')
+        try:
+            command('import', str(staged), '--user-repo', repo, '--yes', '--hard-link' if linked else '--copy',
+                    timeout=120 if linked else 7200)
+        except ValueError as error:
+            # lms refuses an existing destination, which then belongs to someone else.
+            if 'Target file already exists' in str(error):
+                IMPORT_TARGET.unlink()
+            raise
+        # lms can exit successfully without importing, so confirm the registered file itself.
+        registered = target.is_file() and not target.is_symlink()
+        if registered and linked:
+            registered = os.path.samefile(target, staged)
+        elif registered:
+            registered = target.stat().st_size == size
+        if not registered:
+            raise ValueError('LM Studio did not register the model. Your original file is unchanged; retry the import.')
+        IMPORT_TARGET.unlink()
+        progress(job, f'{name} was imported as {repo}. Start the server and load it from Installed; '
+                      'LM Studio may take a moment to list it.')
+    except Exception as error:
+        retained = clear_imports()
+        if retained:
+            raise ValueError(f'{error} A registration file was preserved at {retained}. '
+                             'Check it before retrying; your original file is unchanged.') from error
+        raise
+    finally:
+        os.close(source)
+        clear_imports()
+
+
 def execute(data, job):
     action = data['action']
     if action in {'stop', 'restart'}:
@@ -398,6 +705,8 @@ def execute(data, job):
             command('daemon', 'up')
             progress(job, 'Downloading custom model. LM Studio is selecting the requested file/quantization.')
             command('get', data['source'], '--gguf', '--yes', timeout=14400, job=job)
+    elif action == 'import':
+        import_local(data, job)
     elif action == 'load':
         with request('/api/v1/models') as response:
             models = json.load(response)['models']
@@ -564,7 +873,7 @@ def main():
             os.dup2(null.fileno(), fd)
     try:
         execute(data, job)
-        keep = data['action'] == 'test' or (data['action'] == 'download' and data.get('preset'))
+        keep = data['action'] in {'test', 'import'} or (data['action'] == 'download' and data.get('preset'))
         progress(job, job.get('message', 'Done') if keep else 'Done.', state='completed')
     except Exception as error:
         progress(job, str(error), state='failed')
