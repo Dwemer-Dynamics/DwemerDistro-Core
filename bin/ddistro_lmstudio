@@ -18,6 +18,8 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 HOME = Path('/home/dwemer')
@@ -45,6 +47,17 @@ CACHE_TYPES = {'f32', 'f16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1'}
 TEST_NUMBERS = {'temperature': (0, 1, float), 'max_output_tokens': (1, 4096, int),
                 'top_p': (0, 1, float), 'top_k': (1, 1000, int), 'min_p': (0, 1, float),
                 'repeat_penalty': (0.1, 2, float)}
+# Hugging Face discovery: fixed public API, validated names, short cache and a request budget shared by all sessions.
+HF = 'https://huggingface.co'
+HF_REPO = re.compile(r'[A-Za-z0-9][\w.-]{0,95}/[\w.-]{1,96}', re.A)
+HF_FILE = re.compile(r'[\w.+-]{1,200}\.gguf', re.I | re.A)
+HF_SPLIT = re.compile(r'-\d{5}-of-\d{5}\.gguf$', re.I)
+# Calibration data (an imatrix name without a quant) and multi-token prediction companions (mtp- prefix) share
+# repositories with models.
+HF_IMATRIX = re.compile(r'(?<![A-Za-z0-9])imatrix(?![A-Za-z0-9])', re.I)
+HF_MTP = re.compile(r'mtp[-_.]', re.I)
+HF_QUANT = re.compile(r'(?<![A-Za-z0-9])(I?Q\d_[A-Z0-9_]+?|TQ\d_\d|MXFP4|BF16|F16|F32)(?=[.-]|$)', re.I)
+HF_CACHE, HF_CACHE_SECONDS, HF_BUDGET = STATE / 'hf-cache.json', 600, 30
 os.umask(0o077)
 
 
@@ -193,8 +206,8 @@ def status():
             job = read_json(STATE / 'job.json', {})
             if job.get('state') == 'running':
                 message = 'Operation interrupted. Check the model state and retry.'
-                if job.get('preset'):
-                    message = 'Operation interrupted. Retry to resume a preset download.'
+                if job.get('preset') or job.get('file'):
+                    message = 'Operation interrupted. Retry to resume the download.'
                 if job.get('action') == 'import':
                     retained = clear_imports()
                     message = ('Import interrupted. Private staging was cleared and your original file is '
@@ -298,8 +311,12 @@ def validate(data):
         configuration(data.get('generation', {}), 'test')
     if action == 'download':
         if data.get('preset'):
-            if data['preset'] not in {m['id'] for m in read_json(CATALOG, {})['models']}:
+            if data['preset'] not in {m['id'] for m in catalog_models()}:
                 raise ValueError('Unknown preset.')
+        elif 'repo' in data:
+            hf_repo(data['repo'])
+            if not isinstance(data.get('file'), str) or not HF_FILE.fullmatch(data['file']) or '..' in data['file']:
+                raise ValueError('Choose a standalone .gguf file from the repository.')
         else:
             source = data.get('source', '')
             # lms accepts HF URLs or a catalog identifier; flags, local paths and other hosts do not pass.
@@ -342,30 +359,220 @@ def preset_installed(model):
     return any(m.get('path') == model['repo'] + '/' + model['file'] and m.get('sizeBytes') == model['bytes'] for m in installed)
 
 
+# Presets keep their original list for Quickstart; recommended community candidates live beside it.
+def catalog_models():
+    catalog = read_json(CATALOG, {})
+    return catalog.get('models', []) + catalog.get('recommended', [])
+
+
+# Exact identity only: the file lms import creates for this repository and name, with the pinned byte count.
+def installed_file(repo, file, size):
+    try:
+        info = (models_folder() / repo / file).lstat()
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_size == size
+
+
+# API lookups follow only canonical-name redirects; downloads may also continue to the Hugging Face CDN.
+class HFRedirects(urllib.request.HTTPRedirectHandler):
+    def __init__(self, cdn):
+        self.cdn = cdn
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        url = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
+        host = (url.hostname or '').lower()
+        if not (url.scheme == 'https' and url.port in {None, 443} and (
+                (host == 'huggingface.co' and url.path.startswith('/api/models/')) or (self.cdn and (
+                    host == 'huggingface.co' or host.endswith('.huggingface.co') or host.endswith('.hf.co'))))):
+            raise urllib.error.HTTPError(req.full_url, code, 'Redirect refused', headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def hf_opener(cdn=False):
+    return urllib.request.build_opener(HFRedirects(cdn))
+
+
+def hf_get(path, query, limit):
+    req = urllib.request.Request(HF + path + '?' + urllib.parse.urlencode(query),
+                                 headers={'Accept': 'application/json', 'User-Agent': 'DwemerDistro-LMStudio'})
+    body, deadline = b'', time.monotonic() + 20
+    try:
+        with hf_opener().open(req, timeout=10) as response:
+            while chunk := response.read(65536):
+                body += chunk
+                if len(body) > limit:
+                    raise ValueError('Hugging Face returned more data than DwemerDistro accepts.')
+                if time.monotonic() > deadline:
+                    raise ValueError('Hugging Face took too long to respond. Retry later.')
+    except urllib.error.HTTPError as error:
+        if error.code in {401, 403, 404}:
+            raise ValueError('Repository not found, private, or not available without signing in.')
+        if error.code == 429:
+            raise ValueError('Hugging Face is limiting requests. Wait a minute and retry.')
+        if 300 <= error.code < 400:
+            raise ValueError('Hugging Face redirected to an unexpected location, so the request was stopped.')
+        raise ValueError(f'Hugging Face returned HTTP {error.code}. Retry later.')
+    except OSError:
+        raise ValueError('Could not reach Hugging Face. Check the internet connection and retry.')
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise ValueError('Hugging Face returned an unreadable response.')
+
+
+# One shared cache and per-minute request budget for every browser session; errors are never cached.
+def hf_cached(key, fetch, fresh=False):
+    with (STATE / 'hf.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            cache = read_json(HF_CACHE, {})
+        except (OSError, ValueError):
+            cache = {}
+        now = time.time()
+        entries = cache.get('entries') if isinstance(cache, dict) and isinstance(cache.get('entries'), dict) else {}
+        entries = {k: v for k, v in entries.items() if isinstance(v, dict) and isinstance(v.get('at'), (int, float))
+                   and 0 <= now - v['at'] < HF_CACHE_SECONDS and 'value' in v}
+        if not fresh and key in entries:
+            return entries[key]['value']
+        recent = cache.get('requests') if isinstance(cache, dict) and isinstance(cache.get('requests'), list) else []
+        recent = [t for t in recent if isinstance(t, (int, float)) and 0 <= now - t < 60]
+        if len(recent) >= HF_BUDGET:
+            raise ValueError('Too many Hugging Face lookups in the last minute. Wait a moment and retry.')
+        recent.append(now)
+        write_json(HF_CACHE, {'entries': entries, 'requests': recent})
+        value = fetch()
+        entries[key] = {'at': time.time(), 'value': value}
+        entries = dict(sorted(entries.items(), key=lambda item: item[1]['at'])[-40:])
+        write_json(HF_CACHE, {'entries': entries, 'requests': recent})
+        return value
+
+
+def hf_repo(value):
+    if not isinstance(value, str) or len(value) > 300:
+        value = ''
+    value = value.strip()
+    url = re.fullmatch(r'https://huggingface\.co/([^/?#]+/[^/?#]+)(?:/(?:tree|blob|resolve)/[^?#]*)?/?(?:[?#].*)?', value)
+    repo = url.group(1) if url else value
+    if not HF_REPO.fullmatch(repo) or '..' in repo or repo.split('/')[0] in {'datasets', 'spaces', 'api'}:
+        raise ValueError('Enter a Hugging Face model repository as owner/name or its https://huggingface.co/ URL.')
+    return repo
+
+
+def hf_count(value):
+    return value if type(value) is int and value >= 0 else 0
+
+
+def hf_search(data):
+    query, page = data.get('query'), data.get('page', 1)
+    if not isinstance(query, str) or not re.fullmatch(r'[\w .+/-]{2,80}', query.strip(), re.A):
+        raise ValueError('Search with 2–80 letters, numbers, spaces, dots, hyphens or slashes, or paste a '
+                         'https://huggingface.co/ repository URL.')
+    if type(page) is not int or not 1 <= page <= 5:
+        raise ValueError('Invalid results page.')
+    query, limit = ' '.join(query.split()), 20 * page
+
+    def fetch():
+        found = hf_get('/api/models', [('search', query), ('filter', 'gguf'), ('sort', 'downloads'), ('direction', '-1'),
+                                       ('limit', limit)] + [('expand[]', key) for key in
+                                       ('gated', 'downloads', 'likes', 'lastModified', 'private')], 1024**2)
+        if not isinstance(found, list):
+            raise ValueError('Hugging Face returned an unreadable response.')
+        results = [{'id': item['id'], 'downloads': hf_count(item.get('downloads')), 'likes': hf_count(item.get('likes')),
+                    'gated': bool(item.get('gated')), 'updated': str(item.get('lastModified') or '')[:10]}
+                   for item in found[:limit] if isinstance(item, dict) and isinstance(item.get('id'), str)
+                   and HF_REPO.fullmatch(item['id']) and not item.get('private')]
+        return {'query': query, 'page': page, 'results': results, 'more': len(found) >= limit and page < 5}
+    return hf_cached(f'search:{query.lower()}:{page}', fetch)
+
+
+# List GGUF files with the reason any of them cannot be downloaded as one standalone language model.
+def hf_files(value, fresh=False):
+    repo = hf_repo(value)
+
+    def fetch():
+        info = hf_get(f'/api/models/{repo}', [('blobs', 'true')], 8 * 1024**2)
+        if not isinstance(info, dict) or not isinstance(info.get('id'), str) or not HF_REPO.fullmatch(info['id']) or \
+                not isinstance(info.get('sha'), str) or not re.fullmatch(r'[0-9a-f]{40}', info['sha']) or \
+                not isinstance(info.get('siblings'), list):
+            raise ValueError('Hugging Face returned incomplete repository metadata.')
+        locked = ('Gated on Hugging Face; downloads that need sign-in are not supported here.' if info.get('gated') else
+                  'This repository is private or disabled.' if info.get('private') or info.get('disabled') else '')
+        files = []
+        for sibling in info['siblings'][:10000]:
+            name = sibling.get('rfilename') if isinstance(sibling, dict) else None
+            if not isinstance(name, str) or not name.lower().endswith('.gguf'):
+                continue
+            lfs = sibling.get('lfs') if isinstance(sibling.get('lfs'), dict) else {}
+            size, digest, base = lfs.get('size'), lfs.get('sha256'), name.rsplit('/', 1)[-1]
+            reason = ('Part of a split set; split models are not supported.' if HF_SPLIT.search(name) else
+                      'Vision projector, not a language model.' if 'mmproj' in base.lower() else
+                      'Importance-matrix calibration data, not a language model.' if HF_IMATRIX.search(base) and not HF_QUANT.search(base) else
+                      'Multi-token prediction companion, not a standalone model.' if HF_MTP.match(base) else
+                      'Stored in a subfolder; not supported here.' if '/' in name else
+                      'Unsupported file name.' if not HF_FILE.fullmatch(name) or '..' in name else
+                      'Missing size or checksum metadata.' if type(size) is not int or size <= 0 or
+                      sibling.get('size', size) != size or not isinstance(digest, str) or
+                      not re.fullmatch(r'[0-9a-f]{64}', digest) else locked)
+            quant = HF_QUANT.search(base)
+            files.append({'name': name[:300], 'size': size if type(size) is int and size > 0 else None,
+                          'quant': quant.group(1).upper() if quant else '', 'selectable': not reason, 'reason': reason,
+                          'sha256': digest if not reason else None})
+            if len(files) >= 300:
+                break
+        return {'repo': info['id'], 'revision': info['sha'], 'gated': bool(info.get('gated')), 'files': files,
+                'truncated': len(files) >= 300}
+    result = hf_cached(f'files:{repo.lower()}', fetch, fresh)
+    # Installed state is local and changes after downloads, so it is checked on every request, not cached.
+    for file in result['files']:
+        file['installed'] = file['selectable'] and installed_file(result['repo'], file['name'], file['size'])
+    return result
+
+
 def download_preset(data, job):
-    model = next(m for m in read_json(CATALOG, {})['models'] if m['id'] == data['preset'])
+    download_verified(next(m for m in catalog_models() if m['id'] == data['preset']), job)
+
+
+# Re-resolve the chosen file from Hugging Face; the browser supplies only repository and file names.
+def download_hf(data, job):
+    progress(job, 'Checking the file on Hugging Face...')
+    info = hf_files(data['repo'], fresh=True)
+    file = next((f for f in info['files'] if f['name'] == data['file']), None)
+    if not file or not file['selectable']:
+        raise ValueError((file or {}).get('reason') or 'That file is not in the repository. Search again.')
+    download_verified({'name': file['name'], 'repo': info['repo'], 'revision': info['revision'], 'file': file['name'],
+                       'bytes': file['size'], 'sha256': file['sha256']}, job, check=True)
+
+
+def download_verified(model, job, check=False):
     command('daemon', 'up')
     if preset_installed(model):
-        progress(job, 'This preset is already installed.')
+        progress(job, f"{model['name']} is already installed.")
         return
-    folder = STATE / 'downloads'
-    folder.mkdir(exist_ok=True)
+    # Staging is keyed by the expected SHA-256, so equal file names from different repositories never share a partial.
+    folder = STATE / 'downloads' / model['sha256']
+    folder.mkdir(parents=True, exist_ok=True)
     target = folder / model['file']
     partial = target.with_suffix('.part')
+    legacy = STATE / 'downloads' / model['file']
+    if 'id' in model:
+        for old, new in ((legacy, target), (legacy.with_suffix('.part'), partial)):
+            if old.is_file() and not old.is_symlink() and not new.exists():
+                old.replace(new)
     # A file verified by an earlier attempt that failed to import is reused after re-verification.
     if target.exists():
         if target.stat().st_size == model['bytes'] and sha256(target, job, model['bytes']) == model['sha256']:
             partial.unlink(missing_ok=True)
-            import_preset(model, target, job)
+            import_preset(model, target, job, check)
             return
         target.unlink()
     offset = partial.stat().st_size if partial.exists() else 0
     if shutil.disk_usage(folder).free < model['bytes'] - offset + 1024**3:
         raise ValueError('Not enough disk space for this model plus 1 GB working space.')
-    url = f"https://huggingface.co/{model['repo']}/resolve/{model['revision']}/{model['file']}"
+    url = f"{HF}/{model['repo']}/resolve/{model['revision']}/{urllib.parse.quote(model['file'])}"
     if offset < model['bytes']:
         req = urllib.request.Request(url, headers={'Range': f'bytes={offset}-'} if offset else {})
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with hf_opener(cdn=True).open(req, timeout=60) as response:
             if offset and (response.status != 206 or not response.headers.get('Content-Range', '').startswith(f'bytes {offset}-')):
                 offset = 0
             with partial.open('ab' if offset else 'wb') as output:
@@ -384,10 +591,18 @@ def download_preset(data, job):
         partial.unlink(missing_ok=True)
         raise ValueError('Model checksum failed. Retry to download a clean copy.')
     partial.replace(target)
-    import_preset(model, target, job)
+    import_preset(model, target, job, check)
 
 
-def import_preset(model, target, job):
+def import_preset(model, target, job, check=False):
+    if check:
+        # A searched file passed its checksum; its metadata must still describe one whole language model.
+        try:
+            with target.open('rb', buffering=1024**2) as stream:
+                check_gguf(stream, model['bytes'], language=True)
+        except ValueError:
+            target.unlink(missing_ok=True)
+            raise
     job.pop('downloaded', None)
     job.pop('total', None)
     progress(job, 'Step 3 of 3: Importing verified model into LM Studio...', phase='import')
@@ -477,7 +692,7 @@ def open_import_source(letter, parts):
 
 # Read the GGUF header and metadata without loading tensors. Rejects other formats, malformed headers and
 # split sets, so the extension alone is never trusted.
-def check_gguf(stream, size):
+def check_gguf(stream, size, language=False):
     deadline, items = time.monotonic() + GGUF_SECONDS, 0
 
     def invalid(reason):
@@ -531,6 +746,7 @@ def check_gguf(stream, size):
         raise ValueError('This GGUF version is not supported. Use a current GGUF (version 2 or 3) file.')
     # Each entry needs at least a key length, one key byte and a type.
     jump(count * 13)
+    found = {b'general.architecture': None, b'general.type': None}
     for _ in range(count):
         tick()
         length = struct.unpack('<Q', take(8))[0]
@@ -538,7 +754,13 @@ def check_gguf(stream, size):
             raise invalid('a metadata key is too long')
         key = take(length)
         kind = struct.unpack('<I', take(4))[0]
-        if key != b'split.count':
+        if language and key in found and kind == GGUF_STRING:
+            length = struct.unpack('<Q', take(8))[0]
+            # Overlong values are skipped and recorded as unrecognised.
+            found[key] = take(length) if length <= 64 else b''
+            if length > 64:
+                stream.seek(jump(length))
+        elif key != b'split.count':
             skip(kind)
         elif kind != GGUF_UINT16:
             raise invalid('its split.count metadata has the wrong type')
@@ -546,6 +768,16 @@ def check_gguf(stream, size):
         elif struct.unpack('<H', take(2))[0] > 1:
             raise ValueError('This file is one part of a split GGUF model. Split models are not supported; '
                              'merge them into one .gguf file first.')
+    if language:
+        # Vision projectors use the clip architecture; imatrix data and adapters declare a non-model general.type.
+        # A file with no architecture at all cannot be loaded as a language model.
+        architecture, kind = found[b'general.architecture'], found[b'general.type']
+        if architecture == b'clip' or kind == b'mmproj':
+            raise ValueError('This file is a vision projector, not a language model.')
+        if kind == b'imatrix':
+            raise ValueError('This file is importance-matrix calibration data, not a language model.')
+        if kind not in {None, b'model'} or not architecture:
+            raise ValueError('This file is not a standalone language model.')
 
 
 # LM Studio's model folder, resolved as lms import does: the home named by ~/.lmstudio-home-pointer (lms writes it
@@ -728,6 +960,8 @@ def execute(data, job):
     elif action == 'download':
         if data.get('preset'):
             download_preset(data, job)
+        elif 'repo' in data:
+            download_hf(data, job)
         else:
             command('daemon', 'up')
             progress(job, 'Downloading custom model. LM Studio is selecting the requested file/quantization.')
@@ -853,7 +1087,16 @@ def main():
     if action == 'init':
         return {'ok': True}
     if action == 'catalog':
-        return read_json(CATALOG, {'models': []})
+        catalog = read_json(CATALOG, {'models': []})
+        for model in catalog.get('models', []) + catalog.get('recommended', []):
+            model['installed'] = installed_file(model['repo'], model['file'], model['bytes'])
+        return catalog
+    if action in {'search', 'files'}:
+        # Read-only lookups: no job lock, engine start or download.
+        data = json.loads(sys.stdin.read(4096) or '{}')
+        if not isinstance(data, dict):
+            raise ValueError('Invalid request.')
+        return hf_search(data) if action == 'search' else hf_files(data.get('repo'))
     if action == 'status':
         return status()
     if action == 'access':
@@ -896,6 +1139,8 @@ def main():
         job['model'] = data['model']
     if data['action'] == 'download' and data.get('preset'):
         job['preset'] = data['preset']
+    elif data['action'] == 'download' and 'repo' in data:
+        job.update(repo=data['repo'], file=data['file'])
     write_json(STATE / 'job.json', job)
     if os.fork():
         lock.close()
@@ -907,7 +1152,7 @@ def main():
             os.dup2(null.fileno(), fd)
     try:
         execute(data, job)
-        keep = data['action'] in {'test', 'import'} or (data['action'] == 'download' and data.get('preset'))
+        keep = data['action'] in {'test', 'import'} or (data['action'] == 'download' and (data.get('preset') or 'repo' in data))
         progress(job, job.get('message', 'Done') if keep else 'Done.', state='completed')
     except Exception as error:
         progress(job, str(error), state='failed')
