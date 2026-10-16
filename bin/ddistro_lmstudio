@@ -615,6 +615,9 @@ def download_verified(model, job, check=False):
     if entry:
         progress(job, f"{model['name']} is already installed.", **model_identity(entry))
         return
+    # An imported file that lms does not list yet must not be downloaded again; its import would also be refused.
+    if installed_file(model['repo'], model['file'], model['bytes']):
+        raise ValueError(f"{model['name']} is downloaded, but LM Studio has not listed it yet. Retry in a moment.")
     # Staging is keyed by the expected SHA-256, so equal file names from different repositories never share a partial.
     folder = STATE / 'downloads' / model['sha256']
     folder.mkdir(parents=True, exist_ok=True)
