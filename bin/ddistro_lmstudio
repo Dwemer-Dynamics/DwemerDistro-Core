@@ -58,6 +58,14 @@ HF_IMATRIX = re.compile(r'(?<![A-Za-z0-9])imatrix(?![A-Za-z0-9])', re.I)
 HF_MTP = re.compile(r'mtp[-_.]', re.I)
 HF_QUANT = re.compile(r'(?<![A-Za-z0-9])(I?Q\d_[A-Z0-9_]+?|TQ\d_\d|MXFP4|BF16|F16|F32)(?=[.-]|$)', re.I)
 HF_CACHE, HF_CACHE_SECONDS, HF_BUDGET = STATE / 'hf-cache.json', 600, 30
+# Browse filters map to fixed Hugging Face API values; HF parameter ranges include both ends.
+HF_SIZES = {'': None, '0-4': 'max:4B', '4-9': 'min:4B,max:9B', '9-15': 'min:9B,max:15B', '15-35': 'min:15B,max:35B',
+            '35-': 'min:35B'}
+HF_TASKS = {'': None, 'text-generation': 'text-generation', 'image-text-to-text': 'image-text-to-text'}
+HF_SORTS = {'trending': 'trendingScore', 'downloads': 'downloads', 'likes': 'likes', 'updated': 'lastModified',
+            'newest': 'createdAt'}
+HF_CURSOR = re.compile(r'[A-Za-z0-9+/=_-]{1,1500}', re.A)
+HF_PAGE = 20
 os.umask(0o077)
 
 
@@ -393,12 +401,14 @@ def hf_opener(cdn=False):
     return urllib.request.build_opener(HFRedirects(cdn))
 
 
-def hf_get(path, query, limit):
+# With pages=True, also return the next-page cursor from a Link header that points back at the same endpoint.
+def hf_get(path, query, limit, pages=False):
     req = urllib.request.Request(HF + path + '?' + urllib.parse.urlencode(query),
                                  headers={'Accept': 'application/json', 'User-Agent': 'DwemerDistro-LMStudio'})
     body, deadline = b'', time.monotonic() + 20
     try:
         with hf_opener().open(req, timeout=10) as response:
+            link = response.headers.get('Link', '') if pages else ''
             while chunk := response.read(65536):
                 body += chunk
                 if len(body) > limit:
@@ -406,6 +416,8 @@ def hf_get(path, query, limit):
                 if time.monotonic() > deadline:
                     raise ValueError('Hugging Face took too long to respond. Retry later.')
     except urllib.error.HTTPError as error:
+        if error.code == 400 and pages:
+            raise ValueError('Hugging Face rejected these results. Search again.')
         if error.code in {401, 403, 404}:
             raise ValueError('Repository not found, private, or not available without signing in.')
         if error.code == 429:
@@ -416,9 +428,19 @@ def hf_get(path, query, limit):
     except OSError:
         raise ValueError('Could not reach Hugging Face. Check the internet connection and retry.')
     try:
-        return json.loads(body)
+        value = json.loads(body)
     except ValueError:
         raise ValueError('Hugging Face returned an unreadable response.')
+    if not pages:
+        return value
+    cursor, found = None, re.search(r'<([^<>]{1,4096})>\s*;\s*rel="next"', link)
+    if found:
+        url = urllib.parse.urlsplit(found.group(1))
+        values = urllib.parse.parse_qs(url.query).get('cursor', [])
+        if url.scheme == 'https' and url.hostname == 'huggingface.co' and url.path == path and len(values) == 1 and \
+                HF_CURSOR.fullmatch(values[0]):
+            cursor = values[0]
+    return value, cursor
 
 
 # One shared cache and per-minute request budget for every browser session; errors are never cached.
@@ -463,27 +485,60 @@ def hf_count(value):
     return value if type(value) is int and value >= 0 else 0
 
 
+def hf_choice(data, key, choices, default=''):
+    value = data.get(key, default)
+    if not isinstance(value, str) or value not in choices:
+        raise ValueError('Invalid search filter. Reset filters and retry.')
+    return value
+
+
+# Metadata Hugging Face read from a repository's GGUF header, when it has one. The rest of that object, including
+# chat templates, is dropped here and never cached or returned.
+def hf_gguf(item):
+    info = item.get('gguf') if isinstance(item.get('gguf'), dict) else {}
+    params, arch, context = info.get('total'), info.get('architecture'), info.get('context_length')
+    return {'params': params if type(params) is int and 0 < params < 10**13 else None,
+            'architecture': arch if isinstance(arch, str) and re.fullmatch(r'[\w.-]{1,40}', arch, re.A) else None,
+            'context': context if type(context) is int and 0 < context <= 2**24 else None}
+
+
+# Browse or search public GGUF repositories, one bounded page at a time. The browser returns only the opaque cursor
+# from the previous page; the endpoint, host and every other parameter are rebuilt here from allowlists.
 def hf_search(data):
-    query, page = data.get('query'), data.get('page', 1)
-    if not isinstance(query, str) or not re.fullmatch(r'[\w .+/-]{2,80}', query.strip(), re.A):
+    query, author, cursor = data.get('query', ''), data.get('author', ''), data.get('cursor')
+    if not isinstance(query, str) or (query.strip() and not re.fullmatch(r'[\w .+/-]{2,80}', query.strip(), re.A)):
         raise ValueError('Search with 2–80 letters, numbers, spaces, dots, hyphens or slashes, or paste a '
                          'https://huggingface.co/ repository URL.')
-    if type(page) is not int or not 1 <= page <= 5:
-        raise ValueError('Invalid results page.')
-    query, limit = ' '.join(query.split()), 20 * page
+    if not isinstance(author, str) or (author.strip() and
+                                       not re.fullmatch(r'[A-Za-z0-9][\w.-]{0,95}', author.strip(), re.A)):
+        raise ValueError('Creator must be a Hugging Face user or organisation name, such as bartowski.')
+    if cursor is not None and (not isinstance(cursor, str) or not HF_CURSOR.fullmatch(cursor)):
+        raise ValueError('Invalid results page. Search again.')
+    size, task = hf_choice(data, 'size', HF_SIZES), hf_choice(data, 'task', HF_TASKS)
+    sort = hf_choice(data, 'sort', HF_SORTS, 'trending')
+    query, author = ' '.join(query.split()), author.strip()
+    params = [('filter', 'gguf'), ('gated', 'false'), ('sort', HF_SORTS[sort]), ('direction', '-1'), ('limit', HF_PAGE)]
+    for key, value in (('search', query), ('author', author), ('num_parameters', HF_SIZES[size]),
+                       ('pipeline_tag', HF_TASKS[task]), ('cursor', cursor)):
+        if value:
+            params.append((key, value))
+    params += [('expand[]', key) for key in ('gated', 'downloads', 'likes', 'lastModified', 'private', 'pipeline_tag', 'gguf')]
 
     def fetch():
-        found = hf_get('/api/models', [('search', query), ('filter', 'gguf'), ('sort', 'downloads'), ('direction', '-1'),
-                                       ('limit', limit)] + [('expand[]', key) for key in
-                                       ('gated', 'downloads', 'likes', 'lastModified', 'private')], 1024**2)
+        # GGUF headers include chat templates that HF cannot leave out, so a page of 20 may reach a few hundred KB.
+        found, after = hf_get('/api/models', params, 4 * 1024**2, pages=True)
         if not isinstance(found, list):
             raise ValueError('Hugging Face returned an unreadable response.')
         results = [{'id': item['id'], 'downloads': hf_count(item.get('downloads')), 'likes': hf_count(item.get('likes')),
-                    'gated': bool(item.get('gated')), 'updated': str(item.get('lastModified') or '')[:10]}
-                   for item in found[:limit] if isinstance(item, dict) and isinstance(item.get('id'), str)
+                    'gated': bool(item.get('gated')), 'updated': str(item.get('lastModified') or '')[:10],
+                    'task': item['pipeline_tag'] if isinstance(item.get('pipeline_tag'), str) and
+                    re.fullmatch(r'[a-z-]{1,40}', item['pipeline_tag']) else None, **hf_gguf(item)}
+                   for item in found[:HF_PAGE] if isinstance(item, dict) and isinstance(item.get('id'), str)
                    and HF_REPO.fullmatch(item['id']) and not item.get('private')]
-        return {'query': query, 'page': page, 'results': results, 'more': len(found) >= limit and page < 5}
-    return hf_cached(f'search:{query.lower()}:{page}', fetch)
+        return {'query': query, 'author': author, 'size': size, 'task': task, 'sort': sort, 'results': results,
+                'cursor': after if len(found) >= HF_PAGE else None}
+    key = json.dumps(['search', query.lower(), author, size, task, sort, cursor])
+    return hf_cached(key, fetch)
 
 
 # List GGUF files with the reason any of them cannot be downloaded as one standalone language model.
