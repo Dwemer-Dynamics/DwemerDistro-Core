@@ -28,6 +28,8 @@ CATALOG = Path('/etc/dwemerdistro-lmstudio.json')
 MUTATIONS = {'start', 'stop', 'restart', 'settings', 'download', 'import', 'load', 'unload', 'test', 'model-defaults', 'test-preset'}
 IMPORTS = STATE / 'imports'
 IMPORT_TARGET = STATE / 'import-target.json'
+# Distinct language models that may stay loaded together, such as a dialogue model and a smaller decision model.
+MAX_LOADED = 2
 # Byte sizes of fixed-width GGUF metadata value types (enum gguf_type in ggml's gguf.h).
 GGUF_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 GGUF_UINT16, GGUF_STRING, GGUF_ARRAY = 2, 8, 9
@@ -131,7 +133,7 @@ def resources():
 
 
 def model_changed():
-    # Tests and load reports describe one loaded instance; any load or unload turns them into history.
+    # Instance ids can repeat after a reload, so any load or unload turns every test and load report into history.
     for name in ('last-test.json', 'last-load.json'):
         (STATE / name).unlink(missing_ok=True)
     previous = read_json(STATE / 'model-state.json', {}).get('changedAt', 0)
@@ -152,6 +154,21 @@ def memlock_limit():
 
 def status():
     models, running = [], False
+    # Keep the stopped manager useful without waking the engine or treating cached models as loaded.
+    try:
+        inventory_cache = read_json(STATE / 'model-inventory.json', {})
+        if not isinstance(inventory_cache, dict):
+            inventory_cache = {}
+    except (OSError, ValueError):
+        inventory_cache = {}
+    inventory = inventory_cache.get('models', [])
+    if not isinstance(inventory, list) or any(not isinstance(model, dict) for model in inventory):
+        inventory = []
+    inventory = [{key: value for key, value in model.items() if key != 'loaded_instances'}
+                 for model in inventory if model.get('type') == 'llm']
+    inventory_updated = inventory_cache.get('updatedAt')
+    if not isinstance(inventory_updated, (int, float)) or not math.isfinite(inventory_updated):
+        inventory_updated = None
     changed = read_json(STATE / 'model-state.json', {}).get('changedAt')
     try:
         with request('/api/v1/models') as response:
@@ -159,12 +176,20 @@ def status():
             running = True
     except (OSError, ValueError, KeyError):
         pass
+    if running:
+        inventory = [{key: value for key, value in model.items() if key != 'loaded_instances'}
+                     for model in models if model.get('type') == 'llm']
     keys = {m.get('key') for m in models if m.get('loaded_instances')}
     instances = {i.get('id') for m in models for i in m.get('loaded_instances') or []}
     # A killed worker must not leave the UI waiting forever after a distro restart.
     with (STATE / 'job.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Status callers share the job lock so they cannot race the atomic cache replacement.
+            if running and (inventory != inventory_cache.get('models') or
+                            inventory_updated is None or time.time() - inventory_updated >= 300):
+                inventory_updated = time.time()
+                write_json(STATE / 'model-inventory.json', {'models': inventory, 'updatedAt': inventory_updated})
             job = read_json(STATE / 'job.json', {})
             if job.get('state') == 'running':
                 message = 'Operation interrupted. Check the model state and retry.'
@@ -188,11 +213,13 @@ def status():
             job = read_json(STATE / 'job.json', {})
     last_test, last_load = read_json(STATE / 'last-test.json', {}), read_json(STATE / 'last-load.json', {})
     result = {'installed': LMS.is_file(), 'running': running, 'models': models, 'job': job,
+              'inventory': inventory, 'inventoryUpdatedAt': inventory_updated,
+              'inventoryCached': not running and bool(inventory),
               'endpoint': API + '/v1', 'chatUrl': API + '/v1/chat/completions',
               'settings': read_json(STATE / 'settings.json', {'autostart': False}),
               'modelDefaults': read_json(STATE / 'model-defaults.json', {}),
               'testPresets': read_json(STATE / 'test-presets.json', {}),
-              'advancedAvailable': Path(SDK_PYTHON).is_file(),
+              'advancedAvailable': Path(SDK_PYTHON).is_file(), 'maxLoaded': MAX_LOADED,
               'lastTest': last_test if last_test.get('model') in instances else {},
               'lastLoad': last_load if last_load.get('model') in keys else {},
               'memoryLockLimit': memlock_limit(), 'resources': resources()}
@@ -713,13 +740,17 @@ def execute(data, job):
         model = next((m for m in models if m['key'] == data['model'] and m['type'] == 'llm'), None)
         if not model:
             raise ValueError('Choose an installed language model. Start the API first.')
+        if model.get('loaded_instances'):
+            raise ValueError('This model is already loaded. Unload it before loading it again.')
+        if sum(len(m.get('loaded_instances') or []) for m in models) >= MAX_LOADED:
+            raise ValueError(f'At most {MAX_LOADED} models can be loaded at once. Unload one before loading another.')
         available = resources()
-        # Leave space for the desktop and KV cache. LM Studio also applies its own load guardrails.
+        # Free memory already excludes loaded models. Leave space for the desktop and KV cache; LM Studio also
+        # applies its own load guardrails.
         budget = available['ramAvailable'] + (available['vramFree'] if data.get('gpu', 100) else 0) - 2 * 1024**3
         if model['size_bytes'] > budget:
-            raise ValueError('Insufficient available RAM/VRAM for this model plus 2 GB headroom. Choose a smaller model or free memory.')
-        if any(m.get('loaded_instances') for m in models):
-            raise ValueError('Unload the current model before loading another. This avoids unexpected memory pressure.')
+            raise ValueError('Insufficient available RAM/VRAM for this model plus 2 GB headroom. Choose a smaller model, '
+                             'unload another model or free memory.')
         advanced = data.get('advanced', {})
         if advanced:
             if not Path(SDK_PYTHON).is_file():
@@ -860,6 +891,9 @@ def main():
     except BlockingIOError:
         raise ValueError('Another operation is running. Wait for it to finish.')
     job = {'id': secrets.token_hex(8), 'action': data['action'], 'state': 'running', 'message': 'Starting...', 'updated': time.time()}
+    # With two models loaded, a running job names its target so another model's view never shows its output.
+    if data['action'] in {'load', 'unload', 'test'}:
+        job['model'] = data['model']
     if data['action'] == 'download' and data.get('preset'):
         job['preset'] = data['preset']
     write_json(STATE / 'job.json', job)
