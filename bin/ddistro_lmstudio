@@ -362,9 +362,19 @@ def sha256(path, job, size):
     return digest.hexdigest()
 
 
-def preset_installed(model):
+def installed_entry(model):
     installed = json.loads(command('ls', '--json'))
-    return any(m.get('path') == model['repo'] + '/' + model['file'] and m.get('sizeBytes') == model['bytes'] for m in installed)
+    return next((m for m in installed if m.get('path') == model['repo'] + '/' + model['file'] and
+                 m.get('sizeBytes') == model['bytes']), None)
+
+
+# The manager selects a finished download only by the key lms lists for that exact file. A key grouping several
+# variants may load a different file, so it is not reported and the user chooses the model in the list instead.
+def model_identity(entry):
+    key = (entry or {}).get('modelKey')
+    if entry and entry.get('type', 'llm') == 'llm' and isinstance(key, str) and key and len(entry.get('variants') or []) <= 1:
+        return {'modelKey': key}
+    return {}
 
 
 # Presets keep their original list for Quickstart; recommended community candidates live beside it.
@@ -601,8 +611,9 @@ def download_hf(data, job):
 
 def download_verified(model, job, check=False):
     command('daemon', 'up')
-    if preset_installed(model):
-        progress(job, f"{model['name']} is already installed.")
+    entry = installed_entry(model)
+    if entry:
+        progress(job, f"{model['name']} is already installed.", **model_identity(entry))
         return
     # Staging is keyed by the expected SHA-256, so equal file names from different repositories never share a partial.
     folder = STATE / 'downloads' / model['sha256']
@@ -670,8 +681,9 @@ def import_preset(model, target, job, check=False):
     if target.stat().st_nlink < 2:
         raise ValueError('Import reported success but no model link was created. The verified download is kept; retry to import it.')
     target.unlink()
-    if preset_installed(model):
-        progress(job, f"{model['name']} is installed.")
+    entry = installed_entry(model)
+    if entry:
+        progress(job, f"{model['name']} is installed.", **model_identity(entry))
     else:
         # LM Studio indexes imports asynchronously; the hard link above already proves the import.
         progress(job, f"{model['name']} was imported. LM Studio may take a moment to list it.")
@@ -970,8 +982,13 @@ def import_local(data, job):
         if not registered:
             raise ValueError('LM Studio did not register the model. Your original file is unchanged; retry the import.')
         IMPORT_TARGET.unlink()
+        # The model is registered; a failed listing only leaves the user to choose it in the list.
+        try:
+            identity = model_identity(installed_entry({'repo': repo, 'file': name, 'bytes': size}))
+        except (OSError, ValueError):
+            identity = {}
         progress(job, f'{name} was imported as {repo}. Start the server and load it from Installed; '
-                      'LM Studio may take a moment to list it.')
+                      'LM Studio may take a moment to list it.', **identity)
     except Exception as error:
         retained = clear_imports()
         if retained:
