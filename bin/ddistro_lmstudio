@@ -685,7 +685,17 @@ def import_preset(model, target, job, check=False):
     if target.stat().st_nlink < 2:
         raise ValueError('Import reported success but no model link was created. The verified download is kept; retry to import it.')
     target.unlink()
+    # LM Studio indexes imports asynchronously, so give it a short, bounded time to list the exact file.
     entry = installed_entry(model)
+    deadline = time.monotonic() + 10
+    if not entry:
+        progress(job, 'Waiting for LM Studio to list the model...')
+    while not entry and time.monotonic() < deadline:
+        time.sleep(0.5)
+        try:
+            entry = installed_entry(model)
+        except ValueError:
+            pass
     if entry:
         progress(job, f"{model['name']} is installed.", **model_identity(entry))
     else:
