@@ -308,9 +308,10 @@ def validate(data):
         number(data, 'gpu', 0, 100, 100)
         configuration(data.get('advanced', {}), 'load')
     if action == 'settings':
-        startup = data.get('startupModel', '')
-        if not isinstance(startup, str) or len(startup) > 512 or startup.startswith('-') or '\x00' in startup:
-            raise ValueError('Invalid startup model.')
+        for key in ('startupModel', 'startupDecisionModel'):
+            startup = data.get(key, '')
+            if not isinstance(startup, str) or len(startup) > 512 or startup.startswith('-') or '\x00' in startup:
+                raise ValueError('Invalid startup model.')
     if action == 'test-preset':
         if not isinstance(data.get('name'), str) or not re.fullmatch(r'[\w .-]{1,60}', data['name']):
             raise ValueError('Preset name must be 1–60 letters, numbers, spaces, dots or hyphens.')
@@ -377,10 +378,10 @@ def model_identity(entry):
     return {}
 
 
-# Presets keep their original list for Quickstart; recommended community candidates live beside it.
+# Presets keep their original list for Quickstart; recommended dialogue and decision candidates live beside it.
 def catalog_models():
     catalog = read_json(CATALOG, {})
-    return catalog.get('models', []) + catalog.get('recommended', [])
+    return catalog.get('models', []) + catalog.get('recommended', []) + catalog.get('decisionRecommended', [])
 
 
 # Exact identity only: the file lms import creates for this repository and name, with the pinned byte count.
@@ -1013,8 +1014,10 @@ def execute(data, job):
     elif action == 'settings':
         settings = read_json(STATE / 'settings.json', {})
         settings.update(autostart=data['autostart'])
-        if 'startupModel' in data:
-            settings['startupModel'] = data['startupModel']
+        # Each startup model changes only when sent, so a save naming only the dialogue model keeps the decision model.
+        for key in ('startupModel', 'startupDecisionModel'):
+            if key in data:
+                settings[key] = data[key]
         write_json(STATE / 'settings.json', settings)
     elif action == 'model-defaults':
         defaults = read_json(STATE / 'model-defaults.json', {})
@@ -1156,6 +1159,28 @@ with lmstudio.Client("127.0.0.1:1234") as client:
         progress(job, message, **{key: value for key, value in result.items() if key != 'updated'})
 
 
+# Returns once the job has ended and released the job lock. A failed, interrupted or replaced job raises.
+def wait_for_job(job_id):
+    # A load runs lms or the SDK for at most 300 seconds; the rest covers memory checks and bookkeeping.
+    deadline = time.monotonic() + 360
+    with (STATE / 'job.lock').open('a') as lock:
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise ValueError('The startup model load did not finish within 360 seconds.')
+                time.sleep(1)
+        job = read_json(STATE / 'job.json', {})
+    if job.get('id') != job_id:
+        raise ValueError('Another operation replaced the startup model load.')
+    if job.get('state') == 'failed':
+        raise ValueError(job.get('message') or 'The startup model load failed.')
+    if job.get('state') != 'completed':
+        raise ValueError('The startup model load was interrupted.')
+
+
 def main():
     initialize()
     action = sys.argv[1] if len(sys.argv) == 2 else ''
@@ -1163,7 +1188,7 @@ def main():
         return {'ok': True}
     if action == 'catalog':
         catalog = read_json(CATALOG, {'models': []})
-        for model in catalog.get('models', []) + catalog.get('recommended', []):
+        for model in catalog.get('models', []) + catalog.get('recommended', []) + catalog.get('decisionRecommended', []):
             model['installed'] = installed_file(model['repo'], model['file'], model['bytes'])
         return catalog
     if action in {'search', 'files'}:
@@ -1185,14 +1210,22 @@ def main():
         settings = read_json(STATE / 'settings.json', {})
         if settings.get('autostart') and LMS.is_file():
             start()
-            if settings.get('startupModel'):
-                model = settings['startupModel']
+            # The dialogue model first, then the optional decision model. Each exact key loads once, and a key that is
+            # already loaded is skipped, so running startup again changes nothing.
+            keys = [settings.get(key) for key in ('startupModel', 'startupDecisionModel')]
+            with request('/api/v1/models', timeout=10) as response:
+                loaded = {m.get('key') for m in json.load(response)['models'] if m.get('loaded_instances')}
+            keys = [model for model in dict.fromkeys(keys) if isinstance(model, str) and model and model not in loaded]
+            for model in keys:
                 defaults = read_json(STATE / 'model-defaults.json', {}).get(model, {})
                 # Use the same job lock and validation as manual loads.
                 result = subprocess.run([sys.executable, __file__, 'submit'], input=json.dumps(
                     {**defaults, 'action': 'load', 'model': model}), capture_output=True, text=True, timeout=10)
                 if result.returncode:
                     raise ValueError(result.stdout)
+                # Every load, the last too, must end before startup reports success: the next load needs the job lock and
+                # is checked against the memory this one leaves, and a failed load must not look like a ready startup.
+                wait_for_job(json.loads(result.stdout)['id'])
         return {'ok': True}
     if action == 'shutdown':
         if LMS.is_file():
