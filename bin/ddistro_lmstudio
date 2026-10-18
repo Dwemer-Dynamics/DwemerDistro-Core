@@ -13,6 +13,7 @@ import re
 import secrets
 import selectors
 import shutil
+import signal
 import stat
 import struct
 import subprocess
@@ -27,6 +28,11 @@ STATE = HOME / '.config/dwemerdistro/lmstudio'
 LMS = HOME / '.lmstudio/bin/lms'
 API = 'http://127.0.0.1:1234'
 CATALOG = Path('/etc/dwemerdistro-lmstudio.json')
+# Engine processes are this user's processes running an executable from LM Studio's install folders (the llmster
+# versions, the lms CLI and backend runtimes), and their descendants; user files elsewhere in ~/.lmstudio never match.
+ENGINE = HOME / '.lmstudio'
+ENGINE_DIRS = ('llmster', 'bin', 'extensions/backends')
+HELPER = Path(__file__).resolve()
 MUTATIONS = {'start', 'stop', 'restart', 'settings', 'download', 'import', 'load', 'unload', 'test', 'model-defaults', 'test-preset'}
 IMPORTS = STATE / 'imports'
 IMPORT_TARGET = STATE / 'import-target.json'
@@ -367,6 +373,198 @@ def validate(data):
             raise ValueError('Invalid reasoning setting.')
         if not isinstance(data.get('prompt'), str) or not 1 <= len(data['prompt']) <= 4000:
             raise ValueError('Enter a prompt up to 4000 characters.')
+
+
+# Keys LM Studio lists now, or listed at its last check while it is stopped.
+def known_models():
+    try:
+        with request('/api/v1/models') as response:
+            models = json.load(response)['models']
+    except (OSError, ValueError, KeyError):
+        try:
+            models = read_json(STATE / 'model-inventory.json', {}).get('models', [])
+        except (OSError, ValueError, AttributeError):
+            models = []
+    return {m.get('key') for m in models if isinstance(m, dict) and m.get('type') == 'llm'} if isinstance(models, list) else set()
+
+
+def proc_stat(pid):
+    # (state, parent, session, start time in clock ticks, real uid), or None once the process is gone.
+    try:
+        text = Path(f'/proc/{pid}/stat').read_text()
+        uid = int(re.search(r'^Uid:\s+(\d+)', Path(f'/proc/{pid}/status').read_text(), re.M).group(1))
+    except (OSError, AttributeError, ValueError):
+        return None
+    fields = text[text.rindex(')') + 2:].split()
+    return fields[0], int(fields[1]), int(fields[3]), int(fields[19]), uid
+
+
+def own_processes():
+    table = {}
+    for proc in Path('/proc').iterdir():
+        info = proc_stat(proc.name) if proc.name.isdigit() else None
+        if info and info[4] == os.getuid() and info[0] not in 'ZX':
+            table[int(proc.name)] = info
+    return table
+
+
+def helper_process(pid, commands):
+    try:
+        args = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')[:-1]
+        return (len(args) == 3 and b'python' in os.path.basename(args[0]) and args[2].decode() in commands and
+                Path(os.fsdecode(args[1])).resolve() == HELPER)
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def engine_process(pid):
+    try:
+        exe = Path(os.readlink(f'/proc/{pid}/exe').removesuffix(' (deleted)'))
+    except OSError:
+        return False
+    return any(exe.is_relative_to((ENGINE / folder).resolve()) for folder in ENGINE_DIRS)
+
+
+# New jobs and startup drivers hold this shared barrier only while they are admitted (until a worker records its pid),
+# so a running force stop refuses them without ever waiting behind a running or hung job.
+def admit():
+    gate = (STATE / 'admit.lock').open('a')
+    try:
+        fcntl.flock(gate, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        gate.close()
+        raise ValueError('A force stop is running. Try again in a moment.')
+    return gate
+
+
+# A pidfd pins the process, and its unchanged start time proves the pid was not reused since it was identified.
+def send(pid, start, sig):
+    try:
+        handle = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return False
+    try:
+        info = proc_stat(pid)
+        if not info or info[3] != start or info[0] in 'ZX':
+            return False
+        signal.pidfd_send_signal(handle, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    finally:
+        os.close(handle)
+
+
+def survivors(targets, seconds):
+    deadline = time.monotonic() + seconds
+    while True:
+        alive = {pid: start for pid, start in targets.items()
+                 if (info := proc_stat(pid)) and info[3] == start and info[0] not in 'ZX'}
+        if not alive or time.monotonic() > deadline:
+            return alive
+        time.sleep(.1)
+
+
+# Emergency recovery that never queues behind the job lock. It freezes the recorded job worker, a running autostart or
+# start-saved helper and their descendants so none can restart the engine, ends this user's LM Studio engine processes,
+# then ends the frozen ones and reconciles the job record under the lock. Settings, defaults and models are kept.
+def force_stop():
+    with (STATE / 'force.lock').open('a') as guard:
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('A force stop is already running.')
+        gate, deadline = (STATE / 'admit.lock').open('a'), time.monotonic() + 3
+        while True:
+            try:
+                fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    gate.close()
+                    raise ValueError('An operation is starting. Try Force stop again in a moment.')
+                time.sleep(.05)
+        job, deadline = read_json(STATE / 'job.json', {}), time.monotonic() + 3
+        # A worker records itself right after it starts.
+        while job.get('state') == 'running' and 'pid' not in job and time.monotonic() < deadline:
+            time.sleep(.1)
+            job = read_json(STATE / 'job.json', {})
+        table, ancestors, pid = own_processes(), set(), os.getpid()
+        while pid > 1 and pid not in ancestors:
+            ancestors.add(pid)
+            pid = (proc_stat(pid) or (0, 0))[1]
+        roots = {pid: info[3] for pid, info in table.items()
+                 if pid not in ancestors and helper_process(pid, {'autostart', 'start-saved'})}
+        worker = job.get('pid')
+        if (job.get('state') == 'running' and isinstance(worker, int) and worker in table and worker not in ancestors and
+                table[worker][3] == job.get('pidStart') and helper_process(worker, {'submit'})):
+            roots[worker] = table[worker][3]
+        frozen, tried = {}, set()
+        for _ in range(5):
+            # The worker leads its own session, so processes it started stay found after their parent exits.
+            table = own_processes()
+            sessions = {pid for pid in roots if pid in table and table[pid][2] == pid}
+            tree, grown = {pid: start for pid, start in roots.items() if pid in table}, True
+            while grown:
+                grown = False
+                for pid, info in table.items():
+                    if pid not in tree and pid not in ancestors and (info[1] in tree or info[2] in sessions):
+                        tree[pid], grown = info[3], True
+            new = {pid: start for pid, start in tree.items() if pid not in tried}
+            if not new:
+                break
+            for pid, start in new.items():
+                tried.add(pid)
+                if send(pid, start, signal.SIGSTOP):
+                    frozen[pid] = start
+        table = own_processes()
+        engine, grown = {pid: info[3] for pid, info in table.items()
+                         if pid not in ancestors and pid not in frozen and engine_process(pid)}, True
+        while grown:
+            grown = False
+            for pid, info in table.items():
+                if pid not in engine and pid not in ancestors and pid not in frozen and info[1] in engine:
+                    engine[pid], grown = info[3], True
+        for pid, start in engine.items():
+            send(pid, start, signal.SIGTERM)
+        for pid, start in {**survivors(engine, 5), **frozen}.items():
+            send(pid, start, signal.SIGKILL)
+        left = survivors({**engine, **frozen}, 5)
+        with (STATE / 'job.lock').open('a') as lock:
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() > deadline:
+                        raise ValueError('LM Studio processes were stopped, but another operation still holds the job '
+                                         'lock. Check again in a moment, or restart Dwemer Distro.')
+                    time.sleep(.2)
+            # Only the job that was running when the force stop began is closed; a newer record is left as it is.
+            latest = read_json(STATE / 'job.json', {})
+            if latest.get('id') == job.get('id') and latest.get('state') == 'running':
+                message = 'Force stopped. The operation was interrupted; check the model state and retry.'
+                if latest.get('action') == 'import':
+                    retained = clear_imports()
+                    message = 'Force stopped. Import staging was cleared and your original file is unchanged.' + (
+                        f' A registration file was preserved at {retained}. Check it before retrying.' if retained else '')
+                progress(latest, message, state='failed')
+            try:
+                request('/api/v1/models', timeout=1).close()
+                reachable = True
+            except OSError:
+                reachable = False
+                SLOTS.unlink(missing_ok=True)
+            model_changed()
+        gate.close()
+    if reachable:
+        raise ValueError(f'LM Studio still answers at {API} after Force stop. It may run outside Dwemer Distro; close it '
+                         'there, or restart Dwemer Distro.')
+    if left:
+        raise ValueError(f'{len(left)} LM Studio process(es) did not stop. Restart Dwemer Distro to recover.')
+    return {'ok': True, 'stopped': len(engine) + len(frozen),
+            'interrupted': job.get('action') if job.get('state') == 'running' else None}
 
 
 def start():
@@ -1053,9 +1251,14 @@ def execute(data, job):
         settings = read_json(STATE / 'settings.json', {})
         settings.update(autostart=data['autostart'])
         # Each startup model changes only when sent, so a save naming only the dialogue model keeps the decision model.
+        # Saving never loads or unloads a model.
         for key in ('startupModel', 'startupDecisionModel'):
             if key in data:
+                if data[key] and data[key] != settings.get(key) and data[key] not in known_models():
+                    raise ValueError('Choose an installed language model. Start LM Studio once if the list is empty.')
                 settings[key] = data[key]
+        if settings.get('startupDecisionModel') and settings.get('startupDecisionModel') == settings.get('startupModel'):
+            raise ValueError('Choose a different decision model, or None.')
         write_json(STATE / 'settings.json', settings)
     elif action == 'model-defaults':
         defaults = read_json(STATE / 'model-defaults.json', {})
@@ -1260,9 +1463,13 @@ def main():
     if action == 'authorize':
         data = json.loads(sys.stdin.read(16384))
         return {'authorized': hmac.compare_digest(str(data.get('token', '')), (STATE / 'access').read_text())}
-    if action == 'autostart':
+    if action == 'force-stop':
+        return force_stop()
+    if action in {'autostart', 'start-saved'}:
         settings = read_json(STATE / 'settings.json', {})
-        if settings.get('autostart') and LMS.is_file():
+        # Autostart follows the saved toggle; start-saved is an explicit Start that loads the same saved models.
+        if action == 'start-saved' or (settings.get('autostart') and LMS.is_file()):
+            admit().close()
             start()
             # The dialogue model first, then the optional decision model. Each exact key loads once, and a key that is
             # already loaded is skipped, so running startup again changes nothing.
@@ -1291,10 +1498,11 @@ def main():
         raise ValueError('Unknown command.')
     data = json.loads(sys.stdin.read(16384))
     validate(data)
-    lock = (STATE / 'job.lock').open('a')
+    gate, lock = admit(), (STATE / 'job.lock').open('a')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        gate.close()
         raise ValueError('Another operation is running. Wait for it to finish.')
     job = {'id': secrets.token_hex(8), 'action': data['action'], 'state': 'running', 'message': 'Starting...', 'updated': time.time()}
     # With two models loaded, a running job names its target so another model's view never shows its output.
@@ -1307,9 +1515,14 @@ def main():
     write_json(STATE / 'job.json', job)
     if os.fork():
         lock.close()
+        gate.close()
         return job
     # Keep the inherited lock for the complete job; close the web/launcher pipes before returning.
     os.setsid()
+    # Force stop identifies this worker by its pid and start time.
+    job.update(pid=os.getpid(), pidStart=proc_stat(os.getpid())[3])
+    write_json(STATE / 'job.json', job)
+    gate.close()
     with open(os.devnull, 'r+') as null:
         for fd in (0, 1, 2):
             os.dup2(null.fileno(), fd)
