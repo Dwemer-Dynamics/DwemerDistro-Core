@@ -32,6 +32,9 @@ IMPORTS = STATE / 'imports'
 IMPORT_TARGET = STATE / 'import-target.json'
 # Distinct language models that may stay loaded together, such as a dialogue model and a smaller decision model.
 MAX_LOADED = 2
+# Numbered slots (1..MAX_LOADED) map to exact loaded model keys and persist across polls and page reloads. They only
+# organise loading here; inference clients still choose a model by its id.
+SLOTS = STATE / 'slots.json'
 # Byte sizes of fixed-width GGUF metadata value types (enum gguf_type in ggml's gguf.h).
 GGUF_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 GGUF_UINT16, GGUF_STRING, GGUF_ARRAY = 2, 8, 9
@@ -161,6 +164,23 @@ def model_changed():
     write_json(STATE / 'model-state.json', {'changedAt': max(time.time(), previous + .001)})
 
 
+def slot_map(models):
+    # Saved slots keep loaded models; a loaded model without one (an older helper, lms or the desktop app) takes the
+    # lowest free slot. A model that is no longer loaded frees its slot.
+    loaded = [m.get('key') for m in models if m.get('loaded_instances') and m.get('type') == 'llm']
+    saved, slots = read_json(SLOTS, {}), {}
+    saved = saved if isinstance(saved, dict) else {}
+    for number in range(1, MAX_LOADED + 1):
+        key = saved.get(str(number))
+        if key in loaded and key not in slots.values():
+            slots[str(number)] = key
+    for key in loaded:
+        free = next((str(n) for n in range(1, MAX_LOADED + 1) if str(n) not in slots), None)
+        if key not in slots.values() and free:
+            slots[free] = key
+    return slots
+
+
 def memlock_limit():
     # The engine's soft RLIMIT_MEMLOCK in bytes; None when unlimited or the engine is not running.
     for proc in Path('/proc').iterdir():
@@ -230,6 +250,10 @@ def status():
             gone = (tested is not None and tested not in instances) or (loaded is not None and loaded not in keys)
             if running and gone and changed == read_json(STATE / 'model-state.json', {}).get('changedAt'):
                 model_changed()
+            # Same guard: a job that loaded or unloaded after the list above was read keeps its own slot record.
+            if running and changed == read_json(STATE / 'model-state.json', {}).get('changedAt'):
+                if slot_map(models) != read_json(SLOTS, {}):
+                    write_json(SLOTS, slot_map(models))
         except BlockingIOError:
             job = read_json(STATE / 'job.json', {})
     last_test, last_load = read_json(STATE / 'last-test.json', {}), read_json(STATE / 'last-load.json', {})
@@ -241,6 +265,7 @@ def status():
               'modelDefaults': read_json(STATE / 'model-defaults.json', {}),
               'testPresets': read_json(STATE / 'test-presets.json', {}),
               'advancedAvailable': Path(SDK_PYTHON).is_file(), 'maxLoaded': MAX_LOADED,
+              'slots': slot_map(models) if running else {},
               'lastTest': last_test if last_test.get('model') in instances else {},
               'lastLoad': last_load if last_load.get('model') in keys else {},
               'memoryLockLimit': memlock_limit(), 'resources': resources()}
@@ -307,6 +332,8 @@ def validate(data):
         number(data, 'ttl', 60, 86400, 600)
         number(data, 'gpu', 0, 100, 100)
         configuration(data.get('advanced', {}), 'load')
+    if action == 'load' and 'slot' in data:
+        number(data, 'slot', 1, MAX_LOADED, 1)
     if action == 'settings':
         for key in ('startupModel', 'startupDecisionModel'):
             startup = data.get(key, '')
@@ -1018,6 +1045,7 @@ def execute(data, job):
     action = data['action']
     if action in {'stop', 'restart'}:
         command('daemon', 'down')
+        SLOTS.unlink(missing_ok=True)
         model_changed()
     if action in {'start', 'restart'}:
         start()
@@ -1066,6 +1094,15 @@ def execute(data, job):
             raise ValueError('This model is already loaded. Unload it before loading it again.')
         if sum(len(m.get('loaded_instances') or []) for m in models) >= MAX_LOADED:
             raise ValueError(f'At most {MAX_LOADED} models can be loaded at once. Unload one before loading another.')
+        # An explicit slot must be free; nothing is ever replaced. Without one (startup, older callers) the lowest
+        # free slot is used.
+        slots = slot_map(models)
+        slot = str(data['slot']) if 'slot' in data else next((str(n) for n in range(1, MAX_LOADED + 1) if str(n) not in slots), None)
+        if slot is None or slot in slots:
+            holder = next((m.get('display_name') or m['key'] for m in models if m['key'] == slots.get(slot)), 'another model')
+            raise ValueError(f'Slot {slot} holds {holder}. Unload it first; loading never replaces a model.' if slot
+                             else 'No slot is free. Unload a model first.')
+        job['slot'] = int(slot)
         available = resources()
         # Free memory already excludes loaded models. Leave space for the desktop and KV cache; LM Studio also
         # applies its own load guardrails.
@@ -1102,6 +1139,7 @@ with lmstudio.Client("127.0.0.1:1234") as client:
             # The engine default keeps models in memory.
             applied, locking = {}, True
         model_changed()
+        write_json(SLOTS, {**slots, slot: data['model']})
         limit = memlock_limit()
         # llama.cpp only warns when mlock fails, so the reported setting alone would overstate it.
         if locking and limit is not None and limit < model['size_bytes']:
@@ -1114,6 +1152,12 @@ with lmstudio.Client("127.0.0.1:1234") as client:
     elif action == 'unload':
         command('unload', data['model'])
         model_changed()
+        # The unload already succeeded; if the list is unavailable, status frees the slot on its next check.
+        try:
+            with request('/api/v1/models') as response:
+                write_json(SLOTS, slot_map(json.load(response)['models']))
+        except (OSError, ValueError, KeyError):
+            pass
     elif action == 'test':
         with request('/api/v1/models') as response:
             models = json.load(response)['models']
@@ -1240,6 +1284,7 @@ def main():
     if action == 'shutdown':
         if LMS.is_file():
             command('daemon', 'down')
+            SLOTS.unlink(missing_ok=True)
             model_changed()
         return {'ok': True}
     if action != 'submit':
