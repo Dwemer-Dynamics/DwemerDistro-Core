@@ -119,10 +119,13 @@ LIBC = ctypes.CDLL(None, use_errno=True)
 # does not support. The only selectable profile denies /agent, so the most specific entry
 # leaves Codex itself only that helper directory readable, and the Linux sandbox masks all of
 # /agent (helper included) for tools.
+# There is deliberately no legacy allowed_sandbox_modes either: Codex 0.163.0 classifies any
+# profile with a write entry as workspace-write, so ["read-only"] would reject dwemer-scratch and
+# fall back to a read-only profile. allowed_permission_profiles and default_permissions are the
+# authority, and the broker strips every client sandbox, sandboxPolicy, and permissions override.
 REQUIREMENTS_TOML = """\
 # Managed by ddistro_agent; bound read-only at /etc/codex/requirements.toml in the sandbox.
 allowed_approval_policies = ["never"]
-allowed_sandbox_modes = ["read-only"]
 default_permissions = "dwemer-scratch"
 allow_login_shell = false
 allow_managed_hooks_only = true
