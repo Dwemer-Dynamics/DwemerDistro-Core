@@ -44,6 +44,39 @@ if [ -f "$DWEMER_GIT_CONFIG" ] && ! command -v git-credential-manager >/dev/null
     fi
 fi
 
+MAINTENANCE_LOCK="/run/lock/dwemerdistro-maintenance.lock"
+
+# Hold the common maintenance lock shared on fd 7. ddistro changes apply/rollback take it
+# exclusively, so they never interleave with maintenance; shared holders (including nested
+# helpers) still serialize through their own locks. Root creates the fixed root-owned file
+# once; it is never replaced. Release with flock -u, which also covers services that
+# inherited fd 7.
+acquire_maintenance_lock() {
+    local info=""
+    if [ "$(id -u)" -eq 0 ] && [ ! -e "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ]; then
+        (umask 022; set -C; : > "$MAINTENANCE_LOCK") 2>/dev/null || true
+    fi
+    if [ -f "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ] && exec 7<"$MAINTENANCE_LOCK"; then
+        info="$(stat -L -c '%u %h %a' /proc/self/fd/7 2>/dev/null)"
+    fi
+    case "$info" in
+        "0 1 644") ;;
+        "0 1 "*) [ "$(id -u)" -eq 0 ] && chmod 0644 /proc/self/fd/7 || info="" ;;
+        *) info="" ;;
+    esac
+    if [ -z "$info" ]; then
+        exec 7<&-
+        printf "${RED}[ERROR] $MAINTENANCE_LOCK is not a root-owned plain file; it was not replaced.${NC}\n"; exit 1
+    fi
+    if ! flock -s -w 30 7; then
+        exec 7<&-
+        printf "${RED}[ERROR] Another DwemerDistro maintenance or ddistro changes operation is running.${NC}\n"; exit 75
+    fi
+}
+
+acquire_maintenance_lock
+trap 'flock -u 7 2>/dev/null || true' EXIT
+
 print_header "UPDATING SYSTEM FILES"
 
 printf ">> Copying scripts to /usr/local/bin...\n"
@@ -57,6 +90,8 @@ if [ $? -eq 0 ]; then
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_custom_mod /usr/local/bin/ddistro_custom_mod || exit 1
     # Every user runs the ddistro CLI for status and logs; only root may change it.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro /usr/local/bin/ddistro || exit 1
+    # Root-only file changes helper; ddistro checks it is root-owned before running it.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_changes /usr/local/bin/ddistro_changes || exit 1
     printf "${GREEN}[SUCCESS] Scripts successfully copied to /usr/local/bin/${NC}\n"
 else
     printf "${RED}[ERROR] Error copying scripts to /usr/local/bin/${NC}\n"
@@ -71,7 +106,7 @@ printf ">> Checking installed server repository origins...\n"
 
 printf ">> Ensuring UTF-8 is the PostgreSQL default...\n"
 update-locale LANG=C.UTF-8 LC_ALL=C.UTF-8
-service postgresql start >/dev/null || exit 1
+service postgresql start >/dev/null 7<&- || exit 1
 /usr/local/bin/ensure_postgres_utf8 || exit 1
 
 printf ">> Copying configuration files to /etc...\n"

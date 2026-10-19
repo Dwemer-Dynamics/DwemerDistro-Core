@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""One stable command surface for DwemerDistro status, logs, and server updates.
+"""One stable command surface for DwemerDistro status, logs, server updates, and file changes.
 
 See ASSISTANT.md for the command and JSON contract. This tool is not a sandbox or an
 authorization boundary: it runs with the caller's privileges, never elevates, and calls
-only the trusted root-owned helper below, always with explicit argument vectors.
+only the trusted root-owned helpers below, always with explicit argument vectors.
 """
 import errno
 import json
@@ -21,10 +21,14 @@ import uuid
 TOOL = {"name": "ddistro", "version": "1.0.0", "source": "DwemerDistro-Core"}
 SCHEMA_VERSION = 1
 SERVER_HELPER = "/usr/local/bin/ddistro_server"
+CHANGES_HELPER = "/usr/local/bin/ddistro_changes"
 HELPER_OWNER_UID = 0
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 STATUS_TIMEOUT = 120
 UPDATE_TIMEOUT = 3 * 3600  # Reign updates include a native build.
+CHANGES_TIMEOUT = 600
+CHANGES_STDOUT_LIMIT = 24 * 1024 * 1024  # an 8 MiB change batch plus its diff
+CHANGES_DIFF_BYTES = 8 * 1024 * 1024  # JSON-encoded diff bound in ddistro_changes
 STOP_GRACE = 10
 STATUS_STDOUT_LIMIT = 1024 * 1024
 OUTPUT_TAIL_BYTES = 64 * 1024
@@ -39,7 +43,7 @@ REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 STATE_TOKEN = re.compile(r"^[a-z][a-z0-9-]{0,31}\Z")
 
 # Stable error code names and their process exit codes. partial, conflict, and rollback
-# are reserved for later stages and are not produced yet.
+# come only from ddistro changes apply and rollback.
 ERRORS = {
     "failed": 1, "internal_error": 1, "helper_failed": 1, "helper_protocol": 1,
     "partial": 10, "conflict": 11, "rollback": 12,
@@ -93,6 +97,9 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
   logs <product|apache|postgres> [--log NAME] [--lines N]   (N <= 400)
   server status [product]
   server update <product> --branch <main|dev|...> [--force]   (root)
+  changes prepare --product herika [--path RELATIVE ...]       (root)
+  changes diff|stage|status|rollback TASK | changes list         (root)
+  changes apply TASK --manifest-sha256 HASH                     (root)
 
 Products: herika (chim, skyrim), lorkhan, stobe (kenshi), dialectic (fnv, ttw), reign.
 --force discards local edits to tracked server files; it is never added automatically."""
@@ -146,19 +153,20 @@ def tail_lines(raw, limit=OUTPUT_TAIL_LINES):
 
 def check_helper(path):
     """Accept only a root-owned regular file in a root-owned directory that only root can change."""
+    name = os.path.basename(path)
     try:
         info, parent = os.lstat(path), os.stat(os.path.dirname(path))
     except FileNotFoundError:
-        raise CliError("helper_unavailable", "ddistro_server is not installed.",
+        raise CliError("helper_unavailable", f"{name} is not installed.",
                        {"helper": path, "reason": "missing"})
     except OSError:
-        raise CliError("helper_unavailable", "ddistro_server cannot be inspected.",
+        raise CliError("helper_unavailable", f"{name} cannot be inspected.",
                        {"helper": path, "reason": "unreadable"})
     trusted = (stat.S_ISREG(info.st_mode) and info.st_uid == HELPER_OWNER_UID and not info.st_mode & 0o022
                and parent.st_uid == HELPER_OWNER_UID and not parent.st_mode & 0o022
                and os.access(path, os.X_OK))
     if not trusted:
-        raise CliError("helper_unavailable", "ddistro_server is not a trusted root-owned executable.",
+        raise CliError("helper_unavailable", f"{name} is not a trusted root-owned executable.",
                        {"helper": path, "reason": "untrusted"})
 
 
@@ -225,16 +233,18 @@ def stop_child(proc):
             signal.signal(sig, handler)
 
 
-def run_helper(args, timeout, keep, echo=False, watch_blocker=False):
-    check_helper(SERVER_HELPER)
+def run_helper(args, timeout, keep, echo=False, watch_blocker=False, helper=None, echo_stdout=True):
+    helper = helper or SERVER_HELPER
+    name = os.path.basename(helper)
+    check_helper(helper)
     try:
-        proc = subprocess.Popen([SERVER_HELPER] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        proc = subprocess.Popen([helper] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, env=helper_env(), cwd="/", close_fds=True,
                                 start_new_session=True)
     except OSError as error:
-        raise CliError("helper_unavailable", "ddistro_server could not be started.",
-                       {"helper": SERVER_HELPER, "reason": errno.errorcode.get(error.errno, "error")})
-    out = Capture(proc.stdout, keep, echo, watch_blocker)
+        raise CliError("helper_unavailable", f"{name} could not be started.",
+                       {"helper": helper, "reason": errno.errorcode.get(error.errno, "error")})
+    out = Capture(proc.stdout, keep, echo and echo_stdout, watch_blocker)
     err = Capture(proc.stderr, OUTPUT_TAIL_BYTES, echo)
     out.start()
     err.start()
@@ -243,11 +253,11 @@ def run_helper(args, timeout, keep, echo=False, watch_blocker=False):
     try:
         while proc.poll() is None:
             if time.monotonic() > deadline:
-                failure = ("timeout", f"ddistro_server did not finish within {timeout} seconds.")
+                failure = ("timeout", f"{name} did not finish within {timeout} seconds.")
                 break
             time.sleep(0.1)
     except (KeyboardInterrupt, Cancelled):
-        failure = ("cancelled", "Cancelled; ddistro_server was stopped.")
+        failure = ("cancelled", f"Cancelled; {name} was stopped.")
     if failure:
         stop_child(proc)
     out.join(5)
@@ -351,13 +361,19 @@ def cmd_capabilities(opts, ctx):
             {"name": "server status", "arguments": ["[product]"], "mutates": False},
             {"name": "server update", "arguments": ["<product>"], "flags": ["--branch", "--force"],
              "mutates": True, "requires_root": True},
-        ],
+        ] + [dict(CHANGES_SPEC[name], name="changes " + name, requires_root=True) for name in CHANGES_SPEC],
         "global_flags": ["--json", "--request-id"],
         "aliases": ALIASES,
         "log_targets": {target: names for target, (_, names) in LOG_SOURCES.items()},
         "error_codes": ERRORS,
-        "limits": {"log_lines": MAX_LOG_LINES, "log_bytes": MAX_LOG_BYTES, "line_chars": MAX_LINE_CHARS},
-        "features": {"file_changes": False, "locks": False, "agent": False, "chat": False},
+        "limits": {"log_lines": MAX_LOG_LINES, "log_bytes": MAX_LOG_BYTES, "line_chars": MAX_LINE_CHARS,
+                   "change_files": 200, "change_file_bytes": 1024 * 1024, "change_batch_bytes": 8 * 1024 * 1024,
+                   "change_diff_bytes": CHANGES_DIFF_BYTES},
+        # A diff with diff_truncated true is a preview only; changes stage refuses it, so a
+        # staged manifest always comes with its complete diff.
+        "change_review": {"truncated_flag": "diff_truncated", "stage_refuses_truncated": True},
+        "change_products": ["herika"],
+        "features": {"file_changes": True, "locks": True, "agent": False, "chat": False},
     }
     return data, "\n".join(command["name"] for command in data["commands"])
 
@@ -524,9 +540,125 @@ def cmd_server_update(opts, ctx):
     return data, f"Updated {product} on branch {branch}."
 
 
+# ddistro changes: the root-only ddistro_changes helper does the work; this layer checks
+# arguments and the helper's trust, then passes its one JSON result through unchanged.
+CHANGES_SPEC = {
+    "prepare": {"flags": ["--product", "--path"], "mutates": False},
+    "diff": {"arguments": ["TASK"], "mutates": False},
+    "stage": {"arguments": ["TASK"], "mutates": False},
+    "apply": {"arguments": ["TASK"], "flags": ["--manifest-sha256"], "mutates": True},
+    "status": {"arguments": ["TASK"], "mutates": False},
+    "rollback": {"arguments": ["TASK"], "mutates": True},
+    "list": {"mutates": False},
+}
+TASK_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
+HASH = re.compile(r"^[0-9a-f]{64}\Z")
+
+
+def changes_result(code, out):
+    """Validate the helper's single JSON document and its exit code; anything else is helper_protocol."""
+    if out.total > CHANGES_STDOUT_LIMIT:
+        raise CliError("helper_protocol", "ddistro_changes returned too much output.")
+    try:
+        doc = json.loads(bytes(out.data).decode("utf-8"), parse_constant=reject_constant)
+    except ValueError:
+        doc = None
+    if type(doc) is dict and set(doc) == {"schema_version", "ok", "data", "error"}             and type(doc["schema_version"]) is int and doc["schema_version"] == 1:
+        error = doc["error"]
+        if doc["ok"] is True and code == 0 and type(doc["data"]) is dict and error is None:
+            return doc["data"]
+        if doc["ok"] is False and doc["data"] is None and type(error) is dict \
+                and set(error) == {"code", "message", "details"} and error["code"] in ERRORS \
+                and ERRORS[error["code"]] == code and code != 0 and type(error["message"]) is str \
+                and type(error["details"]) is dict:
+            raise CliError(error["code"], error["message"][:4096], error["details"])
+    raise CliError("helper_protocol", "ddistro_changes returned an unexpected result.", {"helper_exit": code})
+
+
+def changes_human(name, data):
+    if name == "prepare":
+        return f"Prepared task {data['task_id']} for {data['product']}.\nWorkspace: {data['workspace']}"
+    if name in ("diff", "stage"):
+        return (data["diff"] or "(no changes)\n") + f"manifest-sha256: {data['manifest_sha256']}"
+    if name == "list":
+        return "\n".join(f"{t['task_id']}  {t['state']:<20} {t['product'] or '-'}" for t in data["tasks"])
+    return f"{data['task_id']}: {data['state']} ({len(data.get('files') or [])} files)"
+
+
+def cmd_changes(opts, ctx):
+    name = ctx["command"].split(" ", 1)[1]
+    if os.geteuid() != 0:
+        raise CliError("permission_denied", "ddistro changes must run as root (for example with sudo). "
+                       "ddistro never elevates by itself.")
+    if name in ("apply", "rollback"):
+        ctx["operation_id"] = str(uuid.uuid4())
+    args = [name]
+    if name == "prepare":
+        args += ["--product", opts["product"]]
+        for path in opts["paths"]:
+            args += ["--path", path]
+    elif name != "list":
+        args.append(opts["task"])
+    if name == "apply":
+        args += ["--manifest-sha256", opts["manifest-sha256"]]
+    code, out, _ = run_helper(args, CHANGES_TIMEOUT, CHANGES_STDOUT_LIMIT + 1, echo=not ctx["json"],
+                              helper=CHANGES_HELPER, echo_stdout=False)
+    data = changes_result(code, out)
+    warnings = data.get("warnings", [])
+    if type(warnings) is not list or len(warnings) > 400 or any(type(w) is not str for w in warnings):
+        raise CliError("helper_protocol", "ddistro_changes returned malformed warnings.", {"helper_exit": code})
+    if name == "stage" and data.get("diff_truncated") is not False:
+        raise CliError("helper_protocol", "ddistro_changes staged a diff that is not complete.", {"helper_exit": code})
+    for warning in dict.fromkeys(redact(w[:300]) for w in warnings):
+        ctx["warnings"].append(warning)
+    return data, changes_human(name, data)
+
+
+def parse_changes(rest, ctx):
+    if len(rest) < 2 or rest[1] not in CHANGES_SPEC:
+        raise CliError("invalid_argument", "Expected changes " + "|".join(CHANGES_SPEC) + ".")
+    name = rest[1]
+    ctx["command"] = "changes " + name
+    flags = CHANGES_SPEC[name].get("flags", [])
+    opts, positional, args, index = {"paths": []}, [], rest[2:], 0
+    while index < len(args):
+        token = args[index]
+        if token in flags:
+            if index + 1 >= len(args):
+                raise CliError("invalid_argument", f"{token} needs a value.")
+            if token == "--path":
+                opts["paths"].append(args[index + 1])
+            elif token[2:] in opts:
+                raise CliError("invalid_argument", f"{token} was given more than once.")
+            else:
+                opts[token[2:]] = args[index + 1]
+            index += 2
+            continue
+        if token.startswith("-"):
+            raise CliError("invalid_argument", f"Unsupported option for changes {name}: {token[:40]}")
+        positional.append(token)
+        index += 1
+    if len(positional) != len(CHANGES_SPEC[name].get("arguments", [])):
+        raise CliError("invalid_argument", f"Wrong number of arguments for changes {name}.\n" + USAGE)
+    if positional:
+        if not TASK_ID.match(positional[0]):
+            raise CliError("invalid_argument", "TASK must be a lowercase task UUID from changes prepare.")
+        opts["task"] = positional[0]
+    if name == "prepare":
+        if "product" not in opts:
+            raise CliError("invalid_argument", "changes prepare requires --product.")
+        opts["product"] = resolve_product(opts["product"])
+        if len(opts["paths"]) > 200 or any(len(path) > 512 or "\0" in path for path in opts["paths"]):
+            raise CliError("invalid_argument", "At most 200 --path values of up to 512 characters are allowed.")
+    if name == "apply" and not HASH.match(opts.get("manifest-sha256", "")):
+        raise CliError("invalid_argument", "changes apply requires --manifest-sha256 with the 64-hex hash from stage.")
+    return opts
+
+
 COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products": cmd_products,
             "status": cmd_status, "logs": cmd_logs, "server status": cmd_server_status,
             "server update": cmd_server_update}
+COMMANDS.update({"changes " + name: cmd_changes for name in CHANGES_SPEC})
 
 
 # --- Arguments and output -------------------------------------------------------------
@@ -555,6 +687,8 @@ def parse_command(rest, ctx):
             raise CliError("invalid_argument", "A command is required.\n" + USAGE)
         return {}
     name = rest[0]
+    if name == "changes":
+        return parse_changes(rest, ctx)
     if name == "server":
         if len(rest) < 2 or rest[1] not in ("status", "update"):
             raise CliError("invalid_argument", "Expected server status or server update.")
