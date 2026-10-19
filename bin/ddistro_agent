@@ -100,6 +100,8 @@ TEXT_LIMIT = 256 * 1024
 MAX_THREADS_PER_TASK = 256
 MAX_TRACKED_REQUESTS = 1024
 SHUTDOWN_GRACE = 10.0
+# The client reader polls so it can leave before interpreter shutdown instead of blocking in stdin.
+CLIENT_POLL = 0.2
 REFUSAL_WINDOW = 15.0
 PR_SET_NO_NEW_PRIVS = 38
 O_PATH_DIR = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -835,14 +837,18 @@ class Broker:
         self.server_requests = {}
         self.failure = None
         self.stop_timer = None
+        self.closed = False
 
     def run(self):
-        for target in (self._pump_client, self._drain_stderr):
-            threading.Thread(target=target, daemon=True).start()
+        reader = threading.Thread(target=self._pump_client, daemon=True)
+        reader.start()
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
         self._pump_server()
+        self.closed = True
         if self.stop_timer:
             self.stop_timer.cancel()
         stop_process_group(self.proc)
+        reader.join(CLIENT_POLL * 10)
         return self.proc.returncode
 
     def request_stop(self):
@@ -860,14 +866,49 @@ class Broker:
         self.request_stop()
 
     # client -> server
-    def _pump_client(self):
-        while True:
+    def _client_lines(self):
+        """Client lines, a partial line at EOF, or one over-limit chunk; stops once the server is gone."""
+        try:
+            fd = self.client_in.fileno()
+        except (AttributeError, OSError, ValueError):
+            fd = None
+        if fd is None:
+            while not self.closed:
+                try:
+                    line = self.client_in.readline(CLIENT_LINE_LIMIT + 1)
+                except (OSError, ValueError):
+                    return
+                if not line:
+                    return
+                yield line
+            return
+        pending = bytearray()
+        while not self.closed:
             try:
-                line = self.client_in.readline(CLIENT_LINE_LIMIT + 1)
+                if not select.select([fd], [], [], CLIENT_POLL)[0]:
+                    continue
+                chunk = os.read(fd, 65536)
             except (OSError, ValueError):
-                line = b""
-            if not line:
                 break
+            if not chunk:
+                break
+            start = len(pending)
+            pending += chunk
+            while True:
+                end = pending.find(b"\n", start)
+                if end < 0:
+                    break
+                yield bytes(pending[:end + 1])
+                del pending[:end + 1]
+                start = 0
+            if len(pending) > CLIENT_LINE_LIMIT:
+                yield bytes(pending)
+                return
+        if pending and not self.closed:
+            yield bytes(pending)
+
+    def _pump_client(self):
+        for line in self._client_lines():
             if len(line) > CLIENT_LINE_LIMIT:
                 self._fail("client_message_too_large")
                 return
@@ -878,6 +919,8 @@ class Broker:
                 self.proc.stdin.close()
         except OSError:
             pass
+        if self.closed:
+            return
         self.stop_timer = threading.Timer(SHUTDOWN_GRACE, self.request_stop)
         self.stop_timer.daemon = True
         self.stop_timer.start()
