@@ -24,6 +24,12 @@ INSTALL_DATABASE_CREATED=0
 INSTALL_ROOT_CREATED=0
 LOCK_HELD=0
 FORCE_UPDATE=0
+# Update-only exit codes for a checkout blocked by local files. Each is preceded by one stdout line:
+# DDISTRO_UPDATE_BLOCKED {"schema_version":1,"reason":...,"product":...,"branch":...,"total":N,"files":[...]}
+# The files list is capped; total counts every blocking path found.
+UPDATE_BLOCKED_TRACKED_EXIT=79
+UPDATE_BLOCKED_UNTRACKED_EXIT=80
+UPDATE_BLOCKED_FILE_LIMIT=20
 
 # Record provenance before changing origin, so an interrupted migration can be retried.
 mark_herika_migration_pending() {
@@ -167,8 +173,12 @@ Reign uninstall retains its database and data; repair reinstalls it.
 
 Install is allowed only when both the canonical server root and application
 database are absent. Repair handles legacy and partial installations. Update
-never installs a missing product. --force discards tracked server-file changes
-before an update, but leaves untracked files and runtime data untouched.
+never installs a missing product. --force discards local edits to tracked
+server files before an update. Git may also replace untracked or ignored files
+that conflict with the update, so back up custom files first.
+
+Update exit codes: 79 means edits to tracked files block the update (retry with
+--force to discard them); 80 means untracked files are in the way and must be moved.
 EOF
 }
 
@@ -935,6 +945,92 @@ clone_repository() {
     fi
 }
 
+# Escape one value for the blocker line; other bytes pass through unchanged.
+json_string() {
+    local value="$1" escaped="" char code index
+    for ((index = 0; index < ${#value}; index++)); do
+        char="${value:index:1}"
+        case "$char" in
+            '"') escaped+='\"' ;;
+            '\') escaped+='\\' ;;
+            *)
+                printf -v code '%d' "'$char"
+                if [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; then
+                    printf -v char '\\u%04x' "$code"
+                fi
+                escaped+="$char"
+                ;;
+        esac
+    done
+    printf '"%s"' "$escaped"
+}
+
+fail_update_blocked() {
+    local reason="$1" status="$2" branch="$3" message="$4"
+    shift 4
+    local files="" path count=0
+
+    for path in "$@"; do
+        [ "$count" -lt "$UPDATE_BLOCKED_FILE_LIMIT" ] || break
+        files+="${files:+,}$(json_string "$path")"
+        count=$((count + 1))
+    done
+    printf 'DDISTRO_UPDATE_BLOCKED {"schema_version":1,"reason":"%s","product":"%s","branch":%s,"total":%d,"files":[%s]}\n' \
+        "$reason" "$PRODUCT" "$(json_string "$branch")" "$#" "$files"
+    fail "$message" "$status"
+}
+
+# Classify a failed update checkout from Git's own refusal, using NUL-separated plumbing for paths.
+# Untracked collisions win because discarding tracked edits would not let the update continue.
+classify_update_blocker() {
+    local branch="$1" checkout_output="$2" path
+    local -a candidates=() blocked=()
+    local -a repo_git=(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" --literal-pathspecs)
+
+    case "$checkout_output" in
+        *"untracked working tree files would be"*|*"would lose untracked files"*)
+            while IFS= read -r -d '' path; do
+                if [ -e "$PRODUCT_ROOT/$path" ] || [ -L "$PRODUCT_ROOT/$path" ]; then
+                    candidates+=("$path")
+                fi
+            done < <("${repo_git[@]}" diff -z --no-renames --name-only --diff-filter=A HEAD "origin/$branch" --)
+            if [ "${#candidates[@]}" -gt 0 ]; then
+                while IFS= read -r -d '' path; do
+                    blocked+=("$path")
+                done < <(printf '%s\0' "${candidates[@]}" \
+                    | xargs -0 "${repo_git[@]}" ls-files -z --others --exclude-standard --)
+            fi
+            fail_update_blocked untracked-files "$UPDATE_BLOCKED_UNTRACKED_EXIT" "$branch" \
+                "Untracked $PRODUCT files are in the way of this update. Move them, then update again." \
+                "${blocked[@]}"
+            ;;
+    esac
+
+    case "$checkout_output" in
+        *"Your local changes to the following files would be overwritten"*)
+            # Staged, unstaged, deleted and mode-changed tracked paths that the target also changes.
+            # Index and work tree are read separately: a staged change the work tree undoes still blocks.
+            local -A seen=()
+            while IFS= read -r -d '' path; do
+                [ -n "${seen[$path]+set}" ] && continue
+                seen[$path]=1
+                candidates+=("$path")
+            done < <("${repo_git[@]}" diff -z --no-renames --name-only --cached HEAD --
+                     "${repo_git[@]}" diff -z --no-renames --name-only --)
+            if [ "${#candidates[@]}" -gt 0 ]; then
+                while IFS= read -r -d '' path; do
+                    blocked+=("$path")
+                done < <(printf '%s\0' "${candidates[@]}" \
+                    | xargs -0 "${repo_git[@]}" diff -z --no-renames --name-only HEAD "origin/$branch" --)
+            fi
+            if [ "${#blocked[@]}" -gt 0 ]; then
+                fail_update_blocked tracked-changes "$UPDATE_BLOCKED_TRACKED_EXIT" "$branch" \
+                    "Local edits to tracked $PRODUCT files block this update." "${blocked[@]}"
+            fi
+            ;;
+    esac
+}
+
 update_repository() {
     local branch="$1"
     [ -d "$PRODUCT_ROOT/.git" ] || fail "$PRODUCT is not installed."
@@ -967,8 +1063,16 @@ update_repository() {
         git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" reset --hard HEAD \
             || fail "Could not discard tracked changes for $PRODUCT."
     fi
-    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" checkout -B "$branch" "origin/$branch" \
-        || fail "Could not select $PRODUCT branch $branch."
+    # Keep Git's refusal in English so a blocked update can be classified; it is still shown.
+    local checkout_output checkout_status
+    checkout_output="$(LC_ALL=C git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" \
+        checkout -B "$branch" "origin/$branch" 2>&1)"
+    checkout_status=$?
+    [ -z "$checkout_output" ] || printf '%s\n' "$checkout_output" >&2
+    if [ "$checkout_status" -ne 0 ]; then
+        [ "$COMMAND" != update ] || classify_update_blocker "$branch" "$checkout_output"
+        fail "Could not select $PRODUCT branch $branch."
+    fi
     git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" reset --hard "origin/$branch" \
         || fail "Could not update $PRODUCT to origin/$branch."
 }
