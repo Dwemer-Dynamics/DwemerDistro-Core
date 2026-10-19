@@ -912,12 +912,32 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 # --- Shared web listener (root; Apache config only, never repository code) -------------
 
+# Never served from a mod checkout: Git metadata in any custom mod or a manual ExampleServer,
+# and the source-only folders of the known Kagrenac install paths (launcher id, manual folder,
+# legacy path). A manually named or forked copy elsewhere needs its own server-side rules.
+GIT_DENY_DIR = r"^/var/www/html/(ExampleServer|custom-mods/[^/]+)/(.+/)?\.git(/|$)"
+SOURCE_DENY_DIR = r"^/var/www/html/(ExampleServer|custom-mods/(example-server|KagrenacServer))/(client|ports|docs)(/|$)"
+GIT_DENY_URL = r"^/+(ExampleServer|custom-mods/+[^/]+)/+(.*/)?\.git(/|$)"
+SOURCE_DENY_URL = r"^/+(ExampleServer|custom-mods/+(example-server|KagrenacServer))/+(client|ports|docs)(/|$)"
+
+
 def web_site_text(port):
-    """This manager's own Apache site: one loopback listener serving only the custom mod paths."""
+    """This manager's own Apache site: one loopback listener serving only the custom mod paths.
+
+    The DirectoryMatch denials sit outside the virtual host, so they also apply on the other
+    listeners that serve /var/www/html; the LocationMatch copies come after this listener's
+    grant, which would otherwise override them.
+    """
     return f"""{WEB_MARKER} To change the port, set
 # CUSTOM_MODS_PORT ({CUSTOM_PORT_MIN}-{CUSTOM_PORT_MAX}) in {SERVICES_CONF}, then run:
 #   sudo ddistro_custom_mod setup-web
 Listen 127.0.0.1:{port}
+<DirectoryMatch "{GIT_DENY_DIR}">
+\tRequire all denied
+</DirectoryMatch>
+<DirectoryMatch "{SOURCE_DENY_DIR}">
+\tRequire all denied
+</DirectoryMatch>
 <VirtualHost 127.0.0.1:{port}>
 \tDocumentRoot /var/www/html
 \t<Location "/">
@@ -925,6 +945,12 @@ Listen 127.0.0.1:{port}
 \t</Location>
 \t<LocationMatch "^/(ExampleServer|custom-mods/[^/]+)(/|$)">
 \t\tRequire all granted
+\t</LocationMatch>
+\t<LocationMatch "{GIT_DENY_URL}">
+\t\tRequire all denied
+\t</LocationMatch>
+\t<LocationMatch "{SOURCE_DENY_URL}">
+\t\tRequire all denied
 \t</LocationMatch>
 \tErrorLog ${{APACHE_LOG_DIR}}/custom_mods_error.log
 \tCustomLog ${{APACHE_LOG_DIR}}/custom_mods_access.log combined

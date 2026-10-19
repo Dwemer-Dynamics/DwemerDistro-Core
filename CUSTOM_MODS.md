@@ -42,6 +42,25 @@ repeats `apache2ctl configtest`. If the test or reload fails, its previous file 
 starts, and install, update, switch, and restore run it before the health check. `status`
 and `check` only read the port.
 
+The same site file also denies, with explicit Apache rules and no `.htaccess`:
+
+- `.git` metadata at any depth under `/var/www/html/custom-mods/<folder>` and
+  `/var/www/html/ExampleServer`;
+- the source-only folders `client/`, `ports/` and `docs/` (with any config or build output
+  inside them) of the known KAGRENAC AI Mod Maker install paths: `/custom-mods/example-server`
+  (launcher id), `/custom-mods/KagrenacServer` (manual folder) and `/ExampleServer` (legacy).
+
+The `DirectoryMatch` denials sit outside the custom mod virtual host, so they also apply on
+other Apache listeners that serve `/var/www/html`, such as the official ports, unless one
+of those sites grants the paths again in its own `DirectoryMatch`, `Files` or `Location`
+section; `LocationMatch` copies follow the custom listener's own grant. Other mods' routes
+and the official sites are otherwise unchanged. A manually named or forked install in any
+other folder is **not** covered for `client/`, `ports/` or `docs/`; its owner must add
+equivalent server-side rules. After **Update Distro**, the rules take effect the next time
+`setup-web` runs (distro start, a custom mod install, update, switch or restore, or
+`sudo ddistro_custom_mod setup-web`). Check every listener over HTTP and expect `403`, for
+example `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:19000/custom-mods/KagrenacServer/.git/HEAD`.
+
 To change the port: edit `CUSTOM_MODS_PORT` as root, run
 `sudo ddistro_custom_mod setup-web` (the old custom listener is replaced; official ports
 are not touched), then update every client pairing URL (for example `server_url`) to the

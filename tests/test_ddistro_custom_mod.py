@@ -94,6 +94,31 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(mod.config_uses_port("<VirtualHost *:19042>", 19042))
         self.assertFalse(mod.config_uses_port("Listen 8081\n<VirtualHost *:8081>", 19042))
 
+    def test_web_site_denies_git_and_kagrenac_source_folders(self):
+        import re
+        text = mod.web_site_text(19042)
+        vhost = text.index("<VirtualHost")
+        for pattern in (mod.GIT_DENY_DIR, mod.SOURCE_DENY_DIR):
+            self.assertLess(text.index(f'<DirectoryMatch "{pattern}">\n\tRequire all denied'), vhost)
+        grant = text.index("\t\tRequire all granted")
+        for pattern in (mod.GIT_DENY_URL, mod.SOURCE_DENY_URL):
+            self.assertGreater(text.index(f'<LocationMatch "{pattern}">\n\t\tRequire all denied'), grant)
+        denied_urls = ["/custom-mods/any-mod/.git/HEAD", "/custom-mods/any-mod/.git", "/ExampleServer/.git/config",
+                       "/custom-mods/any-mod/sub/.git/HEAD", "//custom-mods//any-mod//.git/HEAD",
+                       "/custom-mods/example-server/client/config.json", "/custom-mods/KagrenacServer/docs",
+                       "/custom-mods/KagrenacServer/ports/x/build/a.dll", "/ExampleServer/client/"]
+        served_urls = ["/custom-mods/any-mod/health.php", "/custom-mods/any-mod/client/x.php",
+                       "/custom-mods/example-server/ui/", "/custom-mods/KagrenacServer/health.php",
+                       "/custom-mods/KagrenacServer/.gitignore", "/custom-mods/KagrenacServer/clients.php"]
+        url_deny = lambda url: any(re.search(p, url) for p in (mod.GIT_DENY_URL, mod.SOURCE_DENY_URL))
+        dir_deny = lambda url: any(re.search(p, "/var/www/html" + url) for p in (mod.GIT_DENY_DIR, mod.SOURCE_DENY_DIR))
+        for url in denied_urls:
+            self.assertTrue(url_deny(url), url)
+        for url in denied_urls[:4] + denied_urls[5:]:
+            self.assertTrue(dir_deny(url), url)
+        for url in served_urls:
+            self.assertFalse(url_deny(url) or dir_deny(url), url)
+
     def test_rejects_bad_ids(self):
         for bad in ("ab", "Example", "-abc", "abc-", "a--b", "a_b", "../x", "herika", "stobe", "custom-mods",
                     "a" * 33, "example-test\n", 7, None):
