@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+"""One stable command surface for DwemerDistro status, logs, and server updates.
+
+See ASSISTANT.md for the command and JSON contract. This tool is not a sandbox or an
+authorization boundary: it runs with the caller's privileges, never elevates, and calls
+only the trusted root-owned helper below, always with explicit argument vectors.
+"""
+import errno
+import json
+import os
+import pwd
+import re
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+TOOL = {"name": "ddistro", "version": "1.0.0", "source": "DwemerDistro-Core"}
+SCHEMA_VERSION = 1
+SERVER_HELPER = "/usr/local/bin/ddistro_server"
+HELPER_OWNER_UID = 0
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+STATUS_TIMEOUT = 120
+UPDATE_TIMEOUT = 3 * 3600  # Reign updates include a native build.
+STOP_GRACE = 10
+STATUS_STDOUT_LIMIT = 1024 * 1024
+OUTPUT_TAIL_BYTES = 64 * 1024
+OUTPUT_TAIL_LINES = 60
+HELPER_LINE_LIMIT = 128 * 1024
+MAX_LOG_LINES = 400
+DEFAULT_LOG_LINES = 100
+MAX_LOG_BYTES = 256 * 1024
+MAX_LINE_CHARS = 4096
+BLOCKED_PREFIX = b"DDISTRO_UPDATE_BLOCKED "
+REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
+STATE_TOKEN = re.compile(r"^[a-z][a-z0-9-]{0,31}\Z")
+
+# Stable error code names and their process exit codes. partial, conflict, and rollback
+# are reserved for later stages and are not produced yet.
+ERRORS = {
+    "failed": 1, "internal_error": 1, "helper_failed": 1, "helper_protocol": 1,
+    "partial": 10, "conflict": 11, "rollback": 12,
+    "invalid_argument": 64, "not_found": 66, "unsupported": 69, "helper_unavailable": 69,
+    "busy": 75, "permission_denied": 77, "unsafe_path": 77,
+    "update_blocked_tracked": 79, "update_blocked_untracked": 80,
+    "timeout": 124, "cancelled": 130,
+}
+
+# The official servers managed by ddistro_server, in its status order.
+PRODUCTS = {
+    "herika": {"name": "CHIM (HerikaServer)", "aliases": ["chim", "skyrim"],
+               "branches": ["main", "dev", "aiagent"]},
+    "lorkhan": {"name": "LorkhanServer", "aliases": [], "branches": ["main", "dev", "unstable", "lorkhan"]},
+    "stobe": {"name": "Stobe (StobeServer)", "aliases": ["kenshi"], "branches": ["main", "dev", "stobe"]},
+    "dialectic": {"name": "Dialectic (DialecticServer)", "aliases": ["fnv", "ttw"],
+                  "branches": ["main", "dev", "dialectic"]},
+    "reign": {"name": "ReignServer", "aliases": [], "branches": ["main", "dev", "unstable", "reign"]},
+}
+ALIASES = {alias: key for key, product in PRODUCTS.items() for alias in product["aliases"]}
+
+# Allowlisted log files per target, first is the default. Nothing outside these roots is read.
+LOG_SOURCES = {
+    "herika": ("/var/www/html/HerikaServer/log", ["chim.log", "output_from_llm.log", "output_to_plugin.log",
+               "context_sent_to_llm.log", "debugStream.log", "minai.log", "vision.log"]),
+    "lorkhan": ("/var/log/lorkhanserver", ["lorkhan.log", "output_from_llm.log", "output_from_llm_fast.log",
+                "output_to_plugin.log", "context_sent_to_llm.log", "context_sent_to_llm_fast.log", "stt.log"]),
+    "stobe": ("/var/www/html/StobeServer/log", ["stobe.log", "stobeserver.log", "stobe_import.log",
+              "output_from_llm.log", "context_sent_to_llm.log"]),
+    "dialectic": ("/var/www/html/DialecticServer/log", ["dialectic.log", "service.log", "manager.log",
+                  "monitor.log", "output_from_llm.log", "output_from_llm_fast.log", "output_to_plugin.log",
+                  "context_sent_to_llm.log", "context_sent_to_llm_fast.log", "debugStream.log"]),
+    "reign": ("/var/www/html/ReignServer/data/logs", ["server.log", "server-log.jsonl", "llm-log.jsonl",
+              "otel-traces.ndjson"]),
+    "apache": ("/var/log/apache2", ["error.log", "other_vhosts_access.log", "stobe_error.log",
+               "dialectic_error.log"]),
+    "postgres": ("/var/log/postgresql", ["main"]),  # newest postgresql-<version>-main.log
+}
+POSTGRES_LOG = re.compile(r"^postgresql-([0-9]{1,3})-main\.log\Z")
+
+STATUS_STRINGS = ("product", "state", "repository_state", "root", "database", "branch", "version",
+                  "production_branch", "development_branch")
+STATUS_KEYS = set(STATUS_STRINGS) | {"schema_version", "database_present", "port"}
+BLOCKER_KEYS = {"schema_version", "reason", "product", "branch", "total", "files"}
+BLOCKER_REASONS = {79: "tracked-changes", 80: "untracked-files"}
+
+USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
+
+  version | capabilities | products
+  status [product]
+  logs <product|apache|postgres> [--log NAME] [--lines N]   (N <= 400)
+  server status [product]
+  server update <product> --branch <main|dev|...> [--force]   (root)
+
+Products: herika (chim, skyrim), lorkhan, stobe (kenshi), dialectic (fnv, ttw), reign.
+--force discards local edits to tracked server files; it is never added automatically."""
+
+
+class CliError(Exception):
+    def __init__(self, code, message, details=None):
+        super().__init__(message)
+        self.code, self.message, self.details = code, message, details or {}
+
+
+class Cancelled(BaseException):
+    pass
+
+
+# --- Redaction ------------------------------------------------------------------------
+
+CONTROL = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]")
+URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]{1,15}://)[^\s/@\"'<>]+@")
+URL_QUERY = re.compile(r"(?i)(\bhttps?://[^\s\"'<>?#]+)[?#][^\s\"'<>]*")
+AUTH_SCHEME = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
+KEY_VALUE = re.compile(r"(?im)((?:authorization|api[_-]?key|apikey|pairing[_-]?key|access[_-]?token|"
+                       r"refresh[_-]?token|auth[_-]?token|token|password|passwd|pwd|secret|private[_-]?key)"
+                       r"[\"']?\s*[:=]\s*).*$")
+TOKEN_SHAPES = re.compile(r"\b(?:hf_|sk-|gh[pousr]_|github_pat_|xox[abp]-)[A-Za-z0-9_-]{16,}")
+
+
+def redact(text):
+    """Same intent as the launcher's DiagnosticEvidenceService.Sanitize, plus control bytes."""
+    text = CONTROL.sub("?", text)
+    text = URL_USERINFO.sub(r"\1[redacted]@", text)
+    text = URL_QUERY.sub(r"\1?[redacted]", text)
+    text = AUTH_SCHEME.sub(r"\1 [redacted]", text)
+    text = KEY_VALUE.sub(r"\1[redacted]", text)
+    return TOKEN_SHAPES.sub("[redacted]", text)
+
+
+def clean_line(text):
+    text = redact(text)
+    if len(text) > MAX_LINE_CHARS:
+        text = text[:MAX_LINE_CHARS] + " [line truncated]"
+    return text
+
+
+def tail_lines(raw, limit=OUTPUT_TAIL_LINES):
+    rows = bytes(raw).decode("utf-8", "replace").replace("\r", "").split("\n")
+    return [clean_line(row) for row in rows if row.strip()][-limit:]
+
+
+# --- Trusted helper execution ---------------------------------------------------------
+
+def check_helper(path):
+    """Accept only a root-owned regular file in a root-owned directory that only root can change."""
+    try:
+        info, parent = os.lstat(path), os.stat(os.path.dirname(path))
+    except FileNotFoundError:
+        raise CliError("helper_unavailable", "ddistro_server is not installed.",
+                       {"helper": path, "reason": "missing"})
+    except OSError:
+        raise CliError("helper_unavailable", "ddistro_server cannot be inspected.",
+                       {"helper": path, "reason": "unreadable"})
+    trusted = (stat.S_ISREG(info.st_mode) and info.st_uid == HELPER_OWNER_UID and not info.st_mode & 0o022
+               and parent.st_uid == HELPER_OWNER_UID and not parent.st_mode & 0o022
+               and os.access(path, os.X_OK))
+    if not trusted:
+        raise CliError("helper_unavailable", "ddistro_server is not a trusted root-owned executable.",
+                       {"helper": path, "reason": "untrusted"})
+
+
+def helper_env():
+    try:
+        home = pwd.getpwuid(os.geteuid()).pw_dir
+    except KeyError:
+        home = "/"
+    env = {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "HOME": home,
+           "GIT_TERMINAL_PROMPT": "0"}
+    port = os.environ.get("DDISTRO_POSTGRES_PORT", "")
+    if re.match(r"^[0-9]{1,5}\Z", port):
+        env["DDISTRO_POSTGRES_PORT"] = port
+    return env
+
+
+class Capture(threading.Thread):
+    """Drain one pipe, keep a bounded tail, and remember a complete blocker line."""
+
+    def __init__(self, stream, keep, echo=False, watch_blocker=False):
+        super().__init__(daemon=True)
+        self.stream, self.keep, self.echo, self.watch = stream, keep, echo, watch_blocker
+        self.data, self.total, self.blocker = bytearray(), 0, None
+
+    def run(self):
+        line_start = True
+        try:
+            while True:
+                chunk = self.stream.readline(HELPER_LINE_LIMIT)
+                if not chunk:
+                    break
+                self.total += len(chunk)
+                if self.watch and line_start and chunk.startswith(BLOCKED_PREFIX) and chunk.endswith(b"\n"):
+                    self.blocker = chunk
+                line_start = chunk.endswith(b"\n")
+                self.data += chunk
+                if len(self.data) > self.keep:
+                    del self.data[:len(self.data) - self.keep]
+                if self.echo:
+                    print(clean_line(chunk.decode("utf-8", "replace").rstrip("\r\n")), file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            pass
+
+
+def stop_child(proc):
+    previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for sig, wait in ((signal.SIGTERM, STOP_GRACE), (signal.SIGKILL, 5)):
+            try:
+                os.killpg(proc.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                break
+            try:
+                proc.wait(timeout=wait)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # leftover helper children
+        except (ProcessLookupError, PermissionError):
+            pass
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def run_helper(args, timeout, keep, echo=False, watch_blocker=False):
+    check_helper(SERVER_HELPER)
+    try:
+        proc = subprocess.Popen([SERVER_HELPER] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=helper_env(), cwd="/", close_fds=True,
+                                start_new_session=True)
+    except OSError as error:
+        raise CliError("helper_unavailable", "ddistro_server could not be started.",
+                       {"helper": SERVER_HELPER, "reason": errno.errorcode.get(error.errno, "error")})
+    out = Capture(proc.stdout, keep, echo, watch_blocker)
+    err = Capture(proc.stderr, OUTPUT_TAIL_BYTES, echo)
+    out.start()
+    err.start()
+    deadline = time.monotonic() + timeout
+    failure = None
+    try:
+        while proc.poll() is None:
+            if time.monotonic() > deadline:
+                failure = ("timeout", f"ddistro_server did not finish within {timeout} seconds.")
+                break
+            time.sleep(0.1)
+    except (KeyboardInterrupt, Cancelled):
+        failure = ("cancelled", "Cancelled; ddistro_server was stopped.")
+    if failure:
+        stop_child(proc)
+    out.join(5)
+    err.join(5)
+    if failure:
+        raise CliError(failure[0], failure[1], {"helper_exit": proc.returncode, "stdout_tail": tail_lines(out.data),
+                                                "stderr_tail": tail_lines(err.data)})
+    return proc.returncode, out, err
+
+
+# --- Server status --------------------------------------------------------------------
+
+def protocol_error(reason):
+    return CliError("helper_protocol", "ddistro_server returned an unexpected status document.",
+                    {"reason": reason})
+
+
+def reject_constant(value):
+    raise ValueError(value)
+
+
+def validate_record(record, product):
+    if type(record) is not dict or set(record) != STATUS_KEYS:
+        raise protocol_error("status keys")
+    if type(record["schema_version"]) is not int or record["schema_version"] != 1:
+        raise protocol_error("status schema_version")
+    for key in STATUS_STRINGS:
+        if type(record[key]) is not str or len(record[key]) > 4096:
+            raise protocol_error("status " + key)
+    if record["product"] != product:
+        raise protocol_error("status product")
+    if not STATE_TOKEN.match(record["state"]) or not STATE_TOKEN.match(record["repository_state"]):
+        raise protocol_error("status state")
+    if record["database_present"] not in (True, False, None) or type(record["database_present"]) is int:
+        raise protocol_error("status database_present")
+    if type(record["port"]) is not int or not 0 < record["port"] < 65536:
+        raise protocol_error("status port")
+    return dict(record)
+
+
+def helper_status(product=None):
+    code, out, err = run_helper(["status", product or "all", "--json"], STATUS_TIMEOUT, STATUS_STDOUT_LIMIT)
+    if code != 0:
+        raise CliError("helper_failed", "ddistro_server status failed.",
+                       {"helper_exit": code, "stderr_tail": tail_lines(err.data, 20)})
+    if out.total > STATUS_STDOUT_LIMIT:
+        raise protocol_error("status output too large")
+    try:
+        document = json.loads(bytes(out.data).decode("utf-8"), parse_constant=reject_constant)
+    except ValueError:
+        raise protocol_error("status is not one JSON document")
+    if product:
+        return [validate_record(document, product)]
+    if type(document) is not dict or set(document) != {"schema_version", "servers"} \
+            or type(document["schema_version"]) is not int or document["schema_version"] != 1 \
+            or type(document["servers"]) is not list \
+            or len(document["servers"]) != len(PRODUCTS):
+        raise protocol_error("status list")
+    return [validate_record(record, key) for record, key in zip(document["servers"], PRODUCTS)]
+
+
+DATABASE_WORDS = {True: "present", False: "absent", None: "unknown"}
+
+
+def human_status(records):
+    return "\n".join(f"{r['product']:<10} {r['state']:<15} branch={r['branch'] or '-':<10} "
+                     f"version={r['version'] or '-'} database={DATABASE_WORDS[r['database_present']]}"
+                     for r in records)
+
+
+# --- Commands -------------------------------------------------------------------------
+
+def resolve_product(token, extra=()):
+    if token in PRODUCTS or token in extra:
+        return token
+    if token in ALIASES:
+        return ALIASES[token]
+    choices = ", ".join(list(PRODUCTS) + list(extra))
+    raise CliError("invalid_argument", f"Unknown product. Expected one of: {choices}.")
+
+
+def current_user():
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        return str(os.geteuid())
+
+
+def cmd_version(opts, ctx):
+    data = dict(TOOL, schema_version=SCHEMA_VERSION)
+    return data, f"ddistro {TOOL['version']} (JSON schema {SCHEMA_VERSION})"
+
+
+def cmd_capabilities(opts, ctx):
+    data = {
+        "commands": [
+            {"name": "version", "mutates": False}, {"name": "capabilities", "mutates": False},
+            {"name": "products", "mutates": False},
+            {"name": "status", "arguments": ["[product]"], "mutates": False},
+            {"name": "logs", "arguments": ["<target>"], "flags": ["--log", "--lines"], "mutates": False},
+            {"name": "server status", "arguments": ["[product]"], "mutates": False},
+            {"name": "server update", "arguments": ["<product>"], "flags": ["--branch", "--force"],
+             "mutates": True, "requires_root": True},
+        ],
+        "global_flags": ["--json", "--request-id"],
+        "aliases": ALIASES,
+        "log_targets": {target: names for target, (_, names) in LOG_SOURCES.items()},
+        "error_codes": ERRORS,
+        "limits": {"log_lines": MAX_LOG_LINES, "log_bytes": MAX_LOG_BYTES, "line_chars": MAX_LINE_CHARS},
+        "features": {"file_changes": False, "locks": False, "agent": False, "chat": False},
+    }
+    return data, "\n".join(command["name"] for command in data["commands"])
+
+
+def cmd_products(opts, ctx):
+    products = [{"id": key, "name": value["name"], "aliases": value["aliases"], "branches": value["branches"],
+                 "logs": LOG_SOURCES[key][1]} for key, value in PRODUCTS.items()]
+    human = "\n".join(f"{p['id']:<10} {p['name']:<28} aliases: {', '.join(p['aliases']) or '-'}" for p in products)
+    return {"products": products}, human
+
+
+def cmd_status(opts, ctx):
+    records = helper_status(opts.get("product"))
+    servers = [{key: record[key] for key in ("product", "state", "repository_state", "database_present",
+                                              "branch", "version")} for record in records]
+    data = {"user": current_user(), "is_root": os.geteuid() == 0, "servers": servers}
+    return data, human_status(records)
+
+
+def cmd_server_status(opts, ctx):
+    records = helper_status(opts.get("product"))
+    return {"servers": records}, human_status(records)
+
+
+def postgres_log_name(root):
+    try:
+        versions = [int(match.group(1)) for match in map(POSTGRES_LOG.match, os.listdir(root)) if match]
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        raise CliError("permission_denied", "The PostgreSQL log folder is not readable by this user.",
+                       {"path": root, "read_as": current_user()})
+    return f"postgresql-{max(versions)}-main.log" if versions else None
+
+
+def read_tail(path, lines):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise CliError("unsafe_path", "The log is not a regular file.", {"path": path})
+        start = max(0, info.st_size - MAX_LOG_BYTES)
+        os.lseek(fd, start, os.SEEK_SET)
+        raw = bytearray()
+        while len(raw) < MAX_LOG_BYTES:
+            chunk = os.read(fd, MAX_LOG_BYTES - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    rows = bytes(raw).decode("utf-8", "replace").replace("\r", "").split("\n")
+    if rows and rows[-1] == "":
+        rows.pop()
+    if start > 0 and len(rows) > 1:
+        rows.pop(0)  # partial first line
+    truncated = start > 0 or len(rows) > lines
+    output, size = [], 0
+    for row in reversed(rows[-lines:]):
+        row = clean_line(row)
+        size += len(row.encode("utf-8")) + 1
+        if size > MAX_LOG_BYTES:
+            truncated = True
+            break
+        output.append(row)
+    output.reverse()
+    return {"size_bytes": info.st_size, "modified": int(info.st_mtime), "truncated": truncated, "lines": output}
+
+
+def cmd_logs(opts, ctx):
+    target = opts["target"]
+    root, names = LOG_SOURCES[target]
+    name = opts.get("log") or names[0]
+    if name not in names:
+        raise CliError("invalid_argument", f"Unknown log for {target}. Expected one of: {', '.join(names)}.")
+    data = {"target": target, "log": name, "read_as": current_user(), "available": False, "reason": None,
+            "lines": []}
+    try:
+        root_info = os.lstat(root)
+    except FileNotFoundError:
+        root_info = None
+    except PermissionError:
+        raise CliError("permission_denied", "The log folder is not readable by this user.",
+                       {"path": root, "read_as": data["read_as"]})
+    if root_info is not None and (not stat.S_ISDIR(root_info.st_mode) or os.path.realpath(root) != root):
+        raise CliError("unsafe_path", "The log folder is redirected; it was not read.", {"path": root})
+    filename = name if target != "postgres" else (postgres_log_name(root) if root_info else None)
+    data["path"] = os.path.join(root, filename) if filename else root
+    try:
+        if root_info is None or filename is None:
+            raise FileNotFoundError
+        data.update(read_tail(data["path"], opts.get("lines", DEFAULT_LOG_LINES)), available=True)
+    except FileNotFoundError:
+        data["reason"] = "missing"
+    except PermissionError:
+        raise CliError("permission_denied", "The log is not readable by this user.",
+                       {"path": data["path"], "read_as": data["read_as"]})
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise CliError("unsafe_path", "The log is a symbolic link; it was not read.", {"path": data["path"]})
+        raise CliError("failed", "The log could not be read.",
+                       {"path": data["path"], "reason": errno.errorcode.get(error.errno, "error")})
+    if not data["available"]:
+        return data, f"{data['path']}: not present (no log written yet)."
+    header = f"== {data['path']} ({len(data['lines'])} lines" + (", truncated" if data["truncated"] else "") + ")"
+    return data, "\n".join([header] + data["lines"])
+
+
+def parse_blocker(line, product, code):
+    """Validate the one-line DDISTRO_UPDATE_BLOCKED payload; anything unexpected is ignored."""
+    try:
+        doc = json.loads(line[len(BLOCKED_PREFIX):].decode("utf-8"), parse_constant=reject_constant)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    valid = (type(doc) is dict and set(doc) == BLOCKER_KEYS and type(doc["schema_version"]) is int
+             and doc["schema_version"] == 1 and doc["reason"] == BLOCKER_REASONS[code]
+             and doc["product"] == product and type(doc["branch"]) is str and len(doc["branch"]) <= 255
+             and type(doc["total"]) is int and doc["total"] >= 0 and type(doc["files"]) is list
+             and len(doc["files"]) <= min(20, doc["total"])
+             and all(type(path) is str and len(path) <= 4096 for path in doc["files"]))
+    if not valid:
+        return None
+    return dict(doc, files=[CONTROL.sub("?", path) for path in doc["files"]])
+
+
+def cmd_server_update(opts, ctx):
+    product, branch, force = opts["product"], opts.get("branch"), opts.get("force", False)
+    if not branch:
+        raise CliError("invalid_argument", "server update requires --branch.")
+    if branch not in PRODUCTS[product]["branches"]:
+        raise CliError("invalid_argument",
+                       f"Unsupported branch for {product}. Expected one of: {', '.join(PRODUCTS[product]['branches'])}.")
+    if os.geteuid() != 0:
+        raise CliError("permission_denied", "server update must run as root. ddistro never elevates by itself.")
+    ctx["operation_id"] = str(uuid.uuid4())
+    before = helper_status(product)[0]
+    if before["state"] == "not-installed":
+        raise CliError("not_found", f"{product} is not installed. Update never installs missing products.",
+                       {"product": product, "state": before["state"]})
+    args = ["update", product, "--branch", branch] + (["--force"] if force else [])
+    code, out, err = run_helper(args, UPDATE_TIMEOUT, OUTPUT_TAIL_BYTES, echo=not ctx["json"], watch_blocker=True)
+    details = {"product": product, "branch": branch, "force": force, "helper_exit": code,
+               "stdout_tail": tail_lines(out.data), "stderr_tail": tail_lines(err.data)}
+    if code in BLOCKER_REASONS:
+        details["blocker"] = parse_blocker(out.blocker, product, code) if out.blocker else None
+        details["force_may_resolve"] = code == 79
+        if code == 79:
+            raise CliError("update_blocked_tracked", f"Local edits to tracked {product} files block this update. "
+                           "Re-run with --force only if discarding them is intended.", details)
+        raise CliError("update_blocked_untracked",
+                       f"Untracked {product} files are in the way of this update. Move them, then update again.",
+                       details)
+    mapped = {75: "busy", 64: "invalid_argument", 130: "cancelled", 143: "cancelled"}.get(code)
+    if code != 0:
+        raise CliError(mapped or "helper_failed", f"ddistro_server update failed (exit {code}).", details)
+    data = {"product": product, "branch": branch, "force": force, "before": before,
+            "stdout_tail": details["stdout_tail"], "stderr_tail": details["stderr_tail"]}
+    try:
+        data["after"] = helper_status(product)[0]
+    except CliError as error:
+        data["after"] = None
+        ctx["warnings"].append(f"Post-update status unavailable: {error.code}.")
+    return data, f"Updated {product} on branch {branch}."
+
+
+COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products": cmd_products,
+            "status": cmd_status, "logs": cmd_logs, "server status": cmd_server_status,
+            "server update": cmd_server_update}
+
+
+# --- Arguments and output -------------------------------------------------------------
+
+def parse_globals(argv, ctx):
+    rest, index = [], 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--json":
+            ctx["json"] = True
+        elif token == "--request-id":
+            if ctx["request_id_given"] or index + 1 >= len(argv) or not REQUEST_ID.match(argv[index + 1]):
+                raise CliError("invalid_argument", "--request-id needs one value of up to 64 letters, digits, ._:-")
+            ctx["request_id"], ctx["request_id_given"] = argv[index + 1], True
+            index += 1
+        else:
+            rest.append(token)
+        index += 1
+    return rest
+
+
+def parse_command(rest, ctx):
+    if not rest or rest[0] in ("-h", "--help", "help"):
+        ctx["command"] = "help"
+        if not rest:
+            raise CliError("invalid_argument", "A command is required.\n" + USAGE)
+        return {}
+    name = rest[0]
+    if name == "server":
+        if len(rest) < 2 or rest[1] not in ("status", "update"):
+            raise CliError("invalid_argument", "Expected server status or server update.")
+        name, rest = "server " + rest[1], rest[1:]
+    if name not in COMMANDS:
+        raise CliError("invalid_argument", "Unknown command.\n" + USAGE)
+    ctx["command"] = name
+    valued = {"logs": ("--log", "--lines"), "server update": ("--branch",)}.get(name, ())
+    switches = ("--force",) if name == "server update" else ()
+    opts, positional, index, args = {}, [], 0, rest[1:]
+    while index < len(args):
+        token = args[index]
+        if token in valued:
+            if index + 1 >= len(args):
+                raise CliError("invalid_argument", f"{token} needs a value.")
+            if token[2:] in opts:
+                raise CliError("invalid_argument", f"{token} was given more than once.")
+            opts[token[2:]] = args[index + 1]
+            index += 1
+        elif token in switches:
+            opts["force"] = True
+        elif token.startswith("-"):
+            raise CliError("invalid_argument", f"Unsupported option for {name}: {token[:40]}")
+        else:
+            positional.append(token)
+        index += 1
+    required = {"logs": 1, "server update": 1}.get(name, 0)
+    allowed = 1 if name in ("status", "server status", "logs", "server update") else 0
+    if not required <= len(positional) <= allowed:
+        raise CliError("invalid_argument", f"Wrong number of arguments for {name}.\n" + USAGE)
+    if name == "logs":
+        opts["target"] = resolve_product(positional[0], ("apache", "postgres"))
+        if "lines" in opts:
+            if not re.match(r"^[0-9]{1,4}\Z", opts["lines"]) or not 1 <= int(opts["lines"]) <= MAX_LOG_LINES:
+                raise CliError("invalid_argument", f"--lines must be between 1 and {MAX_LOG_LINES}.")
+            opts["lines"] = int(opts["lines"])
+    elif positional:
+        opts["product"] = resolve_product(positional[0])
+    return opts
+
+
+def emit(ctx, data=None, human="", error=None):
+    if ctx["json"]:
+        document = {"schema_version": SCHEMA_VERSION, "ok": error is None, "command": ctx["command"],
+                    "request_id": ctx["request_id"], "tool": TOOL, "data": data, "error": error,
+                    "warnings": ctx["warnings"]}
+        if ctx.get("operation_id"):
+            document["operation_id"] = ctx["operation_id"]
+        sys.stdout.write(json.dumps(document, ensure_ascii=True) + "\n")
+        sys.stdout.flush()
+        return
+    if error is None:
+        if human:
+            print(human, flush=True)
+    else:
+        print("[FAIL] " + error["message"], file=sys.stderr)
+        blocker = error["details"].get("blocker") or {}
+        for path in blocker.get("files", []):
+            print("  " + path, file=sys.stderr)
+    for warning in ctx["warnings"]:
+        print("[WARN] " + warning, file=sys.stderr)
+
+
+def raise_cancelled(signum, frame):
+    raise Cancelled()
+
+
+def main(argv):
+    ctx = {"json": "--json" in argv, "command": None, "request_id": str(uuid.uuid4()),
+           "request_id_given": False, "warnings": []}
+    signal.signal(signal.SIGTERM, raise_cancelled)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, raise_cancelled)
+    try:
+        opts = parse_command(parse_globals(argv, ctx), ctx)
+        if ctx["command"] == "help":
+            emit(ctx, {"usage": USAGE}, USAGE)
+            return 0
+        data, human = COMMANDS[ctx["command"]](opts, ctx)
+        emit(ctx, data, human)
+        return 0
+    except CliError as error:
+        failure = error
+    except (KeyboardInterrupt, Cancelled):
+        failure = CliError("cancelled", "Cancelled.")
+    except Exception:
+        failure = CliError("internal_error", "ddistro hit an unexpected internal error.")
+    exit_code = ERRORS[failure.code]
+    try:
+        emit(ctx, None, "", {"code": failure.code, "exit_code": exit_code, "message": redact(failure.message),
+                             "details": failure.details})
+    except BrokenPipeError:
+        pass
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
