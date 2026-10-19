@@ -1,0 +1,171 @@
+#!/bin/bash
+# Explicit installer for the DwemerDistro assistant runtime (pinned native Codex).
+# See ASSISTANT_RUNTIME.md. Root only; idempotent; never touches an existing sign-in.
+#
+#   install_assistant_runtime [--archive PATH] [--install-prerequisites]
+#
+# Without --archive the pinned release is downloaded over HTTPS. The archive hash is
+# verified before extraction and the extracted binary hash before it is installed.
+set -euo pipefail
+umask 022
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+CODEX_URL="https://github.com/openai/codex/releases/download/rust-v0.163.0/codex-x86_64-unknown-linux-musl.tar.gz"
+ARCHIVE_SHA256="beb339e8ecd9ba057a6bb2dc81ad8ca474812edfbf0fc5056ca818797648dde4"
+BINARY_NAME="codex-x86_64-unknown-linux-musl"
+BINARY_SHA256="399ff69c431c066e40de318fba45c2b07f45a76b19939d247ee4828fc70c4215"
+RUNTIME_ROOT="/opt/dwemerdistro-agent"
+RUNTIME_DIR="$RUNTIME_ROOT/runtime"
+AGENT_USER="ddagent"
+STATE_ROOT="/var/lib/dwemerdistro/assistant"
+
+ARCHIVE=""
+INSTALL_PREREQUISITES=0
+
+die() {
+    printf '[ERROR] %s\n' "$1" >&2
+    exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --archive)
+            [ "$#" -ge 2 ] || die "--archive needs a path"
+            ARCHIVE="$2"
+            shift 2
+            ;;
+        --install-prerequisites)
+            INSTALL_PREREQUISITES=1
+            shift
+            ;;
+        -h|--help)
+            sed -n '2,8p' "$0"
+            exit 0
+            ;;
+        *)
+            die "unknown option: $1"
+            ;;
+    esac
+done
+
+[ "$(id -u)" = "0" ] || die "run as root (wsl -u root install_assistant_runtime)"
+[ "$(uname -m)" = "x86_64" ] || die "the pinned runtime is x86_64 only"
+
+# --- bubblewrap: never installed silently
+if [ ! -x /usr/bin/bwrap ]; then
+    if [ "$INSTALL_PREREQUISITES" = "1" ]; then
+        apt-get update
+        apt-get install -y --no-install-recommends bubblewrap
+    else
+        die "bubblewrap is required. Rerun with --install-prerequisites or run: apt-get install bubblewrap"
+    fi
+fi
+# Features, not versions: distro backports (for example Debian 0.8.0-2+deb12u1) add --bind-fd.
+BWRAP_HELP="$(/usr/bin/bwrap --help 2>&1 || true)"
+for FLAG in --bind-fd --ro-bind-data --clearenv --die-with-parent; do
+    grep -q -- "$FLAG" <<<"$BWRAP_HELP" \
+        || die "bubblewrap $(/usr/bin/bwrap --version 2>/dev/null | awk '{print $2}') lacks $FLAG, which the sandbox requires"
+done
+[ "$(stat -c %u /usr/bin/bwrap)" = "0" ] || die "/usr/bin/bwrap is not root-owned"
+[ -x /usr/bin/python3 ] || die "/usr/bin/python3 is required (it runs the in-sandbox guard)"
+
+# --- pinned runtime
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+chmod 0700 "$WORK_DIR"
+
+if [ -f "$RUNTIME_DIR/$BINARY_NAME" ] && [ "$(sha256sum "$RUNTIME_DIR/$BINARY_NAME" | awk '{print $1}')" = "$BINARY_SHA256" ]; then
+    printf '>> Pinned runtime already installed.\n'
+    RUNTIME_CHANGED=0
+else
+    if [ -n "$ARCHIVE" ]; then
+        [ -f "$ARCHIVE" ] && [ ! -L "$ARCHIVE" ] || die "archive not found: $ARCHIVE"
+        cp -- "$ARCHIVE" "$WORK_DIR/codex.tar.gz"
+    else
+        command -v curl >/dev/null 2>&1 || die "curl is required to download the runtime (or pass --archive PATH)"
+        printf '>> Downloading %s\n' "$CODEX_URL"
+        curl --proto '=https' --tlsv1.2 -fsSL --max-time 900 -o "$WORK_DIR/codex.tar.gz" "$CODEX_URL" \
+            || die "download failed"
+    fi
+    [ "$(sha256sum "$WORK_DIR/codex.tar.gz" | awk '{print $1}')" = "$ARCHIVE_SHA256" ] \
+        || die "archive SHA256 does not match the pinned release; nothing was extracted"
+    # Exactly one regular file with the expected name, before anything is extracted.
+    LISTING="$(tar -tvzf "$WORK_DIR/codex.tar.gz")"
+    [ "$(printf '%s\n' "$LISTING" | wc -l)" = "1" ] || die "unexpected archive layout"
+    case "$LISTING" in
+        -*" $BINARY_NAME") ;;
+        *) die "unexpected archive layout" ;;
+    esac
+    mkdir "$WORK_DIR/extract"
+    tar -xzf "$WORK_DIR/codex.tar.gz" -C "$WORK_DIR/extract" --no-same-owner --no-same-permissions -- "$BINARY_NAME"
+    [ -f "$WORK_DIR/extract/$BINARY_NAME" ] && [ ! -L "$WORK_DIR/extract/$BINARY_NAME" ] || die "unexpected archive layout"
+    [ "$(sha256sum "$WORK_DIR/extract/$BINARY_NAME" | awk '{print $1}')" = "$BINARY_SHA256" ] \
+        || die "extracted binary SHA256 does not match the pinned runtime"
+    install -d -o root -g root -m 0755 "$RUNTIME_ROOT" "$RUNTIME_DIR"
+    install -o root -g root -m 0755 "$WORK_DIR/extract/$BINARY_NAME" "$RUNTIME_DIR/.$BINARY_NAME.new"
+    mv -f "$RUNTIME_DIR/.$BINARY_NAME.new" "$RUNTIME_DIR/$BINARY_NAME"
+    printf '>> Installed pinned runtime %s\n' "$BINARY_SHA256"
+    RUNTIME_CHANGED=1
+fi
+
+install -d -o root -g root -m 0755 "$RUNTIME_ROOT" "$RUNTIME_DIR" "$RUNTIME_DIR/bin"
+chown root:root "$RUNTIME_DIR/$BINARY_NAME"
+chmod 0755 "$RUNTIME_DIR/$BINARY_NAME"
+for LINK in codex codex-linux-sandbox; do
+    ln -sfn "../$BINARY_NAME" "$RUNTIME_DIR/bin/$LINK"
+done
+
+# --- dedicated identity: no login shell, no home, no supplementary groups
+if ! getent passwd "$AGENT_USER" >/dev/null; then
+    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$AGENT_USER"
+    printf '>> Created system user %s\n' "$AGENT_USER"
+fi
+AGENT_UID="$(id -u "$AGENT_USER")"
+AGENT_GID="$(id -g "$AGENT_USER")"
+AGENT_SHELL="$(getent passwd "$AGENT_USER" | cut -d: -f7)"
+[ "$AGENT_UID" != "0" ] && [ "$AGENT_GID" != "0" ] || die "$AGENT_USER must not be root"
+case "$AGENT_SHELL" in
+    /usr/sbin/nologin|/sbin/nologin|/bin/false|/usr/bin/false) ;;
+    *) die "$AGENT_USER has a login shell ($AGENT_SHELL); refusing to use it" ;;
+esac
+[ "$(id -G "$AGENT_USER")" = "$AGENT_GID" ] || die "$AGENT_USER has supplementary groups; remove them first"
+# Its group may search task folders, so it must be ddagent's alone.
+[ "$(getent group "$AGENT_GID" | cut -d: -f1,4)" = "$AGENT_USER:" ] \
+    || die "group $AGENT_GID must be named $AGENT_USER and have no members"
+getent passwd | awk -F: -v gid="$AGENT_GID" -v user="$AGENT_USER" '$4 == gid && $1 != user { found = 1 } END { exit !found }' \
+    && die "another account uses group $AGENT_GID as its primary group"
+
+# --- state: root-owned metadata, a private account home that keeps any existing sign-in
+ensure_root_dir() {
+    if [ -L "$1" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }; then
+        die "$1 is not a directory"
+    fi
+    if [ -d "$1" ] && [ "$(stat -c %u "$1")" != "0" ]; then
+        die "$1 exists and is not root-owned"
+    fi
+    install -d -o root -g "${3:-root}" -m "$2" "$1"
+}
+ensure_root_dir /var/lib/dwemerdistro 0755
+ensure_root_dir "$STATE_ROOT" 0755
+# Search only for ddagent's group: bwrap resolves the scratch bind by path as ddagent.
+# Task folders get the same mode from ddistro changes prepare (or serve, for older tasks).
+ensure_root_dir "$STATE_ROOT/tasks" 0710 "$AGENT_USER"
+ensure_root_dir "$STATE_ROOT/agent" 0755
+ensure_root_dir "$STATE_ROOT/agent/threads" 0700
+
+ACCOUNT_HOME="$STATE_ROOT/codex-home"
+if [ -L "$ACCOUNT_HOME" ] || { [ -e "$ACCOUNT_HOME" ] && [ ! -d "$ACCOUNT_HOME" ]; }; then
+    die "$ACCOUNT_HOME is not a directory"
+fi
+if [ -d "$ACCOUNT_HOME" ]; then
+    [ "$(stat -c %u "$ACCOUNT_HOME")" = "$AGENT_UID" ] || die "$ACCOUNT_HOME is not owned by $AGENT_USER"
+    chmod 0700 "$ACCOUNT_HOME"
+else
+    install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "$ACCOUNT_HOME"
+fi
+
+if [ "$RUNTIME_CHANGED" = "1" ]; then
+    rm -f "$STATE_ROOT/agent/attestation.json"
+fi
+
+printf '[SUCCESS] Assistant runtime installed. Next: ddistro_agent probe\n'

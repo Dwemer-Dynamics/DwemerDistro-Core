@@ -11,6 +11,7 @@ import contextlib
 import difflib
 import errno
 import fcntl
+import grp
 import hashlib
 import json
 import os
@@ -36,6 +37,8 @@ PRODUCT_ROOTS = {"herika": "/var/www/html/HerikaServer"}
 KNOWN_PRODUCTS = ("herika", "lorkhan", "stobe", "dialectic", "reign")
 ALIASES = {"chim": "herika", "skyrim": "herika", "kenshi": "stobe", "fnv": "dialectic", "ttw": "dialectic"}
 SCRATCH_USERS = ("ddagent", "dwemer")
+AGENT_USER = "ddagent"  # assistant runtime account; its group may search task folders (ASSISTANT_RUNTIME.md)
+TRAVERSE_MODE = 0o710
 LINT_USER = "nobody"
 MAX_FILE_BYTES = 1024 * 1024
 MAX_FILES = 200
@@ -122,6 +125,27 @@ def check_state_dir(info, path):
                           {"path": path, "reason": "untrusted"})
 
 
+def agent_gid():
+    """ddagent's group when it is dedicated: named ddagent, no members, nobody else's primary group."""
+    try:
+        entry = pwd.getpwnam(AGENT_USER)
+        group = grp.getgrgid(entry.pw_gid)
+    except KeyError:
+        return None
+    if entry.pw_gid == 0 or group.gr_name != AGENT_USER or group.gr_mem or any(
+            other.pw_gid == entry.pw_gid and other.pw_name != AGENT_USER for other in pwd.getpwall()):
+        return None
+    return entry.pw_gid
+
+
+def private_dir(info):
+    """Root-only, or root:ddagent 0710 so the runtime's sandbox can reach work/ without listing anything."""
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+        return False
+    mode = stat.S_IMODE(info.st_mode)
+    return not mode & 0o077 or (mode == TRAVERSE_MODE and info.st_gid == agent_gid())
+
+
 def ensure_state_root(create):
     """Walk STATE_ROOT from / without following links; create missing parts root-only."""
     current = "/"
@@ -142,6 +166,9 @@ def ensure_state_root(create):
                 os.close(fd)
             info = os.lstat(current)
         check_state_dir(info, current)
+    if not private_dir(info):
+        raise ChangeError("unsafe_path", f"{STATE_ROOT} is not a private root-owned folder.",
+                          {"path": STATE_ROOT, "reason": "untrusted"})
 
 
 def fsync_dir(path):
@@ -222,7 +249,7 @@ def task_dir(task_id):
         info = os.lstat(path)
     except FileNotFoundError:
         raise ChangeError("not_found", "No ddistro changes task has that ID.", {"task_id": task_id})
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+    if not private_dir(info):
         raise ChangeError("unsafe_path", "The task folder is not root-only.", {"task_id": task_id})
     return path
 
@@ -629,6 +656,15 @@ def cmd_prepare(opts):
             "product_root": PRODUCT_ROOTS[product], "created": now(), "scratch_user": account,
             "scratch_uid": uid, "scratch_gid": gid, "diagnostic_only": not rels, "paths": records}
     write_state(os.path.join(path, "task.json"), json.dumps(task, indent=1, sort_keys=True).encode(), exclusive=True)
+    gid = agent_gid() if account == AGENT_USER else None
+    if gid is not None:
+        # Search only, so the runtime can bind work/; task.json, base/ and later state stay root-only.
+        fd = os.open(path, DIR_FLAGS)
+        try:
+            os.fchown(fd, 0, gid)
+            os.fchmod(fd, TRAVERSE_MODE)
+        finally:
+            os.close(fd)
     progress(f"Prepared task {task_id} with {len(rels)} selected files.")
     return {"task_id": task_id, "workspace": work, "product": product, "diagnostic_only": not rels,
             "scratch_user": account, "files": [{"path": r["path"], "exists": r["exists"]} for r in records]}
