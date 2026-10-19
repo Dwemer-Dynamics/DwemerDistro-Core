@@ -715,9 +715,15 @@ fi
 
 # Keep DwemerDistro-managed PocketTTS connectors on the backend that just started.
 # One bounded check; it never blocks the rest of startup.
-if [ -x /usr/local/bin/sync_pockettts_connectors ]; then
-	runuser -u dwemer -- /usr/local/bin/sync_pockettts_connectors --startup ||
-		echo "PocketTTS connector check is incomplete; see the details above. Continuing startup."
+if [ -e /usr/local/bin/sync_pockettts_connectors ]; then
+	# Check access as the account that reads and executes the helper.
+	if runuser -u dwemer -- test -r /usr/local/bin/sync_pockettts_connectors &&
+	   runuser -u dwemer -- test -x /usr/local/bin/sync_pockettts_connectors; then
+		runuser -u dwemer -- /usr/local/bin/sync_pockettts_connectors --startup ||
+			echo "PocketTTS connector check is incomplete; see the details above. Continuing startup."
+	else
+		echo "PocketTTS connector helper is not accessible to dwemer; run the DwemerDistro update to repair it. Continuing startup."
+	fi
 fi
 
 if [ -f "/home/dwemer/piper/cuda-keyring_1.1-1_all.deb" ]; then 
