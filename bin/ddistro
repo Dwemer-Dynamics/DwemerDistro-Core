@@ -22,11 +22,15 @@ TOOL = {"name": "ddistro", "version": "1.0.0", "source": "DwemerDistro-Core"}
 SCHEMA_VERSION = 1
 SERVER_HELPER = "/usr/local/bin/ddistro_server"
 CHANGES_HELPER = "/usr/local/bin/ddistro_changes"
+AGENT_HELPER = "/usr/local/bin/ddistro_agent"
 HELPER_OWNER_UID = 0
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 STATUS_TIMEOUT = 120
 UPDATE_TIMEOUT = 3 * 3600  # Reign updates include a native build.
 CHANGES_TIMEOUT = 600
+AGENT_STATUS_TIMEOUT = 120  # the first status after an install hashes the pinned runtime
+AGENT_PROBE_TIMEOUT = 600
+AGENT_STDOUT_LIMIT = 256 * 1024
 CHANGES_STDOUT_LIMIT = 24 * 1024 * 1024  # an 8 MiB change batch plus its diff
 CHANGES_DIFF_BYTES = 8 * 1024 * 1024  # JSON-encoded diff bound in ddistro_changes
 STOP_GRACE = 10
@@ -100,6 +104,8 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
   changes prepare --product herika [--path RELATIVE ...]       (root)
   changes diff|stage|status|rollback TASK | changes list         (root)
   changes apply TASK --manifest-sha256 HASH                     (root)
+  agent status | agent probe                                    (probe: root)
+  agent serve --task TASK      (root; raw Codex App Server JSONL, no --json envelope)
 
 Products: herika (chim, skyrim), lorkhan, stobe (kenshi), dialectic (fnv, ttw), reign.
 --force discards local edits to tracked server files; it is never added automatically."""
@@ -361,7 +367,12 @@ def cmd_capabilities(opts, ctx):
             {"name": "server status", "arguments": ["[product]"], "mutates": False},
             {"name": "server update", "arguments": ["<product>"], "flags": ["--branch", "--force"],
              "mutates": True, "requires_root": True},
-        ] + [dict(CHANGES_SPEC[name], name="changes " + name, requires_root=True) for name in CHANGES_SPEC],
+        ] + [dict(CHANGES_SPEC[name], name="changes " + name, requires_root=True) for name in CHANGES_SPEC] + [
+            {"name": "agent status", "mutates": False},
+            {"name": "agent probe", "mutates": True, "requires_root": True},
+            {"name": "agent serve", "flags": ["--task"], "mutates": False, "requires_root": True,
+             "transport": "jsonl"},
+        ],
         "global_flags": ["--json", "--request-id"],
         "aliases": ALIASES,
         "log_targets": {target: names for target, (_, names) in LOG_SOURCES.items()},
@@ -373,7 +384,10 @@ def cmd_capabilities(opts, ctx):
         # staged manifest always comes with its complete diff.
         "change_review": {"truncated_flag": "diff_truncated", "stage_refuses_truncated": True},
         "change_products": ["herika"],
-        "features": {"file_changes": True, "locks": True, "agent": False, "chat": False},
+        # agent means the commands and a trusted helper are present; readiness (runtime installed
+        # and a passing probe on this distro) is only ever reported by agent status.
+        "features": {"file_changes": True, "locks": True, "agent": agent_helper_trusted(), "chat": False},
+        "agent": {"provider": "codex", "readiness_command": "agent status", "ready_when": ["installed", "probe_passed"]},
     }
     return data, "\n".join(command["name"] for command in data["commands"])
 
@@ -655,9 +669,139 @@ def parse_changes(rest, ctx):
     return opts
 
 
+# ddistro agent: the ddistro_agent helper owns the runtime, sandbox, and attestation. status and
+# probe are validated into the normal envelope; serve replaces this process with the helper.
+AGENT_STATUS_KEYS = {"installed", "probe_passed", "provider", "version", "reason"}
+AGENT_TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,63}\Z")  # status reasons and probe check names
+
+
+def agent_helper_trusted():
+    try:
+        check_helper(AGENT_HELPER)
+        return True
+    except CliError:
+        return False
+
+
+def agent_document(out, keys):
+    if out.total > AGENT_STDOUT_LIMIT:
+        raise CliError("helper_protocol", "ddistro_agent returned too much output.")
+    try:
+        doc = json.loads(bytes(out.data).decode("utf-8"), parse_constant=reject_constant)
+    except ValueError:
+        doc = None
+    if type(doc) is not dict or set(doc) != keys:
+        raise CliError("helper_protocol", "ddistro_agent returned an unexpected result.")
+    return doc
+
+
+def agent_status():
+    code, out, _ = run_helper(["status"], AGENT_STATUS_TIMEOUT, AGENT_STDOUT_LIMIT + 1, helper=AGENT_HELPER)
+    doc = agent_document(out, AGENT_STATUS_KEYS)
+    valid = (code == 0 and type(doc["installed"]) is bool and type(doc["probe_passed"]) is bool
+             and (doc["installed"] or not doc["probe_passed"]) and doc["provider"] == "codex"
+             and (doc["version"] is None or type(doc["version"]) is str and len(doc["version"]) <= 64)
+             and type(doc["reason"]) is str and AGENT_TOKEN.match(doc["reason"]))
+    if not valid:
+        raise CliError("helper_protocol", "ddistro_agent returned an unexpected status.", {"helper_exit": code})
+    return doc
+
+
+def agent_human(data):
+    return f"{data['provider']} {data['version'] or '-'}: {data['reason']}"
+
+
+def cmd_agent_status(opts, ctx):
+    data = agent_status()
+    return data, agent_human(data)
+
+
+def probe_diagnostics(value):
+    """Bounded per-step exit status and redacted stderr lines; anything else is dropped."""
+    steps = {}
+    for name, step in list(value.items())[:8] if type(value) is dict else []:
+        if not AGENT_TOKEN.match(name) or type(step) is not dict:
+            continue
+        clean = {}
+        if type(step.get("exit")) is int:
+            clean["exit"] = step["exit"]
+        for key in ("failure", "error"):
+            if type(step.get(key)) is str:
+                clean[key] = clean_line(step[key][:64])
+        lines = step.get("stderr")
+        if type(lines) is list:
+            clean["stderr"] = [clean_line(line[:300]) for line in lines[:20] if type(line) is str]
+        steps[name] = clean
+    return steps
+
+
+def cmd_agent_probe(opts, ctx):
+    if os.geteuid() != 0:
+        raise CliError("permission_denied", "agent probe must run as root. ddistro never elevates by itself.")
+    ctx["operation_id"] = str(uuid.uuid4())
+    code, out, _ = run_helper(["probe"], AGENT_PROBE_TIMEOUT, AGENT_STDOUT_LIMIT + 1, helper=AGENT_HELPER)
+    doc = agent_document(out, {"passed", "checks", "diagnostics"})
+    checks = doc["checks"]
+    if type(checks) is not dict or len(checks) > 64 or not all(
+            type(name) is str and AGENT_TOKEN.match(name) and type(value) is bool for name, value in checks.items()):
+        raise CliError("helper_protocol", "ddistro_agent returned malformed probe checks.", {"helper_exit": code})
+    if code == 75:
+        raise CliError("busy", "An assistant session is running. Stop it before running the isolation check.")
+    if type(doc["passed"]) is not bool or code != (0 if doc["passed"] else 1) or doc["passed"] != (
+            bool(checks) and all(checks.values())):
+        raise CliError("helper_protocol", "ddistro_agent returned an inconsistent probe result.", {"helper_exit": code})
+    # Failed checks first, so a short list still shows what is wrong.
+    rows = sorted(({"name": name, "passed": value} for name, value in checks.items()), key=lambda row: row["passed"])
+    data = {"passed": doc["passed"], "checks": rows, "diagnostics": probe_diagnostics(doc["diagnostics"])}
+    data.update(agent_status())
+    human = "\n".join([("Isolation check passed." if data["passed"] else "Isolation check failed.") + " " + agent_human(data)]
+                      + [f"  {'ok  ' if row['passed'] else 'FAIL'} {row['name']}" for row in rows])
+    return data, human
+
+
+def serve_refusal(error, reason, exit_code):
+    """agent serve owns stdout for JSONL, so its own refusals are one JSON line on stderr only."""
+    try:
+        sys.stderr.write(json.dumps({"error": error, "reason": reason}) + "\n")
+        sys.stderr.flush()
+    except OSError:
+        pass
+    return exit_code
+
+
+def agent_serve(args):
+    """Exactly agent serve --task TASK: validated here, then this process becomes the root helper."""
+    if len(args) != 2 or args[0] != "--task" or not TASK_ID.match(args[1]):
+        return serve_refusal("invalid_argument", "usage: agent serve --task TASK (no other options)", 64)
+    if os.geteuid() != 0:
+        return serve_refusal("assistant_unavailable", "requires_root", 3)
+    try:
+        check_helper(AGENT_HELPER)
+        os.chdir("/")
+        os.execve(AGENT_HELPER, [AGENT_HELPER, "serve", "--task", args[1]],
+                  {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
+    except CliError:
+        return serve_refusal("assistant_unavailable", "helper_unavailable", 3)
+    except OSError:
+        return serve_refusal("assistant_unavailable", "helper_unavailable", 3)
+
+
+def command_words(argv):
+    """The first two command tokens, skipping the global flags wherever they appear first."""
+    words, index = [], 0
+    while index < len(argv) and len(words) < 2:
+        if argv[index] == "--request-id":
+            index += 2
+            continue
+        if argv[index] != "--json":
+            words.append(argv[index])
+        index += 1
+    return words
+
+
 COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products": cmd_products,
             "status": cmd_status, "logs": cmd_logs, "server status": cmd_server_status,
-            "server update": cmd_server_update}
+            "server update": cmd_server_update, "agent status": cmd_agent_status, "agent probe": cmd_agent_probe}
 COMMANDS.update({"changes " + name: cmd_changes for name in CHANGES_SPEC})
 
 
@@ -693,6 +837,10 @@ def parse_command(rest, ctx):
         if len(rest) < 2 or rest[1] not in ("status", "update"):
             raise CliError("invalid_argument", "Expected server status or server update.")
         name, rest = "server " + rest[1], rest[1:]
+    elif name == "agent":
+        if len(rest) < 2 or rest[1] not in ("status", "probe"):
+            raise CliError("invalid_argument", "Expected agent status, agent probe, or agent serve --task TASK.")
+        name, rest = "agent " + rest[1], rest[1:]
     if name not in COMMANDS:
         raise CliError("invalid_argument", "Unknown command.\n" + USAGE)
     ctx["command"] = name
@@ -757,6 +905,10 @@ def raise_cancelled(signum, frame):
 
 
 def main(argv):
+    if command_words(argv) == ["agent", "serve"]:
+        if argv[:2] != ["agent", "serve"]:
+            return serve_refusal("invalid_argument", "agent serve takes no --json or --request-id", 64)
+        return agent_serve(argv[2:])
     ctx = {"json": "--json" in argv, "command": None, "request_id": str(uuid.uuid4()),
            "request_id_given": False, "warnings": []}
     signal.signal(signal.SIGTERM, raise_cancelled)

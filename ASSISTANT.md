@@ -14,6 +14,8 @@ ddistro server update <product> --branch <branch> [--force]       # root only
 ddistro changes prepare --product herika [--path RELATIVE ...]    # root only, see File changes
 ddistro changes diff|stage|status|rollback TASK | changes list    # root only
 ddistro changes apply TASK --manifest-sha256 HASH                 # root only
+ddistro agent status | agent probe                                # probe root only, see Assistant agent
+ddistro agent serve --task TASK                                   # root only, raw JSONL
 ```
 
 Products are the five `ddistro_server` products: `herika` (aliases `chim`, `skyrim`),
@@ -53,7 +55,9 @@ stdout and failures are `[FAIL] ...` on stderr.
 | `timeout`, `cancelled` | 124, 130 | Helper stopped after timeout, or the caller cancelled |
 
 `capabilities` lists only implemented commands, aliases, log names, limits, and error
-codes; `features.file_changes` and `locks` are `true`, `agent` and `chat` are `false`.
+codes; `features.file_changes` and `locks` are `true` and `chat` is `false`. `features.agent`
+is `true` only when the trusted `ddistro_agent` helper is installed; it never means the
+assistant is ready. Readiness comes only from `agent status` (`installed` and `probe_passed`).
 
 ## Status and update
 
@@ -98,7 +102,9 @@ at `/var/www/html/HerikaServer` is editable; other products are `unsupported`.
   text file or a new file in an existing folder. `.git`, logs, caches, uploads, voices,
   `conf/conf*.php`, and likely credential files are refused even when named. No paths gives a
   diagnostic-only workspace with sanitized status and recent log lines in `.ddistro-context/`.
-- Task state is `/var/lib/dwemerdistro/assistant/tasks/<uuid>/` (root, `0700`; files `0600`)
+- Task state is `/var/lib/dwemerdistro/assistant/tasks/<uuid>/` (root `0700`, or
+  `root:ddagent 0710` when the workspace is `ddagent`'s so the assistant runtime can reach
+  `work/` without listing or reading anything else; files `0600`)
   with `task.json` (`schema_version`, `task_id`, `product`, `workspace`, baseline hashes and
   metadata). The workspace is `<task>/work`, owned by `ddagent` if it exists, otherwise
   `dwemer`; a root broker can bind it without exposing the task metadata.
@@ -131,10 +137,33 @@ nested updates work), while `changes apply` and `rollback` need it exclusively a
 `busy` otherwise. Root creates it if missing and never replaces it; unprivileged updaters
 only open it read-only and stop with a message if it is missing.
 
+## Assistant agent
+
+`agent` commands run the root-owned `/usr/local/bin/ddistro_agent` (installed `0755` by
+`update.sh` and trust-checked like the other helpers). See ASSISTANT_RUNTIME.md for the
+runtime, sandbox, and probe. `update.sh` never downloads the runtime or installs packages;
+that is an explicit `install_assistant_runtime` run as root.
+
+- `agent status` (any user) returns `{installed, probe_passed, provider: "codex", version,
+  reason}` exactly as the helper reports it. `reason` is a token such as `ready`,
+  `probe_required`, `probe_stale`, `not_installed`, or `bwrap_unsupported`. A runtime that
+  is not ready is still `ok`; only an unusable helper is an error.
+- `agent probe` (root, adds `operation_id`) runs the real isolation probe and returns
+  `{passed, checks: [{name, passed}], diagnostics, ...status fields}`, failed checks first.
+  A failed probe is `ok` with `passed: false`, and the helper has removed the attestation.
+  A running session gives `busy` (75) and leaves the attestation unchanged. `diagnostics`
+  holds per-step exit status and bounded, redacted stderr lines.
+- `agent serve --task TASK` (root) accepts exactly those arguments; `--json` and
+  `--request-id` are refused. After checking the helper, `ddistro` replaces itself with
+  `ddistro_agent serve --task TASK` (same process, a minimal environment, working directory
+  `/`), so stdin and stdout are the helper's raw Codex App Server JSONL with no envelope or
+  progress text. Refusals by `ddistro` itself are one `{"error", "reason"}` line on stderr
+  with exit `64` (bad arguments) or `3` (`requires_root`, `helper_unavailable`); the
+  helper's own refusals and exit codes are described in ASSISTANT_RUNTIME.md.
+
 ## Trust boundaries and future scope
 
 The CLI is a convenience and contract layer, not a sandbox or authorization boundary:
 anything it can do, the same user can do directly. Root-only work stays in
-`ddistro_server` and `ddistro_changes`, which own their locking. Later stages may add an
-isolated assistant agent and launcher chat; each will appear in `capabilities` only when
-implemented. The existing CHIM-MCP `/chat` is unchanged.
+`ddistro_server` and `ddistro_changes`, which own their locking. Launcher chat may come
+later and will appear in `capabilities` only when implemented. The existing CHIM-MCP `/chat` is unchanged.
