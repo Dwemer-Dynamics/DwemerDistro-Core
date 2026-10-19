@@ -1009,9 +1009,14 @@ classify_update_blocker() {
     case "$checkout_output" in
         *"Your local changes to the following files would be overwritten"*)
             # Staged, unstaged, deleted and mode-changed tracked paths that the target also changes.
+            # Index and work tree are read separately: a staged change the work tree undoes still blocks.
+            local -A seen=()
             while IFS= read -r -d '' path; do
+                [ -n "${seen[$path]+set}" ] && continue
+                seen[$path]=1
                 candidates+=("$path")
-            done < <("${repo_git[@]}" diff -z --no-renames --name-only HEAD --)
+            done < <("${repo_git[@]}" diff -z --no-renames --name-only --cached HEAD --
+                     "${repo_git[@]}" diff -z --no-renames --name-only --)
             if [ "${#candidates[@]}" -gt 0 ]; then
                 while IFS= read -r -d '' path; do
                     blocked+=("$path")
