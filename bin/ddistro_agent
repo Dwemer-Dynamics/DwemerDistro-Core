@@ -1,0 +1,1172 @@
+#!/usr/bin/env python3
+"""Distro-owned runtime broker for the DwemerDistro assistant (native Codex).
+
+  ddistro_agent status            # any user; bounded JSON installation/attestation state
+  ddistro_agent serve --task ID   # root; raw Codex App Server JSONL on stdin/stdout
+
+See ASSISTANT_RUNTIME.md for the task contract, sandbox layout, and client parameters.
+
+Privilege split:
+  * root validates the task, the pinned runtime, and the attestation, opens the task's
+    scratch directory and the account home as file descriptors, and holds the singleton lock.
+  * everything Codex runs as the dedicated ddagent identity with no supplementary groups,
+    no_new_privs, and no capabilities, inside a bubblewrap sandbox that exposes only /usr,
+    a sanitized /etc, the pinned runtime, the account home, the sanitized task context,
+    and /work. Native tools run inside Codex's own sandbox under a root-managed permission
+    profile that can write /work and cannot read the account home.
+  * bwrap resolves --bind-fd sources by path as ddagent, so the root-owned directories above
+    /work are root:ddagent 0710 (search only). A root-supplied guard is the first program in
+    every sandbox and refuses unless /work and /agent/home are the descriptors root opened.
+  * applying scratch changes to a live install is never done here.
+"""
+import argparse
+import ctypes
+import errno
+import fcntl
+import grp
+import hashlib
+import json
+import os
+import platform
+import pwd
+import re
+import resource
+import secrets
+import select
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import time
+
+PROVIDER = "codex"
+CODEX_VERSION = "0.163.0"
+RUNTIME_ROOT = "/opt/dwemerdistro-agent"
+RUNTIME_DIR = RUNTIME_ROOT + "/runtime"
+RUNTIME_NAME = "codex-x86_64-unknown-linux-musl"
+RUNTIME_BINARY = RUNTIME_DIR + "/" + RUNTIME_NAME
+RUNTIME_BIN_DIR = RUNTIME_DIR + "/bin"
+# Extracted binary from rust-v0.163.0 codex-x86_64-unknown-linux-musl.tar.gz
+# (archive sha256 beb339e8ecd9ba057a6bb2dc81ad8ca474812edfbf0fc5056ca818797648dde4).
+RUNTIME_SHA256 = "399ff69c431c066e40de318fba45c2b07f45a76b19939d247ee4828fc70c4215"
+RUNTIME_LINKS = ("codex", "codex-linux-sandbox")
+BWRAP = "/usr/bin/bwrap"
+GUARD_PYTHON = "/usr/bin/python3"
+AGENT_USER = "ddagent"
+NOLOGIN_SHELLS = ("/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "/usr/bin/false")
+STATE_ROOT = "/var/lib/dwemerdistro/assistant"
+TASKS_ROOT = STATE_ROOT + "/tasks"
+AGENT_STATE = STATE_ROOT + "/agent"
+THREADS_DIR = AGENT_STATE + "/threads"
+ACCOUNT_HOME_NAME = "codex-home"
+ATTESTATION_NAME = "attestation.json"
+LOCK_NAME = "serve.lock"
+SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Paths inside the sandbox.
+PROFILE = "dwemer-scratch"
+SANDBOX_HOME = "/agent/home"
+SANDBOX_WORK = "/work"
+SANDBOX_CONTEXT = "/task/task.json"
+SANDBOX_USER_HOME = "/home/ddagent"
+SANDBOX_PATH = RUNTIME_BIN_DIR + ":/usr/bin:/bin"
+ROOT_LINKS = ("bin", "sbin", "lib", "lib32", "lib64", "libx32")
+ETC_BINDS = ("alternatives", "ssl", "ca-certificates", "ca-certificates.conf", "ld.so.cache",
+             "ld.so.conf", "ld.so.conf.d", "nsswitch.conf", "host.conf", "gai.conf", "protocols",
+             "services", "localtime", "php", "mime.types")
+# Files that would let the account home override the managed policy, instructions, or
+# environment (Codex loads $CODEX_HOME/.env before reading any config).
+UNMANAGED_HOME_FILES = ("config.toml", "managed_config.toml", "requirements.toml", "hooks.json",
+                        "AGENTS.md", "AGENTS.override.md", ".env")
+
+SCHEMA_VERSION = 1
+ATTESTATION_SCHEMA = 1
+LAYOUT_VERSION = "ddagent-sandbox-1"
+TASK_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+PRODUCT_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}\Z")
+CLIENT_LINE_LIMIT = 8 * 1024 * 1024
+SERVER_LINE_LIMIT = 32 * 1024 * 1024
+STDERR_LIMIT = 64 * 1024
+DIAG_BYTES = 4096
+DIAG_LINES = 20
+METADATA_LIMIT = 64 * 1024
+# Matches ddistro changes MAX_STATE_BYTES: a valid Stage B task.json carries its selected records.
+TASK_METADATA_LIMIT = 4 * 1024 * 1024
+TEXT_LIMIT = 256 * 1024
+MAX_THREADS_PER_TASK = 256
+MAX_TRACKED_REQUESTS = 1024
+SHUTDOWN_GRACE = 10.0
+REFUSAL_WINDOW = 15.0
+PR_SET_NO_NEW_PRIVS = 38
+O_PATH_DIR = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+SCRATCH_ANCESTOR_MODE = 0o710
+GUARD_EXIT = 97
+# Loaded before any fork so the child only calls prctl.
+LIBC = ctypes.CDLL(None, use_errno=True)
+
+# Profiles live only in requirements so the account-home user layer cannot redefine them.
+# There is deliberately no managed [permissions.filesystem] deny_read (Codex 0.163.0): Codex
+# always makes its per-session arg0 helper alias directory, $CODEX_HOME/tmp/arg0-linux/codex-arg0*
+# (symlinks to the pinned runtime binary and a lock file; no credentials), an extra readable
+# root, and rejects startup if any managed deny_read root contains it. A managed deny on /agent,
+# /agent/home or /agent/home/tmp therefore cannot load, and exact managed denies beneath the
+# profile's /agent deny would be nested masks under its read-only tmpfs, which the Linux sandbox
+# does not support. The only selectable profile denies /agent, so the most specific entry
+# leaves Codex itself only that helper directory readable, and the Linux sandbox masks all of
+# /agent (helper included) for tools.
+REQUIREMENTS_TOML = """\
+# Managed by ddistro_agent; bound read-only at /etc/codex/requirements.toml in the sandbox.
+allowed_approval_policies = ["never"]
+allowed_sandbox_modes = ["read-only"]
+default_permissions = "dwemer-scratch"
+allow_login_shell = false
+allow_managed_hooks_only = true
+
+[allowed_permission_profiles]
+dwemer-scratch = true
+
+[permissions.dwemer-scratch]
+description = "DwemerDistro assistant: task scratch only"
+
+[permissions.dwemer-scratch.filesystem]
+":minimal" = "read"
+":slash_tmp" = "write"
+"/usr" = "read"
+"/etc" = "read"
+"/opt/dwemerdistro-agent/runtime" = "read"
+"/task" = "read"
+"/agent" = "deny"
+
+[permissions.dwemer-scratch.filesystem.":workspace_roots"]
+"." = "write"
+
+[permissions.dwemer-scratch.network]
+enabled = false
+
+[features]
+apps = false
+browser_use = false
+computer_use = false
+hooks = false
+image_generation = false
+memories = false
+multi_agent = false
+plugins = false
+remote_plugin = false
+"""
+
+CONFIG_TOML = """\
+# Managed by ddistro_agent; bound read-only at /etc/codex/config.toml in the sandbox.
+default_permissions = "dwemer-scratch"
+approval_policy = "never"
+check_for_update_on_startup = false
+
+[shell_environment_policy]
+inherit = "core"
+"""
+
+APP_SERVER_COMMAND = (RUNTIME_BIN_DIR + "/codex", "app-server", "--strict-config", "--listen", "stdio://")
+
+
+class Refusal(Exception):
+    """A fail-closed condition with a stable, secret-free reason code."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class PolicyError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    finally:
+        os.close(fd)
+    return digest.hexdigest()
+
+
+def policy_sha256():
+    return sha256_bytes((LAYOUT_VERSION + "\0" + REQUIREMENTS_TOML + "\0" + CONFIG_TOML).encode())
+
+
+def root_only_writable(st):
+    return st.st_uid == 0 and not st.st_mode & 0o022
+
+
+def trusted_chain(path, reason):
+    """Every component of an absolute path must be a real, root-owned, root-only-writable entry."""
+    current = "/"
+    st = os.lstat(current)
+    if not root_only_writable(st):
+        raise Refusal(reason)
+    for part in [p for p in path.split("/") if p]:
+        current = os.path.join(current, part)
+        try:
+            st = os.lstat(current)
+        except OSError:
+            raise Refusal(reason)
+        if stat.S_ISLNK(st.st_mode) or not root_only_writable(st):
+            raise Refusal(reason)
+    return st
+
+
+def open_root_dir(path, reason, private=False):
+    """Open a directory without following symlinks, requiring root ownership on every component."""
+    fd = os.open("/", O_PATH_DIR)
+    try:
+        if not root_only_writable(os.fstat(fd)):
+            raise Refusal(reason)
+        for part in [p for p in path.split("/") if p]:
+            next_fd = os.open(part, O_PATH_DIR, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+            if not root_only_writable(os.fstat(fd)):
+                raise Refusal(reason)
+        if private and os.fstat(fd).st_mode & 0o077:
+            raise Refusal(reason)
+        return fd
+    except OSError:
+        os.close(fd)
+        raise Refusal(reason)
+    except Refusal:
+        os.close(fd)
+        raise
+
+
+def read_bounded(fd, limit):
+    data = b""
+    while len(data) <= limit:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return data
+        data += chunk
+    raise Refusal("metadata_too_large")
+
+
+def write_root_file(dir_fd, name, data, mode):
+    """Atomically replace a file in a root-only directory."""
+    tmp = ".%s.%s.tmp" % (name, secrets.token_hex(4))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=dir_fd)
+    try:
+        os.fchmod(fd, mode)
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+
+
+def remove_entry(dir_fd, name):
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+
+
+# ---------------------------------------------------------------- installation and attestation
+
+def agent_identity():
+    try:
+        pw = pwd.getpwnam(AGENT_USER)
+    except KeyError:
+        raise Refusal("agent_identity_missing")
+    if pw.pw_uid == 0 or pw.pw_gid == 0 or pw.pw_shell not in NOLOGIN_SHELLS:
+        raise Refusal("agent_identity_unsafe")
+    if any(AGENT_USER in g.gr_mem for g in grp.getgrall()):
+        raise Refusal("agent_identity_unsafe")
+    # The group gets search access above /work, so it must be ddagent's alone.
+    try:
+        group = grp.getgrgid(pw.pw_gid)
+    except KeyError:
+        raise Refusal("agent_identity_unsafe")
+    if group.gr_name != AGENT_USER or group.gr_mem or any(
+            p.pw_gid == pw.pw_gid and p.pw_name != AGENT_USER for p in pwd.getpwall()):
+        raise Refusal("agent_identity_unsafe")
+    return pw
+
+
+def runtime_state(attestation):
+    st = trusted_chain(RUNTIME_BINARY, "runtime_untrusted")
+    if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o100:
+        raise Refusal("runtime_untrusted")
+    trusted_chain(RUNTIME_BIN_DIR, "runtime_untrusted")
+    for name in RUNTIME_LINKS:
+        try:
+            if os.readlink(os.path.join(RUNTIME_BIN_DIR, name)) != "../" + RUNTIME_NAME:
+                raise Refusal("runtime_untrusted")
+        except OSError:
+            raise Refusal("runtime_untrusted")
+    key = [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+    # status may reuse an attested digest when the root-owned file is provably unchanged.
+    if attestation and attestation.get("runtime_stat") == key and attestation.get("runtime_sha256") == RUNTIME_SHA256:
+        digest = RUNTIME_SHA256
+    else:
+        digest = sha256_file(RUNTIME_BINARY)
+    if digest != RUNTIME_SHA256:
+        raise Refusal("runtime_hash_mismatch")
+    return key
+
+
+def bwrap_state():
+    st = trusted_chain(BWRAP, "bwrap_missing")
+    if not stat.S_ISREG(st.st_mode):
+        raise Refusal("bwrap_missing")
+    try:
+        result = subprocess.run([BWRAP, "--help"], stdin=subprocess.DEVNULL, capture_output=True,
+                                timeout=10, env={"PATH": SAFE_PATH})
+    except (OSError, subprocess.TimeoutExpired):
+        raise Refusal("bwrap_unsupported")
+    usage = result.stdout + result.stderr
+    if any(flag not in usage for flag in (b"--bind-fd", b"--ro-bind-data", b"--clearenv", b"--die-with-parent")):
+        raise Refusal("bwrap_unsupported")
+    # The sandbox guard runs on the host's read-only /usr, so its interpreter must be root's.
+    python = os.path.realpath(GUARD_PYTHON)
+    if not python.startswith("/usr/") or not stat.S_ISREG(trusted_chain(python, "python_untrusted").st_mode):
+        raise Refusal("python_untrusted")
+    return sha256_file(BWRAP)
+
+
+def scratch_ancestor(st, identity):
+    """A root directory above /work: ddagent's dedicated group may search it, never list or change it."""
+    return (stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and st.st_gid == identity.pw_gid
+            and stat.S_IMODE(st.st_mode) == SCRATCH_ANCESTOR_MODE)
+
+
+def open_tasks_root(identity):
+    fd = open_root_dir(TASKS_ROOT, "state_untrusted")
+    if not scratch_ancestor(os.fstat(fd), identity):
+        os.close(fd)
+        raise Refusal("tasks_root_untrusted")
+    return fd
+
+
+def state_layout(identity):
+    for path, private in ((STATE_ROOT, False), (AGENT_STATE, False), (THREADS_DIR, True)):
+        os.close(open_root_dir(path, "state_untrusted", private))
+    os.close(open_tasks_root(identity))
+    try:
+        st = os.lstat(os.path.join(STATE_ROOT, ACCOUNT_HOME_NAME))
+    except OSError:
+        raise Refusal("account_home_missing")
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != identity.pw_uid or st.st_mode & 0o077:
+        raise Refusal("account_home_untrusted")
+
+
+def installation(attestation=None):
+    """Verify everything a session depends on; returns the facts an attestation is bound to."""
+    if platform.system() != "Linux" or platform.machine() != "x86_64":
+        raise Refusal("unsupported_platform")
+    helper = os.path.realpath(__file__)
+    if not stat.S_ISREG(trusted_chain(helper, "helper_untrusted").st_mode):
+        raise Refusal("helper_untrusted")
+    runtime_stat = runtime_state(attestation)
+    identity = agent_identity()
+    bwrap_digest = bwrap_state()
+    state_layout(identity)
+    uname = os.uname()
+    return identity, {
+        "schema_version": ATTESTATION_SCHEMA,
+        "provider": PROVIDER,
+        "codex_version": CODEX_VERSION,
+        "runtime_sha256": RUNTIME_SHA256,
+        "runtime_stat": runtime_stat,
+        "policy_sha256": policy_sha256(),
+        "helper_sha256": sha256_file(helper),
+        "bwrap_sha256": bwrap_digest,
+        "kernel": "%s %s" % (uname.release, uname.version),
+        "agent_uid": identity.pw_uid,
+        "agent_gid": identity.pw_gid,
+    }
+
+
+def read_attestation():
+    try:
+        dir_fd = open_root_dir(AGENT_STATE, "state_untrusted")
+    except Refusal:
+        return None
+    try:
+        fd = os.open(ATTESTATION_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError:
+        os.close(dir_fd)
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or not root_only_writable(st):
+            return None
+        document = json.loads(read_bounded(fd, METADATA_LIMIT))
+        return document if isinstance(document, dict) else None
+    except (OSError, ValueError, Refusal):
+        return None
+    finally:
+        os.close(fd)
+        os.close(dir_fd)
+
+
+def attestation_matches(attestation, binding):
+    if not attestation or attestation.get("passed") is not True:
+        return False
+    return all(attestation.get(key) == value for key, value in binding.items())
+
+
+def verified_session_identity():
+    """Full verification for a session: fresh runtime hash plus a matching attestation."""
+    identity, binding = installation(None)
+    attestation = read_attestation()
+    if attestation is None:
+        raise Refusal("probe_required")
+    if not attestation_matches(attestation, binding):
+        raise Refusal("probe_stale")
+    return identity
+
+
+# ---------------------------------------------------------------- task and account state
+
+def load_task(task_id, identity):
+    if not TASK_ID_PATTERN.match(task_id):
+        raise Refusal("task_id_invalid")
+    tasks_fd = open_tasks_root(identity)
+    task_fd = meta_fd = None
+    try:
+        try:
+            task_fd = os.open(task_id, O_DIR, dir_fd=tasks_fd)
+        except FileNotFoundError:
+            raise Refusal("task_missing")
+        except OSError:
+            raise Refusal("task_untrusted")
+        st = os.fstat(task_fd)
+        # A root-only 0700 task predates the runtime; it gains search access only after all checks.
+        legacy = st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o700
+        if not (legacy or scratch_ancestor(st, identity)):
+            raise Refusal("task_untrusted")
+        try:
+            meta_fd = os.open("task.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=task_fd)
+        except OSError:
+            raise Refusal("task_metadata_missing")
+        st = os.fstat(meta_fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o177:
+            raise Refusal("task_untrusted")
+        try:
+            document = json.loads(read_bounded(meta_fd, TASK_METADATA_LIMIT))
+        except ValueError:
+            raise Refusal("task_metadata_invalid")
+        context = sanitize_task(document, task_id)
+        try:
+            work_fd = os.open("work", O_PATH_DIR, dir_fd=task_fd)
+        except OSError:
+            raise Refusal("task_work_missing")
+        st = os.fstat(work_fd)
+        if st.st_uid != identity.pw_uid:
+            os.close(work_fd)
+            raise Refusal("work_owner_mismatch")
+        if st.st_mode & 0o002:
+            os.close(work_fd)
+            raise Refusal("task_untrusted")
+        if legacy:
+            try:
+                os.fchown(task_fd, 0, identity.pw_gid)
+                os.fchmod(task_fd, SCRATCH_ANCESTOR_MODE)
+            except OSError:
+                os.close(work_fd)
+                raise Refusal("task_untrusted")
+        return context, work_fd
+    finally:
+        for fd in (meta_fd, task_fd, tasks_fd):
+            if fd is not None:
+                os.close(fd)
+
+
+def sanitize_task(document, task_id):
+    if not isinstance(document, dict):
+        raise Refusal("task_metadata_invalid")
+    version = document.get("schema_version")
+    if type(version) is not int or version != SCHEMA_VERSION or document.get("task_id") != task_id:
+        raise Refusal("task_metadata_invalid")
+    product = document.get("product")
+    workspace = document.get("workspace")
+    if not isinstance(product, str) or not PRODUCT_PATTERN.match(product):
+        raise Refusal("task_metadata_invalid")
+    if not isinstance(workspace, str) or not 0 < len(workspace) <= 256 or not workspace.isprintable():
+        raise Refusal("task_metadata_invalid")
+    # Only these labels reach the model; nothing from task.json is used as a host path.
+    return {"schema_version": SCHEMA_VERSION, "task_id": task_id, "product": product,
+            "workspace": workspace, "scratch": SANDBOX_WORK}
+
+
+def open_account_home(identity):
+    state_fd = open_root_dir(STATE_ROOT, "state_untrusted")
+    try:
+        home_fd = os.open(ACCOUNT_HOME_NAME, O_PATH_DIR, dir_fd=state_fd)
+    except OSError:
+        raise Refusal("account_home_missing")
+    finally:
+        os.close(state_fd)
+    st = os.fstat(home_fd)
+    if st.st_uid != identity.pw_uid or st.st_mode & 0o077:
+        os.close(home_fd)
+        raise Refusal("account_home_untrusted")
+    for name in UNMANAGED_HOME_FILES:
+        try:
+            os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            pass
+        os.close(home_fd)
+        raise Refusal("account_home_unmanaged_config")
+    return home_fd
+
+
+class SingletonLock:
+    def __init__(self):
+        dir_fd = open_root_dir(AGENT_STATE, "state_untrusted")
+        try:
+            self.fd = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
+        except OSError:
+            raise Refusal("state_untrusted")
+        finally:
+            os.close(dir_fd)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(self.fd)
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                raise Refusal("busy")
+            raise Refusal("state_untrusted")
+
+
+class ThreadStore:
+    """Root-owned task -> Codex thread mapping; resume and turns are limited to these threads."""
+
+    def __init__(self, task_id):
+        self.task_id = task_id
+        self.ids = []
+        if task_id is None:
+            return
+        dir_fd = open_root_dir(THREADS_DIR, "state_untrusted", private=True)
+        try:
+            fd = os.open(task_id + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise Refusal("state_untrusted")
+        finally:
+            os.close(dir_fd)
+        try:
+            st = os.fstat(fd)
+            # Same rule as task.json: a regular root file with mode 0600 or stricter.
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o177:
+                raise Refusal("state_untrusted")
+            document = json.loads(read_bounded(fd, METADATA_LIMIT))
+            if not isinstance(document, dict) or document.get("task_id") != task_id:
+                raise Refusal("state_untrusted")
+            ids = document.get("thread_ids")
+            if not isinstance(ids, list):
+                raise Refusal("state_untrusted")
+            self.ids = [i for i in ids if isinstance(i, str) and 0 < len(i) <= 128]
+        except ValueError:
+            raise Refusal("state_untrusted")
+        finally:
+            os.close(fd)
+
+    def __contains__(self, thread_id):
+        return isinstance(thread_id, str) and thread_id in self.ids
+
+    def add(self, thread_id):
+        if not isinstance(thread_id, str) or not 0 < len(thread_id) <= 128 or thread_id in self.ids:
+            return
+        self.ids = (self.ids + [thread_id])[-MAX_THREADS_PER_TASK:]
+        if self.task_id is None:
+            return
+        document = {"schema_version": SCHEMA_VERSION, "task_id": self.task_id, "thread_ids": self.ids}
+        dir_fd = open_root_dir(THREADS_DIR, "state_untrusted", private=True)
+        try:
+            write_root_file(dir_fd, self.task_id + ".json", json.dumps(document).encode(), 0o600)
+        finally:
+            os.close(dir_fd)
+
+
+# ---------------------------------------------------------------- sandbox
+
+# Trusted guard: this root-supplied code runs in the root-owned GUARD_PYTHON from the read-only
+# /usr bind, as the agent UID, as the first program in every sandbox, before Codex or any probe
+# command. bwrap resolves --bind-fd sources by path; the guard requires that /agent/home and /work
+# are the device:inode of the descriptors root opened, that the process is exactly the agent UID
+# and GID with no groups, no_new_privs and no capabilities, and only then execs the command.
+SANDBOX_GUARD = r"""
+import os, sys
+uid, gid = int(sys.argv[1]), int(sys.argv[2])
+def ident(path):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return "%d:%d" % (st.st_dev, st.st_ino)
+status = open("/proc/self/status").read()
+if (os.getresuid() != (uid, uid, uid) or os.getresgid() != (gid, gid, gid) or os.getgroups() not in ([], [gid])
+        or "NoNewPrivs:\t1" not in status or "CapEff:\t0000000000000000" not in status
+        or ident("/agent/home") != sys.argv[3] or ident("/work") != sys.argv[4]):
+    sys.stderr.write("ddistro_agent guard: sandbox identity mismatch\n")
+    sys.exit(97)  # GUARD_EXIT
+os.execv(sys.argv[5], sys.argv[5:])
+"""
+
+
+def fd_identity(fd):
+    st = os.fstat(fd)
+    return "%d:%d" % (st.st_dev, st.st_ino)
+
+
+def sandbox_files(identity, context):
+    passwd = "root:x:0:0::/nonexistent:/usr/sbin/nologin\n%s:x:%d:%d::%s:/usr/sbin/nologin\n" % (
+        AGENT_USER, identity.pw_uid, identity.pw_gid, SANDBOX_USER_HOME)
+    group = "root:x:0:\n%s:x:%d:\n" % (AGENT_USER, identity.pw_gid)
+    files = {
+        "/etc/passwd": passwd.encode(),
+        "/etc/group": group.encode(),
+        "/etc/codex/requirements.toml": REQUIREMENTS_TOML.encode(),
+        "/etc/codex/config.toml": CONFIG_TOML.encode(),
+        SANDBOX_CONTEXT: (json.dumps(context, indent=2) + "\n").encode(),
+    }
+    # Copied as data so WSL's generated resolv.conf never exposes /mnt or /run.
+    for name in ("hosts", "resolv.conf"):
+        try:
+            with open(os.path.realpath("/etc/" + name), "rb") as handle:
+                files["/etc/" + name] = handle.read(32 * 1024)
+        except OSError:
+            continue
+    return files
+
+
+def sandbox_command(identity, context, work_fd, home_fd, command, expect=None):
+    """Outer bubblewrap sandbox; returns argv and the descriptors it consumes.
+
+    expect overrides the (home, work) identities the guard requires; only the probe uses it."""
+    home_id, work_id = expect or (fd_identity(home_fd), fd_identity(work_fd))
+    guard = [GUARD_PYTHON, "-I", "-S", "-c", SANDBOX_GUARD, str(identity.pw_uid), str(identity.pw_gid), home_id, work_id]
+    env = {"HOME": SANDBOX_USER_HOME, "USER": AGENT_USER, "LOGNAME": AGENT_USER, "PATH": SANDBOX_PATH,
+           "LANG": "C.UTF-8", "TMPDIR": "/tmp", "CODEX_HOME": SANDBOX_HOME}
+    argv = [BWRAP, "--unshare-all", "--share-net", "--die-with-parent", "--new-session", "--clearenv"]
+    for key, value in env.items():
+        argv += ["--setenv", key, value]
+    argv += ["--ro-bind", "/usr", "/usr", "--tmpfs", "/usr/local"]
+    for name in ROOT_LINKS:
+        path = "/" + name
+        if os.path.islink(path):
+            argv += ["--symlink", os.readlink(path), path]
+        elif os.path.isdir(path):
+            argv += ["--ro-bind", path, path]
+    argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/home",
+             "--dir", SANDBOX_USER_HOME, "--dir", "/etc", "--dir", "/etc/codex", "--dir", "/task",
+             "--dir", "/agent", "--dir", RUNTIME_ROOT, "--ro-bind", RUNTIME_DIR, RUNTIME_DIR]
+    for name in ETC_BINDS:
+        path = "/etc/" + name
+        real = os.path.realpath(path)
+        if os.path.exists(path) and real.startswith(("/etc/", "/usr/")):
+            argv += ["--ro-bind", path, path]
+    fds = []
+    for dest, data in sandbox_files(identity, context).items():
+        read_fd, write_fd = os.pipe()
+        try:
+            if len(data) >= 60000:
+                raise Refusal("sandbox_setup_failed")
+            os.write(write_fd, data)
+        finally:
+            os.close(write_fd)
+        fds.append(read_fd)
+        argv += ["--ro-bind-data", str(read_fd), dest]
+    argv += ["--bind-fd", str(home_fd), SANDBOX_HOME, "--bind-fd", str(work_fd), SANDBOX_WORK,
+             "--chdir", SANDBOX_WORK, "--"] + guard + list(command)
+    return argv, fds + [home_fd, work_fd]
+
+
+def drop_privileges():
+    """Runs in the child after setgroups/setgid/setuid: no core dumps, no new privileges."""
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    os.umask(0o077)
+    if LIBC.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "no_new_privs")
+
+
+def spawn_sandboxed(identity, context, work_fd, home_fd, command, stdin, stdout, stderr, expect=None):
+    argv, fds = sandbox_command(identity, context, work_fd, home_fd, command, expect)
+    try:
+        return subprocess.Popen(argv, stdin=stdin, stdout=stdout, stderr=stderr, pass_fds=fds, close_fds=True,
+                                user=identity.pw_uid, group=identity.pw_gid, extra_groups=[], process_group=0,
+                                preexec_fn=drop_privileges, env={"PATH": SAFE_PATH}, cwd="/")
+    except OSError:
+        raise Refusal("sandbox_setup_failed")
+    finally:
+        for fd in fds[:-2]:
+            os.close(fd)
+
+
+def stop_process_group(proc, grace=SHUTDOWN_GRACE):
+    """Orderly stop: EOF first, then signal only this session's own process group."""
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+    except OSError:
+        pass
+    try:
+        proc.wait(grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(3)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+# ---------------------------------------------------------------- JSONL broker
+
+def request_key(request_id):
+    return (type(request_id).__name__, request_id)
+
+
+def valid_request_id(request_id):
+    if isinstance(request_id, bool):
+        return False
+    return isinstance(request_id, int) or (isinstance(request_id, str) and len(request_id) <= 128)
+
+
+def reject_unknown(params, allowed):
+    extra = sorted(set(params) - set(allowed))
+    if extra:
+        raise PolicyError(-32602, "parameter not permitted by DwemerDistro assistant policy: " + extra[0][:64])
+
+
+def bounded_text(params, key):
+    value = params.get(key)
+    if value is not None and (not isinstance(value, str) or len(value) > TEXT_LIMIT):
+        raise PolicyError(-32602, "invalid parameter: " + key)
+
+
+def enforce_sandbox(params):
+    """Pin cwd, approvals, and the managed profile; legacy workspaceWrite maps to the stronger profile."""
+    if params.get("approvalPolicy") not in (None, "never"):
+        raise PolicyError(-32602, "approvalPolicy must be never")
+    if params.get("approvalsReviewer") not in (None, "user"):
+        raise PolicyError(-32602, "approvalsReviewer is not permitted")
+    if params.get("cwd") not in (None, SANDBOX_WORK):
+        raise PolicyError(-32602, "cwd must be " + SANDBOX_WORK)
+    if params.get("permissions") not in (None, PROFILE):
+        raise PolicyError(-32602, "permissions must be " + PROFILE)
+    if params.get("sandbox") not in (None, "workspace-write"):
+        raise PolicyError(-32602, "sandbox override is not permitted")
+    policy = params.get("sandboxPolicy")
+    if policy is not None:
+        if not isinstance(policy, dict) or policy.get("type") != "workspaceWrite":
+            raise PolicyError(-32602, "sandboxPolicy override is not permitted")
+        if policy.get("writableRoots") or policy.get("networkAccess") or policy.get("readOnlyAccess"):
+            raise PolicyError(-32602, "sandboxPolicy override is not permitted")
+    for key in ("sandbox", "sandboxPolicy", "permissions", "approvalsReviewer"):
+        params.pop(key, None)
+    params["approvalPolicy"] = "never"
+    params["cwd"] = SANDBOX_WORK
+    bounded_text(params, "developerInstructions")
+    bounded_text(params, "model")
+    return params
+
+
+THREAD_START_KEYS = ("model", "approvalPolicy", "approvalsReviewer", "cwd", "sandbox", "permissions",
+                     "developerInstructions", "ephemeral", "serviceName", "personality", "serviceTier")
+THREAD_RESUME_KEYS = ("threadId", "model", "approvalPolicy", "approvalsReviewer", "cwd", "sandbox", "permissions",
+                      "developerInstructions", "personality", "serviceTier", "excludeTurns")
+TURN_START_KEYS = ("threadId", "input", "model", "effort", "summary", "approvalPolicy", "approvalsReviewer", "cwd",
+                   "sandboxPolicy", "permissions", "outputSchema", "personality", "serviceTier", "clientUserMessageId")
+LOGIN_KEYS = {"chatgpt": ("type", "appBrand", "codexStreamlinedLogin", "useHostedLoginSuccessPage"),
+              "chatgptDeviceCode": ("type",)}
+# Read-only or account methods whose parameters do not affect the sandbox.
+PASSTHROUGH_METHODS = ("initialize", "model/list", "configRequirements/read", "permissionProfile/list",
+                       "account/rateLimits/read")
+SIMPLE_METHODS = {"account/read": ("refreshToken",), "account/login/cancel": ("loginId",), "account/logout": ()}
+# Server requests whose client answers could widen access; the broker always denies them.
+DENIED_SERVER_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                          "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval",
+                          "item/tool/call", "mcpServer/elicitation/request", "account/chatgptAuthTokens/refresh")
+
+
+class Broker:
+    """Bidirectional JSONL relay that only forwards the launcher's allowed method surface."""
+
+    def __init__(self, proc, client_in, client_out, threads, err_sink=None):
+        self.proc = proc
+        self.client_in = client_in
+        self.client_out = client_out
+        self.threads = threads
+        self.err_sink = err_sink
+        self.out_lock = threading.Lock()
+        self.in_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.pending = {}
+        self.server_requests = {}
+        self.failure = None
+        self.stop_timer = None
+
+    def run(self):
+        for target in (self._pump_client, self._drain_stderr):
+            threading.Thread(target=target, daemon=True).start()
+        self._pump_server()
+        if self.stop_timer:
+            self.stop_timer.cancel()
+        stop_process_group(self.proc)
+        return self.proc.returncode
+
+    def request_stop(self):
+        """Signal-safe: terminate only this session's process group."""
+        if self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    def _fail(self, reason):
+        with self.state_lock:
+            if self.failure is None:
+                self.failure = reason
+        self.request_stop()
+
+    # client -> server
+    def _pump_client(self):
+        while True:
+            try:
+                line = self.client_in.readline(CLIENT_LINE_LIMIT + 1)
+            except (OSError, ValueError):
+                line = b""
+            if not line:
+                break
+            if len(line) > CLIENT_LINE_LIMIT:
+                self._fail("client_message_too_large")
+                return
+            if line.strip():
+                self._handle_client(line)
+        try:
+            with self.in_lock:
+                self.proc.stdin.close()
+        except OSError:
+            pass
+        self.stop_timer = threading.Timer(SHUTDOWN_GRACE, self.request_stop)
+        self.stop_timer.daemon = True
+        self.stop_timer.start()
+
+    def _handle_client(self, line):
+        try:
+            message = json.loads(line)
+        except ValueError:
+            self._reply_error(None, -32700, "parse error")
+            return
+        if not isinstance(message, dict):
+            self._reply_error(None, -32600, "invalid request")
+            return
+        method = message.get("method")
+        if method is not None:
+            if "id" not in message:
+                if method == "initialized":
+                    self._to_server(message)
+                return
+            request_id = message["id"]
+            if not valid_request_id(request_id) or not isinstance(method, str):
+                self._reply_error(None, -32600, "invalid request")
+                return
+            try:
+                message["params"] = self._authorize(method, message.get("params"))
+            except PolicyError as exc:
+                self._reply_error(request_id, exc.code, exc.message)
+                return
+            if method in ("thread/start", "thread/resume"):
+                with self.state_lock:
+                    self.pending[request_key(request_id)] = method
+            self._to_server(message)
+            return
+        if "id" in message and ("result" in message or "error" in message):
+            with self.state_lock:
+                server_method = self.server_requests.pop(request_key(message["id"]), None)
+            if server_method is None:
+                return
+            if server_method in DENIED_SERVER_REQUESTS:
+                message = {"id": message["id"], "error": {"code": -32001, "message": "denied by DwemerDistro assistant policy"}}
+            self._to_server(message)
+
+    def _authorize(self, method, params):
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise PolicyError(-32602, "params must be an object")
+        if method in PASSTHROUGH_METHODS:
+            return params
+        if method in SIMPLE_METHODS:
+            reject_unknown(params, SIMPLE_METHODS[method])
+            return params
+        if method == "account/login/start":
+            allowed = LOGIN_KEYS.get(params.get("type"))
+            if allowed is None:
+                raise PolicyError(-32602, "only chatgpt browser or device-code sign-in is supported")
+            reject_unknown(params, allowed)
+            return params
+        if method == "thread/start":
+            reject_unknown(params, THREAD_START_KEYS)
+            return enforce_sandbox(params)
+        if method == "thread/resume":
+            reject_unknown(params, THREAD_RESUME_KEYS)
+            self._require_thread(params)
+            return enforce_sandbox(params)
+        if method == "turn/start":
+            reject_unknown(params, TURN_START_KEYS)
+            self._require_thread(params)
+            self._check_input(params.get("input"))
+            return enforce_sandbox(params)
+        if method == "turn/interrupt":
+            reject_unknown(params, ("threadId", "turnId"))
+            self._require_thread(params)
+            return params
+        raise PolicyError(-32601, "method not available in DwemerDistro assistant: " + method[:64])
+
+    def _require_thread(self, params):
+        with self.state_lock:
+            known = params.get("threadId") in self.threads
+        if not known:
+            raise PolicyError(-32602, "threadId does not belong to this task")
+
+    @staticmethod
+    def _check_input(items):
+        if not isinstance(items, list) or not 0 < len(items) <= 64:
+            raise PolicyError(-32602, "input must be a non-empty list")
+        for item in items:
+            kind = item.get("type") if isinstance(item, dict) else None
+            if kind == "text" and isinstance(item.get("text"), str) and len(item["text"]) <= CLIENT_LINE_LIMIT:
+                reject_unknown(item, ("type", "text", "text_elements"))
+                continue
+            url = item.get("url") if kind == "image" else None
+            if isinstance(url, str) and url.startswith(("data:image/", "https://")):
+                reject_unknown(item, ("type", "url", "detail"))
+                continue
+            raise PolicyError(-32602, "only text and image URL input is permitted")
+
+    def _to_server(self, message):
+        data = json.dumps(message, separators=(",", ":")).encode() + b"\n"
+        try:
+            with self.in_lock:
+                self.proc.stdin.write(data)
+                self.proc.stdin.flush()
+        except (OSError, ValueError):
+            self._fail("server_input_closed")
+
+    def _reply_error(self, request_id, code, message):
+        self._to_client(json.dumps({"id": request_id, "error": {"code": code, "message": message}}).encode() + b"\n")
+
+    # server -> client
+    def _pump_server(self):
+        while True:
+            try:
+                line = self.proc.stdout.readline(SERVER_LINE_LIMIT + 1)
+            except (OSError, ValueError):
+                return
+            if not line:
+                return
+            if len(line) > SERVER_LINE_LIMIT:
+                self._fail("server_message_too_large")
+                return
+            line = self._inspect_server(line)
+            if line is not None and not self._to_client(line):
+                self._fail("client_closed")
+                return
+
+    def _inspect_server(self, line):
+        try:
+            message = json.loads(line)
+        except ValueError:
+            return line
+        if not isinstance(message, dict) or "id" not in message:
+            return line
+        key = request_key(message["id"]) if valid_request_id(message["id"]) else None
+        if key is None:
+            return line
+        if "method" in message:
+            with self.state_lock:
+                if len(self.server_requests) < MAX_TRACKED_REQUESTS:
+                    self.server_requests[key] = message["method"]
+            return line
+        with self.state_lock:
+            method = self.pending.pop(key, None)
+        result = message.get("result")
+        if method is None or not isinstance(result, dict):
+            return line
+        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+        profile = result.get("activePermissionProfile") if isinstance(result.get("activePermissionProfile"), dict) else {}
+        if (profile.get("id") != PROFILE or result.get("approvalPolicy") != "never"
+                or result.get("cwd") != SANDBOX_WORK or not isinstance(thread.get("id"), str)):
+            self._fail("policy_mismatch")
+            return json.dumps({"id": message["id"], "error": {
+                "code": -32001, "message": "DwemerDistro assistant policy was not applied; session closed"}}).encode() + b"\n"
+        with self.state_lock:
+            try:
+                self.threads.add(thread["id"])
+            except (OSError, Refusal):
+                self.failure = self.failure or "state_untrusted"
+        return line
+
+    def _to_client(self, data):
+        try:
+            with self.out_lock:
+                self.client_out.write(data)
+                self.client_out.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _drain_stderr(self):
+        forwarded = 0
+        while True:
+            try:
+                chunk = self.proc.stderr.read1(4096)
+            except (OSError, ValueError):
+                return
+            if not chunk:
+                return
+            if self.err_sink is not None and forwarded < STDERR_LIMIT:
+                chunk = chunk[:STDERR_LIMIT - forwarded]
+                forwarded += len(chunk)
+                try:
+                    self.err_sink.write(chunk)
+                    self.err_sink.flush()
+                except (OSError, ValueError):
+                    pass
+
+
+# ---------------------------------------------------------------- commands
+
+def require_root():
+    if os.geteuid() != 0:
+        raise Refusal("requires_root")
+
+
+def cmd_status():
+    report = {"installed": False, "probe_passed": False, "provider": PROVIDER, "version": None, "reason": "not_installed"}
+    try:
+        attestation = read_attestation()
+        _, binding = installation(attestation)
+        report["installed"] = True
+        report["version"] = CODEX_VERSION
+        if attestation is None:
+            report["reason"] = "probe_required"
+        elif not attestation_matches(attestation, binding):
+            report["reason"] = "probe_stale"
+        else:
+            report["probe_passed"] = True
+            report["reason"] = "ready"
+    except Refusal as exc:
+        report["reason"] = exc.reason
+    except OSError:
+        report["reason"] = "state_untrusted"
+    print(json.dumps(report))
+    return 0
+
+
+def refuse_session(reason):
+    """Fail closed without starting a model, answering JSON-RPC requests with the reason."""
+    sys.stderr.write(json.dumps({"error": "assistant_unavailable", "reason": reason}) + "\n")
+    sys.stderr.flush()
+    if sys.stdin.isatty():
+        return 3
+    fd = sys.stdin.fileno()
+    deadline = time.monotonic() + REFUSAL_WINDOW
+    pending = b""
+    answered = 0
+    while answered < 16 and len(pending) <= CLIENT_LINE_LIMIT:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            break
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        pending += chunk
+        while b"\n" in pending and answered < 16:
+            line, pending = pending.split(b"\n", 1)
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(message, dict) and isinstance(message.get("method"), str) and valid_request_id(message.get("id")):
+                error = {"code": -32001, "message": "DwemerDistro assistant unavailable", "data": {"reason": reason}}
+                sys.stdout.buffer.write(json.dumps({"id": message["id"], "error": error}).encode() + b"\n")
+                sys.stdout.buffer.flush()
+                answered += 1
+    return 3
+
+
+def cmd_serve(task_id):
+    try:
+        require_root()
+        if not TASK_ID_PATTERN.match(task_id):
+            raise Refusal("task_id_invalid")
+        # Task errors are reported even when the runtime still needs a probe.
+        context, work_fd = load_task(task_id, agent_identity())
+        identity = verified_session_identity()
+        lock = SingletonLock()
+        home_fd = open_account_home(identity)
+        threads = ThreadStore(task_id)
+        try:
+            proc = spawn_sandboxed(identity, context, work_fd, home_fd, APP_SERVER_COMMAND,
+                                   subprocess.PIPE, subprocess.PIPE, subprocess.PIPE)
+        finally:
+            os.close(work_fd)
+            os.close(home_fd)
+    except Refusal as exc:
+        return refuse_session(exc.reason)
+    except OSError:
+        return refuse_session("state_untrusted")
+    broker = Broker(proc, sys.stdin.buffer, sys.stdout.buffer, threads, sys.stderr.buffer)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda *_: broker.request_stop())
+    returncode = broker.run()
+    if broker.failure:
+        sys.stderr.write(json.dumps({"error": "session_closed", "reason": broker.failure}) + "\n")
+        return 4
+    del lock
+    return 0 if returncode in (0, -signal.SIGTERM) else 4
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="ddistro_agent", allow_abbrev=False,
+                                     description="DwemerDistro assistant runtime broker (native Codex).")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("status", allow_abbrev=False, help="installation and attestation state as JSON")
+    serve = commands.add_parser("serve", allow_abbrev=False, help="root: Codex App Server JSONL for one task")
+    serve.add_argument("--task", required=True, help="task UUID prepared under " + TASKS_ROOT)
+    args = parser.parse_args(argv)
+    if args.command == "status":
+        return cmd_status()
+    return cmd_serve(args.task)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
