@@ -2,6 +2,7 @@
 """Distro-owned runtime broker for the DwemerDistro assistant (native Codex).
 
   ddistro_agent status            # any user; bounded JSON installation/attestation state
+  ddistro_agent probe             # root; real sandbox probe, writes the root-owned attestation
   ddistro_agent serve --task ID   # root; raw Codex App Server JSONL on stdin/stdout
 
 See ASSISTANT_RUNTIME.md for the task contract, sandbox layout, and client parameters.
@@ -1201,16 +1202,436 @@ def cmd_serve(task_id):
     return 0 if returncode in (0, -signal.SIGTERM) else 4
 
 
+# ---------------------------------------------------------------- probe
+
+PROBE_NET = """
+import socket, sys
+try:
+    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=4).close()
+except Exception:
+    sys.exit(1)
+"""
+
+# Runs inside the native Codex tool sandbox; prints only key=0/1 lines.
+PROBE_TOOL_SCRIPT = r"""
+HOST_SECRET="$1"; LIVE_DIR="$2"; AGENT_UID="$3"; LISTEN_PORT="$4"; PYNET="$5"
+flag() { if [ "$2" = 1 ]; then echo "$1=1"; else echo "$1=0"; fi; }
+echo tool_ran=1
+v=0; if printf probe >/work/.ddagent-probe 2>/dev/null && [ "$(cat /work/.ddagent-probe 2>/dev/null)" = probe ]; then v=1; fi
+flag scratch_write $v
+v=0
+for d in "$LIVE_DIR" /task /usr /etc /opt/dwemerdistro-agent/runtime /agent/home; do
+  if (printf x >"$d/.ddagent-escape") 2>/dev/null; then v=1; fi
+done
+for f in /task/task.json /etc/codex/requirements.toml /etc/codex/config.toml; do
+  if (printf x >>"$f") 2>/dev/null; then v=1; fi
+done
+flag outside_write $v
+v=0
+if cat /agent/home/ddagent-auth-canary.json >/dev/null 2>&1 || ls -A /agent/home >/dev/null 2>&1; then v=1; fi
+for p in /proc/[0-9]*; do
+  if cat "$p/root/agent/home/ddagent-auth-canary.json" >/dev/null 2>&1 || ls -A "$p/root/agent/home" >/dev/null 2>&1; then v=1; fi
+  if [ -e "$p/root$HOST_SECRET" ] || [ -e "$p/root$LIVE_DIR" ]; then v=1; fi
+done
+flag auth_read $v
+v=0; if env | grep -v '^CODEX_HOME=' | grep -qiE 'api_key|token|secret|password|^openai|^azure|^anthropic'; then v=1; fi
+flag env_secrets $v
+v=0
+for f in "$HOST_SECRET" "$LIVE_DIR" /etc/shadow /root /home/dwemer /var/www /var/lib /usr/local/bin/ddistro_agent; do
+  if [ -e "$f" ]; then v=1; fi
+done
+flag host_paths_visible $v
+v=0
+for f in /mnt /mnt/c /mnt/wsl /run/WSL /init /tmp/.X11-unix /run/user; do if [ -e "$f" ]; then v=1; fi; done
+if [ -n "${WSL_INTEROP:-}" ] || [ -n "${WSL_DISTRO_NAME:-}" ] || command -v cmd.exe >/dev/null 2>&1; then v=1; fi
+flag windows_visible $v
+v=0
+if [ "$(id -u)" != "$AGENT_UID" ]; then v=1; fi
+grep -q '^NoNewPrivs:[[:space:]]*1' /proc/self/status || v=1
+grep -q '^CapEff:[[:space:]]*0000000000000000' /proc/self/status || v=1
+if command -v sudo >/dev/null 2>&1 && sudo -n true </dev/null >/dev/null 2>&1; then v=1; fi
+if command -v su >/dev/null 2>&1 && su -c true root </dev/null >/dev/null 2>&1; then v=1; fi
+flag privilege_escalation $v
+v=0
+for f in /run/postgresql /var/run/postgresql /tmp/.s.PGSQL.5432; do if [ -e "$f" ]; then v=1; fi; done
+if python3 -c "$PYNET" 127.0.0.1 "$LISTEN_PORT" || python3 -c "$PYNET" 127.0.0.1 5432; then v=1; fi
+flag database_reachable $v
+v=0
+if python3 -c "$PYNET" 1.1.1.1 443 || python3 -c "$PYNET" chatgpt.com 443; then v=1; fi
+flag tool_network $v
+"""
+
+# Runs in the outer sandbox exactly where the App Server runs (no tool sandbox).
+PROBE_OUTER_SCRIPT = r"""
+import os, socket, sys
+uid, port = int(sys.argv[1]), int(sys.argv[2])
+def flag(name, value):
+    print("%s=%d" % (name, 1 if value else 0))
+def reach(host, port):
+    try:
+        socket.create_connection((host, port), timeout=8).close()
+        return True
+    except Exception:
+        return False
+status = open("/proc/self/status").read()
+flag("outer_identity", os.getuid() == uid and os.geteuid() == uid and "NoNewPrivs:\t1" in status
+     and "CapEff:\t0000000000000000" in status and os.getgroups() in ([], [os.getgid()]))
+hidden = ("/mnt", "/run", "/init", "/var", "/root", "/usr/local/bin/ddistro_agent", "/etc/shadow")
+flag("outer_hidden", not any(os.path.lexists(p) for p in hidden) and os.path.isdir("/agent/home") and os.path.isdir("/work"))
+flag("host_listener_reachable", reach("127.0.0.1", port))
+flag("provider_network", reach("chatgpt.com", 443))
+"""
+
+
+def parse_flags(output):
+    flags = {}
+    for line in output.decode("ascii", "replace").splitlines():
+        match = re.match(r"^([a-z_]+)=([01])$", line.strip())
+        if match:
+            flags[match.group(1)] = match.group(2) == "1"
+    return flags
+
+
+DIAG_URL_QUERY = re.compile(r"(?i)\b(https?://[^\s?#]+)[?#]\S*")
+DIAG_SECRETS = re.compile(r"(?i)\b(?:bearer|basic)\s+\S+|(?:token|key|secret|password|passwd|auth\w*)[\"']?\s*[:=]\s*\S+"
+                          r"|\b(?:sk-|eyJ)[A-Za-z0-9._-]{8,}|\b[0-9a-fA-F]{32,}\b")
+
+
+def diagnostic(returncode, stderr):
+    """Bounded, redacted stderr tail and exit status (negative: signal) of one probe step."""
+    lines = []
+    for line in stderr[-DIAG_BYTES:].decode("utf-8", "replace").splitlines()[-DIAG_LINES:]:
+        line = re.sub(r"[\x00-\x1f\x7f]", "?", line)
+        line = DIAG_SECRETS.sub("[redacted]", DIAG_URL_QUERY.sub(r"\1?[redacted]", line))[:300]
+        if line.strip():
+            lines.append(line)
+    return {"exit": returncode, "stderr": lines}
+
+
+def run_sandboxed_flags(identity, context, work_path, home_path, command, timeout, mismatch=False):
+    """mismatch tells the guard to expect the account home at /work, as if another directory were bound there."""
+    work_fd = os.open(work_path, O_PATH_DIR)
+    home_fd = os.open(home_path, O_PATH_DIR)
+    try:
+        expect = (fd_identity(home_fd), fd_identity(home_fd)) if mismatch else None
+        proc = spawn_sandboxed(identity, context, work_fd, home_fd, command,
+                               subprocess.DEVNULL, subprocess.PIPE, subprocess.PIPE, expect)
+    finally:
+        os.close(work_fd)
+        os.close(home_fd)
+    output = errors = b""
+    streams = [proc.stdout.fileno(), proc.stderr.fileno()]
+    deadline = time.monotonic() + timeout
+    try:
+        while streams:
+            remaining = deadline - time.monotonic()
+            ready = select.select(streams, [], [], remaining)[0] if remaining > 0 else []
+            if not ready:
+                break
+            for fd in ready:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    streams.remove(fd)
+                elif fd == proc.stdout.fileno():
+                    output = (output + chunk)[:64 * 1024]
+                else:
+                    errors = (errors + chunk)[-DIAG_BYTES:]
+    finally:
+        stop_process_group(proc, grace=2.0)
+    return parse_flags(output), diagnostic(proc.returncode, errors)
+
+
+class ProbeClient:
+    """In-process JSONL client for a Broker connected through pipes."""
+
+    def __init__(self):
+        client_read, self.write_fd = os.pipe()
+        self.read_fd, client_write = os.pipe()
+        self.broker_in = os.fdopen(client_read, "rb")
+        self.broker_out = os.fdopen(client_write, "wb")
+        self.buffer = b""
+        self.dead = False
+
+    def send(self, message):
+        os.write(self.write_fd, json.dumps(message).encode() + b"\n")
+
+    def close(self):
+        os.close(self.write_fd)
+
+    def receive(self, request_id, timeout=30.0):
+        """The reply to request_id, or None. After EOF or a timeout every later call fails fast."""
+        if self.dead:
+            return None
+        deadline = time.monotonic() + timeout
+        while True:
+            while b"\n" in self.buffer:
+                line, self.buffer = self.buffer.split(b"\n", 1)
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(message, dict) and message.get("id") == request_id and "method" not in message:
+                    return message
+            remaining = deadline - time.monotonic()
+            chunk = b""
+            if remaining > 0 and select.select([self.read_fd], [], [], remaining)[0]:
+                chunk = os.read(self.read_fd, 1024 * 1024)
+            if not chunk:
+                self.dead = True
+                return None
+            self.buffer = (self.buffer + chunk)[-SERVER_LINE_LIMIT:]
+
+
+def no_agent_processes(identity, timeout=5.0):
+    """ddagent is dedicated and the probe holds the singleton lock, so any survivor is a leak."""
+    deadline = time.monotonic() + timeout
+    while True:
+        alive = 0
+        for entry in os.listdir("/proc"):
+            try:
+                if entry.isdigit() and os.stat("/proc/" + entry).st_uid == identity.pw_uid:
+                    alive += 1
+            except OSError:
+                continue
+        if alive == 0:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+
+
+class TailSink(bytearray):
+    """Broker err_sink that keeps the last DIAG_BYTES of App Server stderr for probe diagnostics."""
+
+    def write(self, chunk):
+        self[:] = (bytes(self) + chunk)[-DIAG_BYTES:]
+
+    def flush(self):
+        pass
+
+
+def start_probe_session(identity, context, work_path, home_path):
+    client = ProbeClient()
+    work_fd = os.open(work_path, O_PATH_DIR)
+    home_fd = os.open(home_path, O_PATH_DIR)
+    try:
+        proc = spawn_sandboxed(identity, context, work_fd, home_fd, APP_SERVER_COMMAND,
+                               subprocess.PIPE, subprocess.PIPE, subprocess.PIPE)
+    finally:
+        os.close(work_fd)
+        os.close(home_fd)
+    sink = TailSink()
+    broker = Broker(proc, client.broker_in, client.broker_out, ThreadStore(None), sink)
+
+    def relay():
+        try:
+            broker.run()
+        finally:
+            # EOF tells the probe client the backend is gone instead of letting each request time out.
+            with broker.out_lock:
+                client.broker_out.close()
+
+    worker = threading.Thread(target=relay, daemon=True)
+    worker.start()
+    return client, broker, worker, sink
+
+
+def probe_app_server(identity, context, work_path, home_path, checks, diagnostics):
+    client, broker, worker, sink = start_probe_session(identity, context, work_path, home_path)
+    client.send({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "ddistro_agent_probe", "title": "probe", "version": "1"}}})
+    checks["app_server_initialize"] = "result" in (client.receive(1, 60) or {})
+    client.send({"method": "initialized", "params": {}})
+    client.send({"id": 2, "method": "account/read", "params": {}})
+    account = (client.receive(2) or {}).get("result")
+    checks["signed_out_state"] = isinstance(account, dict) and account.get("account") is None
+    client.send({"id": 3, "method": "configRequirements/read", "params": {}})
+    result = (client.receive(3) or {}).get("result") or {}
+    requirements = result.get("requirements") if isinstance(result.get("requirements"), dict) else {}
+    profiles = requirements.get("allowedPermissionProfiles") or {}
+    checks["managed_requirements_active"] = (requirements.get("allowedApprovalPolicies") == ["never"]
+                                             and requirements.get("defaultPermissions") == PROFILE
+                                             and [k for k, v in profiles.items() if v] == [PROFILE])
+    bypasses = [("command/exec", {"command": ["true"]}), ("fs/readFile", {"path": SANDBOX_HOME + "/auth.json"}),
+                ("thread/start", {"sandbox": "danger-full-access"}), ("thread/start", {"config": {"approval_policy": "on-request"}}),
+                ("thread/start", {"approvalPolicy": "on-request"}), ("thread/resume", {"threadId": "not-this-task"})]
+    rejected = True
+    for offset, (method, params) in enumerate(bypasses):
+        client.send({"id": 10 + offset, "method": method, "params": params})
+        response = client.receive(10 + offset) or {}
+        rejected = rejected and "error" in response and "result" not in response
+    checks["client_bypass_rejected"] = rejected
+    client.send({"id": 30, "method": "thread/start", "params": {"sandbox": "workspace-write"}})
+    result = (client.receive(30, 60) or {}).get("result") or {}
+    checks["thread_policy_enforced"] = ((result.get("activePermissionProfile") or {}).get("id") == PROFILE
+                                        and result.get("approvalPolicy") == "never" and result.get("cwd") == SANDBOX_WORK
+                                        and broker.failure is None)
+    client.close()
+    worker.join(SHUTDOWN_GRACE + 10)
+    checks["orderly_shutdown"] = not worker.is_alive() and broker.failure is None and no_agent_processes(identity)
+    diagnostics["app_server"] = dict(diagnostic(broker.proc.returncode, sink), failure=broker.failure)
+    # Cancellation: an interrupted session must take its whole sandbox down.
+    client, broker, worker, sink = start_probe_session(identity, context, work_path, home_path)
+    client.send({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "ddistro_agent_probe", "title": "probe", "version": "1"}}})
+    started = "result" in (client.receive(1, 60) or {})
+    broker.request_stop()
+    worker.join(15)
+    client.close()
+    checks["cancellation_cleanup"] = started and not worker.is_alive() and no_agent_processes(identity)
+    diagnostics["cancellation"] = dict(diagnostic(broker.proc.returncode, sink), failure=broker.failure)
+
+
+def make_probe_tree(identity, base, task):
+    os.mkdir(base, 0o755)
+    os.chmod(base, 0o755)
+    paths = {"task": task, "work": task + "/work", "home": base + "/home",
+             "live": base + "/live", "secret": base + "/host-secret"}
+    # Under the real TASKS_ROOT with a serve task's layout, so the probe crosses the same ancestors.
+    os.mkdir(task, 0o700)
+    os.chown(task, 0, identity.pw_gid)
+    os.chmod(task, SCRATCH_ANCESTOR_MODE)
+    for key in ("work", "home"):
+        os.mkdir(paths[key], 0o700)
+        os.chown(paths[key], identity.pw_uid, identity.pw_gid)
+    os.mkdir(paths["live"])
+    os.chmod(paths["live"], 0o777)  # writable without the sandbox, so denial is meaningful
+    # The host secret is world-readable so only the sandbox can be what denies it.
+    canaries = (("secret", paths["secret"], 0, 0, 0o644),
+                ("canary", paths["home"] + "/ddagent-auth-canary.json", identity.pw_uid, identity.pw_gid, 0o600))
+    tokens = {}
+    for key, path, uid, gid, mode in canaries:
+        tokens[key] = secrets.token_hex(16).encode()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        try:
+            os.write(fd, tokens[key])
+            os.fchmod(fd, mode)
+            os.fchown(fd, uid, gid)
+        finally:
+            os.close(fd)
+    return paths, tokens
+
+
+def file_bytes(path):
+    """Root reads probe canaries next to ddagent-writable entries: no links, FIFOs, or devices."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        return os.read(fd, 4096) if stat.S_ISREG(os.fstat(fd).st_mode) else None
+    finally:
+        os.close(fd)
+
+
+def cmd_probe():
+    checks = {}
+    diagnostics = {}
+    passed = False
+    try:
+        require_root()
+        identity, binding = installation(None)
+        checks.update(platform=True, helper_trusted=True, runtime_verified=True, identity_dedicated=True,
+                      bwrap_supported=True, state_trusted=True)
+        try:
+            lock = SingletonLock()
+        except Refusal as exc:
+            if exc.reason != "busy":
+                raise
+            # A running session is not an isolation failure; the attestation is left as it is.
+            print(json.dumps({"passed": False, "checks": {"lock_available": False}, "diagnostics": {}}))
+            return 75
+        try:
+            SingletonLock()
+            checks["lock_singleton"] = False
+        except Refusal as exc:
+            checks["lock_singleton"] = exc.reason == "busy"
+        passed = run_probe(identity, checks, diagnostics)
+    except Refusal as exc:
+        checks[exc.reason] = False
+    except OSError as exc:
+        checks["probe_setup"] = False
+        diagnostics["setup"] = {"error": errno.errorcode.get(exc.errno, "error")}
+    passed = passed and bool(checks) and all(checks.values())
+    try:
+        dir_fd = open_root_dir(AGENT_STATE, "state_untrusted")
+        try:
+            if passed:
+                document = dict(binding, passed=True, checked_at=int(time.time()), checks=sorted(checks))
+                write_root_file(dir_fd, ATTESTATION_NAME, json.dumps(document).encode(), 0o644)
+            else:
+                remove_entry(dir_fd, ATTESTATION_NAME)
+        finally:
+            os.close(dir_fd)
+    except (Refusal, OSError):
+        passed = False
+    print(json.dumps({"passed": passed, "checks": checks, "diagnostics": diagnostics}))
+    return 0 if passed else 1
+
+
+def run_probe(identity, checks, diagnostics):
+    name = "probe-" + secrets.token_hex(8)  # never a task UUID, so ddistro changes ignores it
+    base, task = os.path.join(AGENT_STATE, name), os.path.join(TASKS_ROOT, name)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        paths, tokens = make_probe_tree(identity, base, task)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = str(listener.getsockname()[1])
+        context = {"schema_version": SCHEMA_VERSION, "task_id": "probe", "product": "probe",
+                   "workspace": "probe", "scratch": SANDBOX_WORK}
+        outer_command = ["/usr/bin/python3", "-c", PROBE_OUTER_SCRIPT, str(identity.pw_uid), port]
+        outer, diagnostics["outer"] = run_sandboxed_flags(identity, context, paths["work"], paths["home"], outer_command, 30)
+        checks["outer_sandbox_isolated"] = outer.get("outer_identity") is True and outer.get("outer_hidden") is True
+        checks["provider_network"] = outer.get("provider_network") is True
+        # The guard must stop a sandbox whose /work is not the directory root opened, before the command runs.
+        guarded, diagnostics["guard"] = run_sandboxed_flags(identity, context, paths["work"], paths["home"], [
+            "/bin/sh", "-c", "echo guard_bypassed=1; : >/work/.ddagent-guard"], 30, mismatch=True)
+        checks["scratch_identity_enforced"] = (diagnostics["guard"]["exit"] == GUARD_EXIT and not guarded
+                                               and not os.path.lexists(paths["work"] + "/.ddagent-guard")
+                                               and checks["outer_sandbox_isolated"])
+        tool_command = [RUNTIME_BIN_DIR + "/codex", "sandbox", "-P", PROFILE, "--include-managed-config", "-C", SANDBOX_WORK,
+                        "--", "/bin/sh", "-c", PROBE_TOOL_SCRIPT, "probe", paths["secret"], paths["live"],
+                        str(identity.pw_uid), port, PROBE_NET]
+        tool, diagnostics["tool"] = run_sandboxed_flags(identity, context, paths["work"], paths["home"], tool_command, 90)
+        expect = {"scratch_write": True, "outside_write": False, "auth_read": False, "env_secrets": False,
+                  "host_paths_visible": False, "windows_visible": False, "privilege_escalation": False,
+                  "database_reachable": False, "tool_network": False}
+        ran = tool.get("tool_ran") is True and all(key in tool for key in expect)
+        checks["tool_sandbox_executes"] = ran
+        probe_file = os.lstat(paths["work"] + "/.ddagent-probe") if os.path.lexists(paths["work"] + "/.ddagent-probe") else None
+        checks["scratch_write"] = ran and tool["scratch_write"] and probe_file is not None and probe_file.st_uid == identity.pw_uid
+        checks["live_write_denied"] = (ran and not tool["outside_write"] and os.listdir(paths["live"]) == []
+                                       and sorted(os.listdir(paths["task"])) == ["work"])
+        checks["auth_read_denied"] = (ran and not tool["auth_read"] and not tool["env_secrets"]
+                                      and file_bytes(paths["home"] + "/ddagent-auth-canary.json") == tokens["canary"])
+        checks["host_secret_denied"] = ran and not tool["host_paths_visible"] and file_bytes(paths["secret"]) == tokens["secret"]
+        checks["windows_interop_denied"] = ran and not tool["windows_visible"]
+        checks["privilege_escalation_denied"] = ran and not tool["privilege_escalation"]
+        # The controls prove the denials are the sandbox, not an absent listener or an offline host.
+        checks["database_access_denied"] = ran and not tool["database_reachable"] and outer.get("host_listener_reachable") is True
+        checks["tool_network_denied"] = ran and not tool["tool_network"] and checks["provider_network"]
+        probe_app_server(identity, context, paths["work"], paths["home"], checks, diagnostics)
+        checks["account_home_stays_managed"] = not any(os.path.lexists(os.path.join(paths["home"], name)) for name in UNMANAGED_HOME_FILES)
+        return True
+    finally:
+        listener.close()
+        for path in (base, task):
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+
+
 def main(argv):
     parser = argparse.ArgumentParser(prog="ddistro_agent", allow_abbrev=False,
                                      description="DwemerDistro assistant runtime broker (native Codex).")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status", allow_abbrev=False, help="installation and attestation state as JSON")
+    commands.add_parser("probe", allow_abbrev=False, help="root: run the real sandbox probe and attest")
     serve = commands.add_parser("serve", allow_abbrev=False, help="root: Codex App Server JSONL for one task")
     serve.add_argument("--task", required=True, help="task UUID prepared under " + TASKS_ROOT)
     args = parser.parse_args(argv)
     if args.command == "status":
         return cmd_status()
+    if args.command == "probe":
+        return cmd_probe()
     return cmd_serve(args.task)
 
 
