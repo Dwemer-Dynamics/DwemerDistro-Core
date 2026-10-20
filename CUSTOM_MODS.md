@@ -9,12 +9,13 @@ argument vectors.
 ddistro_custom_mod status [--check-health] --json        # any user (launcher: dwemer)
 ddistro_custom_mod check https://host/owner/repo --json   # preview only, changes nothing
 ddistro_custom_mod install https://host/owner/repo --expect-commit <sha>   # root
-ddistro_custom_mod update <id>                            # root; stays on the installed branch
+ddistro_custom_mod update <id> [--expect-commit <sha>]    # root; stays on the installed branch
 ddistro_custom_mod branches <id> [--branch <name>] --json  # root; refresh offered branches / preview one
 ddistro_custom_mod switch <id> --branch <name> --expect-commit <sha>   # root
 ddistro_custom_mod backup <id>                            # root
 ddistro_custom_mod unregister <id>                        # root; keeps files and database
 ddistro_custom_mod setup-web                              # root; shared loopback listener
+ddistro_custom_mod setup-web --protect-project <id>       # root; opt a project folder into source denials
 ```
 
 ## Shared web port
@@ -46,20 +47,65 @@ The same site file also denies, with explicit Apache rules and no `.htaccess`:
 
 - `.git` metadata at any depth under `/var/www/html/custom-mods/<folder>` and
   `/var/www/html/ExampleServer`;
-- the source-only folders `client/`, `ports/` and `docs/` (with any config or build output
-  inside them) of the known KAGRENAC AI Mod Maker install paths: `/custom-mods/example-server`
-  (launcher id), `/custom-mods/KagrenacServer` (manual folder) and `/ExampleServer` (legacy).
+- for the known KAGRENAC AI Mod Maker install paths, `/custom-mods/example-server`
+  (launcher id), `/custom-mods/KagrenacServer` (manual folder) and `/ExampleServer` (legacy):
+  the source-only folders `client/`, `ports/`, `docs/`, `config/`, `lib/`, `sql/` and
+  `scripts/` at the project root (with any config or build output inside them), and the
+  files `config.json` and `.env` at any depth. Their other paths (root PHP API, `ui/`,
+  assets, health) are served as before.
 
 The `DirectoryMatch` denials sit outside the custom mod virtual host, so they also apply on
 other Apache listeners that serve `/var/www/html`, such as the official ports, unless one
 of those sites grants the paths again in its own `DirectoryMatch`, `Files` or `Location`
 section; `LocationMatch` copies follow the custom listener's own grant. Other mods' routes
 and the official sites are otherwise unchanged. A manually named or forked install in any
-other folder is **not** covered for `client/`, `ports/` or `docs/`; its owner must add
-equivalent server-side rules. After **Update Distro**, the rules take effect the next time
+other folder is **not** covered for those folders and files unless it is opted in as
+below; otherwise its owner must add equivalent server-side rules. After **Update Distro**, the rules take effect the next time
 `setup-web` runs (distro start, a custom mod install, update, switch or restore, or
 `sudo ddistro_custom_mod setup-web`). Check every listener over HTTP and expect `403`, for
 example `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:19000/custom-mods/KagrenacServer/.git/HEAD`.
+
+### Protected projects (provisional, for the KAGRENAC setup wrapper)
+
+```bash
+sudo ddistro_custom_mod setup-web --protect-project <id>
+```
+
+Opts `/var/www/html/custom-mods/<id>` into extra denials, then runs `setup-web` as usual. Run
+it **before** placing the project's source there (installed, cloned or a manual local dev
+copy). Each opted-in id gets, on every listener as above, the same denials as the known
+KAGRENAC paths:
+
+- the folders `client/`, `ports/`, `docs/`, `config/`, `lib/`, `sql/` and `scripts/` at the
+  project root, with everything inside them;
+- the files `config.json` and `.env` at any depth in the project.
+
+The project's other paths (root PHP API, UI, assets, health) are served as before, and
+other mods get none of these rules. The known paths are always covered and need no opt-in. So an opted-in project must not serve its dashboard,
+health file or assets from those folders. `<id>` follows the manifest id rules (3-32
+lowercase letters, digits, single hyphens; not a reserved name); the id is validated and
+regex-escaped, never passed to a shell. The option may be given once.
+
+- The list is `/var/lib/dwemerdistro-custom-mods/protected-projects`: one id per line,
+  root-owned, mode `0600`, at most 32 ids, outside the registry so `status` never reads it.
+  It is written atomically (synced to disk, then renamed, then the folder synced) and read
+  back to check its real owner, mode and content before the command reports it saved.
+- The id is saved before Apache is changed. If `apache2ctl configtest` or the reload fails,
+  the previous site file comes back (it never has some new rules and not others), the
+  command exits non-zero, saying the protection is saved but not active, and the id
+  stays in the list. Do not place the source until `sudo ddistro_custom_mod setup-web`
+  succeeds; every later run applies the saved list.
+- Every `setup-web` run (with or without the option, including the ones install, update,
+  switch, restore and distro start make) applies the whole list. If the list is a link,
+  not a plain root-owned `0600` file in a root-owned folder, is empty, has an invalid or
+  repeated id, or is too long, `setup-web` stops and changes nothing, so the listener is
+  never rewritten without protection that was asked for. A missing list means no opted-in
+  projects; an empty one is treated as damage, since it is never written empty. Install,
+  update and branch switch read the list first and stop before changing any code, config
+  or database if it is damaged.
+- Protection is never dropped automatically: unregister and update keep it, and this
+  version has no command to remove an id.
+- Without any opted-in id the site file has only the fixed rules above.
 
 To change the port: edit `CUSTOM_MODS_PORT` as root, run
 `sudo ddistro_custom_mod setup-web` (the old custom listener is replaced; official ports
@@ -185,6 +231,15 @@ Install, Update, and branch switching first require the shared PHP security upda
   requires the same `id` and `config_path`. It refuses any incoming file that would land on
   an existing untracked or ignored file or link, then fast-forwards only and migrates as
   `dwemer`.
+- `update <id> --expect-commit <40-hex sha>` does the same, but only to exactly that
+  reviewed commit of the installed branch. If the fetched branch is at a different commit,
+  it refuses before the checkout, config or database change (a ready mod stays ready,
+  with the refusal as its message); check the branch again and retry with the new commit. The pin
+  never allows a non-fast-forward or a branch change; that stays **Switch**. Before the
+  backup or fetch, the checkout must be on the registered branch at the registered commit;
+  otherwise it refuses and changes nothing. Once the checkout has moved, the registry records
+  the new commit even if a later step fails, so a retry starts from what is installed. A
+  `--local-source` install keeps fetching from its registered path.
 - Backups live in `/var/lib/dwemerdistro-custom-mods/backups/<id>/` (root only, `0700`):
   `config.php` and a `pg_dump -Fc` of the mod's database.
 - Unregister hides the mod from the list and keeps its folder, private config, and

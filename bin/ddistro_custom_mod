@@ -44,6 +44,10 @@ WEB_MARKER = "# Managed by ddistro_custom_mod setup-web; do not edit."
 STATE_ROOT = "/var/lib/dwemerdistro-custom-mods"
 REGISTRY_ROOT = STATE_ROOT + "/registry"
 BACKUP_ROOT = STATE_ROOT + "/backups"
+# Root-only opt-in list, one mod id per line, of custom-mods/<id> folders that get the KAGRENAC
+# source denials (setup-web --protect-project). Outside the registry, so status never reads it.
+PROTECTED_PROJECTS = STATE_ROOT + "/protected-projects"
+MAX_PROTECTED_PROJECTS = 32
 # Same lock protocol and path as ddistro_server, so official and custom
 # operations never run at the same time.
 LOCK_PATH = "/run/lock/dwemerdistro-server-manager.d"
@@ -933,21 +937,113 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 # --- Shared web listener (root; Apache config only, never repository code) -------------
 
 # Never served from a mod checkout: Git metadata in any custom mod or a manual ExampleServer,
-# and the source-only folders of the known Kagrenac install paths (launcher id, manual folder,
-# legacy path). A manually named or forked copy elsewhere needs its own server-side rules.
+# and the source-only folders and private files of the known Kagrenac install paths (launcher
+# id, manual folder, legacy path). A manually named or forked copy elsewhere needs setup-web
+# --protect-project (custom-mods/<id> only) or its own server-side rules.
 GIT_DENY_DIR = r"^/var/www/html/(ExampleServer|custom-mods/[^/]+)/(.+/)?\.git(/|$)"
-SOURCE_DENY_DIR = r"^/var/www/html/(ExampleServer|custom-mods/(example-server|KagrenacServer))/(client|ports|docs)(/|$)"
 GIT_DENY_URL = r"^/+(ExampleServer|custom-mods/+[^/]+)/+(.*/)?\.git(/|$)"
-SOURCE_DENY_URL = r"^/+(ExampleServer|custom-mods/+(example-server|KagrenacServer))/+(client|ports|docs)(/|$)"
+# Root-level folders and any-depth file names hidden for the known paths and opted-in projects.
+PROJECT_SOURCE_DIRS = "client|ports|docs|config|lib|sql|scripts"
+PROJECT_PRIVATE_FILES = r"config\.json|\.env"
 
 
-def web_site_text(port):
+def deny_rules(dir_roots, url_roots):
+    """(source folder, project folder, URL) patterns for project roots given as regex alternatives."""
+    return (rf"^/var/www/html/({dir_roots})/({PROJECT_SOURCE_DIRS})(/|$)",
+            rf"^/var/www/html/({dir_roots})(/|$)",
+            rf"^/+({url_roots})/+(({PROJECT_SOURCE_DIRS})(/|$)|(.*/)?({PROJECT_PRIVATE_FILES})(/|$))")
+
+
+SOURCE_DENY_DIR, PRIVATE_DENY_DIR, SOURCE_DENY_URL = deny_rules(
+    "ExampleServer|custom-mods/(example-server|KagrenacServer)", "ExampleServer|custom-mods/+(example-server|KagrenacServer)")
+
+
+def project_deny_rules(protected):
+    """The same patterns scoped to the opted-in custom-mods/<id> only, each id validated and escaped."""
+    ids = "|".join(re.escape(validate_mod_id(mod_id)) for mod_id in protected)
+    return deny_rules(f"custom-mods/({ids})", f"custom-mods/+({ids})")
+
+
+def deny_dir_text(source_dir, project_dir):
+    return (f'<DirectoryMatch "{source_dir}">\n\tRequire all denied\n</DirectoryMatch>\n'
+            f'<DirectoryMatch "{project_dir}">\n\t<FilesMatch "^({PROJECT_PRIVATE_FILES})$">\n'
+            "\t\tRequire all denied\n\t</FilesMatch>\n</DirectoryMatch>\n")
+
+
+def read_protected_projects():
+    """The opted-in ids; missing means none. Anything but a private root file of valid ids is refused.
+
+    The writer never saves an empty list and nothing removes ids, so an empty file is damage, not "none".
+
+    Refusing (instead of skipping) means the listener is never rewritten without a protection
+    that was asked for.
+    """
+    try:
+        parent = os.lstat(STATE_ROOT)
+    except FileNotFoundError:
+        return []
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or parent.st_mode & 0o022:
+        raise ModError(f"{STATE_ROOT} is not a root-owned folder that only root can change. Nothing was changed.")
+    problem = f"{PROTECTED_PROJECTS} is not a private root-owned list (0600). Nothing was changed."
+    try:
+        # Non-blocking, so a FIFO or device returns at once and is then refused by the fstat check.
+        fd = os.open(PROTECTED_PROJECTS, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        raise ModError(problem)
+    with os.fdopen(fd, "rb") as handle:
+        info_ = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info_.st_mode) or info_.st_uid != 0 or info_.st_mode & 0o777 != 0o600:
+            raise ModError(problem)
+        raw = handle.read(MAX_PROTECTED_PROJECTS * 33 + 1)
+    try:
+        lines = raw.decode("ascii").split("\n")
+    except UnicodeDecodeError:
+        raise ModError(problem)
+    if lines[-1] != "" or len(lines) - 1 > MAX_PROTECTED_PROJECTS:
+        raise ModError(problem)
+    projects = lines[:-1]
+    if not projects:
+        raise ModError(problem)
+    try:
+        for mod_id in projects:
+            validate_mod_id(mod_id)
+    except ModError:
+        raise ModError(problem)
+    if len(set(projects)) != len(projects):
+        raise ModError(problem)
+    return projects
+
+
+def protect_project(mod_id):
+    """Persist the opt-in before it is applied, so a failed apply keeps it for the retry and later runs."""
+    projects = read_protected_projects()
+    if mod_id in projects:
+        info(f"{mod_id} is already protected.")
+        return
+    if len(projects) >= MAX_PROTECTED_PROJECTS:
+        raise ModError(f"At most {MAX_PROTECTED_PROJECTS} projects can be protected. Nothing was changed.")
+    ensure_state_dirs()
+    write_root_file(PROTECTED_PROJECTS, "".join(p + "\n" for p in sorted(projects + [mod_id])), mode=0o600)
+    # Reading it back checks the real owner, mode, and content that later runs will see.
+    if mod_id not in read_protected_projects():
+        raise ModError(f"Could not save the protection for {mod_id}.")
+    ok(f"Saved the protection for /custom-mods/{mod_id}.")
+
+
+def web_site_text(port, protected=()):
     """This manager's own Apache site: one loopback listener serving only the custom mod paths.
 
     The DirectoryMatch denials sit outside the virtual host, so they also apply on the other
     listeners that serve /var/www/html; the LocationMatch copies come after this listener's
-    grant, which would otherwise override them.
+    grant, which would otherwise override them. Opted-in projects only add their own copies.
     """
+    outside = inside = ""
+    if protected:
+        source_dir, project_dir, url = project_deny_rules(protected)
+        outside = deny_dir_text(source_dir, project_dir)
+        inside = f'\t<LocationMatch "{url}">\n\t\tRequire all denied\n\t</LocationMatch>\n'
     return f"""{WEB_MARKER} To change the port, set
 # CUSTOM_MODS_PORT ({CUSTOM_PORT_MIN}-{CUSTOM_PORT_MAX}) in {SERVICES_CONF}, then run:
 #   sudo ddistro_custom_mod setup-web
@@ -955,10 +1051,7 @@ Listen 127.0.0.1:{port}
 <DirectoryMatch "{GIT_DENY_DIR}">
 \tRequire all denied
 </DirectoryMatch>
-<DirectoryMatch "{SOURCE_DENY_DIR}">
-\tRequire all denied
-</DirectoryMatch>
-<VirtualHost 127.0.0.1:{port}>
+{deny_dir_text(SOURCE_DENY_DIR, PRIVATE_DENY_DIR)}{outside}<VirtualHost 127.0.0.1:{port}>
 \tDocumentRoot /var/www/html
 \t<Location "/">
 \t\tRequire all denied
@@ -972,7 +1065,7 @@ Listen 127.0.0.1:{port}
 \t<LocationMatch "{SOURCE_DENY_URL}">
 \t\tRequire all denied
 \t</LocationMatch>
-\tErrorLog ${{APACHE_LOG_DIR}}/custom_mods_error.log
+{inside}\tErrorLog ${{APACHE_LOG_DIR}}/custom_mods_error.log
 \tCustomLog ${{APACHE_LOG_DIR}}/custom_mods_access.log combined
 </VirtualHost>
 """
@@ -1015,17 +1108,27 @@ def apache_running():
     return run(["/etc/init.d/apache2", "status"], timeout=30).returncode == 0
 
 
-def write_root_file(path, text):
-    fd, temp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+def write_root_file(path, text, mode=0o644):
+    """Atomic replace; the data is synced before the rename and the folder after it, before returning."""
+    folder = os.path.dirname(path)
+    fd, temp = tempfile.mkstemp(dir=folder, prefix=".tmp-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
-        os.chmod(temp, 0o644)
+            handle.flush()
+            os.chmod(temp, mode)
+            os.fsync(handle.fileno())
         os.replace(temp, path)
     except BaseException:
         if os.path.exists(temp):
             os.unlink(temp)
         raise
+    if hasattr(os, "O_DIRECTORY"):  # always on Linux; Windows cannot open a folder to sync it
+        folder_fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(folder_fd)
+        finally:
+            os.close(folder_fd)
 
 
 def apply_apache(reload, port):
@@ -1070,7 +1173,7 @@ def setup_web():
         if not previous.startswith(WEB_MARKER):
             raise ModError(f"{site} was not written by this manager. Nothing was changed.")
     was_enabled = os.path.lexists(link)
-    text = web_site_text(port)
+    text = web_site_text(port, read_protected_projects())
     conflict = apache_conflict(port, site)
     retry = f"Choose another CUSTOM_MODS_PORT ({CUSTOM_PORT_MIN}-{CUSTOM_PORT_MAX}) in {SERVICES_CONF}, then run " \
             "ddistro_custom_mod setup-web again. Nothing was changed."
@@ -1163,6 +1266,7 @@ def command_install(args):
         raise ModError("Check the repository first; install needs the checked commit.")
     acquire_lock()
     require_php_security()
+    read_protected_projects()  # a damaged list stops here, not in setup-web after the migration
     manifest, branch, commit, policy = inspect_repository(source, local)
     if expected and commit != expected:
         raise ModError("The repository changed after it was checked. Check it again.")
@@ -1265,8 +1369,12 @@ def refresh_policy(entry, source, local):
 
 def command_update(args):
     require_root()
+    expected = args.get("expect_commit")
+    if expected is not None and not SHA_PATTERN.match(expected):
+        raise ModError("--expect-commit must be a full commit id.")
     acquire_lock()
     require_php_security()
+    read_protected_projects()  # a damaged list stops here, not in setup-web after the migration
     entry = read_entry(args["id"])
     folder = checked_folder(entry)
     source, local = entry_source(entry)
@@ -1278,7 +1386,7 @@ def command_update(args):
     write_entry(entry)
     progress = {"changed": False}
     try:
-        update_checkout(entry, folder, source, local, branch, progress)
+        update_checkout(entry, folder, source, local, branch, progress, expect_commit=expected)
     except ModError as error:
         # A refusal before any change keeps a ready mod ready; a failure after it is visible.
         if previous_state == "ready" and not progress["changed"]:
@@ -1337,6 +1445,7 @@ def command_switch(args):
         raise ModError("Review the branch first; switch needs the reviewed commit.")
     acquire_lock()
     require_php_security()
+    read_protected_projects()  # a damaged list stops here, not in setup-web after the migration
     entry = read_entry(args["id"])
     folder = checked_folder(entry)
     source, local = entry_source(entry)
@@ -1354,7 +1463,7 @@ def command_switch(args):
     write_entry(entry)
     progress = {"changed": False}
     try:
-        update_checkout(entry, folder, source, local, target, progress, expect_commit=expected)
+        update_checkout(entry, folder, source, local, target, progress, expect_commit=expected, switching=True)
     except ModError as error:
         entry.clear()
         entry.update(before)
@@ -1404,15 +1513,18 @@ def incoming_collisions(folder, new_paths):
     return collisions
 
 
-def update_checkout(entry, folder, source, local, branch, progress, expect_commit=None):
-    """Update fast-forwards the installed branch; a branch switch (expect_commit) may diverge."""
+def update_checkout(entry, folder, source, local, branch, progress, expect_commit=None, switching=False):
+    """Update fast-forwards the installed branch (to expect_commit when pinned); only a switch may diverge."""
+    if switching and not expect_commit:
+        raise ModError("A branch switch needs the reviewed commit. Nothing was changed.")
     # Custom mods never discard edits: there is no force option here.
     status = git(["status", "--porcelain", "--untracked-files=no"], cwd=folder,
                  message="Could not read the mod folder status.")
     if status.stdout.strip():
         raise ModError("Files tracked by the mod were changed locally. Nothing was updated.")
-    if expect_commit:
-        # Rollback recreates the registered branch at the registered commit, so both must be what is installed.
+    if switching or expect_commit:
+        # Rollback recreates the registered branch at the registered commit, and a pinned update records the
+        # reviewed commit for the registered branch, so both must be what is installed.
         head = git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], cwd=folder, check=False)
         current = git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=folder, check=False)
         if (head.stdout.decode().strip() != entry["commit"]
@@ -1429,11 +1541,12 @@ def update_checkout(entry, folder, source, local, branch, progress, expect_commi
         raise ModError("The update changes the mod id. Nothing was updated.")
     if manifest["setup"]["config_path"] != entry["setup"]["config_path"]:
         raise ModError("The update moves the private config path. Nothing was updated.")
-    if not expect_commit and git(["merge-base", "--is-ancestor", "HEAD", incoming], cwd=folder,
-                                 check=False).returncode != 0:
+    # The validated commit, not the ref, is what lands, so a pinned update installs exactly the reviewed one.
+    if not switching and git(["merge-base", "--is-ancestor", "HEAD", commit], cwd=folder,
+                             check=False).returncode != 0:
         raise ModError("The update is not a fast-forward of the installed version. Nothing was updated.")
     local_ref = f"refs/heads/{branch}"
-    if expect_commit and git(["show-ref", "--verify", "--quiet", local_ref], cwd=folder, check=False).returncode == 0 \
+    if switching and git(["show-ref", "--verify", "--quiet", local_ref], cwd=folder, check=False).returncode == 0 \
             and git(["merge-base", "--is-ancestor", local_ref, expect_commit], cwd=folder,
                     check=False).returncode != 0:
         # checkout -B would discard local commits on an existing destination branch.
@@ -1444,11 +1557,13 @@ def update_checkout(entry, folder, source, local, branch, progress, expect_commi
     collisions = incoming_collisions(folder, new_paths - old_paths)
     if collisions:
         raise ModError(f"The update would replace local file {collisions[0]}. Nothing was updated.")
-    if expect_commit:
+    if switching:
         git(["checkout", "--quiet", "-B", branch, expect_commit], cwd=folder, message="Could not switch branches.")
     else:
-        git(["merge", "--ff-only", "--quiet", incoming], cwd=folder, message="Fast-forward update failed.")
+        git(["merge", "--ff-only", "--quiet", commit], cwd=folder, message="Fast-forward update failed.")
     progress["changed"] = True
+    # Recorded now, so a later failure leaves the registry naming what is checked out and a pinned retry works.
+    entry.update(commit=commit, branch=branch)
     apply_permissions(folder)
     write_config_if_missing(folder, manifest, template, entry["id"])
     if not database_exists(entry["database"]):
@@ -1462,8 +1577,7 @@ def update_checkout(entry, folder, source, local, branch, progress, expect_commi
     healthy, message = check_health(entry["id"], manifest)
     entry.update(name=manifest["name"], description=manifest["description"],
                  project_url=manifest["project_url"], dashboard_path=manifest["dashboard_path"],
-                 health_path=manifest["health_path"], setup=manifest["setup"], assets=manifest["assets"],
-                 commit=commit, branch=branch)
+                 health_path=manifest["health_path"], setup=manifest["setup"], assets=manifest["assets"])
     if not healthy:
         raise ModError(message)
 
@@ -1607,7 +1721,16 @@ def operation_running(entry):
 def command_setup_web(args):
     require_root()
     acquire_lock()
-    setup_web()
+    mod_id = args.get("protect_project")
+    if not mod_id:
+        setup_web()
+        return
+    protect_project(mod_id)
+    try:
+        setup_web()
+    except ModError as error:
+        raise ModError(f"{error} The protection for {mod_id} is saved but not active; do not place its "
+                       "source until sudo ddistro_custom_mod setup-web succeeds.")
 
 
 def command_status(args):
@@ -1630,7 +1753,8 @@ USAGE = """Usage: ddistro_custom_mod <command> [options]
   status [<id>] [--check-health] --json
   check <https-url> --json             Preview a repository's manifest (no changes).
   install <https-url> --expect-commit <sha>
-  update <id>                          Back up, then fast-forward and migrate (same branch).
+  update <id> [--expect-commit <sha>]  Back up, then fast-forward and migrate (same branch);
+                                       with --expect-commit, only to exactly that commit.
   branches <id> [--branch <name>] --json
                                        Refresh the offered branches; with --branch, preview its commit.
   switch <id> --branch <name> --expect-commit <sha>
@@ -1640,6 +1764,8 @@ USAGE = """Usage: ddistro_custom_mod <command> [options]
                                        and adding the same repository again restores it.
   setup-web                            Create or move the shared loopback listener on
                                        CUSTOM_MODS_PORT from /etc/dwemerdistro_services.conf.
+  setup-web --protect-project <id>     Also deny /custom-mods/<id> source folders and private
+                                       files from now on; run before placing the source.
 
 Admin/test only: check|install --local-source </absolute/path/repo.git> (root).
 For a bundle, first: git clone --bare /path/example.bundle /path/example.git
@@ -1660,11 +1786,13 @@ def parse_args(argv):
             args["json"] = True
         elif token == "--check-health" and command == "status":
             args["check_health"] = True
-        elif token in ("--expect-commit", "--local-source", "--branch") and index + 1 < len(rest):
-            allowed = {"--expect-commit": ("install", "switch"), "--local-source": ("check", "install"),
-                       "--branch": ("branches", "switch")}[token]
+        elif token in ("--expect-commit", "--local-source", "--branch", "--protect-project") and index + 1 < len(rest):
+            allowed = {"--expect-commit": ("install", "update", "switch"), "--local-source": ("check", "install"),
+                       "--branch": ("branches", "switch"), "--protect-project": ("setup-web",)}[token]
             if command not in allowed:
                 raise ModError(f"{token} is not supported for {command}.")
+            if token == "--protect-project" and "protect_project" in args:
+                raise ModError("--protect-project takes one custom mod id.")
             args[token[2:].replace("-", "_")] = rest[index + 1]
             index += 1
         elif token.startswith("-"):
@@ -1685,6 +1813,8 @@ def parse_args(argv):
     elif command == "setup-web":
         if positional:
             raise ModError("setup-web takes no arguments.")
+        if "protect_project" in args:
+            args["protect_project"] = validate_mod_id(args["protect_project"])
     else:
         raise ModError(f"Unknown command {command[:40]}.")
     return args
