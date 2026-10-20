@@ -65,7 +65,11 @@ assistant is ready. Readiness comes only from `agent status` (`installed` and `p
 `features.inventory` and `capabilities.inventory` describe `inventory` (scope, the products
 with an extension folder, component ids, and limits). `features.memory` and
 `capabilities.memory` describe `memory` (scope, kinds, defaults, limits) from constants only;
-`capabilities` never opens or creates the memory database.
+`capabilities` never opens or creates the memory database. `features.thread_lifecycle` is
+`true`: `agent serve` forwards `thread/archive`, `thread/unarchive`, and `thread/delete` with
+`threadId` only, and only for one of the serving task's own threads; delete never removes the
+task's change receipts or backups (see "Thread archive and delete" in `ASSISTANT_RUNTIME.md`).
+It is a static fact, like the others, and adds no command.
 
 ## Status and update
 

@@ -400,7 +400,9 @@ def cmd_capabilities(opts, ctx):
         # and a passing probe on this distro) is only ever reported by agent status.
         "features": {"file_changes": True, "locks": True, "agent": agent_helper_trusted(), "chat": False,
                      "models": True, "inventory": True,
-                     "health": True, "assistant_tools": agent_helper_trusted(), "memory": True},
+                     "health": True, "assistant_tools": agent_helper_trusted(), "memory": True,
+                     # agent serve forwards thread/archive, unarchive and delete for this task's threads only.
+                     "thread_lifecycle": True},
         "agent": {"provider": "codex", "readiness_command": "agent status", "ready_when": ["installed", "probe_passed"]},
         # Configured profile assignments only; which profile an NPC is using is not reported.
         "models": {"products": ["herika"], "scope": "configured_profiles", "roles": [role for role, _ in MODELS_ROLES],

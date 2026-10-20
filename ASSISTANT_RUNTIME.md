@@ -387,7 +387,8 @@ delete changes nothing. Neither touches other threads, the account home or sign-
 `task.json`, scratch, change receipts, or backups. Deleting a thread does not forget memory
 notes captured in it: that is a separate, optional user action, `ddistro memory forget
 --thread ID` (or `--task TASK`), which the launcher may offer next to the delete confirmation,
-unchecked by default.
+unchecked by default. `ddistro capabilities` reports this as `features.thread_lifecycle: true`,
+a static fact that adds no command and opens no database.
 
 ## Known limitations
 

@@ -1210,6 +1210,9 @@ class Broker:
         self.tool_jobs = set()
         self.children = set()
         self.stopping = False
+        # _stop_diagnostics runs once; a second caller (client EOF and run() may race) waits for the first.
+        self.diagnostics_claimed = False
+        self.diagnostics_stopped = threading.Event()
         # (threadId, turnId) -> [calls, text bytes, interrupted], oldest evicted; plus a session call count.
         self.turn_budgets = collections.OrderedDict()
         self.session_calls = 0
@@ -1246,7 +1249,18 @@ class Broker:
         """No new runs; SIGTERM then SIGKILL exactly the adopted groups; join every tool thread."""
         with self.state_lock:
             self.stopping = True
+            first = not self.diagnostics_claimed
+            self.diagnostics_claimed = True
             children, jobs = list(self.children), list(self.tool_jobs)
+        if not first:
+            self.diagnostics_stopped.wait()
+            return
+        try:
+            self._stop_children(children, jobs)
+        finally:
+            self.diagnostics_stopped.set()
+
+    def _stop_children(self, children, jobs):
         for child in children:
             child.signal(signal.SIGTERM)
         deadline = time.monotonic() + TOOL_STOP_GRACE
@@ -1263,7 +1277,7 @@ class Broker:
     def request_stop(self):
         """Signal-safe (takes no locks): no new diagnostics, then terminate only this session's process group.
 
-        Running diagnostics are stopped by run() once the App Server has gone."""
+        Running diagnostics are stopped by the client reader, which sees stopping within CLIENT_POLL."""
         self.stopping = True
         if self.proc.poll() is None:
             try:
@@ -1295,7 +1309,7 @@ class Broker:
                 yield line
             return
         pending = bytearray()
-        while not self.closed:
+        while not (self.closed or self.stopping):
             try:
                 if not select.select([fd], [], [], CLIENT_POLL)[0]:
                     continue
@@ -1316,7 +1330,7 @@ class Broker:
             if len(pending) > CLIENT_LINE_LIMIT:
                 yield bytes(pending)
                 return
-        if pending and not self.closed:
+        if pending and not (self.closed or self.stopping):
             yield bytes(pending)
 
     def _pump_client(self):
@@ -1336,6 +1350,9 @@ class Broker:
         self.stop_timer = threading.Timer(SHUTDOWN_GRACE, self.request_stop)
         self.stop_timer.daemon = True
         self.stop_timer.start()
+        # The client is gone: stop diagnostics now rather than once the App Server exits, which can take
+        # longer than the launcher waits before killing this broker.
+        self._stop_diagnostics()
 
     def _handle_client(self, line):
         try:
