@@ -370,6 +370,96 @@ There is no overall verdict: each check is `passed`, `failed`, or `skipped` with
 
 A passing port check proves only that something accepts TCP there, not which service.
 
+## Performance
+
+`performance [product]` measures bounded local timings now; like `health` it changes nothing
+and has no overall verdict. Each measurement is `measured`, `failed`, or `skipped` with a
+`reason`; `duration_ms` values are whole wall-clock milliseconds (`time_unit: "ms"`) measured by
+ddistro now, never provider, TTS, or in-game latency. Herika request timings are recorded by
+HerikaServer itself and reported as `values`. Nothing is judged fast or slow.
+
+```json
+{"captured_at": "...", "scope": "local_bounded", "product": null, "read_as": "root", "time_unit": "ms",
+ "deadline_seconds": 15.0, "complete": true, "summary": {"measured": 7, "failed": 0, "skipped": 6},
+ "measurements": [{"id": "postgres.select1", "component": "postgres", "result": "measured",
+                   "duration_ms": 48, "values": {"client_setup_included": true}, "reason": null}],
+ "scope_limits": ["..."]}
+```
+
+- `server.<product>.http`: the same fixed `GET` health makes (2 s, 64 KiB), timed, for
+  `dialectic` and `stobe` only; values are `http_status`, `service_matched`, `status_ok`. No body,
+  path, or port is returned. Other servers are skipped (`no known local health contract`); a
+  not-installed one is skipped too. Ports come from `ddistro_server status`.
+- `postgres.select1` (root only, else skipped `requires_root`): one `SELECT 1` through the
+  `models` path (`runuser -u postgres psql`, read-only transaction, statement timeout), at most
+  10 seconds. It includes process start, connection setup, and up to 100 ms of polling
+  (`client_setup_included: true`), so it is not query performance. Output other than `1` fails
+  as `unexpected_output`.
+- `host.load` (`/proc/loadavg`, plus `cpu_count`), `host.memory` (`/proc/meminfo` total,
+  available, and swap, in MiB), `host.pressure.cpu|memory|io` (PSI `avg10` percent): fixed paths
+  read with the health config-file reader (4 KiB, no links); missing or malformed counters are
+  skipped, never estimated. These are the distro's Linux (WSL) view, not Windows, game, or GPU load.
+- `herika.request_timing` (all products or `herika` only): recent HerikaServer request records,
+  parsed from the same bounded `chim.log` tail `logs herika` reads (last 256 KiB, no links, regular
+  file only, in an unredirected log folder). See below.
+- `llm.provider_latency`, `tts.recent_timing`: always skipped. No maintained server records
+  provider latency, time to first token, or TTS timing.
+
+### HerikaServer `[PERF]` records
+
+The supported schema is the one HerikaServer's `lib/request_performance.php` writes at the end of
+a request through `Logger::trace`, one line in `log/chim.log`:
+
+```
+[2026-10-20T14:00:00+00:00] [trace] [PERF] {"run_id": "...", "request_type": "...", "status": "complete",
+  "total_ms": 2500.5, "sql_ms": 40.25, "peak_memory_mb": 12, "phases": [{"name": "request_parsed", "delta_ms": 3.1, "total_ms": 3.1}, ...]}
+```
+
+Installed versions that predate it write no such line; the measurement is then skipped (`no [PERF]
+records in the chim.log tail`). It is never turned on: ddistro does not enable trace logging, change
+configuration, or ask for a generation. Legacy connector START/END lines and audit elapsed times are
+not read, because their durations are not defined as request or provider timings.
+
+Only lines matching `[<time>] [trace] [PERF] {...}` are considered, newest first. A record counts
+when its time has a zone and falls in the last 15 minutes (up to 60 s ahead is tolerated), its
+`status` is `complete`, the line is at most 16 KiB, and `total_ms`, `sql_ms` (both at most one day in
+ms), and `peak_memory_mb` (at most 1 TiB) are finite, non-negative JSON numbers (a boolean or string
+is not a number; `NaN`/`Infinity` are malformed). `phases` must be a list of at most 64 entries;
+only these stage names are kept, each with its `delta_ms` (time since the previous mark), validated
+the same way: `request_parsed`, `lock_ready`, `profile_ready`, `context_history_ready`,
+`memory_ready`, `oghma_ready`, `prompt_ready`, `llm_complete`. Other phase names are ignored. The
+newest 32 valid records are summarised:
+
+```json
+{"window_seconds": 900, "tail_bytes": 262144, "perf_records_in_tail": 4, "older_than_window": 1,
+ "skipped_records": {"invalid_number": 1}, "samples": 2, "sample_limit": 32, "sample_limit_reached": false,
+ "window_covered": true, "newest_age_seconds": 30, "oldest_age_seconds": 300,
+ "total_request_ms": {"count": 2, "median": 2500.0, "max": 3000.0}, "sql_ms": {...}, "peak_memory_mb": {...},
+ "stage_delta_ms": {"prompt_ready": {...}, "llm_complete": {"count": 2, "median": 1800.0, "max": 2100.0}},
+ "llm_complete_scope": "connector_generation_output_tts_and_retry_not_provider_latency_or_ttft"}
+```
+
+- `skipped_records` counts rejected `[PERF]` lines by fixed reason only: `malformed`, `oversize`,
+  `invalid_time`, `time_without_zone`, `future_time`, `not_complete`, `missing_field`,
+  `invalid_number`.
+- `llm_complete` is the time from `prompt_ready` until HerikaServer's `call_llm()` returns: local
+  connector work, generation, per-sentence output (which may include TTS synthesis and player TTS),
+  and any fallback retry. It is not provider latency, time to first token, or a TTS timing, and
+  none of those can be separated from it.
+- `window_covered` is true only when the tail reaches back past the 15 minute cutoff (it starts at
+  the file's beginning or at a dated line older than the cutoff) and the sample limit was not hit.
+  Otherwise the result carries `reason` `partial: ...` and makes no claim about the whole period.
+- The raw line, the JSON, `run_id`, `request_type`, `status`, phase names outside the list, and
+  any other key are never returned. No record means `skipped` with a specific reason: no `[PERF]`
+  record in the tail, none in the last 15 minutes, none valid, or the log missing, unreadable, a
+  link, not a regular file, or in a redirected folder.
+
+The whole run has a 15 second deadline. A step that no longer fits is skipped with `deadline
+reached` and the reply has `complete: false`; host counters are always read. At most 64
+measurements are returned. No external request, provider call, or configuration change is made.
+`herika.request_timing` with `window_covered: false` does not make the run incomplete; `complete`
+is only about the deadline.
+
 ## Assistant memory
 
 `memory <action> [flags] --json` (root) manages short, user-controlled notes that the assistant

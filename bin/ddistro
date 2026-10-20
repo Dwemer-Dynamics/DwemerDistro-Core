@@ -114,6 +114,7 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
   models herika                 (root; configured CHIM profile model assignments, read-only)
   inventory                     (read-only presence snapshot: servers, ext folders, components, custom mods)
   health [product]              (bounded local checks: servers, ports, fixed local HTTP health, database presence, disk)
+  performance [product]         (bounded local timings now: fixed local HTTP health, PostgreSQL SELECT 1, host load/memory, recent Herika [PERF] records)
   agent serve --task TASK      (root; raw Codex App Server JSONL, no --json envelope)
   memory status|list|search|add|update|forget|reset|export|configure   (root; assistant notes, see ASSISTANT.md)
   service restart apache       (root; restart, then verify a new process and its ports; see ASSISTANT.md)
@@ -389,6 +390,8 @@ def cmd_capabilities(opts, ctx):
             # Any user may run it; as another user, unreadable folders are reported as unreadable.
             {"name": "inventory", "mutates": False},
             {"name": "health", "arguments": ["[product]"], "mutates": False},
+            # Root measures the PostgreSQL SELECT 1; other users get it skipped (requires_root).
+            {"name": "performance", "arguments": ["[product]"], "mutates": False},
             {"name": "service restart", "arguments": ["<service>"], "mutates": True, "requires_root": True},
         ] + [{"name": "memory " + name, "flags": list(spec[0] + spec[1]), "mutates": name not in MEMORY_READS,
               "requires_root": True} for name, spec in MEMORY_SPEC.items()],
@@ -419,7 +422,7 @@ def cmd_capabilities(opts, ctx):
                      # agent serve forwards thread/archive, unarchive and delete for this task's threads only.
                      "thread_lifecycle": True,
                      # agent serve offers ddistro_action (propose_restart) to a client that opts in; see ASSISTANT_RUNTIME.md.
-                     "assistant_actions": agent_helper_trusted()},
+                     "assistant_actions": agent_helper_trusted(), "performance": True},
         "service_restart": {"services": {name: {"label": spec["label"], "impact": spec["impact"]}
                                          for name, spec in SERVICE_RESTARTS.items()},
                             "verification": ["command", "new_process", "ports"], "lock": "maintenance"},
@@ -436,11 +439,24 @@ def cmd_capabilities(opts, ctx):
                    "application_checks": {"servers": {name: path for name, (path, _) in HEALTH_SERVER_HTTP.items()},
                                           "components": HEALTH_COMPONENT_HTTP},
                    "http_timeout_seconds": HEALTH_HTTP_TIMEOUT, "http_bytes": HEALTH_HTTP_LIMIT},
+        "performance": {"scope": "local_bounded", "results": ["measured", "failed", "skipped"], "time_unit": "ms",
+                        "deadline_seconds": PERFORMANCE_DEADLINE, "max_measurements": PERFORMANCE_MAX,
+                        "http_servers": list(HEALTH_SERVER_HTTP), "postgres": "select1_client_setup_included",
+                        "host": ["load", "memory"] + ["pressure." + name for name in PERFORMANCE_PRESSURE],
+                        "herika_request_timing": {"source": "herika " + PERFORMANCE_HERIKA_LOG + " [PERF]",
+                                                  "window_seconds": PERFORMANCE_HERIKA_WINDOW,
+                                                  "max_samples": PERFORMANCE_HERIKA_SAMPLES, "tail_bytes": MAX_LOG_BYTES,
+                                                  "fields": [name for _, name, _ in PERFORMANCE_HERIKA_FIELDS],
+                                                  "stages": list(PERFORMANCE_HERIKA_STAGES)},
+                        "scope_limits": PERFORMANCE_SCOPE_LIMITS},
         # The broker declares and runs this one tool itself; see ASSISTANT_RUNTIME.md.
         "assistant_tools": {"requires": "initialize capabilities.experimentalApi true", "declared_on": "thread/start",
                             "tools": [{"name": "ddistro_read", "mutates": False,
-                                       "operations": ["inventory", "status", "models", "logs", "health"],
-                                       "max_log_lines": 400, "log_filters": ["query", "since"]},
+                                       "operations": ["inventory", "status", "models", "logs", "health", "performance"],
+                                       "max_log_lines": 400, "log_filters": ["query", "since"],
+                                       # Shared logs are read with log_source; product is a server only (older
+                                       # threads may still send product apache/postgres for logs, which stays valid).
+                                       "log_sources": ["apache", "postgres"]},
                                       {"name": "ddistro_memory", "mutates": True, "operations": ["search", "remember"],
                                        "declared_when": "memory retrieval on at session start",
                                        "remember_requires": "auto_learning on"},
@@ -576,7 +592,9 @@ def filter_rows(rows, query, since, whole_file):
     return kept, info
 
 
-def read_tail(path, lines, query=None, since=None):
+def read_tail_rows(path):
+    """(rows, start offset, fstat) of the last MAX_LOG_BYTES of a regular file, opened without following a link.
+    Rows are raw text (not cleaned or redacted); a partial first row is dropped."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     fd = os.open(path, flags)
     try:
@@ -598,6 +616,11 @@ def read_tail(path, lines, query=None, since=None):
         rows.pop()
     if start > 0 and len(rows) > 1:
         rows.pop(0)  # partial first line
+    return rows, start, info
+
+
+def read_tail(path, lines, query=None, since=None):
+    rows, start, info = read_tail_rows(path)
     search = None
     if query or since:
         rows, search = filter_rows(rows, query, since, start == 0)
@@ -1048,18 +1071,18 @@ def check_system_binary(path):
     check_helper(path)
 
 
-def models_psql(sql, keep):
+def models_psql(sql, keep, timeout=MODELS_TIMEOUT, appname="ddistro-models"):
     """Run one fixed read-only query; returns (exit code, stdout bytes). stderr is never returned."""
     port = os.environ.get("DDISTRO_POSTGRES_PORT", "")
     port = port if re.match(r"^[0-9]{1,5}\Z", port) and 0 < int(port) < 65536 else "5432"
     env = {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PGCONNECT_TIMEOUT": "5",
-           "PGAPPNAME": "ddistro-models", "PGTZ": "UTC",
+           "PGAPPNAME": appname, "PGTZ": "UTC",
            "PGOPTIONS": "-c default_transaction_read_only=on -c statement_timeout=10000 -c lock_timeout=2000 "
                         "-c idle_in_transaction_session_timeout=10000 -c search_path=pg_catalog"}
     args = ["-u", "postgres", "--", MODELS_PSQL, "-X", "-A", "-t", "-q", "--no-password", "-v", "ON_ERROR_STOP=1",
             "-h", MODELS_SOCKET, "-p", port, "-d", MODELS_DATABASE, "-1",
             "-c", "SET TRANSACTION READ ONLY", "-c", sql]
-    code, out, _ = run_helper(args, MODELS_TIMEOUT, keep + 1, helper=MODELS_RUNUSER, env=env)
+    code, out, _ = run_helper(args, timeout, keep + 1, helper=MODELS_RUNUSER, env=env)
     if code == 0 and out.total > keep:
         raise CliError("helper_protocol", "output too large", {"reason": "unexpected_output"})
     return code, bytes(out.data)
@@ -1664,6 +1687,322 @@ def cmd_health(opts, ctx):
              f"{summary['skipped']} skipped (local checks only)"]
     lines += [f"  {c['result']:<7} {c['id']:<32} {c['evidence']}" + (f" ({c['reason']})" if c["reason"] else "")
               for c in checks]
+    return data, "\n".join(lines)
+
+
+# ddistro performance: bounded local timings captured now. Each measurement is measured, failed, or skipped (with a
+# reason); durations are whole wall-clock milliseconds seen by ddistro, never provider latency, and nothing is judged
+# fast or slow. It sends only the fixed local health requests health already makes, one read-only SELECT 1, reads
+# kernel counters, and parses HerikaServer's [PERF] records from the bounded chim.log tail; no other log, provider,
+# model, or configuration is read, and nothing is changed (trace logging is never turned on).
+PERFORMANCE_DEADLINE = 15.0
+PERFORMANCE_PSQL_TIMEOUT = 10
+PERFORMANCE_MAX = 64
+PERFORMANCE_MEMINFO = ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree")
+PERFORMANCE_PRESSURE = ("cpu", "memory", "io")
+PERFORMANCE_SCOPE_LIMITS = [
+    "Durations are wall-clock milliseconds measured by ddistro now, not LLM, TTS, or in-game latency, and are not judged.",
+    "HTTP timings use only the fixed local health requests health makes (Dialectic and Stobe health.php); other "
+    "servers have no local health contract and are skipped. A port or TCP answer is not health.",
+    "The PostgreSQL timing is one read-only SELECT 1 through runuser and psql, so it includes process start, connection "
+    "setup, and up to 100 ms of polling; it is not query performance.",
+    "Host load, memory, and pressure come from /proc as seen by the distro's Linux kernel (WSL); they are not Windows, "
+    "game, or GPU figures. Missing counters are skipped.",
+    "Herika request timings come only from HerikaServer's [PERF] request records in the bounded tail of chim.log, when "
+    "the installed version writes them; only fixed numeric fields are returned. Older versions write none and it is "
+    "skipped. Legacy START/END or audit elapsed times are not read.",
+    "Herika's llm_complete stage is all of call_llm() after prompt_ready: local connector work, generation, line "
+    "output (which may include TTS synthesis and player TTS), and any fallback retry. It is not provider latency, time "
+    "to first token, or a TTS timing; none of those is available separately.",
+]
+# HerikaServer request timing (lib/request_performance.php): at the end of each request it writes, via Logger::trace,
+# one line "[<ISO 8601 time with offset>] [trace] [PERF] <JSON>" to log/chim.log. The JSON has total_ms, sql_ms,
+# peak_memory_mb and phases [{name, delta_ms, total_ms}] (plus run_id, request_type and status, which are never
+# returned). Only the fixed numeric fields and the known stage names below are kept; any other key, a phase name not
+# listed, the line, the run id and the request type are discarded. A record must be status "complete", carry a time
+# with a zone, be no larger than the line bound, and have finite, non-negative numbers within the bounds.
+PERFORMANCE_HERIKA_LOG = "chim.log"
+PERFORMANCE_HERIKA_WINDOW = 900  # seconds: records from the last 15 minutes
+PERFORMANCE_HERIKA_SAMPLES = 32  # newest records kept
+PERFORMANCE_HERIKA_LINE_CHARS = 16384
+PERFORMANCE_HERIKA_MAX_PHASES = 64
+PERFORMANCE_HERIKA_MAX_MS = 86400000.0
+PERFORMANCE_HERIKA_MAX_MB = 1048576.0
+PERFORMANCE_HERIKA_FUTURE = 60  # seconds a record may be ahead of the clock
+PERFORMANCE_HERIKA_LINE = re.compile(r"^\[[^\]\n]{1,40}\] \[trace\] \[PERF\] (\{.*\})\Z")
+PERFORMANCE_HERIKA_FIELDS = (("total_ms", "total_request_ms", PERFORMANCE_HERIKA_MAX_MS),
+                             ("sql_ms", "sql_ms", PERFORMANCE_HERIKA_MAX_MS),
+                             ("peak_memory_mb", "peak_memory_mb", PERFORMANCE_HERIKA_MAX_MB))
+PERFORMANCE_HERIKA_STAGES = ("request_parsed", "lock_ready", "profile_ready", "context_history_ready", "memory_ready",
+                             "oghma_ready", "prompt_ready", "llm_complete")
+
+
+def performance_herika_number(value, bound):
+    """A finite number in [0, bound] (bool is not a number), else None."""
+    if type(value) not in (int, float) or not 0 <= value <= bound:  # NaN fails both comparisons
+        return None
+    return float(value)
+
+
+def performance_herika_record(row):
+    """(epoch seconds, metrics, stage deltas) for one valid [PERF] line, None for another line, or a skip reason."""
+    if "[PERF]" not in row[:120]:
+        return None
+    if len(row) > PERFORMANCE_HERIKA_LINE_CHARS:
+        return "oversize"
+    match = PERFORMANCE_HERIKA_LINE.match(row)
+    if not match:
+        return "malformed"
+    stamp = log_stamp(row)
+    if not stamp:
+        return "invalid_time" if stamp is False else "malformed"
+    if not stamp[1]:
+        return "time_without_zone"
+    try:
+        doc = json.loads(match.group(1), parse_constant=reject_constant)
+    except (ValueError, TypeError, RecursionError):
+        return "malformed"
+    if type(doc) is not dict:
+        return "malformed"
+    if doc.get("status") != "complete":
+        return "not_complete"
+    metrics = {}
+    for field, name, bound in PERFORMANCE_HERIKA_FIELDS:
+        metrics[name] = performance_herika_number(doc.get(field), bound)
+        if metrics[name] is None:
+            return "invalid_number" if field in doc else "missing_field"
+    phases = doc.get("phases")
+    if type(phases) is not list or len(phases) > PERFORMANCE_HERIKA_MAX_PHASES:
+        return "malformed"
+    stages = {}
+    for phase in phases:
+        name = phase.get("name") if type(phase) is dict else None
+        if name not in PERFORMANCE_HERIKA_STAGES or name in stages:
+            continue  # unknown names are never returned; a repeated mark keeps the first
+        delta = performance_herika_number(phase.get("delta_ms"), PERFORMANCE_HERIKA_MAX_MS)
+        if delta is None:
+            return "invalid_number"
+        stages[name] = delta
+    return stamp[0], metrics, stages
+
+
+def performance_herika_stats(values):
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    median = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+    return {"count": len(ordered), "median": round(median, 2), "max": round(ordered[-1], 2)}
+
+
+def performance_herika():
+    """(result, values, reason) from recent HerikaServer [PERF] records in the bounded tail of chim.log."""
+    root = LOG_SOURCES["herika"][0]
+    path = os.path.join(root, PERFORMANCE_HERIKA_LOG)
+    try:
+        root_info = os.lstat(root)
+        if not stat.S_ISDIR(root_info.st_mode) or os.path.realpath(root) != root:
+            return "skipped", None, "log folder redirected; not read"
+        rows, start, _ = read_tail_rows(path)
+    except FileNotFoundError:
+        return "skipped", None, "chim.log not present"
+    except PermissionError:
+        return "skipped", None, "chim.log not readable by this user"
+    except CliError:
+        return "skipped", None, "chim.log is not a regular file; not read"
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            return "skipped", None, "chim.log is a symbolic link; not read"
+        return "skipped", None, "chim.log could not be read"
+    now = time.time()
+    cutoff = now - PERFORMANCE_HERIKA_WINDOW
+    samples, skipped, seen, older, limited = [], {}, 0, 0, False
+    first = next((found[0] for found in map(log_stamp, rows) if found), None)
+    for row in reversed(rows):
+        found = performance_herika_record(row)
+        if found is None:
+            continue
+        seen += 1
+        if isinstance(found, str):
+            skipped[found] = skipped.get(found, 0) + 1
+        elif found[0] < cutoff:
+            older += 1
+        elif found[0] > now + PERFORMANCE_HERIKA_FUTURE:
+            skipped["future_time"] = skipped.get("future_time", 0) + 1
+        elif len(samples) >= PERFORMANCE_HERIKA_SAMPLES:
+            limited = True
+        else:
+            samples.append(found)
+    # The whole window is covered only if the tail starts at the file's beginning or at a dated line before the cutoff,
+    # and no in-window record was left out by the sample limit.
+    covered = (start == 0 or (first is not None and first < cutoff)) and not limited
+    values = {"window_seconds": PERFORMANCE_HERIKA_WINDOW, "tail_bytes": MAX_LOG_BYTES,
+              "perf_records_in_tail": seen, "older_than_window": older,
+              "skipped_records": dict(sorted(skipped.items())), "samples": len(samples),
+              "sample_limit": PERFORMANCE_HERIKA_SAMPLES, "sample_limit_reached": limited,
+              "window_covered": covered}
+    if not seen:
+        return "skipped", values, "no [PERF] records in the chim.log tail (version may not write them)"
+    if not samples:
+        return "skipped", values, ("no valid [PERF] records in the last 15 minutes" if skipped
+                                   else "no [PERF] records in the last 15 minutes")
+    stamps = [sample[0] for sample in samples]
+    values.update({
+        "newest_age_seconds": max(0, int(now - max(stamps))), "oldest_age_seconds": max(0, int(now - min(stamps))),
+        **{name: performance_herika_stats([s[1][name] for s in samples]) for _, name, _ in PERFORMANCE_HERIKA_FIELDS},
+        "stage_delta_ms": {stage: performance_herika_stats([s[2][stage] for s in samples if stage in s[2]])
+                           for stage in PERFORMANCE_HERIKA_STAGES if any(stage in s[2] for s in samples)},
+        "llm_complete_scope": "connector_generation_output_tts_and_retry_not_provider_latency_or_ttft"})
+    return "measured", values, None if covered else "partial: the bounded tail or sample limit did not cover 15 minutes"
+
+
+def performance_numbers(text, pattern):
+    """Named numeric fields of a small /proc file; None when the text does not have the expected shape."""
+    found = {}
+    for match in re.finditer(pattern, text or ""):
+        try:
+            found[match.group(1)] = float(match.group(2))
+        except ValueError:
+            return None
+    return found or None
+
+
+def performance_host():
+    """(id, result, values, reason) for load, memory and each PSI pressure file, from fixed /proc paths only."""
+    results = []
+    load = (health_read_small("/proc/loadavg", (0,)) or "").split()
+    try:
+        values = {"load_1m": float(load[0]), "load_5m": float(load[1]), "load_15m": float(load[2]),
+                  "cpu_count": os.cpu_count()}
+        results.append(("host.load", "measured", values, None))
+    except (IndexError, ValueError):
+        results.append(("host.load", "skipped", None, "/proc/loadavg unavailable or not in the expected format"))
+    meminfo = performance_numbers(health_read_small("/proc/meminfo", (0,)),
+                                  r"(?m)^(" + "|".join(PERFORMANCE_MEMINFO) + r"):\s+([0-9]{1,15}) kB$")
+    if meminfo and {"MemTotal", "MemAvailable"} <= set(meminfo):
+        values = {name.lower() + "_mib": int(meminfo[name]) // 1024 for name in PERFORMANCE_MEMINFO if name in meminfo}
+        results.append(("host.memory", "measured", values, None))
+    else:
+        results.append(("host.memory", "skipped", None, "/proc/meminfo unavailable or not in the expected format"))
+    for name in PERFORMANCE_PRESSURE:
+        text = health_read_small(f"/proc/pressure/{name}", (0,))
+        found = performance_numbers(text, r"(?m)^(some|full) avg10=([0-9]{1,3}\.[0-9]{1,2}) ")
+        if found:
+            results.append((f"host.pressure.{name}", "measured",
+                            {f"{kind}_avg10_percent": value for kind, value in found.items()}, None))
+        else:
+            results.append((f"host.pressure.{name}", "skipped", None,
+                            "pressure stall information unavailable" if text is None else "unexpected format"))
+    return results
+
+
+def performance_postgres(timeout):
+    """(result, duration ms, reason) of one read-only SELECT 1 through the models psql path."""
+    if os.geteuid() != 0:
+        return "skipped", None, "requires_root"
+    try:
+        check_system_binary(MODELS_PSQL)
+        pwd.getpwnam("postgres")
+    except (CliError, KeyError, OSError):
+        return "skipped", None, "helper_unavailable"
+    started = time.monotonic()
+    try:
+        code, raw = models_psql("SELECT 1", 64, timeout=timeout, appname="ddistro-performance")
+    except CliError as error:
+        if error.code == "cancelled":
+            raise
+        return "failed", None, {"timeout": "timeout", "helper_protocol": "unexpected_output"}.get(
+            error.code, "helper_unavailable")
+    elapsed = int((time.monotonic() - started) * 1000)
+    if code != 0:
+        return "failed", elapsed, "database_unavailable" if code == 2 else "query_failed"
+    if raw.strip() != b"1":
+        return "failed", elapsed, "unexpected_output"
+    return "measured", elapsed, None
+
+
+def cmd_performance(opts, ctx):
+    product = opts.get("product")
+    captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    deadline = time.monotonic() + PERFORMANCE_DEADLINE
+    measurements = []
+    deadline_hit = False
+
+    def add(measurement_id, component, result, duration_ms=None, values=None, reason=None):
+        if len(measurements) < PERFORMANCE_MAX:
+            measurements.append({"id": measurement_id, "component": component, "result": result,
+                                 "duration_ms": duration_ms, "values": values, "reason": reason})
+
+    def left(needed):
+        """Seconds left before the deadline when at least needed remain; otherwise None (and the run is partial)."""
+        nonlocal deadline_hit
+        remaining = deadline - time.monotonic()
+        if remaining < needed:
+            deadline_hit = True
+            return None
+        return remaining
+
+    records = None
+    remaining = left(1)
+    if remaining is not None:
+        try:
+            records = helper_status(product, timeout=max(1, min(HEALTH_STATUS_TIMEOUT, int(remaining))))
+        except CliError as error:
+            if error.code == "cancelled":
+                raise
+            add("servers.status", "ddistro_server", "failed", reason="ddistro_server status: " + error.code)
+    else:
+        add("servers.status", "ddistro_server", "skipped", reason="deadline reached")
+    for record in records or []:
+        name = record["product"]
+        if record["state"] == "not-installed":
+            add(f"server.{name}.http", name, "skipped", reason="not installed")
+            continue
+        path, service = HEALTH_SERVER_HTTP.get(name, (None, None))
+        if path is None:
+            add(f"server.{name}.http", name, "skipped", reason="no known local health contract")
+            continue
+        if left(HEALTH_HTTP_TIMEOUT) is None:
+            add(f"server.{name}.http", name, "skipped", reason="deadline reached")
+            continue
+        started = time.monotonic()
+        status, document, problem = health_http_get(record["port"], path)
+        elapsed = int((time.monotonic() - started) * 1000)
+        if document is None:
+            # The problem text is built by health_http_get from fixed words; no body or endpoint is returned.
+            add(f"server.{name}.http", name, "failed", elapsed, {"http_status": status}, problem)
+            continue
+        add(f"server.{name}.http", name, "measured", elapsed,
+            {"http_status": status, "service_matched": document.get("service") == service,
+             "status_ok": status == 200 and health_word(document, "status") == "ok"})
+    timeout = left(2)
+    if timeout is None:
+        add("postgres.select1", "postgres", "skipped", reason="deadline reached")
+    else:
+        result, elapsed, reason = performance_postgres(max(1, min(PERFORMANCE_PSQL_TIMEOUT, int(timeout))))
+        add("postgres.select1", "postgres", result, elapsed, {"client_setup_included": True}, reason)
+    for measurement_id, result, values, reason in performance_host():
+        add(measurement_id, "host", result, values=values, reason=reason)
+    if product in (None, "herika"):
+        if left(1) is None:
+            add("herika.request_timing", "herika", "skipped", reason="deadline reached")
+        else:
+            result, values, reason = performance_herika()
+            add("herika.request_timing", "herika", result, values=values, reason=reason)
+    add("llm.provider_latency", "llm", "skipped", reason="no provider latency or TTFB contract; "
+        "herika.request_timing llm_complete spans connector work, generation, output, and TTS")
+    add("tts.recent_timing", "tts", "skipped", reason="no maintained TTS timing contract; not separable from llm_complete")
+    summary = {result: sum(m["result"] == result for m in measurements) for result in ("measured", "failed", "skipped")}
+    data = {"captured_at": captured_at, "scope": "local_bounded", "product": product, "read_as": current_user(),
+            "time_unit": "ms", "deadline_seconds": PERFORMANCE_DEADLINE, "complete": not deadline_hit,
+            "summary": summary, "measurements": measurements, "scope_limits": PERFORMANCE_SCOPE_LIMITS}
+    lines = [f"DwemerDistro performance at {captured_at}: {summary['measured']} measured, {summary['failed']} failed, "
+             f"{summary['skipped']} skipped (local timings only{'; deadline reached, partial' if deadline_hit else ''})"]
+    for m in measurements:
+        shown = f"{m['duration_ms']} ms" if m["duration_ms"] is not None else ""
+        if m["values"]:
+            shown = ", ".join([shown] * bool(shown) + [f"{k} {json.dumps(v, separators=(',', ':'))}"
+                                                       if isinstance(v, dict) else f"{k} {v}"
+                                                       for k, v in m["values"].items()])
+        lines.append(f"  {m['result']:<8} {m['id']:<28} {shown}" + (f" ({m['reason']})" if m["reason"] else ""))
     return data, "\n".join(lines)
 
 
@@ -2299,7 +2638,7 @@ def command_words(argv):
 COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products": cmd_products,
             "status": cmd_status, "logs": cmd_logs, "server status": cmd_server_status,
             "server update": cmd_server_update, "agent status": cmd_agent_status, "agent probe": cmd_agent_probe,
-            "models": cmd_models, "inventory": cmd_inventory, "health": cmd_health,
+            "models": cmd_models, "inventory": cmd_inventory, "health": cmd_health, "performance": cmd_performance,
             "agent home-config": cmd_agent_home_config, "agent home-config-repair": cmd_agent_home_config_repair,
             "service restart": cmd_service_restart}
 COMMANDS.update({"changes " + name: cmd_changes for name in CHANGES_SPEC})
@@ -2376,7 +2715,7 @@ def parse_command(rest, ctx):
             positional.append(token)
         index += 1
     required = {"logs": 1, "server update": 1, "models": 1}.get(name, 0)
-    allowed = 1 if name in ("status", "health", "server status", "logs", "server update", "models") else 0
+    allowed = 1 if name in ("status", "health", "performance", "server status", "logs", "server update", "models") else 0
     if not required <= len(positional) <= allowed:
         raise CliError("invalid_argument", f"Wrong number of arguments for {name}.\n" + USAGE)
     if name == "logs":

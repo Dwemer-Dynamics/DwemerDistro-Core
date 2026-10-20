@@ -340,14 +340,21 @@ else is refused), every `thread/start` gets the broker's own declaration
 `dynamicTools: [ddistro_read]`. Clients cannot send `dynamicTools`; older clients that do not
 opt in get no tool and are otherwise unchanged. Codex 0.163.0 refuses `dynamicTools` without
 that capability. The declaration (`TOOL_SPEC` in `bin/ddistro_agent`) is one function with
-strict input `{"operation": "inventory"|"status"|"models"|"logs"|"health", "product"?, "log"?,
-"lines"?: 1-400, "query"?: <= 200 chars, "since"?: "YYYY-MM-DDTHH:MM:SSZ"}` and `additionalProperties: false`.
+strict input `{"operation": "inventory"|"status"|"models"|"logs"|"health"|"performance", "product"?,
+"log_source"?: "apache"|"postgres", "log"?, "lines"?: 1-400, "query"?: <= 200 chars,
+"since"?: "YYYY-MM-DDTHH:MM:SSZ"}` and `additionalProperties: false`. `product` lists servers only
+(`herika`, `lorkhan`, `stobe`, `dialectic`, `reign`); the shared Apache and PostgreSQL logs are
+`log_source`. The schema is flat (no `oneOf` or conditionals, which the native tool API does not
+accept), so pairing rules are checked at run time. Threads started before `log_source` were declared
+`product` `apache`/`postgres`; the broker still accepts that for `logs` only.
 
 The broker answers `item/tool/call` itself and never forwards it, so a client cannot see or
 answer the request. It checks that the call is for `ddistro_read` with no namespace, from one
 of this task's threads, and that the arguments match exactly: `inventory` takes nothing;
-`status`/`health` take an optional server product; `models` takes only `herika`; `logs`
-needs a server product, `apache`, or `postgres`, an optional log name from that target's
+`status`/`health`/`performance` take an optional server product (`apache` or `postgres` there is
+refused with a message pointing to `logs` with `log_source`); `models` takes only `herika`; `logs`
+needs a server product or a `log_source` (not both; the older `product` `apache`/`postgres` form
+is still accepted), an optional log name from that target's
 `ddistro logs` allowlist, `lines` (default 50), and the optional `query` (one line of plain text,
 not `--json` or `--request-id`) and `since` (a valid UTC time in exactly that form), passed as
 `--query` and `--since`. Then it runs, as root and outside the
@@ -377,14 +384,18 @@ queries, and secret-shaped values are redacted in every string, and the text is 
 lines first and says so in `data.budget_trimmed_lines` and `truncated: true`.
 
 Every reply also has `coverage`, computed by the broker from its own counters, never by the model:
-`{result, turn_calls, turn_calls_left, turn_output_kib_left, session_calls_left, health?}`. `result` is
-`checked`, `truncated` (clipped, budget-trimmed, a log filter whose `complete` is false, `models`
-with `truncated` not false, or `inventory` with `complete` not true or a truncated section),
+`{result, turn_calls, turn_calls_left, turn_output_kib_left, session_calls_left, health?, performance?}`.
+`result` is `checked`, `truncated` (clipped, budget-trimmed, a log filter whose `complete` is false, `models`
+with `truncated` not false, `inventory` with `complete` not true or a truncated section, or
+`performance` with `complete` not true),
 `failed` also for `models` with `available` not true, `skipped` also for a log not written yet,
 `refused` (`invalid_arguments`), `budget_hit` (`turn_tool_limit`, `session_tool_limit`), `skipped`
-(`busy`, `cancelled`), or `failed`; a health reply adds its `passed`/`failed`/`skipped` counts. The
-client sees the same text in the `dynamicToolCall` item, so the launcher can show a partial-check
-notice from it. A refused call returns `success: false` with error code
+(`busy`, `cancelled`), or `failed`; a health reply adds its `passed`/`failed`/`skipped` counts and
+`checks` (at most 64 `{id, result}` pairs in ddistro's id shape, results only `passed`, `failed`, or
+`skipped`) with `checks_complete` (false when an entry was left out), so overlapping reads such
+as `health herika` then `health` can be counted as unique checks rather than added summaries; a
+performance reply adds its `measured`/`failed`/`skipped` counts. The client sees the same text in
+the `dynamicToolCall` item, so the launcher can show a partial-check notice from it. A refused call returns `success: false` with error code
 `invalid_arguments` and runs nothing. No write, repair, update, approval, or escalation is
 reachable through the tool. Codex reports the call to the client as its usual
 `dynamicToolCall` item notifications.
