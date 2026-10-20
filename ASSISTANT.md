@@ -8,13 +8,14 @@ no daemon, service, or dependency. `update.sh` installs it as root-owned
 ```bash
 ddistro version | capabilities | products
 ddistro status [product]                        # summary, any user
-ddistro logs <product|apache|postgres> [--log NAME] [--lines N]   # any user who can read the file
+ddistro logs <product|apache|postgres> [--log NAME] [--lines N] [--query TEXT] [--since UTC]   # any user who can read the file
 ddistro server status [product]                 # full validated ddistro_server records
 ddistro server update <product> --branch <branch> [--force]       # root only
 ddistro changes prepare --product herika [--path RELATIVE ...]    # root only, see File changes
 ddistro changes diff|stage|status|rollback TASK | changes list    # root only
 ddistro changes apply TASK --manifest-sha256 HASH                 # root only
 ddistro agent status | agent probe                                # probe root only, see Assistant agent
+ddistro agent home-config | agent home-config-repair --sha256 HASH   # root only, see Assistant agent
 ddistro agent serve --task TASK                                   # root only, raw JSONL
 ddistro models herika                                             # root only, see Model assignments
 ddistro inventory                                                 # any user, see Inventory
@@ -102,6 +103,22 @@ characters are replaced. A missing file is `ok` with `available: false` and
 are `permission_denied`; `read_as` reports the user, because root access does not prove
 that `dwemer` can read a file. Reads never write product data.
 
+`--query TEXT` (1-200 characters, one line) and `--since YYYY-MM-DDTHH:MM:SSZ` (UTC, exactly that
+form) filter the same bounded tail; nothing before it is read, so a filter is never a full
+historical scan. The query is literal text, not a pattern, matched case-insensitively against
+the redacted line, so redacted secrets cannot be matched. A line's time comes only from a fixed
+prefix (ISO 8601 with an optional zone, also inside `[...]` or a leading JSON `time`/`timestamp`/`ts`
+field; the Apache error-log form; the common-log `[dd/Mon/yyyy:hh:mm:ss +zone]` form); times
+without a zone are read in the distro's local time (`naive_timestamps: "distro_local_time"` and
+`local_utc_offset`). A line without a time belongs to the dated line above it; with `--since`,
+undated lines before the first dated one are excluded and counted in `excluded_undated`. `--lines`
+then keeps the newest matches. The result adds `filter: {query, since, scanned_lines, dated_lines,
+undated_lines, excluded_undated, matched, returned, whole_file, since_covered, tail_bytes,
+complete, ...}`. `complete` is true only when nothing relevant can be missing: the tail is the
+whole file, or it starts at a dated line before `since`; no line was excluded for an unknown or
+invalid time (bad date or zone offset beyond 14:59); times never go backwards (`out_of_order`); and no
+match was left out by `--lines` or the byte bound. A plain tail (no filter) is unchanged.
+
 ## File changes
 
 `changes` commands run the root-only `/usr/local/bin/ddistro_changes` (installed root-owned
@@ -172,6 +189,16 @@ that is an explicit `install_assistant_runtime` run as root.
   progress text. Refusals by `ddistro` itself are one `{"error", "reason"}` line on stderr
   with exit `64` (bad arguments) or `3` (`requires_root`, `helper_unavailable`); the
   helper's own refusals and exit codes are described in ASSISTANT_RUNTIME.md.
+- `agent home-config` (root) is the dry run for the one repair of serve's
+  `account_home_unmanaged_config` refusal: `{state, reason, file: "config.toml", sha256, size,
+  receipt: null}` with `state` `clean`, `repairable` (with the proposal's `sha256`), or `refused`
+  with a reason token (for example `config_unknown_content`, `config_symlink`,
+  `config_wrong_owner`, `other_unmanaged_file`). It changes nothing.
+- `agent home-config-repair --sha256 HASH` (root, adds `operation_id`) quarantines that file only
+  when it is still exactly the proposal; it returns `state: "repaired"` and `receipt: {id, path}`.
+  A held serve lock is `busy` (75); anything else not repaired is `refused` (65) with
+  `details.reason` (`proposal_changed`, `agent_running`, `quarantine_full`, ...). See
+  "Account-home config repair" in ASSISTANT_RUNTIME.md.
 
 ## Model assignments
 
@@ -304,6 +331,17 @@ There is no overall verdict: each check is `passed`, `failed`, or `skipped` with
   `dwemer` account) and not group- or other-writable; they are opened non-blocking, so a FIFO
   or device never stalls the check. Anything else is ignored and the default port is used.
 - `disk./`, `disk./var/lib/postgresql`, `disk./home/dwemer`: fails below 2 GiB or 5% free.
+
+- `server.<product>.http` and `component.<id>.http` (after a passing port check): one fixed
+  `GET` on `127.0.0.1` with a 2 second total limit and a 64 KiB answer limit, only where the
+  service itself defines the endpoint: `dialectic` `/DialecticServer/health.php` and `stobe`
+  `/StobeServer/health.php` (pass on HTTP 200 with the expected `service` and `status: "ok"`;
+  `database`/`schema`/`background_processor` facts are shown), `omnivoice` `/health` (`status:
+  "ok"`), and the TTS identity `/provider_info` for `xtts`, `chatterbox`, and `pocket_tts` (the
+  same check `ddistro_doctor` uses: the expected provider passes, another provider fails as a
+  port conflict, no `provider` is skipped because older releases predate it). Every other
+  server and component gets a skipped `http` check with `no known local health contract`. No
+  other URL, host, or port is ever requested.
 
 A passing port check proves only that something accepts TCP there, not which service.
 

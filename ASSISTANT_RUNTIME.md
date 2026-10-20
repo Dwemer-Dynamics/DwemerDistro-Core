@@ -10,6 +10,7 @@ install_assistant_runtime [--archive PATH] [--host-archive PATH] [--install-prer
 ddistro_agent status            # any user; one JSON line
 ddistro_agent probe             # root; real sandbox probe; writes the attestation
 ddistro_agent serve --task ID   # root; raw Codex App Server JSONL on stdin/stdout
+ddistro_agent home-config [--repair --sha256 HASH]   # root; account-home config status or quarantine
 ```
 
 ## Pinned runtime
@@ -63,7 +64,8 @@ the installer, downloads the runtime, or installs packages.
 | `.../codex-home` | `ddagent:ddagent 0700` | `CODEX_HOME`: sign-in and history; preserved by the installer |
 | `.../agent/attestation.json` | root `0644` | probe attestation |
 | `.../agent/threads/<UUID>.json` | root `0600` (refused if looser) | task -> thread mapping |
-| `.../agent/serve.lock` | root `0600` | singleton lock for serve and probe |
+| `.../agent/serve.lock` | root `0600` | singleton lock for serve, probe, and home-config |
+| `.../agent/quarantine/<id>/` | root `0700` | a quarantined account-home `config.toml` (unchanged) and its root `0600` `receipt.json` |
 
 `task.json` is `{"schema_version": 1, "task_id": "<UUID>", "product": "<id>",
 "workspace": "<label>"}`. The task ID must be a lowercase UUID. Each path component is
@@ -91,6 +93,35 @@ The account home must not contain `config.toml`, `managed_config.toml`,
 `requirements.toml`, `hooks.json`, `AGENTS.md`, `AGENTS.override.md`, or `.env` (Codex
 loads `$CODEX_HOME/.env` into its environment before reading config). Serve refuses with
 `account_home_unmanaged_config` instead of loading them.
+
+### Account-home config repair
+
+`home-config` (root) reports, and `home-config --repair --sha256 HASH` repairs, only one case of
+that refusal: a `config.toml` whose whole content is a project-trust entry in Codex's format for the sandbox
+workspace (who wrote it is not verified; only its exact content is), `[projects."/work"]` with `trust_level = "trusted"` (spaces and tabs around `=` and
+blank lines before or after are allowed; nothing else, no comment, no CR). It must be `ddagent`'s
+own regular file with mode `0600` or stricter, one link, and at most 4 KiB, and no other unmanaged
+file may be present. Anything else is `refused` with a reason (`config_unknown_content`,
+`config_symlink`, `config_not_regular`, `config_oversize`, `config_wrong_owner`,
+`config_unsafe_mode`, `config_hard_linked`, `other_unmanaged_file`, ...) and left in place; the
+content of a refused file is never returned or loaded. Status prints `{state, reason, file,
+sha256, size, receipt}` and changes nothing; `sha256` is the proposal.
+
+The repair takes the same `serve.lock` without waiting (`busy`, exit `75`, while a session or probe
+holds it; the lock file is never replaced), refuses while any `ddagent` process exists
+(`agent_running`), and needs the current file to still hash to the proposal (`proposal_changed`).
+It then renames the file, unchanged (same inode, owner, and mode), into a new root `0700` folder
+under `agent/quarantine` (root `0700`; at most 64 entries, `quarantine_full`) and writes a root
+`0600` `receipt.json` with its sha256, size, owner, mode, and times. A root `0600`
+`agent/home-config.pending` guard is written before the move and removed only after the moved file
+is verified (same inode, one link, same sha256) and its receipt is written; while it exists serve,
+probe, and home-config refuse with `home_config_repair_pending`. A file that changed is linked back
+without overwriting anything (`config_changed`, guard removed); if that is impossible, or anything
+fails after the move, the guard stays. Clearing it is an administrator step: inspect the receipt
+folder, then remove the guard. Nothing is deleted, and sign-in
+and history in the account home are not touched. The file is moved, not edited, so the workspace is
+simply no longer marked trusted for Codex. The model has no path to this command; the launcher runs
+it only after the user confirms its inline proposal.
 
 ## Sandbox
 
@@ -309,14 +340,16 @@ else is refused), every `thread/start` gets the broker's own declaration
 opt in get no tool and are otherwise unchanged. Codex 0.163.0 refuses `dynamicTools` without
 that capability. The declaration (`TOOL_SPEC` in `bin/ddistro_agent`) is one function with
 strict input `{"operation": "inventory"|"status"|"models"|"logs"|"health", "product"?, "log"?,
-"lines"?: 1-100}` and `additionalProperties: false`.
+"lines"?: 1-400, "query"?: <= 200 chars, "since"?: "YYYY-MM-DDTHH:MM:SSZ"}` and `additionalProperties: false`.
 
 The broker answers `item/tool/call` itself and never forwards it, so a client cannot see or
 answer the request. It checks that the call is for `ddistro_read` with no namespace, from one
 of this task's threads, and that the arguments match exactly: `inventory` takes nothing;
 `status`/`health` take an optional server product; `models` takes only `herika`; `logs`
 needs a server product, `apache`, or `postgres`, an optional log name from that target's
-`ddistro logs` allowlist, and `lines` (default 50). Then it runs, as root and outside the
+`ddistro logs` allowlist, `lines` (default 50), and the optional `query` (one line of plain text,
+not `--json` or `--request-id`) and `since` (a valid UTC time in exactly that form), passed as
+`--query` and `--since`. Then it runs, as root and outside the
 model sandbox, exactly `/usr/local/bin/ddistro <operation> [args] --json`. The helper must
 be root-owned along its whole path. It runs with no stdin, a fixed `PATH`, and no other
 environment except a numeric `DDISTRO_POSTGRES_PORT`. It may write at most 1 MiB of stdout
@@ -339,7 +372,18 @@ recent turns of this task's threads.
 The reply is the native `{"success", "contentItems": [{"type": "inputText", "text"}]}`. `text`
 is JSON: `{"tool", "operation", "captured_at", "ok", "data"|"error"}`. Control characters, URL
 queries, and secret-shaped values are redacted in every string, and the text is clipped to
-64 KiB the same way as above. A refused call returns `success: false` with error code
+64 KiB the same way as above. A `logs` reply that would not fit unclipped drops its oldest
+lines first and says so in `data.budget_trimmed_lines` and `truncated: true`.
+
+Every reply also has `coverage`, computed by the broker from its own counters, never by the model:
+`{result, turn_calls, turn_calls_left, turn_output_kib_left, session_calls_left, health?}`. `result` is
+`checked`, `truncated` (clipped, budget-trimmed, a log filter whose `complete` is false, `models`
+with `truncated` not false, or `inventory` with `complete` not true or a truncated section),
+`failed` also for `models` with `available` not true, `skipped` also for a log not written yet,
+`refused` (`invalid_arguments`), `budget_hit` (`turn_tool_limit`, `session_tool_limit`), `skipped`
+(`busy`, `cancelled`), or `failed`; a health reply adds its `passed`/`failed`/`skipped` counts. The
+client sees the same text in the `dynamicToolCall` item, so the launcher can show a partial-check
+notice from it. A refused call returns `success: false` with error code
 `invalid_arguments` and runs nothing. No write, repair, update, approval, or escalation is
 reachable through the tool. Codex reports the call to the client as its usual
 `dynamicToolCall` item notifications.
@@ -405,6 +449,9 @@ a static fact that adds no command and opens no database.
 - Memory note text travels as argv to the root `ddistro` child, so for that child's
   lifetime it is visible in `/proc/<pid>/cmdline` to processes outside the sandbox that can
   read it; nothing logs it. Secret-shaped text is refused before it is stored.
+- The account-home repair removes the trust entry but does not stop it from being written again (the source of the original file is unverified).
+  An account-free `thread/start` with the pinned runtime did not write one (fixture), so what
+  wrote it is not known; prevention through the managed config was not tested and is not done.
 - The task mapping keeps the 256 most recently started threads in start order, so `thread/list`
   orders by start time and cannot list older threads. A thread started between two pages
   shifts nothing, because the cursor is a thread id, not an offset.
