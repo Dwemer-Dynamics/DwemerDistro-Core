@@ -208,7 +208,7 @@ world-readable host secret, world-writable fake live directory, and loopback lis
 | `tool_network_denied` | tool cannot reach `1.1.1.1:443` or `chatgpt.com:443` |
 | `app_server_initialize`, `signed_out_state` | stdio `initialize`; `account/read` with no sign-in reports `account: null` |
 | `managed_requirements_active` | `configRequirements/read` shows only `never` approvals and only `dwemer-scratch` |
-| `client_bypass_rejected`, `thread_policy_enforced` | override attempts are refused; `thread/start` reports `dwemer-scratch`, `never`, `/work` |
+| `client_bypass_rejected`, `thread_policy_enforced` | override attempts, and history reads of a thread that is not this task's, are refused; `thread/start` reports `dwemer-scratch`, `never`, `/work` |
 | `orderly_shutdown`, `cancellation_cleanup` | EOF and SIGTERM both leave no `ddagent` process |
 | `lock_singleton`, `account_home_stays_managed` | second lock fails; Codex did not create a user config |
 
@@ -224,8 +224,9 @@ makes serve refuse. A root-owned attestation that is group- or other-writable is
 It writes `{"error": "assistant_unavailable", "reason": ...}` to stderr, answers up to 16
 JSON-RPC requests received within 15 seconds with error `-32001` and `data.reason`, then
 exits with status `3`. A singleton lock means one session runs at a time (`busy`).
-Closing stdin, SIGTERM, SIGINT, or SIGHUP stops only the session's own process group.
-Bubblewrap `--die-with-parent` tears down the sandbox. Exit status: `0` after an orderly
+Closing stdin, SIGTERM, SIGINT, or SIGHUP stops only the session's own process group and
+the session's own `ddistro_read` runs (below); the broker returns, and the lease is released,
+only after those runs have been stopped and reaped. Bubblewrap `--die-with-parent` tears down the sandbox. Exit status: `0` after an orderly
 stop, `4` if the broker closed the session (`session_closed` reason on stderr).
 
 The broker relays JSONL both ways and forwards only these client methods:
@@ -237,7 +238,11 @@ The broker relays JSONL both ways and forwards only these client methods:
 | `account/login/start` | `type: "chatgpt"` (browser; `appBrand`, `codexStreamlinedLogin`, `useHostedLoginSuccessPage`) or `type: "chatgptDeviceCode"`; API-key and external-token sign-in are refused |
 | `account/login/cancel`, `account/logout` | unchanged |
 | `thread/start` | `model`, `developerInstructions`, `ephemeral`, `serviceName`, `personality`, `serviceTier` |
-| `thread/resume` | the above plus `threadId` (must be one of this task's threads) and `excludeTurns` |
+| `thread/resume` | the above plus `threadId` (must be one of this task's threads) and `excludeTurns` (absent or `true`; the broker sends `true`, `false` is refused) |
+| `thread/read` | `threadId` (this task), `includeTurns` (absent or `false`; the broker sends `false`) |
+| `thread/turns/list` | `threadId` (this task), `cursor`, `limit`, `sortDirection` (`asc`/`desc`), `itemsView` (`notLoaded`, `summary`, `full`) |
+| `thread/items/list` | `threadId` (this task), `turnId`, `cursor` (a string, or `{"type": "item", "itemId"}` with a `turnId`), `limit`, `sortDirection` |
+| `thread/list` | `cursor`, `limit`, `sortDirection`; answered by the broker from this task's thread mapping (below) |
 | `turn/start` | `threadId` (this task), `input` (only `text` items and `image` items with a `data:image/` or `https://` URL), `model`, `effort`, `summary`, `outputSchema`, `personality`, `serviceTier`, `clientUserMessageId` |
 | `turn/interrupt` | `threadId` (this task), `turnId` |
 
@@ -249,14 +254,94 @@ managed profile applies; any other sandbox value is refused. Every other method 
 `command/exec`, `config/*`, plugins, MCP, and the rest) and every other parameter is
 refused with JSON-RPC `-32601`/`-32602`, without reaching Codex.
 
-Client answers to approval, permission, dynamic-tool, elicitation, and token-refresh server
-requests are replaced with an error. When `thread/start` or `thread/resume` succeeds, the
+History is bounded and read only through this task's threads. A resume never hydrates turns;
+clients page them with `thread/turns/list` and `thread/items/list`, which are the Codex
+0.163.0 stable App Server methods with the parameters above. The broker always sends a
+`limit`: turn pages default to 20 and allow up to 50 (5 and 10 with `itemsView: "full"`),
+item pages default to 100 and allow up to 200. A limit outside that range, a cursor over 4096
+characters, or an id over 128 characters is refused. Cursors are passed to Codex unchanged.
+
+`thread/list` never reaches Codex, whose list covers every thread of the shared account
+home. The broker pages the task's mapping, newest first by default (default 25, up to 50),
+reads each listed thread with an internal metadata-only `thread/read`, and answers
+`{"data": [Thread], "nextCursor", "backwardsCursor": null}` in the Codex `ThreadListResponse`
+shape. `nextCursor` is the last listed thread id; a cursor that is not one of this task's
+threads is refused. Threads Codex can no longer read (for example ephemeral ones) are left out,
+so a page can be shorter than `limit`. Client request ids starting with `ddistro-broker:` are
+reserved for these internal reads (and the broker's own `turn/interrupt`) and refused.
+
+Client answers to approval, permission, elicitation, and token-refresh server requests are
+replaced with an error. Dynamic-tool calls (`item/tool/call`) never reach the client (below). When `thread/start` or `thread/resume` succeeds, the
 broker checks the reported `activePermissionProfile.id`, `approvalPolicy`, and `cwd`. A
 mismatch closes the session (`policy_mismatch`). Started threads are recorded in the
 task's root-owned mapping.
 
 The broker does not log request or response bodies. App Server stderr is forwarded up to
 64 KiB. Lines are limited to 8 MiB from the client and 32 MiB from the server.
+
+### Response byte budget
+
+Page sizes do not bound bytes: one tool item or full turn can exceed the launcher's 4 MiB line
+limit. Any server line over 3 MiB is re-encoded with long strings clipped (65536, then 16384,
+4096, 1024, 256 characters) until it fits. Each clipped string ends with `...[clipped by
+DwemerDistro: N of M characters omitted]`, and the `result` (or notification `params`) gets
+`ddistroTruncation: {clippedStrings, maxStringChars, budgetBytes}`. Ids, `type`, `status`,
+`role`, `method`, cursors, and keys ending in `Id` are never clipped, and no item or page is
+dropped, so pagination is unchanged. A response that still does not fit, or a server line over
+32 MiB that starts with its `id` and `result`/`error` (discarded unparsed, the session stays
+up), is answered with JSON-RPC `-32003` and
+`data: {"reason": "response_too_large", "budgetBytes"}`; ask for a smaller `limit` or
+`itemsView: "summary"`. Any other server line over 32 MiB (a notification, a request, or a
+response whose `id` is not first) cannot be dropped safely, and an oversized response is
+discarded for at most 256 MiB in total. In either case every request the broker tracks
+(thread start/resume, history reads, `thread/list`) is answered with `-32003` and
+`data.reason: "server_message_too_large"`, and the session closes with that reason (exit 4).
+An unfittable notification under 32 MiB is dropped; an unfittable server request is
+answered with an error to Codex. `thread/read` replies and `thread/list` entries always carry
+`turns: []`, and listed thread metadata strings are clipped to 4096 characters.
+
+### ddistro_read dynamic tool
+
+When the client's `initialize` has `capabilities.experimentalApi: true` (a boolean; anything
+else is refused), every `thread/start` gets the broker's own declaration
+`dynamicTools: [ddistro_read]`. Clients cannot send `dynamicTools`; older clients that do not
+opt in get no tool and are otherwise unchanged. Codex 0.163.0 refuses `dynamicTools` without
+that capability. The declaration (`TOOL_SPEC` in `bin/ddistro_agent`) is one function with
+strict input `{"operation": "inventory"|"status"|"models"|"logs"|"health", "product"?, "log"?,
+"lines"?: 1-100}` and `additionalProperties: false`.
+
+The broker answers `item/tool/call` itself and never forwards it, so a client cannot see or
+answer the request. It checks that the call is for `ddistro_read` with no namespace, from one
+of this task's threads, and that the arguments match exactly: `inventory` takes nothing;
+`status`/`health` take an optional server product; `models` takes only `herika`; `logs`
+needs a server product, `apache`, or `postgres`, an optional log name from that target's
+`ddistro logs` allowlist, and `lines` (default 50). Then it runs, as root and outside the
+model sandbox, exactly `/usr/local/bin/ddistro <operation> [args] --json`. The helper must
+be root-owned along its whole path. It runs with no stdin, a fixed `PATH`, and no other
+environment except a numeric `DDISTRO_POSTGRES_PORT`. It may write at most 1 MiB of stdout
+and run for 90 seconds, with at most two calls at a time. Its envelope must have
+`schema_version` 1, the expected `command`, and `ok`, with `data` as an object on success.
+Each run is its own process group, owned by the session: when the session ends (stdin
+closed, a signal, App Server exit, or a broker failure) no new run starts, running groups get
+SIGTERM and after 2 seconds SIGKILL, and the broker waits for them to be reaped and their
+threads to finish before it returns. A group is signalled only while its leader is unreaped,
+so no other process is ever signalled. A cancelled run is not answered.
+
+Tool use is bounded per turn and per session so a model stuck in a read loop stops: at most 16
+calls and 512 KiB of returned text per turn (a whole-distro check is about 4-10 calls), and 256
+calls per session. Calls past a limit run nothing and return `success: false` with error code
+`turn_tool_limit` or `session_tool_limit` and a message telling the model to answer from what
+it has. If a turn reaches 32 calls anyway, the broker sends `turn/interrupt` for it once. The
+client can interrupt a turn at any time with `turn/interrupt`. Budgets are kept for the 64 most
+recent turns of this task's threads.
+
+The reply is the native `{"success", "contentItems": [{"type": "inputText", "text"}]}`. `text`
+is JSON: `{"tool", "operation", "captured_at", "ok", "data"|"error"}`. Control characters, URL
+queries, and secret-shaped values are redacted in every string, and the text is clipped to
+64 KiB the same way as above. A refused call returns `success: false` with error code
+`invalid_arguments` and runs nothing. No write, repair, update, approval, or escalation is
+reachable through the tool. Codex reports the call to the client as its usual
+`dynamicToolCall` item notifications.
 
 ## Known limitations
 
@@ -265,4 +350,8 @@ The broker does not log request or response bodies. App Server stderr is forward
 - The App Server process itself shares the WSL network namespace, so it can reach
   loopback services. Only its sign-in and provider traffic use that network. Tools cannot.
 - `thread/resume` of a persisted thread and real turns need a signed-in account and are
-  not covered by the no-inference probe.
+  not covered by the no-inference probe. The probe also does not read history pages; it only
+  checks that reads of another thread are refused.
+- The task mapping keeps the 256 most recently started threads in start order, so `thread/list`
+  orders by start time and cannot list older threads. A thread started between two pages
+  shifts nothing, because the cursor is a thread id, not an offset.

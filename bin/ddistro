@@ -10,7 +10,9 @@ import json
 import os
 import pwd
 import re
+import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -107,6 +109,7 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
   agent status | agent probe                                    (probe: root)
   models herika                 (root; configured CHIM profile model assignments, read-only)
   inventory                     (read-only presence snapshot: servers, ext folders, components, custom mods)
+  health [product]              (bounded local checks: servers, ports, database presence, disk; no repair)
   agent serve --task TASK      (root; raw Codex App Server JSONL, no --json envelope)
 
 Products: herika (chim, skyrim), lorkhan, stobe (kenshi), dialectic (fnv, ttw), reign.
@@ -377,6 +380,7 @@ def cmd_capabilities(opts, ctx):
             {"name": "models", "arguments": ["herika"], "mutates": False, "requires_root": True},
             # Any user may run it; as another user, unreadable folders are reported as unreadable.
             {"name": "inventory", "mutates": False},
+            {"name": "health", "arguments": ["[product]"], "mutates": False},
         ],
         "global_flags": ["--json", "--request-id"],
         "aliases": ALIASES,
@@ -392,7 +396,8 @@ def cmd_capabilities(opts, ctx):
         # agent means the commands and a trusted helper are present; readiness (runtime installed
         # and a passing probe on this distro) is only ever reported by agent status.
         "features": {"file_changes": True, "locks": True, "agent": agent_helper_trusted(), "chat": False,
-                     "models": True, "inventory": True},
+                     "models": True, "inventory": True,
+                     "health": True, "assistant_tools": agent_helper_trusted()},
         "agent": {"provider": "codex", "readiness_command": "agent status", "ready_when": ["installed", "probe_passed"]},
         # Configured profile assignments only; which profile an NPC is using is not reported.
         "models": {"products": ["herika"], "scope": "configured_profiles", "roles": [role for role, _ in MODELS_ROLES],
@@ -401,6 +406,13 @@ def cmd_capabilities(opts, ctx):
                       "components": [c[0] for c in INVENTORY_COMPONENTS], "max_entries": INVENTORY_MAX_ENTRIES,
                       "scan_limit": INVENTORY_SCAN_LIMIT, "max_custom_mods": INVENTORY_MAX_MODS,
                       "string_chars": INVENTORY_STRING_CHARS},
+        "health": {"scope": "local_bounded", "results": ["passed", "failed", "skipped"], "overall_verdict": False,
+                   "scope_limits": HEALTH_SCOPE_LIMITS},
+        # The broker declares and runs this one tool itself; see ASSISTANT_RUNTIME.md.
+        "assistant_tools": {"requires": "initialize capabilities.experimentalApi true", "declared_on": "thread/start",
+                            "tools": [{"name": "ddistro_read", "mutates": False,
+                                       "operations": ["inventory", "status", "models", "logs", "health"],
+                                       "max_log_lines": 100}]},
     }
     return data, "\n".join(command["name"] for command in data["commands"])
 
@@ -1173,6 +1185,173 @@ def cmd_inventory(opts, ctx):
     return data, "\n".join(lines)
 
 
+# ddistro health: bounded local checks with fresh evidence. A check is passed, failed, or skipped (with a
+# reason); there is no overall verdict, nothing is repaired, and no provider or in-game path is exercised.
+HEALTH_STATUS_TIMEOUT = 30
+HEALTH_CONNECT_TIMEOUT = 1.5
+HEALTH_SERVICES_CONF = "/etc/dwemerdistro_services.conf"
+HEALTH_DISK_MIN_BYTES = 2 * 1024 ** 3
+HEALTH_READ_LIMIT = 4096
+# Component -> (services.conf key or None, default port, per-component port file); defaults as in ddistro_doctor.
+HEALTH_COMPONENT_PORTS = {
+    "xtts": ("XTTS_PORT", 8020, None),
+    "omnivoice": ("OMNIVOICE_PORT", 8021, None),
+    "parakeet": ("PARAKEET_PORT", 8022, None),
+    "chatterbox": (None, 8020, "/home/dwemer/chatterbox/.dwemerdistro-port"),
+    "pocket_tts": (None, 8020, "/home/dwemer/pocket-tts/.dwemerdistro-port"),
+    "pockettts_audiocpp": ("POCKETTTS_AUDIOCPP_PORT", 8086, None),
+}
+HEALTH_SCOPE_LIMITS = [
+    "A port check proves only that something accepts TCP on 127.0.0.1, not which service or that it answers correctly.",
+    "Database checks report presence as seen by ddistro_server status; tables, credentials, and queries are not checked.",
+    "Components without a known local port are skipped; marker presence alone is never reported as passed.",
+    "No external provider, model, network, or in-game path is tested, and nothing is repaired.",
+]
+
+
+def health_port_value(text):
+    text = text.strip().strip("\"'")
+    return int(text) if re.match(r"^[0-9]{1,5}\Z", text) and 0 < int(text) < 65536 else None
+
+
+def health_owners(dwemer):
+    """Accounts trusted to own a health config file and its folders: root, plus dwemer for its own files."""
+    try:
+        return (0, pwd.getpwnam("dwemer").pw_uid) if dwemer else (0,)
+    except KeyError:
+        return (0,)
+
+
+def health_read_small(path, owners):
+    """Up to HEALTH_READ_LIMIT bytes of a fixed small config file; None when absent, unsafe, or too large.
+
+    The path is walked from / one name at a time without following a link (as inventory does); "/", every
+    folder, and the file must be owned by one of owners and not group/other writable. The file must be a
+    regular file before and after a non-blocking open, so a FIFO, device, or swapped name never blocks or
+    redirects the read."""
+    parent, name = path.rsplit("/", 1)
+    file_flags = (os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOCTTY", 0)
+                  | getattr(os, "O_CLOEXEC", 0))
+
+    def trusted(info):
+        return info.st_uid in owners and not info.st_mode & 0o022
+    fd = fd_file = None
+    try:
+        fd = os.open("/", INVENTORY_DIR_FLAGS)
+        for part in [p for p in parent.split("/") if p]:
+            if not trusted(os.fstat(fd)):
+                return None
+            next_fd = os.open(part, INVENTORY_DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        if not trusted(os.fstat(fd)):
+            return None
+        before = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > HEALTH_READ_LIMIT:
+            return None
+        fd_file = os.open(name, file_flags, dir_fd=fd)
+        info = os.fstat(fd_file)
+        if ((info.st_dev, info.st_ino) != (before.st_dev, before.st_ino) or not stat.S_ISREG(info.st_mode)
+                or info.st_size > HEALTH_READ_LIMIT or not trusted(info)):
+            return None
+        data = os.read(fd_file, HEALTH_READ_LIMIT + 1)
+        return None if len(data) > HEALTH_READ_LIMIT else data.decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        for handle in (fd_file, fd):
+            if handle is not None:
+                os.close(handle)
+
+
+def health_services_conf():
+    """Plain NAME=port lines of a root-owned services.conf; it is never sourced."""
+    text = health_read_small(HEALTH_SERVICES_CONF, health_owners(False)) or ""
+    return {match.group(1): port for match in re.finditer(r"(?m)^\s*([A-Z_]{1,40})=(\S+)\s*$", text)
+            if (port := health_port_value(match.group(2)))}
+
+
+def health_connect(port):
+    started = time.monotonic()
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=HEALTH_CONNECT_TIMEOUT).close()
+        return True, f"tcp 127.0.0.1:{port} accepted in {int((time.monotonic() - started) * 1000)} ms"
+    except OSError as error:
+        return False, f"tcp 127.0.0.1:{port} {errno.errorcode.get(error.errno, 'timeout') if error.errno else 'timeout'}"
+
+
+def cmd_health(opts, ctx):
+    product = opts.get("product")
+    captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    checks = []
+
+    def add(check_id, component, result, evidence, reason=None):
+        checks.append({"id": check_id, "component": component, "result": result, "evidence": evidence,
+                       "reason": reason, "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+
+    def port_check(check_id, component, port, source):
+        passed, evidence = health_connect(port)
+        add(check_id, component, "passed" if passed else "failed", f"{evidence} (port from {source})")
+
+    try:
+        records = helper_status(product, timeout=HEALTH_STATUS_TIMEOUT)
+    except CliError as error:
+        if error.code == "cancelled":
+            raise
+        records = None
+        add("servers.status", "ddistro_server", "failed", "ddistro_server status: " + error.code)
+    for record in records or []:
+        name, state = record["product"], record["state"]
+        if state == "not-installed":
+            add(f"server.{name}.installed", name, "skipped", "state not-installed", "not installed")
+            continue
+        add(f"server.{name}.installed", name, "passed" if state == "installed" else "failed",
+            f"state {state}, repository {record['repository_state']}")
+        port_check(f"server.{name}.port", name, record["port"], "ddistro_server status")
+        present = record["database_present"]
+        add(f"server.{name}.database", name, {True: "passed", False: "failed", None: "skipped"}[present],
+            f"database {DATABASE_WORDS[present]}", None if present is not None else "PostgreSQL not ready for status")
+    pg_port = health_port_value(os.environ.get("DDISTRO_POSTGRES_PORT", "")) or 5432
+    port_check("postgres.port", "postgres", pg_port, "DDISTRO_POSTGRES_PORT" if pg_port != 5432 else "default")
+    if product is None:
+        conf = health_services_conf()
+        for component_id, name, role, mode, markers in INVENTORY_COMPONENTS:
+            state = inventory_component(component_id, name, role, mode, markers)["state"]
+            if state != "present":
+                add(f"component.{component_id}.port", component_id, "skipped", f"startup marker {state}",
+                    "not installed" if state == "absent" else "marker could not be checked")
+                continue
+            if component_id not in HEALTH_COMPONENT_PORTS:
+                add(f"component.{component_id}.port", component_id, "skipped", "startup marker present",
+                    "no known local port contract")
+                continue
+            key, port, port_file = HEALTH_COMPONENT_PORTS[component_id]
+            source = "default"
+            if key and key in conf:
+                port, source = conf[key], HEALTH_SERVICES_CONF
+            saved = health_port_value(health_read_small(port_file, health_owners(True)) or "") if port_file else None
+            if saved:
+                port, source = saved, port_file
+            port_check(f"component.{component_id}.port", component_id, port, source)
+    for path in ("/", "/var/lib/postgresql", "/home/dwemer"):
+        try:
+            usage = shutil.disk_usage(path)
+        except OSError:
+            add(f"disk.{path}", "disk", "skipped", path + " not present", "path absent or unreadable")
+            continue
+        low = usage.free < HEALTH_DISK_MIN_BYTES or usage.free * 20 < usage.total
+        add(f"disk.{path}", "disk", "failed" if low else "passed",
+            f"{usage.free // 1024 ** 2} MiB free of {usage.total // 1024 ** 2} MiB (minimum 2048 MiB and 5%)")
+    summary = {result: sum(c["result"] == result for c in checks) for result in ("passed", "failed", "skipped")}
+    data = {"captured_at": captured_at, "scope": "local_bounded", "product": product,
+            "read_as": current_user(), "summary": summary, "checks": checks, "scope_limits": HEALTH_SCOPE_LIMITS}
+    lines = [f"DwemerDistro health at {data['captured_at']}: {summary['passed']} passed, {summary['failed']} failed, "
+             f"{summary['skipped']} skipped (local checks only)"]
+    lines += [f"  {c['result']:<7} {c['id']:<32} {c['evidence']}" + (f" ({c['reason']})" if c["reason"] else "")
+              for c in checks]
+    return data, "\n".join(lines)
+
+
 def command_words(argv):
     """The first two command tokens, skipping the global flags wherever they appear first."""
     words, index = [], 0
@@ -1189,7 +1368,7 @@ def command_words(argv):
 COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products": cmd_products,
             "status": cmd_status, "logs": cmd_logs, "server status": cmd_server_status,
             "server update": cmd_server_update, "agent status": cmd_agent_status, "agent probe": cmd_agent_probe,
-            "models": cmd_models, "inventory": cmd_inventory}
+            "models": cmd_models, "inventory": cmd_inventory, "health": cmd_health}
 COMMANDS.update({"changes " + name: cmd_changes for name in CHANGES_SPEC})
 
 
@@ -1252,7 +1431,7 @@ def parse_command(rest, ctx):
             positional.append(token)
         index += 1
     required = {"logs": 1, "server update": 1, "models": 1}.get(name, 0)
-    allowed = 1 if name in ("status", "server status", "logs", "server update", "models") else 0
+    allowed = 1 if name in ("status", "health", "server status", "logs", "server update", "models") else 0
     if not required <= len(positional) <= allowed:
         raise CliError("invalid_argument", f"Wrong number of arguments for {name}.\n" + USAGE)
     if name == "logs":
