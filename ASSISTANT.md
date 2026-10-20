@@ -344,7 +344,9 @@ FTS or SQL syntax.
 
 A note is `{"id", "kind", "text", "source", "task_id", "thread_id", "captured_at", "updated_at",
 "expires_at", "expired"}` with UTC `...Z` times; `settings` is `{"retrieval": bool,
-"auto_learning": bool}`, defaulting to retrieval on and automatic learning off. Limits: 1000
+"auto_learning": bool}`, defaulting to both on: memory is automatic. A setting stored by `configure`
+(for example an earlier `off`) wins over the default; the launcher configures both on once as it
+connects, before the broker starts, and `configure` otherwise stays a debugging control. Limits: 1000
 notes (`limit_reached`, exit 65), 2000 characters per note, 10 search results, 200 query
 characters, 8 query terms. `--task` is a ddistro task id; `--thread` is 1-128 letters, digits,
 `-` or `_`.

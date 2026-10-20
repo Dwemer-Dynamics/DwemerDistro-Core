@@ -364,12 +364,15 @@ foreign thread, or a namespace runs nothing and returns `invalid_arguments`. It 
   `disabled` when retrieval is off;
 - `ddistro memory add --source assistant --kind K --text T --task TASK --thread THREAD --json`,
   where `TASK` is this session's task and `THREAD` the calling thread, both from the broker,
-  never from the model. The CLI refuses it with `disabled` and a message that only the user can
-  add notes unless both retrieval and automatic learning (default off) are on, refuses
-  secret-shaped text, and refuses a note that claims a verified fix.
+  never from the model. The CLI refuses it with `disabled` unless both retrieval and automatic
+  learning (both on by default) are on, refuses secret-shaped text, and refuses a note that
+  claims a verified fix.
 
-Configuration, forget, update, reset, and export are never reachable from the model; they
-are launcher actions the user takes. Memory calls share the `ddistro_read` children, process
+Memory is automatic: the model searches and remembers on its own under the launcher's
+instructions, and the user has no note editor. Configuration, forget, update, reset, and export
+are never reachable from the model. The launcher runs `memory configure` (both on) as it
+connects, before this broker starts, and offers the user only Clear memory (`memory reset
+--yes`, after a confirmation); the other actions remain CLI controls for debugging. Memory calls share the `ddistro_read` children, process
 group supervision, concurrency, 90 s / 1 MiB bounds, reply envelope and redaction, and the same
 per-turn and per-session budgets (the two tools count together). Recalled notes are returned
 as tool data marked `non_authoritative`; a note cannot change the policy, the sandbox, the
