@@ -106,6 +106,7 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
   changes apply TASK --manifest-sha256 HASH                     (root)
   agent status | agent probe                                    (probe: root)
   models herika                 (root; configured CHIM profile model assignments, read-only)
+  inventory                     (read-only presence snapshot: servers, ext folders, components, custom mods)
   agent serve --task TASK      (root; raw Codex App Server JSONL, no --json envelope)
 
 Products: herika (chim, skyrim), lorkhan, stobe (kenshi), dialectic (fnv, ttw), reign.
@@ -305,8 +306,8 @@ def validate_record(record, product):
     return dict(record)
 
 
-def helper_status(product=None):
-    code, out, err = run_helper(["status", product or "all", "--json"], STATUS_TIMEOUT, STATUS_STDOUT_LIMIT)
+def helper_status(product=None, timeout=STATUS_TIMEOUT):
+    code, out, err = run_helper(["status", product or "all", "--json"], timeout, STATUS_STDOUT_LIMIT)
     if code != 0:
         raise CliError("helper_failed", "ddistro_server status failed.",
                        {"helper_exit": code, "stderr_tail": tail_lines(err.data, 20)})
@@ -374,6 +375,8 @@ def cmd_capabilities(opts, ctx):
             {"name": "agent serve", "flags": ["--task"], "mutates": False, "requires_root": True,
              "transport": "jsonl"},
             {"name": "models", "arguments": ["herika"], "mutates": False, "requires_root": True},
+            # Any user may run it; as another user, unreadable folders are reported as unreadable.
+            {"name": "inventory", "mutates": False},
         ],
         "global_flags": ["--json", "--request-id"],
         "aliases": ALIASES,
@@ -389,11 +392,15 @@ def cmd_capabilities(opts, ctx):
         # agent means the commands and a trusted helper are present; readiness (runtime installed
         # and a passing probe on this distro) is only ever reported by agent status.
         "features": {"file_changes": True, "locks": True, "agent": agent_helper_trusted(), "chat": False,
-                     "models": True},
+                     "models": True, "inventory": True},
         "agent": {"provider": "codex", "readiness_command": "agent status", "ready_when": ["installed", "probe_passed"]},
         # Configured profile assignments only; which profile an NPC is using is not reported.
         "models": {"products": ["herika"], "scope": "configured_profiles", "roles": [role for role, _ in MODELS_ROLES],
                    "max_assignments": MODELS_MAX, "string_chars": MODELS_STRING_CHARS},
+        "inventory": {"scope": "presence_only", "extension_products": list(INVENTORY_EXTENSION_ROOTS),
+                      "components": [c[0] for c in INVENTORY_COMPONENTS], "max_entries": INVENTORY_MAX_ENTRIES,
+                      "scan_limit": INVENTORY_SCAN_LIMIT, "max_custom_mods": INVENTORY_MAX_MODS,
+                      "string_chars": INVENTORY_STRING_CHARS},
     }
     return data, "\n".join(command["name"] for command in data["commands"])
 
@@ -939,6 +946,233 @@ def cmd_models(opts, ctx):
     return data, "\n".join(lines)
 
 
+# ddistro inventory: one fresh, read-only snapshot of what is installed, for the launcher's assistant.
+# It only reports presence: no repository or plugin code runs, no file content is read, no link is
+# followed, and nothing says whether an extension is enabled or healthy or a component is running.
+INVENTORY_STATUS_TIMEOUT = 20
+INVENTORY_MODS_TIMEOUT = 10
+INVENTORY_MODS_HELPER = "/usr/local/bin/ddistro_custom_mod"
+INVENTORY_MODS_STDOUT_LIMIT = 1024 * 1024
+INVENTORY_MAX_ENTRIES = 200  # per extension folder, sorted by name
+INVENTORY_SCAN_LIMIT = 4096  # directory entries examined per folder before giving up
+INVENTORY_MAX_MODS = 100
+INVENTORY_STRING_CHARS = 128
+# Products whose repositories load add-ons from an ext/ folder; the others have no known root.
+INVENTORY_EXTENSION_ROOTS = {"herika": "/var/www/html/HerikaServer", "dialectic": "/var/www/html/DialecticServer"}
+# The startup markers start_env and update_gws check, in that order. "all" markers must all be
+# present, "any" needs one. A marker present means startup would try the component, not that it runs.
+INVENTORY_COMPONENTS = (
+    ("dashboard", "Dwemer Dashboard", "dashboard", "all", ("/var/www/html/Dwemer-Dashboard/.git",)),
+    ("minime_t5", "Minime-T5 / TXT2VEC", "embeddings", "all", ("/home/dwemer/minime-t5/start.sh",)),
+    ("mimic3", "Mimic3", "tts", "all", ("/home/dwemer/mimic3/start.sh",)),
+    ("melotts", "MeloTTS", "tts", "all", ("/home/dwemer/MeloTTS/start.sh",)),
+    ("parakeet", "Parakeet", "stt", "all", ("/home/dwemer/parakeet-api-server/start.sh",)),
+    ("chatterbox", "Chatterbox", "tts", "all", ("/home/dwemer/chatterbox/start.sh",)),
+    ("pockettts_audiocpp", "PocketTTS (audio.cpp)", "tts", "all", ("/home/dwemer/audio.cpp/start.sh",)),
+    ("pocket_tts", "pocket-tts", "tts", "all", ("/home/dwemer/pocket-tts/start.sh",)),
+    ("piper", "Piper TTS", "tts", "all", ("/home/dwemer/piper/cuda-keyring_1.1-1_all.deb",
+                                         "/home/dwemer/piper/start.sh")),
+    ("localwhisper", "LocalWhisper", "stt", "all", ("/home/dwemer/remote-faster-whisper/start.sh",)),
+    ("xtts", "CHIM XTTS", "tts", "all", ("/home/dwemer/xtts-api-server/start.sh",)),
+    ("higgs", "Higgs TTS", "tts", "all", ("/home/dwemer/higgs-tts/service.sh",)),
+    ("omnivoice", "OmniVoice TTS", "tts", "all", ("/home/dwemer/omnivoice-tts/start-gpu.sh",)),
+    ("chim_mcp", "CHIM MCP Server", "mcp", "any", ("/home/dwemer/CHIM-MCP/start.sh",
+                                                   "/home/dwemer/chim-mcp-server/start.sh")),
+)
+INVENTORY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+()@,=~-]{0,127}\Z")
+INVENTORY_MOD_ID = re.compile(r"^[a-z][a-z0-9-]{1,30}[a-z0-9]\Z")
+INVENTORY_COMMIT = re.compile(r"^(?:[0-9a-f]{40})?\Z")
+INVENTORY_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+INVENTORY_ERRNO = {errno.ENOENT: "absent", errno.ELOOP: "redirected", errno.ENOTDIR: "not_directory",
+                   errno.EACCES: "unreadable", errno.EPERM: "unreadable"}
+
+
+def inventory_reason(error):
+    if error.code == "cancelled":
+        raise error
+    return error.code if error.code in ("helper_unavailable", "helper_failed", "helper_protocol", "timeout") else "failed"
+
+
+def inventory_step(fd, name):
+    """Opens the folder name below fd without following a link; returns (fd, "") or (None, state).
+
+    Linux may refuse a link opened with O_DIRECTORY|O_NOFOLLOW with ENOTDIR rather than ELOOP, so
+    any failure other than a plain absence is classified by a no-follow stat of the same name under
+    the same fd: a link is redirected, a non-folder is not_directory. Nothing is ever followed."""
+    try:
+        return os.open(name, INVENTORY_DIR_FLAGS, dir_fd=fd), ""
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ELOOP):
+            return None, INVENTORY_ERRNO[error.errno]
+        failure = error.errno
+    try:
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except OSError as error:
+        # It changed after the open failed, so it is not provably absent.
+        return None, "unreadable" if error.errno == errno.ENOENT else INVENTORY_ERRNO.get(error.errno, "unreadable")
+    if stat.S_ISLNK(info.st_mode):
+        return None, "redirected"
+    if not stat.S_ISDIR(info.st_mode):
+        return None, "not_directory"
+    return None, INVENTORY_ERRNO.get(failure, "unreadable") if failure in (errno.EACCES, errno.EPERM) else "unreadable"
+
+
+def inventory_open_dir(path):
+    """Opens a fixed absolute folder from / one name at a time, refusing a link at every step.
+
+    Returns (fd, "") or (None, state) for the first name that could not be opened."""
+    fd = os.open("/", INVENTORY_DIR_FLAGS)
+    for name in path.strip("/").split("/"):
+        next_fd, state = inventory_step(fd, name)
+        os.close(fd)
+        if next_fd is None:
+            return None, state
+        fd = next_fd
+    return fd, ""
+
+
+def inventory_marker(path):
+    parent, name = path.rsplit("/", 1)
+    try:
+        fd, state = inventory_open_dir(parent)
+        if fd is None:
+            # A plain file where a folder should be means the marker cannot exist; a link stays redirected.
+            return "absent" if state == "not_directory" else state
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        finally:
+            os.close(fd)
+    except OSError as error:
+        return INVENTORY_ERRNO.get(error.errno, "unreadable")
+    if stat.S_ISLNK(info.st_mode):
+        return "redirected"
+    return "present" if stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode) else "unreadable"
+
+
+def inventory_component(component_id, name, role, mode, markers):
+    states = [inventory_marker(path) for path in markers]
+    if (all if mode == "all" else any)(state == "present" for state in states):
+        state = "present"
+    else:
+        state = next((s for s in states if s not in ("present", "absent")), "absent")
+    return {"id": component_id, "name": name, "role": role, "state": state}
+
+
+def inventory_extensions(product, root):
+    """Names of the entries directly in <root>/ext, never followed or opened; links are reported as links."""
+    result = {"product": product, "root": "ext", "state": "listed", "total": 0, "truncated": False, "skipped": 0,
+              "entries": []}
+    try:
+        root_fd, state = inventory_open_dir(root)
+        if root_fd is None:
+            result["state"] = "product_absent" if state == "absent" else state
+            return result
+        try:
+            ext_fd, state = inventory_step(root_fd, "ext")
+        finally:
+            os.close(root_fd)
+    except OSError as error:
+        ext_fd, state = None, INVENTORY_ERRNO.get(error.errno, "unreadable")
+    if ext_fd is None:
+        result["state"] = state
+        return result
+    entries = []
+    try:
+        with os.scandir(ext_fd) as scan:
+            for entry in scan:
+                result["total"] += 1
+                if result["total"] > INVENTORY_SCAN_LIMIT:
+                    result["total"], result["truncated"] = INVENTORY_SCAN_LIMIT, True
+                    break
+                if not INVENTORY_NAME.match(entry.name) or redact(entry.name) != entry.name:
+                    result["skipped"] += 1
+                    continue
+                kind = ("link" if entry.is_symlink() else "dir" if entry.is_dir(follow_symlinks=False)
+                        else "file" if entry.is_file(follow_symlinks=False) else "other")
+                entries.append({"name": entry.name, "kind": kind})
+    except OSError as error:
+        return dict(result, state=INVENTORY_ERRNO.get(error.errno, "unreadable"), total=0, skipped=0)
+    finally:
+        os.close(ext_fd)
+    entries.sort(key=lambda item: (item["name"].lower(), item["name"]))
+    result["truncated"] = result["truncated"] or len(entries) > INVENTORY_MAX_ENTRIES
+    result["entries"] = entries[:INVENTORY_MAX_ENTRIES]
+    return result
+
+
+def inventory_text(value, limit=INVENTORY_STRING_CHARS):
+    return clean_line(re.sub(r"[\t\r\n]", " ", value[:limit * 2]))[:limit] if type(value) is str else ""
+
+
+def inventory_custom_mods():
+    """Registry entries from ddistro_custom_mod status (no health check, no network); a few fields only."""
+    section = {"available": False, "reason": "", "truncated": False, "items": []}
+    try:
+        code, out, _ = run_helper(["status", "--json"], INVENTORY_MODS_TIMEOUT, INVENTORY_MODS_STDOUT_LIMIT + 1,
+                                  helper=INVENTORY_MODS_HELPER)
+    except CliError as error:
+        section["reason"] = inventory_reason(error)
+        return section
+    if code != 0:
+        section["reason"] = "helper_failed"
+        return section
+    try:
+        if out.total > INVENTORY_MODS_STDOUT_LIMIT:
+            raise ValueError("size")
+        doc = json.loads(bytes(out.data).decode("utf-8"), parse_constant=reject_constant)
+        if type(doc) is not dict or doc.get("schema_version") != 1 or type(doc.get("mods")) is not list:
+            raise ValueError("shape")
+        items = []
+        for mod in doc["mods"]:
+            if type(mod) is not dict or type(mod.get("id")) is not str or not INVENTORY_MOD_ID.match(mod["id"]):
+                raise ValueError("mod")
+            state, commit = mod.get("state"), mod.get("commit", "")
+            items.append({"id": mod["id"], "name": inventory_text(mod.get("name")),
+                          "state": state if type(state) is str and STATE_TOKEN.match(state) else "unknown",
+                          "branch": inventory_text(mod.get("branch")),
+                          "commit": commit if type(commit) is str and INVENTORY_COMMIT.match(commit) else ""})
+    except (ValueError, UnicodeDecodeError):
+        section["reason"] = "helper_protocol"
+        return section
+    section.update(available=True, truncated=len(items) > INVENTORY_MAX_MODS, items=items[:INVENTORY_MAX_MODS])
+    return section
+
+
+def cmd_inventory(opts, ctx):
+    captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    servers = {"available": False, "reason": "", "items": []}
+    try:
+        records = helper_status(timeout=INVENTORY_STATUS_TIMEOUT)
+        servers.update(available=True, items=[
+            {"product": r["product"], "state": r["state"], "repository_state": r["repository_state"],
+             "database_present": r["database_present"], "branch": inventory_text(r["branch"]),
+             "version": inventory_text(r["version"])} for r in records])
+    except CliError as error:
+        servers["reason"] = inventory_reason(error)
+    extensions = {"items": [inventory_extensions(product, root) for product, root in INVENTORY_EXTENSION_ROOTS.items()],
+                  "no_known_root": [product for product in PRODUCTS if product not in INVENTORY_EXTENSION_ROOTS]}
+    components = {"basis": "startup_markers", "items": [inventory_component(*c) for c in INVENTORY_COMPONENTS]}
+    custom_mods = inventory_custom_mods()
+    complete = (servers["available"] and custom_mods["available"] and not custom_mods["truncated"]
+                and all(item["state"] in ("listed", "absent", "product_absent") and not item["truncated"]
+                        and not item["skipped"] for item in extensions["items"])
+                and all(item["state"] in ("present", "absent") for item in components["items"]))
+    data = {"captured_at": captured_at, "scope": "presence_only", "read_as": current_user(), "complete": complete,
+            "servers": servers, "extensions": extensions, "components": components, "custom_mods": custom_mods}
+    lines = [f"DwemerDistro inventory at {captured_at} (presence only; not enabled, running, or healthy state)"]
+    lines += ["Servers:"] + ([f"  {r['product']:<10} {r['state']:<15} branch={r['branch'] or '-'} "
+                             f"version={r['version'] or '-'} database={DATABASE_WORDS[r['database_present']]}"
+                             for r in servers["items"]] or [f"  unavailable: {servers['reason']}"])
+    for item in extensions["items"]:
+        names = ", ".join(e["name"] + ("/" if e["kind"] == "dir" else "") for e in item["entries"]) or "-"
+        lines.append(f"{item['product']} ext ({item['state']}{', truncated' if item['truncated'] else ''}"
+                     f"{', %d names skipped' % item['skipped'] if item['skipped'] else ''}): {names}")
+    lines.append("Components: " + ", ".join(f"{c['id']}={c['state']}" for c in components["items"]))
+    lines.append("Custom mods: " + (", ".join(f"{m['id']} ({m['state']})" for m in custom_mods["items"]) or "-")
+                 if custom_mods["available"] else f"Custom mods: unavailable: {custom_mods['reason']}")
+    return data, "\n".join(lines)
+
+
 def command_words(argv):
     """The first two command tokens, skipping the global flags wherever they appear first."""
     words, index = [], 0
@@ -955,7 +1189,7 @@ def command_words(argv):
 COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products": cmd_products,
             "status": cmd_status, "logs": cmd_logs, "server status": cmd_server_status,
             "server update": cmd_server_update, "agent status": cmd_agent_status, "agent probe": cmd_agent_probe,
-            "models": cmd_models}
+            "models": cmd_models, "inventory": cmd_inventory}
 COMMANDS.update({"changes " + name: cmd_changes for name in CHANGES_SPEC})
 
 

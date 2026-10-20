@@ -17,6 +17,7 @@ ddistro changes apply TASK --manifest-sha256 HASH                 # root only
 ddistro agent status | agent probe                                # probe root only, see Assistant agent
 ddistro agent serve --task TASK                                   # root only, raw JSONL
 ddistro models herika                                             # root only, see Model assignments
+ddistro inventory                                                 # any user, see Inventory
 ```
 
 Products are the five `ddistro_server` products: `herika` (aliases `chim`, `skyrim`),
@@ -60,6 +61,8 @@ codes; `features.file_changes` and `locks` are `true` and `chat` is `false`. `fe
 is `true` only when the trusted `ddistro_agent` helper is installed; it never means the
 assistant is ready. Readiness comes only from `agent status` (`installed` and `probe_passed`).
 `features.models` and `capabilities.models` describe `models herika` (roles and limits).
+`features.inventory` and `capabilities.inventory` describe `inventory` (scope, the products
+with an extension folder, component ids, and limits).
 
 ## Status and update
 
@@ -196,6 +199,64 @@ assignments, not necessarily the profile an NPC is using.
   assignments, and a `reason` token: `requires_root`, `helper_unavailable`,
   `database_unavailable`, `schema_missing`, `query_failed`, `timeout`, or
   `unexpected_output`. `psql` stderr and SQL are never returned, and no model is guessed.
+
+## Inventory
+
+`inventory` is one fresh, read-only, presence-only snapshot of the whole distro for the
+launcher's assistant. It runs no repository, plugin, or component code, reads no extension
+or component code, configuration, or credential contents itself, and follows no link. The
+server and custom mod rows come from the trusted `ddistro_server` and `ddistro_custom_mod`
+helpers, which consult their own records (version, catalog presence) internally; only an
+allowlisted status and presence projection of their output is kept. Presence is all it
+reports, never health: an extension that is present may be disabled or broken, and a
+component whose startup marker is present may not be running.
+
+```json
+{"captured_at": "2026-10-19T12:00:00Z", "scope": "presence_only", "read_as": "root", "complete": true,
+ "servers": {"available": true, "reason": "", "items": [{"product": "herika", "state": "installed",
+             "repository_state": "managed", "database_present": true, "branch": "aiagent", "version": "..."}]},
+ "extensions": {"items": [{"product": "herika", "root": "ext", "state": "listed", "total": 2, "truncated": false,
+                           "skipped": 0, "entries": [{"name": "example_mod", "kind": "dir"}]}],
+                "no_known_root": ["lorkhan", "stobe", "reign"]},
+ "components": {"basis": "startup_markers", "items": [{"id": "xtts", "name": "CHIM XTTS", "role": "tts",
+                                                        "state": "present"}]},
+ "custom_mods": {"available": true, "reason": "", "truncated": false,
+                 "items": [{"id": "example-server", "name": "...", "state": "ready", "branch": "main", "commit": "..."}]}}
+```
+
+- `servers` comes from the same validated `ddistro_server status all --json` as `status`
+  (bounded to 20 seconds here), reduced to product, state, repository state, database
+  presence (`null` when unknown), branch, and version; branch and version are redacted and
+  clipped to 128 characters. Database presence is the helper's own catalog check; no
+  product table is read.
+- `extensions` lists the names directly inside `ext/` of HerikaServer and DialecticServer,
+  the products whose repositories load add-ons from that folder; `no_known_root` names the
+  others. Each folder is opened from `/` one component at a time with `O_NOFOLLOW`, each
+  step anchored to the folder already opened; when a step fails, a no-follow stat of that
+  name under the same folder decides the state, so any link on the way (the product root,
+  `ext/`, or a parent) gives `redirected` and nothing is listed. `state` is `listed`,
+  `absent` (no `ext/`), `product_absent`, `redirected`, `not_directory` (a non-folder where a
+  folder should be), or `unreadable` (including a name that changed while being checked).
+  `kind` is `dir`, `file`, `link` (never followed), or `other`. Hidden names, names outside
+  `[A-Za-z0-9][A-Za-z0-9 ._+()@,=~-]{0,127}`, and names the log redaction would change are
+  counted in `skipped`, not listed; any skipped name makes `complete` false, because those
+  names are omitted. At most 200 names are returned, sorted; at most 4096
+  entries are examined, and `truncated` marks either limit (`total` is then a lower bound).
+- `components` checks the startup markers `start_env` and `update_gws` use (for example
+  `/home/dwemer/xtts-api-server/start.sh`, the Dwemer Dashboard's `.git`), without
+  following links: `present`, `absent`, `redirected` (the marker or any folder above it is a
+  link), or `unreadable`. Present means startup
+  would try the component, not that it runs or is healthy. Paths are never returned.
+- `custom_mods` runs the trusted `/usr/local/bin/ddistro_custom_mod status --json` (no
+  `--check-health`, no network, 10 seconds) and keeps only `id`, `name`, `state`, `branch`,
+  and a 40-hex `commit` for at most 100 mods; repository, URLs, folders, databases, and
+  messages are dropped.
+- A section that cannot be read is still `ok`: `available: false` with a `reason` token
+  (`helper_unavailable`, `helper_failed`, `helper_protocol`, `timeout`, or `failed`). `complete`
+  is true only when every section was read in full: nothing unavailable, truncated, or
+  skipped, and no folder or marker `redirected`, `not_directory`, or `unreadable`; cancellation stops the helper and the
+  whole command is `cancelled`. Run as a user other than root, folders that user cannot read
+  are `unreadable` and database presence may be `null`; the launcher runs it as root.
 
 ## Trust boundaries and future scope
 
