@@ -22,11 +22,15 @@ TOOL = {"name": "ddistro", "version": "1.0.0", "source": "DwemerDistro-Core"}
 SCHEMA_VERSION = 1
 SERVER_HELPER = "/usr/local/bin/ddistro_server"
 CHANGES_HELPER = "/usr/local/bin/ddistro_changes"
+AGENT_HELPER = "/usr/local/bin/ddistro_agent"
 HELPER_OWNER_UID = 0
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 STATUS_TIMEOUT = 120
 UPDATE_TIMEOUT = 3 * 3600  # Reign updates include a native build.
 CHANGES_TIMEOUT = 600
+AGENT_STATUS_TIMEOUT = 120  # the first status after an install hashes the pinned runtime
+AGENT_PROBE_TIMEOUT = 600
+AGENT_STDOUT_LIMIT = 256 * 1024
 CHANGES_STDOUT_LIMIT = 24 * 1024 * 1024  # an 8 MiB change batch plus its diff
 CHANGES_DIFF_BYTES = 8 * 1024 * 1024  # JSON-encoded diff bound in ddistro_changes
 STOP_GRACE = 10
@@ -100,6 +104,10 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
   changes prepare --product herika [--path RELATIVE ...]       (root)
   changes diff|stage|status|rollback TASK | changes list         (root)
   changes apply TASK --manifest-sha256 HASH                     (root)
+  agent status | agent probe                                    (probe: root)
+  models herika                 (root; configured CHIM profile model assignments, read-only)
+  inventory                     (read-only presence snapshot: servers, ext folders, components, custom mods)
+  agent serve --task TASK      (root; raw Codex App Server JSONL, no --json envelope)
 
 Products: herika (chim, skyrim), lorkhan, stobe (kenshi), dialectic (fnv, ttw), reign.
 --force discards local edits to tracked server files; it is never added automatically."""
@@ -233,13 +241,13 @@ def stop_child(proc):
             signal.signal(sig, handler)
 
 
-def run_helper(args, timeout, keep, echo=False, watch_blocker=False, helper=None, echo_stdout=True):
+def run_helper(args, timeout, keep, echo=False, watch_blocker=False, helper=None, echo_stdout=True, env=None):
     helper = helper or SERVER_HELPER
     name = os.path.basename(helper)
     check_helper(helper)
     try:
         proc = subprocess.Popen([helper] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, env=helper_env(), cwd="/", close_fds=True,
+                                stderr=subprocess.PIPE, env=env or helper_env(), cwd="/", close_fds=True,
                                 start_new_session=True)
     except OSError as error:
         raise CliError("helper_unavailable", f"{name} could not be started.",
@@ -298,8 +306,8 @@ def validate_record(record, product):
     return dict(record)
 
 
-def helper_status(product=None):
-    code, out, err = run_helper(["status", product or "all", "--json"], STATUS_TIMEOUT, STATUS_STDOUT_LIMIT)
+def helper_status(product=None, timeout=STATUS_TIMEOUT):
+    code, out, err = run_helper(["status", product or "all", "--json"], timeout, STATUS_STDOUT_LIMIT)
     if code != 0:
         raise CliError("helper_failed", "ddistro_server status failed.",
                        {"helper_exit": code, "stderr_tail": tail_lines(err.data, 20)})
@@ -361,7 +369,15 @@ def cmd_capabilities(opts, ctx):
             {"name": "server status", "arguments": ["[product]"], "mutates": False},
             {"name": "server update", "arguments": ["<product>"], "flags": ["--branch", "--force"],
              "mutates": True, "requires_root": True},
-        ] + [dict(CHANGES_SPEC[name], name="changes " + name, requires_root=True) for name in CHANGES_SPEC],
+        ] + [dict(CHANGES_SPEC[name], name="changes " + name, requires_root=True) for name in CHANGES_SPEC] + [
+            {"name": "agent status", "mutates": False},
+            {"name": "agent probe", "mutates": True, "requires_root": True},
+            {"name": "agent serve", "flags": ["--task"], "mutates": False, "requires_root": True,
+             "transport": "jsonl"},
+            {"name": "models", "arguments": ["herika"], "mutates": False, "requires_root": True},
+            # Any user may run it; as another user, unreadable folders are reported as unreadable.
+            {"name": "inventory", "mutates": False},
+        ],
         "global_flags": ["--json", "--request-id"],
         "aliases": ALIASES,
         "log_targets": {target: names for target, (_, names) in LOG_SOURCES.items()},
@@ -373,7 +389,18 @@ def cmd_capabilities(opts, ctx):
         # staged manifest always comes with its complete diff.
         "change_review": {"truncated_flag": "diff_truncated", "stage_refuses_truncated": True},
         "change_products": ["herika"],
-        "features": {"file_changes": True, "locks": True, "agent": False, "chat": False},
+        # agent means the commands and a trusted helper are present; readiness (runtime installed
+        # and a passing probe on this distro) is only ever reported by agent status.
+        "features": {"file_changes": True, "locks": True, "agent": agent_helper_trusted(), "chat": False,
+                     "models": True, "inventory": True},
+        "agent": {"provider": "codex", "readiness_command": "agent status", "ready_when": ["installed", "probe_passed"]},
+        # Configured profile assignments only; which profile an NPC is using is not reported.
+        "models": {"products": ["herika"], "scope": "configured_profiles", "roles": [role for role, _ in MODELS_ROLES],
+                   "max_assignments": MODELS_MAX, "string_chars": MODELS_STRING_CHARS},
+        "inventory": {"scope": "presence_only", "extension_products": list(INVENTORY_EXTENSION_ROOTS),
+                      "components": [c[0] for c in INVENTORY_COMPONENTS], "max_entries": INVENTORY_MAX_ENTRIES,
+                      "scan_limit": INVENTORY_SCAN_LIMIT, "max_custom_mods": INVENTORY_MAX_MODS,
+                      "string_chars": INVENTORY_STRING_CHARS},
     }
     return data, "\n".join(command["name"] for command in data["commands"])
 
@@ -655,9 +682,514 @@ def parse_changes(rest, ctx):
     return opts
 
 
+# ddistro agent: the ddistro_agent helper owns the runtime, sandbox, and attestation. status and
+# probe are validated into the normal envelope; serve replaces this process with the helper.
+AGENT_STATUS_KEYS = {"installed", "probe_passed", "provider", "version", "reason"}
+AGENT_TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,63}\Z")  # status reasons and probe check names
+
+
+def agent_helper_trusted():
+    try:
+        check_helper(AGENT_HELPER)
+        return True
+    except CliError:
+        return False
+
+
+def agent_document(out, keys):
+    if out.total > AGENT_STDOUT_LIMIT:
+        raise CliError("helper_protocol", "ddistro_agent returned too much output.")
+    try:
+        doc = json.loads(bytes(out.data).decode("utf-8"), parse_constant=reject_constant)
+    except ValueError:
+        doc = None
+    if type(doc) is not dict or set(doc) != keys:
+        raise CliError("helper_protocol", "ddistro_agent returned an unexpected result.")
+    return doc
+
+
+def agent_status():
+    code, out, _ = run_helper(["status"], AGENT_STATUS_TIMEOUT, AGENT_STDOUT_LIMIT + 1, helper=AGENT_HELPER)
+    doc = agent_document(out, AGENT_STATUS_KEYS)
+    valid = (code == 0 and type(doc["installed"]) is bool and type(doc["probe_passed"]) is bool
+             and (doc["installed"] or not doc["probe_passed"]) and doc["provider"] == "codex"
+             and (doc["version"] is None or type(doc["version"]) is str and len(doc["version"]) <= 64)
+             and type(doc["reason"]) is str and AGENT_TOKEN.match(doc["reason"]))
+    if not valid:
+        raise CliError("helper_protocol", "ddistro_agent returned an unexpected status.", {"helper_exit": code})
+    return doc
+
+
+def agent_human(data):
+    return f"{data['provider']} {data['version'] or '-'}: {data['reason']}"
+
+
+def cmd_agent_status(opts, ctx):
+    data = agent_status()
+    return data, agent_human(data)
+
+
+def probe_diagnostics(value):
+    """Bounded per-step exit status and redacted stderr lines; anything else is dropped."""
+    steps = {}
+    for name, step in list(value.items())[:8] if type(value) is dict else []:
+        if not AGENT_TOKEN.match(name) or type(step) is not dict:
+            continue
+        clean = {}
+        if type(step.get("exit")) is int:
+            clean["exit"] = step["exit"]
+        for key in ("failure", "error"):
+            if type(step.get(key)) is str:
+                clean[key] = clean_line(step[key][:64])
+        lines = step.get("stderr")
+        if type(lines) is list:
+            clean["stderr"] = [clean_line(line[:300]) for line in lines[:20] if type(line) is str]
+        steps[name] = clean
+    return steps
+
+
+def cmd_agent_probe(opts, ctx):
+    if os.geteuid() != 0:
+        raise CliError("permission_denied", "agent probe must run as root. ddistro never elevates by itself.")
+    ctx["operation_id"] = str(uuid.uuid4())
+    code, out, _ = run_helper(["probe"], AGENT_PROBE_TIMEOUT, AGENT_STDOUT_LIMIT + 1, helper=AGENT_HELPER)
+    doc = agent_document(out, {"passed", "checks", "diagnostics"})
+    checks = doc["checks"]
+    if type(checks) is not dict or len(checks) > 64 or not all(
+            type(name) is str and AGENT_TOKEN.match(name) and type(value) is bool for name, value in checks.items()):
+        raise CliError("helper_protocol", "ddistro_agent returned malformed probe checks.", {"helper_exit": code})
+    if code == 75:
+        raise CliError("busy", "An assistant session is running. Stop it before running the isolation check.")
+    if type(doc["passed"]) is not bool or code != (0 if doc["passed"] else 1) or doc["passed"] != (
+            bool(checks) and all(checks.values())):
+        raise CliError("helper_protocol", "ddistro_agent returned an inconsistent probe result.", {"helper_exit": code})
+    # Failed checks first, so a short list still shows what is wrong.
+    rows = sorted(({"name": name, "passed": value} for name, value in checks.items()), key=lambda row: row["passed"])
+    data = {"passed": doc["passed"], "checks": rows, "diagnostics": probe_diagnostics(doc["diagnostics"])}
+    data.update(agent_status())
+    human = "\n".join([("Isolation check passed." if data["passed"] else "Isolation check failed.") + " " + agent_human(data)]
+                      + [f"  {'ok  ' if row['passed'] else 'FAIL'} {row['name']}" for row in rows])
+    return data, human
+
+
+def serve_refusal(error, reason, exit_code):
+    """agent serve owns stdout for JSONL, so its own refusals are one JSON line on stderr only."""
+    try:
+        sys.stderr.write(json.dumps({"error": error, "reason": reason}) + "\n")
+        sys.stderr.flush()
+    except OSError:
+        pass
+    return exit_code
+
+
+def agent_serve(args):
+    """Exactly agent serve --task TASK: validated here, then this process becomes the root helper."""
+    if len(args) != 2 or args[0] != "--task" or not TASK_ID.match(args[1]):
+        return serve_refusal("invalid_argument", "usage: agent serve --task TASK (no other options)", 64)
+    if os.geteuid() != 0:
+        return serve_refusal("assistant_unavailable", "requires_root", 3)
+    try:
+        check_helper(AGENT_HELPER)
+        os.chdir("/")
+        os.execve(AGENT_HELPER, [AGENT_HELPER, "serve", "--task", args[1]],
+                  {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
+    except CliError:
+        return serve_refusal("assistant_unavailable", "helper_unavailable", 3)
+    except OSError:
+        return serve_refusal("assistant_unavailable", "helper_unavailable", 3)
+
+
+# ddistro models herika: the CHIM connector assigned to each role of each configured profile,
+# read-only from the local dwemer database as the postgres superuser over the Unix socket.
+# Only fixed, explicitly public-qualified SQL built from the constants below ever runs; there
+# are no SQL, schema, or database arguments, no PHP, and no secret-bearing columns are read.
+MODELS_RUNUSER = "/usr/sbin/runuser"
+MODELS_PSQL = "/usr/bin/psql"
+MODELS_SOCKET = "/var/run/postgresql"
+MODELS_DATABASE = "dwemer"
+MODELS_TIMEOUT = 30
+MODELS_MAX = 200
+MODELS_STRING_CHARS = 256
+MODELS_FIELD_CHARS = 512  # clipped in SQL, before redaction and the final 256-character bound
+MODELS_STDOUT_LIMIT = 4 * 1024 * 1024
+# (role, core_profiles field), in HerikaServer's order; roles whose field is missing are skipped.
+MODELS_ROLES = (("standard", "llm_primary_id"), ("fast", "llm_secondary_id"), ("powerful", "llm_tertiary_id"),
+                ("experimental", "llm_quaternary_id"), ("formatter", "llm_formatter_id"),
+                ("fallback", "llm_fallback_id"), ("diary", "diary_connector_id"))
+MODELS_REQUIRED = {"core_profiles.id", "core_profiles.label", "core_llm_connector.id", "core_llm_connector.label",
+                   "core_llm_connector.model", "core_llm_connector.provider", "core_llm_connector.driver"}
+MODELS_COLUMNS = MODELS_REQUIRED | {"core_profiles." + field for _, field in MODELS_ROLES}
+
+
+def check_system_binary(path):
+    """check_helper, also accepting one root-owned symlink hop (Debian's psql links to pg_wrapper)."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        info = None
+    if info is not None and stat.S_ISLNK(info.st_mode):
+        parent = os.stat(os.path.dirname(path))
+        if info.st_uid != HELPER_OWNER_UID or parent.st_uid != HELPER_OWNER_UID or parent.st_mode & 0o022:
+            raise CliError("helper_unavailable", "untrusted link", {"helper": path, "reason": "untrusted"})
+        path = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+    check_helper(path)
+
+
+def models_psql(sql, keep):
+    """Run one fixed read-only query; returns (exit code, stdout bytes). stderr is never returned."""
+    port = os.environ.get("DDISTRO_POSTGRES_PORT", "")
+    port = port if re.match(r"^[0-9]{1,5}\Z", port) and 0 < int(port) < 65536 else "5432"
+    env = {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PGCONNECT_TIMEOUT": "5",
+           "PGAPPNAME": "ddistro-models", "PGTZ": "UTC",
+           "PGOPTIONS": "-c default_transaction_read_only=on -c statement_timeout=10000 -c lock_timeout=2000 "
+                        "-c idle_in_transaction_session_timeout=10000 -c search_path=pg_catalog"}
+    args = ["-u", "postgres", "--", MODELS_PSQL, "-X", "-A", "-t", "-q", "--no-password", "-v", "ON_ERROR_STOP=1",
+            "-h", MODELS_SOCKET, "-p", port, "-d", MODELS_DATABASE, "-1",
+            "-c", "SET TRANSACTION READ ONLY", "-c", sql]
+    code, out, _ = run_helper(args, MODELS_TIMEOUT, keep + 1, helper=MODELS_RUNUSER, env=env)
+    if code == 0 and out.total > keep:
+        raise CliError("helper_protocol", "output too large", {"reason": "unexpected_output"})
+    return code, bytes(out.data)
+
+
+def models_columns():
+    names = ", ".join(f"'{name.split('.')[1]}'" for name in sorted(MODELS_COLUMNS))
+    code, raw = models_psql("SELECT table_name || '.' || column_name FROM information_schema.columns "
+                            "WHERE table_schema = 'public' AND table_name IN ('core_profiles', 'core_llm_connector') "
+                            f"AND column_name IN ({names})", 64 * 1024)
+    if code != 0:
+        return code, None
+    # Intersected with the allowlist, so only our own constants are ever put into SQL.
+    return 0, MODELS_COLUMNS & set(raw.decode("utf-8", "replace").split("\n"))
+
+
+def models_text(value):
+    if value is None:
+        return ""
+    # clean_line keeps tabs and newlines (log rows are already split); one-line values here.
+    return clean_line(re.sub(r"[\t\r\n]", " ", value[:MODELS_FIELD_CHARS]))[:MODELS_STRING_CHARS]
+
+
+def models_rows(raw, roles):
+    rows = []
+    for line in raw.decode("utf-8").split("\n"):
+        if not line:
+            continue
+        row = json.loads(line, parse_constant=reject_constant)
+        if type(row) is not list or len(row) != 8 or type(row[0]) is not int or type(row[3]) is not int \
+                or row[2] not in roles or any(row[i] is not None and type(row[i]) is not str for i in (1, 4, 5, 6, 7)):
+            raise ValueError("row")
+        rows.append({"profile_id": row[0], "profile": models_text(row[1]), "role": row[2], "connector_id": row[3],
+                     "connector": models_text(row[4]), "model": models_text(row[5]),
+                     "provider": models_text(row[6]), "driver": models_text(row[7])})
+    return rows
+
+
+def models_query():
+    """Returns (assignments, truncated, reason); reason is empty only when the read succeeded."""
+    if os.geteuid() != 0:
+        return [], False, "requires_root"
+    try:
+        check_system_binary(MODELS_PSQL)
+        pwd.getpwnam("postgres")
+    except (CliError, KeyError, OSError):
+        return [], False, "helper_unavailable"
+    try:
+        code, columns = models_columns()
+        if code == 0 and not MODELS_REQUIRED <= columns:
+            return [], False, "schema_missing"
+        roles = [(order, role, field) for order, (role, field) in enumerate(MODELS_ROLES)
+                 if "core_profiles." + field in (columns or ())]
+        if code == 0 and not roles:
+            return [], False, "schema_missing"
+        if code == 0:
+            values = ", ".join(f"({order}, '{role}', p.{field})" for order, role, field in roles)
+            text = ", ".join(f"left({column}::text, {MODELS_FIELD_CHARS})"
+                             for column in ("c.label", "c.model", "c.provider", "c.driver"))
+            code, raw = models_psql(
+                f"SELECT json_build_array(p.id, left(p.label::text, {MODELS_FIELD_CHARS}), r.role, c.id, {text}) "
+                f"FROM public.core_profiles AS p CROSS JOIN LATERAL (VALUES {values}) AS r(ord, role, connector_id) "
+                "JOIN public.core_llm_connector AS c ON c.id = r.connector_id "
+                f"ORDER BY p.id, r.ord LIMIT {MODELS_MAX + 1}", MODELS_STDOUT_LIMIT)
+    except CliError as error:
+        if error.code == "cancelled":
+            raise
+        return [], False, {"timeout": "timeout", "helper_protocol": "unexpected_output"}.get(
+            error.code, "helper_unavailable")
+    if code != 0:
+        # psql exits 2 when it cannot connect (server down, database missing); other failures are generic.
+        return [], False, "database_unavailable" if code == 2 else "query_failed"
+    try:
+        rows = models_rows(raw, {role for _, role, _ in roles})
+    except ValueError:
+        return [], False, "unexpected_output"
+    return rows[:MODELS_MAX], len(rows) > MODELS_MAX, ""
+
+
+def cmd_models(opts, ctx):
+    product = opts["product"]
+    if product != "herika":
+        raise CliError("unsupported", "ddistro models currently supports only herika (chim, skyrim).",
+                       {"product": product})
+    captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    assignments, truncated, reason = models_query()
+    data = {"product": product, "available": not reason, "scope": "configured_profiles", "captured_at": captured_at,
+            "assignments": assignments, "truncated": truncated, "reason": reason}
+    if reason:
+        return data, f"herika model assignments unavailable: {reason}"
+    lines = ["Configured CHIM profile model assignments (not necessarily the active NPC profile):"]
+    lines += [f"  {a['profile_id']:>4} {a['profile'] or '-':<24} {a['role']:<12} {a['model'] or '-'} "
+              f"({a['provider'] or '-'}/{a['driver'] or '-'}, connector {a['connector_id']} {a['connector'] or '-'})"
+              for a in assignments] or ["  (none)"]
+    if truncated:
+        lines.append(f"  ... truncated to {MODELS_MAX} assignments")
+    return data, "\n".join(lines)
+
+
+# ddistro inventory: one fresh, read-only snapshot of what is installed, for the launcher's assistant.
+# It only reports presence: no repository or plugin code runs, no file content is read, no link is
+# followed, and nothing says whether an extension is enabled or healthy or a component is running.
+INVENTORY_STATUS_TIMEOUT = 20
+INVENTORY_MODS_TIMEOUT = 10
+INVENTORY_MODS_HELPER = "/usr/local/bin/ddistro_custom_mod"
+INVENTORY_MODS_STDOUT_LIMIT = 1024 * 1024
+INVENTORY_MAX_ENTRIES = 200  # per extension folder, sorted by name
+INVENTORY_SCAN_LIMIT = 4096  # directory entries examined per folder before giving up
+INVENTORY_MAX_MODS = 100
+INVENTORY_STRING_CHARS = 128
+# Products whose repositories load add-ons from an ext/ folder; the others have no known root.
+INVENTORY_EXTENSION_ROOTS = {"herika": "/var/www/html/HerikaServer", "dialectic": "/var/www/html/DialecticServer"}
+# The startup markers start_env and update_gws check, in that order. "all" markers must all be
+# present, "any" needs one. A marker present means startup would try the component, not that it runs.
+INVENTORY_COMPONENTS = (
+    ("dashboard", "Dwemer Dashboard", "dashboard", "all", ("/var/www/html/Dwemer-Dashboard/.git",)),
+    ("minime_t5", "Minime-T5 / TXT2VEC", "embeddings", "all", ("/home/dwemer/minime-t5/start.sh",)),
+    ("mimic3", "Mimic3", "tts", "all", ("/home/dwemer/mimic3/start.sh",)),
+    ("melotts", "MeloTTS", "tts", "all", ("/home/dwemer/MeloTTS/start.sh",)),
+    ("parakeet", "Parakeet", "stt", "all", ("/home/dwemer/parakeet-api-server/start.sh",)),
+    ("chatterbox", "Chatterbox", "tts", "all", ("/home/dwemer/chatterbox/start.sh",)),
+    ("pockettts_audiocpp", "PocketTTS (audio.cpp)", "tts", "all", ("/home/dwemer/audio.cpp/start.sh",)),
+    ("pocket_tts", "pocket-tts", "tts", "all", ("/home/dwemer/pocket-tts/start.sh",)),
+    ("piper", "Piper TTS", "tts", "all", ("/home/dwemer/piper/cuda-keyring_1.1-1_all.deb",
+                                         "/home/dwemer/piper/start.sh")),
+    ("localwhisper", "LocalWhisper", "stt", "all", ("/home/dwemer/remote-faster-whisper/start.sh",)),
+    ("xtts", "CHIM XTTS", "tts", "all", ("/home/dwemer/xtts-api-server/start.sh",)),
+    ("higgs", "Higgs TTS", "tts", "all", ("/home/dwemer/higgs-tts/service.sh",)),
+    ("omnivoice", "OmniVoice TTS", "tts", "all", ("/home/dwemer/omnivoice-tts/start-gpu.sh",)),
+    ("chim_mcp", "CHIM MCP Server", "mcp", "any", ("/home/dwemer/CHIM-MCP/start.sh",
+                                                   "/home/dwemer/chim-mcp-server/start.sh")),
+)
+INVENTORY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+()@,=~-]{0,127}\Z")
+INVENTORY_MOD_ID = re.compile(r"^[a-z][a-z0-9-]{1,30}[a-z0-9]\Z")
+INVENTORY_COMMIT = re.compile(r"^(?:[0-9a-f]{40})?\Z")
+INVENTORY_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+INVENTORY_ERRNO = {errno.ENOENT: "absent", errno.ELOOP: "redirected", errno.ENOTDIR: "not_directory",
+                   errno.EACCES: "unreadable", errno.EPERM: "unreadable"}
+
+
+def inventory_reason(error):
+    if error.code == "cancelled":
+        raise error
+    return error.code if error.code in ("helper_unavailable", "helper_failed", "helper_protocol", "timeout") else "failed"
+
+
+def inventory_step(fd, name):
+    """Opens the folder name below fd without following a link; returns (fd, "") or (None, state).
+
+    Linux may refuse a link opened with O_DIRECTORY|O_NOFOLLOW with ENOTDIR rather than ELOOP, so
+    any failure other than a plain absence is classified by a no-follow stat of the same name under
+    the same fd: a link is redirected, a non-folder is not_directory. Nothing is ever followed."""
+    try:
+        return os.open(name, INVENTORY_DIR_FLAGS, dir_fd=fd), ""
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ELOOP):
+            return None, INVENTORY_ERRNO[error.errno]
+        failure = error.errno
+    try:
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except OSError as error:
+        # It changed after the open failed, so it is not provably absent.
+        return None, "unreadable" if error.errno == errno.ENOENT else INVENTORY_ERRNO.get(error.errno, "unreadable")
+    if stat.S_ISLNK(info.st_mode):
+        return None, "redirected"
+    if not stat.S_ISDIR(info.st_mode):
+        return None, "not_directory"
+    return None, INVENTORY_ERRNO.get(failure, "unreadable") if failure in (errno.EACCES, errno.EPERM) else "unreadable"
+
+
+def inventory_open_dir(path):
+    """Opens a fixed absolute folder from / one name at a time, refusing a link at every step.
+
+    Returns (fd, "") or (None, state) for the first name that could not be opened."""
+    fd = os.open("/", INVENTORY_DIR_FLAGS)
+    for name in path.strip("/").split("/"):
+        next_fd, state = inventory_step(fd, name)
+        os.close(fd)
+        if next_fd is None:
+            return None, state
+        fd = next_fd
+    return fd, ""
+
+
+def inventory_marker(path):
+    parent, name = path.rsplit("/", 1)
+    try:
+        fd, state = inventory_open_dir(parent)
+        if fd is None:
+            # A plain file where a folder should be means the marker cannot exist; a link stays redirected.
+            return "absent" if state == "not_directory" else state
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        finally:
+            os.close(fd)
+    except OSError as error:
+        return INVENTORY_ERRNO.get(error.errno, "unreadable")
+    if stat.S_ISLNK(info.st_mode):
+        return "redirected"
+    return "present" if stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode) else "unreadable"
+
+
+def inventory_component(component_id, name, role, mode, markers):
+    states = [inventory_marker(path) for path in markers]
+    if (all if mode == "all" else any)(state == "present" for state in states):
+        state = "present"
+    else:
+        state = next((s for s in states if s not in ("present", "absent")), "absent")
+    return {"id": component_id, "name": name, "role": role, "state": state}
+
+
+def inventory_extensions(product, root):
+    """Names of the entries directly in <root>/ext, never followed or opened; links are reported as links."""
+    result = {"product": product, "root": "ext", "state": "listed", "total": 0, "truncated": False, "skipped": 0,
+              "entries": []}
+    try:
+        root_fd, state = inventory_open_dir(root)
+        if root_fd is None:
+            result["state"] = "product_absent" if state == "absent" else state
+            return result
+        try:
+            ext_fd, state = inventory_step(root_fd, "ext")
+        finally:
+            os.close(root_fd)
+    except OSError as error:
+        ext_fd, state = None, INVENTORY_ERRNO.get(error.errno, "unreadable")
+    if ext_fd is None:
+        result["state"] = state
+        return result
+    entries = []
+    try:
+        with os.scandir(ext_fd) as scan:
+            for entry in scan:
+                result["total"] += 1
+                if result["total"] > INVENTORY_SCAN_LIMIT:
+                    result["total"], result["truncated"] = INVENTORY_SCAN_LIMIT, True
+                    break
+                if not INVENTORY_NAME.match(entry.name) or redact(entry.name) != entry.name:
+                    result["skipped"] += 1
+                    continue
+                kind = ("link" if entry.is_symlink() else "dir" if entry.is_dir(follow_symlinks=False)
+                        else "file" if entry.is_file(follow_symlinks=False) else "other")
+                entries.append({"name": entry.name, "kind": kind})
+    except OSError as error:
+        return dict(result, state=INVENTORY_ERRNO.get(error.errno, "unreadable"), total=0, skipped=0)
+    finally:
+        os.close(ext_fd)
+    entries.sort(key=lambda item: (item["name"].lower(), item["name"]))
+    result["truncated"] = result["truncated"] or len(entries) > INVENTORY_MAX_ENTRIES
+    result["entries"] = entries[:INVENTORY_MAX_ENTRIES]
+    return result
+
+
+def inventory_text(value, limit=INVENTORY_STRING_CHARS):
+    return clean_line(re.sub(r"[\t\r\n]", " ", value[:limit * 2]))[:limit] if type(value) is str else ""
+
+
+def inventory_custom_mods():
+    """Registry entries from ddistro_custom_mod status (no health check, no network); a few fields only."""
+    section = {"available": False, "reason": "", "truncated": False, "items": []}
+    try:
+        code, out, _ = run_helper(["status", "--json"], INVENTORY_MODS_TIMEOUT, INVENTORY_MODS_STDOUT_LIMIT + 1,
+                                  helper=INVENTORY_MODS_HELPER)
+    except CliError as error:
+        section["reason"] = inventory_reason(error)
+        return section
+    if code != 0:
+        section["reason"] = "helper_failed"
+        return section
+    try:
+        if out.total > INVENTORY_MODS_STDOUT_LIMIT:
+            raise ValueError("size")
+        doc = json.loads(bytes(out.data).decode("utf-8"), parse_constant=reject_constant)
+        if type(doc) is not dict or doc.get("schema_version") != 1 or type(doc.get("mods")) is not list:
+            raise ValueError("shape")
+        items = []
+        for mod in doc["mods"]:
+            if type(mod) is not dict or type(mod.get("id")) is not str or not INVENTORY_MOD_ID.match(mod["id"]):
+                raise ValueError("mod")
+            state, commit = mod.get("state"), mod.get("commit", "")
+            items.append({"id": mod["id"], "name": inventory_text(mod.get("name")),
+                          "state": state if type(state) is str and STATE_TOKEN.match(state) else "unknown",
+                          "branch": inventory_text(mod.get("branch")),
+                          "commit": commit if type(commit) is str and INVENTORY_COMMIT.match(commit) else ""})
+    except (ValueError, UnicodeDecodeError):
+        section["reason"] = "helper_protocol"
+        return section
+    section.update(available=True, truncated=len(items) > INVENTORY_MAX_MODS, items=items[:INVENTORY_MAX_MODS])
+    return section
+
+
+def cmd_inventory(opts, ctx):
+    captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    servers = {"available": False, "reason": "", "items": []}
+    try:
+        records = helper_status(timeout=INVENTORY_STATUS_TIMEOUT)
+        servers.update(available=True, items=[
+            {"product": r["product"], "state": r["state"], "repository_state": r["repository_state"],
+             "database_present": r["database_present"], "branch": inventory_text(r["branch"]),
+             "version": inventory_text(r["version"])} for r in records])
+    except CliError as error:
+        servers["reason"] = inventory_reason(error)
+    extensions = {"items": [inventory_extensions(product, root) for product, root in INVENTORY_EXTENSION_ROOTS.items()],
+                  "no_known_root": [product for product in PRODUCTS if product not in INVENTORY_EXTENSION_ROOTS]}
+    components = {"basis": "startup_markers", "items": [inventory_component(*c) for c in INVENTORY_COMPONENTS]}
+    custom_mods = inventory_custom_mods()
+    complete = (servers["available"] and custom_mods["available"] and not custom_mods["truncated"]
+                and all(item["state"] in ("listed", "absent", "product_absent") and not item["truncated"]
+                        and not item["skipped"] for item in extensions["items"])
+                and all(item["state"] in ("present", "absent") for item in components["items"]))
+    data = {"captured_at": captured_at, "scope": "presence_only", "read_as": current_user(), "complete": complete,
+            "servers": servers, "extensions": extensions, "components": components, "custom_mods": custom_mods}
+    lines = [f"DwemerDistro inventory at {captured_at} (presence only; not enabled, running, or healthy state)"]
+    lines += ["Servers:"] + ([f"  {r['product']:<10} {r['state']:<15} branch={r['branch'] or '-'} "
+                             f"version={r['version'] or '-'} database={DATABASE_WORDS[r['database_present']]}"
+                             for r in servers["items"]] or [f"  unavailable: {servers['reason']}"])
+    for item in extensions["items"]:
+        names = ", ".join(e["name"] + ("/" if e["kind"] == "dir" else "") for e in item["entries"]) or "-"
+        lines.append(f"{item['product']} ext ({item['state']}{', truncated' if item['truncated'] else ''}"
+                     f"{', %d names skipped' % item['skipped'] if item['skipped'] else ''}): {names}")
+    lines.append("Components: " + ", ".join(f"{c['id']}={c['state']}" for c in components["items"]))
+    lines.append("Custom mods: " + (", ".join(f"{m['id']} ({m['state']})" for m in custom_mods["items"]) or "-")
+                 if custom_mods["available"] else f"Custom mods: unavailable: {custom_mods['reason']}")
+    return data, "\n".join(lines)
+
+
+def command_words(argv):
+    """The first two command tokens, skipping the global flags wherever they appear first."""
+    words, index = [], 0
+    while index < len(argv) and len(words) < 2:
+        if argv[index] == "--request-id":
+            index += 2
+            continue
+        if argv[index] != "--json":
+            words.append(argv[index])
+        index += 1
+    return words
+
+
 COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products": cmd_products,
             "status": cmd_status, "logs": cmd_logs, "server status": cmd_server_status,
-            "server update": cmd_server_update}
+            "server update": cmd_server_update, "agent status": cmd_agent_status, "agent probe": cmd_agent_probe,
+            "models": cmd_models, "inventory": cmd_inventory}
 COMMANDS.update({"changes " + name: cmd_changes for name in CHANGES_SPEC})
 
 
@@ -693,6 +1225,10 @@ def parse_command(rest, ctx):
         if len(rest) < 2 or rest[1] not in ("status", "update"):
             raise CliError("invalid_argument", "Expected server status or server update.")
         name, rest = "server " + rest[1], rest[1:]
+    elif name == "agent":
+        if len(rest) < 2 or rest[1] not in ("status", "probe"):
+            raise CliError("invalid_argument", "Expected agent status, agent probe, or agent serve --task TASK.")
+        name, rest = "agent " + rest[1], rest[1:]
     if name not in COMMANDS:
         raise CliError("invalid_argument", "Unknown command.\n" + USAGE)
     ctx["command"] = name
@@ -715,8 +1251,8 @@ def parse_command(rest, ctx):
         else:
             positional.append(token)
         index += 1
-    required = {"logs": 1, "server update": 1}.get(name, 0)
-    allowed = 1 if name in ("status", "server status", "logs", "server update") else 0
+    required = {"logs": 1, "server update": 1, "models": 1}.get(name, 0)
+    allowed = 1 if name in ("status", "server status", "logs", "server update", "models") else 0
     if not required <= len(positional) <= allowed:
         raise CliError("invalid_argument", f"Wrong number of arguments for {name}.\n" + USAGE)
     if name == "logs":
@@ -757,6 +1293,10 @@ def raise_cancelled(signum, frame):
 
 
 def main(argv):
+    if command_words(argv) == ["agent", "serve"]:
+        if argv[:2] != ["agent", "serve"]:
+            return serve_refusal("invalid_argument", "agent serve takes no --json or --request-id", 64)
+        return agent_serve(argv[2:])
     ctx = {"json": "--json" in argv, "command": None, "request_id": str(uuid.uuid4()),
            "request_id_given": False, "warnings": []}
     signal.signal(signal.SIGTERM, raise_cancelled)
