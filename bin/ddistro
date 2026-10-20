@@ -105,6 +105,7 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
   changes diff|stage|status|rollback TASK | changes list         (root)
   changes apply TASK --manifest-sha256 HASH                     (root)
   agent status | agent probe                                    (probe: root)
+  models herika                 (root; configured CHIM profile model assignments, read-only)
   agent serve --task TASK      (root; raw Codex App Server JSONL, no --json envelope)
 
 Products: herika (chim, skyrim), lorkhan, stobe (kenshi), dialectic (fnv, ttw), reign.
@@ -239,13 +240,13 @@ def stop_child(proc):
             signal.signal(sig, handler)
 
 
-def run_helper(args, timeout, keep, echo=False, watch_blocker=False, helper=None, echo_stdout=True):
+def run_helper(args, timeout, keep, echo=False, watch_blocker=False, helper=None, echo_stdout=True, env=None):
     helper = helper or SERVER_HELPER
     name = os.path.basename(helper)
     check_helper(helper)
     try:
         proc = subprocess.Popen([helper] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, env=helper_env(), cwd="/", close_fds=True,
+                                stderr=subprocess.PIPE, env=env or helper_env(), cwd="/", close_fds=True,
                                 start_new_session=True)
     except OSError as error:
         raise CliError("helper_unavailable", f"{name} could not be started.",
@@ -372,6 +373,7 @@ def cmd_capabilities(opts, ctx):
             {"name": "agent probe", "mutates": True, "requires_root": True},
             {"name": "agent serve", "flags": ["--task"], "mutates": False, "requires_root": True,
              "transport": "jsonl"},
+            {"name": "models", "arguments": ["herika"], "mutates": False, "requires_root": True},
         ],
         "global_flags": ["--json", "--request-id"],
         "aliases": ALIASES,
@@ -386,8 +388,12 @@ def cmd_capabilities(opts, ctx):
         "change_products": ["herika"],
         # agent means the commands and a trusted helper are present; readiness (runtime installed
         # and a passing probe on this distro) is only ever reported by agent status.
-        "features": {"file_changes": True, "locks": True, "agent": agent_helper_trusted(), "chat": False},
+        "features": {"file_changes": True, "locks": True, "agent": agent_helper_trusted(), "chat": False,
+                     "models": True},
         "agent": {"provider": "codex", "readiness_command": "agent status", "ready_when": ["installed", "probe_passed"]},
+        # Configured profile assignments only; which profile an NPC is using is not reported.
+        "models": {"products": ["herika"], "scope": "configured_profiles", "roles": [role for role, _ in MODELS_ROLES],
+                   "max_assignments": MODELS_MAX, "string_chars": MODELS_STRING_CHARS},
     }
     return data, "\n".join(command["name"] for command in data["commands"])
 
@@ -786,6 +792,153 @@ def agent_serve(args):
         return serve_refusal("assistant_unavailable", "helper_unavailable", 3)
 
 
+# ddistro models herika: the CHIM connector assigned to each role of each configured profile,
+# read-only from the local dwemer database as the postgres superuser over the Unix socket.
+# Only fixed, explicitly public-qualified SQL built from the constants below ever runs; there
+# are no SQL, schema, or database arguments, no PHP, and no secret-bearing columns are read.
+MODELS_RUNUSER = "/usr/sbin/runuser"
+MODELS_PSQL = "/usr/bin/psql"
+MODELS_SOCKET = "/var/run/postgresql"
+MODELS_DATABASE = "dwemer"
+MODELS_TIMEOUT = 30
+MODELS_MAX = 200
+MODELS_STRING_CHARS = 256
+MODELS_FIELD_CHARS = 512  # clipped in SQL, before redaction and the final 256-character bound
+MODELS_STDOUT_LIMIT = 4 * 1024 * 1024
+# (role, core_profiles field), in HerikaServer's order; roles whose field is missing are skipped.
+MODELS_ROLES = (("standard", "llm_primary_id"), ("fast", "llm_secondary_id"), ("powerful", "llm_tertiary_id"),
+                ("experimental", "llm_quaternary_id"), ("formatter", "llm_formatter_id"),
+                ("fallback", "llm_fallback_id"), ("diary", "diary_connector_id"))
+MODELS_REQUIRED = {"core_profiles.id", "core_profiles.label", "core_llm_connector.id", "core_llm_connector.label",
+                   "core_llm_connector.model", "core_llm_connector.provider", "core_llm_connector.driver"}
+MODELS_COLUMNS = MODELS_REQUIRED | {"core_profiles." + field for _, field in MODELS_ROLES}
+
+
+def check_system_binary(path):
+    """check_helper, also accepting one root-owned symlink hop (Debian's psql links to pg_wrapper)."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        info = None
+    if info is not None and stat.S_ISLNK(info.st_mode):
+        parent = os.stat(os.path.dirname(path))
+        if info.st_uid != HELPER_OWNER_UID or parent.st_uid != HELPER_OWNER_UID or parent.st_mode & 0o022:
+            raise CliError("helper_unavailable", "untrusted link", {"helper": path, "reason": "untrusted"})
+        path = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+    check_helper(path)
+
+
+def models_psql(sql, keep):
+    """Run one fixed read-only query; returns (exit code, stdout bytes). stderr is never returned."""
+    port = os.environ.get("DDISTRO_POSTGRES_PORT", "")
+    port = port if re.match(r"^[0-9]{1,5}\Z", port) and 0 < int(port) < 65536 else "5432"
+    env = {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PGCONNECT_TIMEOUT": "5",
+           "PGAPPNAME": "ddistro-models", "PGTZ": "UTC",
+           "PGOPTIONS": "-c default_transaction_read_only=on -c statement_timeout=10000 -c lock_timeout=2000 "
+                        "-c idle_in_transaction_session_timeout=10000 -c search_path=pg_catalog"}
+    args = ["-u", "postgres", "--", MODELS_PSQL, "-X", "-A", "-t", "-q", "--no-password", "-v", "ON_ERROR_STOP=1",
+            "-h", MODELS_SOCKET, "-p", port, "-d", MODELS_DATABASE, "-1",
+            "-c", "SET TRANSACTION READ ONLY", "-c", sql]
+    code, out, _ = run_helper(args, MODELS_TIMEOUT, keep + 1, helper=MODELS_RUNUSER, env=env)
+    if code == 0 and out.total > keep:
+        raise CliError("helper_protocol", "output too large", {"reason": "unexpected_output"})
+    return code, bytes(out.data)
+
+
+def models_columns():
+    names = ", ".join(f"'{name.split('.')[1]}'" for name in sorted(MODELS_COLUMNS))
+    code, raw = models_psql("SELECT table_name || '.' || column_name FROM information_schema.columns "
+                            "WHERE table_schema = 'public' AND table_name IN ('core_profiles', 'core_llm_connector') "
+                            f"AND column_name IN ({names})", 64 * 1024)
+    if code != 0:
+        return code, None
+    # Intersected with the allowlist, so only our own constants are ever put into SQL.
+    return 0, MODELS_COLUMNS & set(raw.decode("utf-8", "replace").split("\n"))
+
+
+def models_text(value):
+    if value is None:
+        return ""
+    # clean_line keeps tabs and newlines (log rows are already split); one-line values here.
+    return clean_line(re.sub(r"[\t\r\n]", " ", value[:MODELS_FIELD_CHARS]))[:MODELS_STRING_CHARS]
+
+
+def models_rows(raw, roles):
+    rows = []
+    for line in raw.decode("utf-8").split("\n"):
+        if not line:
+            continue
+        row = json.loads(line, parse_constant=reject_constant)
+        if type(row) is not list or len(row) != 8 or type(row[0]) is not int or type(row[3]) is not int \
+                or row[2] not in roles or any(row[i] is not None and type(row[i]) is not str for i in (1, 4, 5, 6, 7)):
+            raise ValueError("row")
+        rows.append({"profile_id": row[0], "profile": models_text(row[1]), "role": row[2], "connector_id": row[3],
+                     "connector": models_text(row[4]), "model": models_text(row[5]),
+                     "provider": models_text(row[6]), "driver": models_text(row[7])})
+    return rows
+
+
+def models_query():
+    """Returns (assignments, truncated, reason); reason is empty only when the read succeeded."""
+    if os.geteuid() != 0:
+        return [], False, "requires_root"
+    try:
+        check_system_binary(MODELS_PSQL)
+        pwd.getpwnam("postgres")
+    except (CliError, KeyError, OSError):
+        return [], False, "helper_unavailable"
+    try:
+        code, columns = models_columns()
+        if code == 0 and not MODELS_REQUIRED <= columns:
+            return [], False, "schema_missing"
+        roles = [(order, role, field) for order, (role, field) in enumerate(MODELS_ROLES)
+                 if "core_profiles." + field in (columns or ())]
+        if code == 0 and not roles:
+            return [], False, "schema_missing"
+        if code == 0:
+            values = ", ".join(f"({order}, '{role}', p.{field})" for order, role, field in roles)
+            text = ", ".join(f"left({column}::text, {MODELS_FIELD_CHARS})"
+                             for column in ("c.label", "c.model", "c.provider", "c.driver"))
+            code, raw = models_psql(
+                f"SELECT json_build_array(p.id, left(p.label::text, {MODELS_FIELD_CHARS}), r.role, c.id, {text}) "
+                f"FROM public.core_profiles AS p CROSS JOIN LATERAL (VALUES {values}) AS r(ord, role, connector_id) "
+                "JOIN public.core_llm_connector AS c ON c.id = r.connector_id "
+                f"ORDER BY p.id, r.ord LIMIT {MODELS_MAX + 1}", MODELS_STDOUT_LIMIT)
+    except CliError as error:
+        if error.code == "cancelled":
+            raise
+        return [], False, {"timeout": "timeout", "helper_protocol": "unexpected_output"}.get(
+            error.code, "helper_unavailable")
+    if code != 0:
+        # psql exits 2 when it cannot connect (server down, database missing); other failures are generic.
+        return [], False, "database_unavailable" if code == 2 else "query_failed"
+    try:
+        rows = models_rows(raw, {role for _, role, _ in roles})
+    except ValueError:
+        return [], False, "unexpected_output"
+    return rows[:MODELS_MAX], len(rows) > MODELS_MAX, ""
+
+
+def cmd_models(opts, ctx):
+    product = opts["product"]
+    if product != "herika":
+        raise CliError("unsupported", "ddistro models currently supports only herika (chim, skyrim).",
+                       {"product": product})
+    captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    assignments, truncated, reason = models_query()
+    data = {"product": product, "available": not reason, "scope": "configured_profiles", "captured_at": captured_at,
+            "assignments": assignments, "truncated": truncated, "reason": reason}
+    if reason:
+        return data, f"herika model assignments unavailable: {reason}"
+    lines = ["Configured CHIM profile model assignments (not necessarily the active NPC profile):"]
+    lines += [f"  {a['profile_id']:>4} {a['profile'] or '-':<24} {a['role']:<12} {a['model'] or '-'} "
+              f"({a['provider'] or '-'}/{a['driver'] or '-'}, connector {a['connector_id']} {a['connector'] or '-'})"
+              for a in assignments] or ["  (none)"]
+    if truncated:
+        lines.append(f"  ... truncated to {MODELS_MAX} assignments")
+    return data, "\n".join(lines)
+
+
 def command_words(argv):
     """The first two command tokens, skipping the global flags wherever they appear first."""
     words, index = [], 0
@@ -801,7 +954,8 @@ def command_words(argv):
 
 COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products": cmd_products,
             "status": cmd_status, "logs": cmd_logs, "server status": cmd_server_status,
-            "server update": cmd_server_update, "agent status": cmd_agent_status, "agent probe": cmd_agent_probe}
+            "server update": cmd_server_update, "agent status": cmd_agent_status, "agent probe": cmd_agent_probe,
+            "models": cmd_models}
 COMMANDS.update({"changes " + name: cmd_changes for name in CHANGES_SPEC})
 
 
@@ -863,8 +1017,8 @@ def parse_command(rest, ctx):
         else:
             positional.append(token)
         index += 1
-    required = {"logs": 1, "server update": 1}.get(name, 0)
-    allowed = 1 if name in ("status", "server status", "logs", "server update") else 0
+    required = {"logs": 1, "server update": 1, "models": 1}.get(name, 0)
+    allowed = 1 if name in ("status", "server status", "logs", "server update", "models") else 0
     if not required <= len(positional) <= allowed:
         raise CliError("invalid_argument", f"Wrong number of arguments for {name}.\n" + USAGE)
     if name == "logs":

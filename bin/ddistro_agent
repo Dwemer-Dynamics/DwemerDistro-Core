@@ -54,6 +54,13 @@ RUNTIME_BIN_DIR = RUNTIME_DIR + "/bin"
 # (archive sha256 beb339e8ecd9ba057a6bb2dc81ad8ca474812edfbf0fc5056ca818797648dde4).
 RUNTIME_SHA256 = "399ff69c431c066e40de318fba45c2b07f45a76b19939d247ee4828fc70c4215"
 RUNTIME_LINKS = ("codex", "codex-linux-sandbox")
+# Models whose metadata selects code_mode_only run every tool through this companion, and
+# 0.163.0 has no in-process runner: without it they fail closed. Codex spawns it from the
+# runtime binary's directory over stdio, inside the outer sandbox, with no network listener.
+# Extracted binary from rust-v0.163.0 codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz
+# (archive sha256 314263128ba6592e7e807c265deeaf928a692b72dcbfeb5e0b20c9423b703529).
+CODE_MODE_HOST = RUNTIME_DIR + "/codex-code-mode-host"
+CODE_MODE_HOST_SHA256 = "8724d73ec190536233ab4628d24a071bfbcf27e5124f08fe35129f26fe48b916"
 BWRAP = "/usr/bin/bwrap"
 GUARD_PYTHON = "/usr/bin/python3"
 AGENT_USER = "ddagent"
@@ -312,10 +319,23 @@ def agent_identity():
     return pw
 
 
-def runtime_state(attestation):
-    st = trusted_chain(RUNTIME_BINARY, "runtime_untrusted")
+def pinned_executable(path, expected, attestation, stat_field, digest_field):
+    st = trusted_chain(path, "runtime_untrusted")
     if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o100:
         raise Refusal("runtime_untrusted")
+    key = [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+    # status may reuse an attested digest when the root-owned file is provably unchanged.
+    if attestation and attestation.get(stat_field) == key and attestation.get(digest_field) == expected:
+        digest = expected
+    else:
+        digest = sha256_file(path)
+    if digest != expected:
+        raise Refusal("runtime_hash_mismatch")
+    return key
+
+
+def runtime_state(attestation):
+    key = pinned_executable(RUNTIME_BINARY, RUNTIME_SHA256, attestation, "runtime_stat", "runtime_sha256")
     trusted_chain(RUNTIME_BIN_DIR, "runtime_untrusted")
     for name in RUNTIME_LINKS:
         try:
@@ -323,15 +343,9 @@ def runtime_state(attestation):
                 raise Refusal("runtime_untrusted")
         except OSError:
             raise Refusal("runtime_untrusted")
-    key = [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
-    # status may reuse an attested digest when the root-owned file is provably unchanged.
-    if attestation and attestation.get("runtime_stat") == key and attestation.get("runtime_sha256") == RUNTIME_SHA256:
-        digest = RUNTIME_SHA256
-    else:
-        digest = sha256_file(RUNTIME_BINARY)
-    if digest != RUNTIME_SHA256:
-        raise Refusal("runtime_hash_mismatch")
-    return key
+    host_key = pinned_executable(CODE_MODE_HOST, CODE_MODE_HOST_SHA256, attestation,
+                                 "code_mode_host_stat", "code_mode_host_sha256")
+    return key, host_key
 
 
 def bwrap_state():
@@ -386,7 +400,7 @@ def installation(attestation=None):
     helper = os.path.realpath(__file__)
     if not stat.S_ISREG(trusted_chain(helper, "helper_untrusted").st_mode):
         raise Refusal("helper_untrusted")
-    runtime_stat = runtime_state(attestation)
+    runtime_stat, host_stat = runtime_state(attestation)
     identity = agent_identity()
     bwrap_digest = bwrap_state()
     state_layout(identity)
@@ -397,6 +411,8 @@ def installation(attestation=None):
         "codex_version": CODEX_VERSION,
         "runtime_sha256": RUNTIME_SHA256,
         "runtime_stat": runtime_stat,
+        "code_mode_host_sha256": CODE_MODE_HOST_SHA256,
+        "code_mode_host_stat": host_stat,
         "policy_sha256": policy_sha256(),
         "helper_sha256": sha256_file(helper),
         "bwrap_sha256": bwrap_digest,
@@ -1594,6 +1610,11 @@ def run_probe(identity, checks, diagnostics):
         checks["scratch_identity_enforced"] = (diagnostics["guard"]["exit"] == GUARD_EXIT and not guarded
                                                and not os.path.lexists(paths["work"] + "/.ddagent-guard")
                                                and checks["outer_sandbox_isolated"])
+        # The App Server spawns the code-mode host from this context; models that run tools only
+        # through code mode fail closed if it cannot start here.
+        host, diagnostics["code_mode_host"] = run_sandboxed_flags(identity, context, paths["work"], paths["home"], [
+            "/bin/sh", "-c", '"$0" --help >/dev/null && echo code_mode_host_ran=1', CODE_MODE_HOST], 30)
+        checks["code_mode_host_executes"] = host.get("code_mode_host_ran") is True
         tool_command = [RUNTIME_BIN_DIR + "/codex", "sandbox", "-P", PROFILE, "--include-managed-config", "-C", SANDBOX_WORK,
                         "--", "/bin/sh", "-c", PROBE_TOOL_SCRIPT, "probe", paths["secret"], paths["live"],
                         str(identity.pw_uid), port, PROBE_NET]

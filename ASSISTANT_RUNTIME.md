@@ -6,7 +6,7 @@ Applying scratch changes to a live install is a separate, trusted launcher/manua
 operation and is never done by this tool. A task ID or `--yes` grants nothing.
 
 ```bash
-install_assistant_runtime [--archive PATH] [--install-prerequisites]   # root, explicit
+install_assistant_runtime [--archive PATH] [--host-archive PATH] [--install-prerequisites]   # root, explicit
 ddistro_agent status            # any user; one JSON line
 ddistro_agent probe             # root; real sandbox probe; writes the attestation
 ddistro_agent serve --task ID   # root; raw Codex App Server JSONL on stdin/stdout
@@ -22,11 +22,25 @@ ddistro_agent serve --task ID   # root; raw Codex App Server JSONL on stdin/stdo
 | Binary SHA256 | `399ff69c431c066e40de318fba45c2b07f45a76b19939d247ee4828fc70c4215` |
 | Installed binary | `/opt/dwemerdistro-agent/runtime/codex-x86_64-unknown-linux-musl` (root, `0755`) |
 | Helper links | `/opt/dwemerdistro-agent/runtime/bin/{codex,codex-linux-sandbox}` -> `../codex-x86_64-unknown-linux-musl` |
+| Code-mode host archive | `https://github.com/openai/codex/releases/download/rust-v0.163.0/codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz` |
+| Host archive SHA256 | `314263128ba6592e7e807c265deeaf928a692b72dcbfeb5e0b20c9423b703529` |
+| Host binary SHA256 | `8724d73ec190536233ab4628d24a071bfbcf27e5124f08fe35129f26fe48b916` |
+| Installed host | `/opt/dwemerdistro-agent/runtime/codex-code-mode-host` (root, `0755`) |
 
-The installer requires root and x86_64. It checks the archive hash before listing or
-extracting it, accepts only the single expected regular file, checks the extracted
-binary hash, and installs atomically. Rerunning it changes nothing when the binary
-already matches. It never installs packages unless `--install-prerequisites` is given.
+The installer requires root and x86_64. For each archive it checks the archive hash before
+listing or extracting it, accepts only the single expected regular file, checks the extracted
+binary hash, and installs atomically. Rerunning it changes nothing when both binaries
+already match; installing either one removes the attestation.
+
+The code-mode host is the official companion from the same release. Models whose metadata
+selects `code_mode_only` run every tool through it, and Codex 0.163.0 has no in-process
+code-mode runner: `features.code_mode_host = false` selects a disabled provider, and only
+`code_mode` (not `code_mode_only`) falls back to direct tools. Without the host such a model
+cannot run any tool (`failed to spawn code-mode host .../codex-code-mode-host`). The App
+Server starts it from the runtime binary's directory with piped stdio and no arguments, so
+it runs as `ddagent` in the same outer sandbox and opens no listener. Its JavaScript has no
+network, file, process, or import access; it can only call the session's tools, which still
+go through the `dwemer-scratch` tool sandbox. It never installs packages unless `--install-prerequisites` is given.
 Bubblewrap must support `--bind-fd`, `--ro-bind-data`, `--clearenv`, and
 `--die-with-parent`. The installer and `status` check the installed `bwrap --help` for these
 features, not its version: distro builds backport `--bind-fd` (Ubuntu 24.04's 0.9.0 and
@@ -169,7 +183,7 @@ and exits `0`. `reason` is one of:
 `probe` prints `{"passed", "checks": {name: bool}, "diagnostics"}`. It exits `0` only when
 every check passes, and only then writes the attestation. Any failure removes an existing
 attestation. If a session holds the lock, it exits `75` with only `lock_available: false`
-and leaves the attestation unchanged. `diagnostics` has, per step (`outer`, `guard`, `tool`,
+and leaves the attestation unchanged. `diagnostics` has, per step (`outer`, `guard`, `code_mode_host`, `tool`,
 `app_server`, `cancellation`, or `setup`), the exit status (negative for a signal) and up to
 20 redacted stderr lines from the last 4 KiB, plus the broker's failure reason. Once the App
 Server exits or a reply times out, the remaining App Server checks fail immediately instead of
@@ -181,6 +195,7 @@ world-readable host secret, world-writable fake live directory, and loopback lis
 |---|---|
 | `outer_sandbox_isolated` | App Server context is `ddagent`, `NoNewPrivs`, `CapEff` 0, and sees no `/mnt`, `/run`, `/var`, or host secrets |
 | `provider_network` | App Server context reaches `chatgpt.com:443` |
+| `code_mode_host_executes` | the pinned code-mode host starts in the App Server context |
 | `scratch_identity_enforced` | told to expect a different directory at `/work`, the guard exits `97` and the command never runs (no marker file) |
 | `tool_sandbox_executes` | `codex sandbox -P dwemer-scratch --include-managed-config` really ran the probe script |
 | `scratch_write` | tool wrote `/work`; root sees the file owned by `ddagent` |
@@ -197,7 +212,7 @@ world-readable host secret, world-writable fake live directory, and loopback lis
 | `orderly_shutdown`, `cancellation_cleanup` | EOF and SIGTERM both leave no `ddagent` process |
 | `lock_singleton`, `account_home_stays_managed` | second lock fails; Codex did not create a user config |
 
-The attestation is bound to the runtime hash and file identity, the policy hash, the
+The attestation is bound to the runtime and code-mode host hashes and file identities, the policy hash, the
 `ddistro_agent` hash, the bubblewrap hash, the kernel release and version, and the
 `ddagent` UID and GID. A change to any of them makes `status` report `probe_stale` and
 makes serve refuse. A root-owned attestation that is group- or other-writable is ignored.

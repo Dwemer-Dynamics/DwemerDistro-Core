@@ -2,10 +2,10 @@
 # Explicit installer for the DwemerDistro assistant runtime (pinned native Codex).
 # See ASSISTANT_RUNTIME.md. Root only; idempotent; never touches an existing sign-in.
 #
-#   install_assistant_runtime [--archive PATH] [--install-prerequisites]
+#   install_assistant_runtime [--archive PATH] [--host-archive PATH] [--install-prerequisites]
 #
-# Without --archive the pinned release is downloaded over HTTPS. The archive hash is
-# verified before extraction and the extracted binary hash before it is installed.
+# Without --archive/--host-archive the pinned release assets are downloaded over HTTPS. Each
+# archive hash is verified before extraction and the extracted binary hash before install.
 set -euo pipefail
 umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -14,12 +14,19 @@ CODEX_URL="https://github.com/openai/codex/releases/download/rust-v0.163.0/codex
 ARCHIVE_SHA256="beb339e8ecd9ba057a6bb2dc81ad8ca474812edfbf0fc5056ca818797648dde4"
 BINARY_NAME="codex-x86_64-unknown-linux-musl"
 BINARY_SHA256="399ff69c431c066e40de318fba45c2b07f45a76b19939d247ee4828fc70c4215"
+# Code-mode companion from the same release; Codex 0.163.0 has no in-process code-mode runner.
+HOST_URL="https://github.com/openai/codex/releases/download/rust-v0.163.0/codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz"
+HOST_ARCHIVE_SHA256="314263128ba6592e7e807c265deeaf928a692b72dcbfeb5e0b20c9423b703529"
+HOST_BINARY_NAME="codex-code-mode-host-x86_64-unknown-linux-musl"
+HOST_BINARY_SHA256="8724d73ec190536233ab4628d24a071bfbcf27e5124f08fe35129f26fe48b916"
+HOST_INSTALLED_NAME="codex-code-mode-host"
 RUNTIME_ROOT="/opt/dwemerdistro-agent"
 RUNTIME_DIR="$RUNTIME_ROOT/runtime"
 AGENT_USER="ddagent"
 STATE_ROOT="/var/lib/dwemerdistro/assistant"
 
 ARCHIVE=""
+HOST_ARCHIVE=""
 INSTALL_PREREQUISITES=0
 
 die() {
@@ -34,12 +41,17 @@ while [ "$#" -gt 0 ]; do
             ARCHIVE="$2"
             shift 2
             ;;
+        --host-archive)
+            [ "$#" -ge 2 ] || die "--host-archive needs a path"
+            HOST_ARCHIVE="$2"
+            shift 2
+            ;;
         --install-prerequisites)
             INSTALL_PREREQUISITES=1
             shift
             ;;
         -h|--help)
-            sed -n '2,8p' "$0"
+            sed -n '2,9p' "$0"
             exit 0
             ;;
         *)
@@ -74,43 +86,54 @@ WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 chmod 0700 "$WORK_DIR"
 
-if [ -f "$RUNTIME_DIR/$BINARY_NAME" ] && [ "$(sha256sum "$RUNTIME_DIR/$BINARY_NAME" | awk '{print $1}')" = "$BINARY_SHA256" ]; then
-    printf '>> Pinned runtime already installed.\n'
-    RUNTIME_CHANGED=0
-else
-    if [ -n "$ARCHIVE" ]; then
-        [ -f "$ARCHIVE" ] && [ ! -L "$ARCHIVE" ] || die "archive not found: $ARCHIVE"
-        cp -- "$ARCHIVE" "$WORK_DIR/codex.tar.gz"
+RUNTIME_CHANGED=0
+
+# install_pinned LABEL URL ARCHIVE_SHA256 MEMBER BINARY_SHA256 INSTALLED_NAME [LOCAL_ARCHIVE]
+install_pinned() {
+    local label="$1" url="$2" archive_sha="$3" member="$4" binary_sha="$5" name="$6" local_archive="${7:-}"
+    local target="$RUNTIME_DIR/$name" archive="$WORK_DIR/$member.tar.gz" listing
+    if [ -f "$target" ] && [ ! -L "$target" ] && [ "$(sha256sum "$target" | awk '{print $1}')" = "$binary_sha" ]; then
+        printf '>> Pinned %s already installed.\n' "$label"
+        return 0
+    fi
+    if [ -n "$local_archive" ]; then
+        [ -f "$local_archive" ] && [ ! -L "$local_archive" ] || die "archive not found: $local_archive"
+        cp -- "$local_archive" "$archive"
     else
-        command -v curl >/dev/null 2>&1 || die "curl is required to download the runtime (or pass --archive PATH)"
-        printf '>> Downloading %s\n' "$CODEX_URL"
-        curl --proto '=https' --tlsv1.2 -fsSL --max-time 900 -o "$WORK_DIR/codex.tar.gz" "$CODEX_URL" \
+        command -v curl >/dev/null 2>&1 || die "curl is required to download the $label (or pass its archive)"
+        printf '>> Downloading %s\n' "$url"
+        curl --proto '=https' --tlsv1.2 -fsSL --max-time 900 -o "$archive" "$url" \
             || die "download failed"
     fi
-    [ "$(sha256sum "$WORK_DIR/codex.tar.gz" | awk '{print $1}')" = "$ARCHIVE_SHA256" ] \
-        || die "archive SHA256 does not match the pinned release; nothing was extracted"
+    [ "$(sha256sum "$archive" | awk '{print $1}')" = "$archive_sha" ] \
+        || die "$label archive SHA256 does not match the pinned release; nothing was extracted"
     # Exactly one regular file with the expected name, before anything is extracted.
-    LISTING="$(tar -tvzf "$WORK_DIR/codex.tar.gz")"
-    [ "$(printf '%s\n' "$LISTING" | wc -l)" = "1" ] || die "unexpected archive layout"
-    case "$LISTING" in
-        -*" $BINARY_NAME") ;;
-        *) die "unexpected archive layout" ;;
+    listing="$(tar -tvzf "$archive")"
+    [ "$(printf '%s\n' "$listing" | wc -l)" = "1" ] || die "unexpected $label archive layout"
+    case "$listing" in
+        -*" $member") ;;
+        *) die "unexpected $label archive layout" ;;
     esac
+    rm -rf "$WORK_DIR/extract"
     mkdir "$WORK_DIR/extract"
-    tar -xzf "$WORK_DIR/codex.tar.gz" -C "$WORK_DIR/extract" --no-same-owner --no-same-permissions -- "$BINARY_NAME"
-    [ -f "$WORK_DIR/extract/$BINARY_NAME" ] && [ ! -L "$WORK_DIR/extract/$BINARY_NAME" ] || die "unexpected archive layout"
-    [ "$(sha256sum "$WORK_DIR/extract/$BINARY_NAME" | awk '{print $1}')" = "$BINARY_SHA256" ] \
-        || die "extracted binary SHA256 does not match the pinned runtime"
+    tar -xzf "$archive" -C "$WORK_DIR/extract" --no-same-owner --no-same-permissions -- "$member"
+    [ -f "$WORK_DIR/extract/$member" ] && [ ! -L "$WORK_DIR/extract/$member" ] || die "unexpected $label archive layout"
+    [ "$(sha256sum "$WORK_DIR/extract/$member" | awk '{print $1}')" = "$binary_sha" ] \
+        || die "extracted $label SHA256 does not match the pinned release"
     install -d -o root -g root -m 0755 "$RUNTIME_ROOT" "$RUNTIME_DIR"
-    install -o root -g root -m 0755 "$WORK_DIR/extract/$BINARY_NAME" "$RUNTIME_DIR/.$BINARY_NAME.new"
-    mv -f "$RUNTIME_DIR/.$BINARY_NAME.new" "$RUNTIME_DIR/$BINARY_NAME"
-    printf '>> Installed pinned runtime %s\n' "$BINARY_SHA256"
+    install -o root -g root -m 0755 "$WORK_DIR/extract/$member" "$RUNTIME_DIR/.$name.new"
+    mv -f "$RUNTIME_DIR/.$name.new" "$target"
+    printf '>> Installed pinned %s %s\n' "$label" "$binary_sha"
     RUNTIME_CHANGED=1
-fi
+}
+
+install_pinned runtime "$CODEX_URL" "$ARCHIVE_SHA256" "$BINARY_NAME" "$BINARY_SHA256" "$BINARY_NAME" "$ARCHIVE"
+install_pinned "code-mode host" "$HOST_URL" "$HOST_ARCHIVE_SHA256" "$HOST_BINARY_NAME" "$HOST_BINARY_SHA256" \
+    "$HOST_INSTALLED_NAME" "$HOST_ARCHIVE"
 
 install -d -o root -g root -m 0755 "$RUNTIME_ROOT" "$RUNTIME_DIR" "$RUNTIME_DIR/bin"
-chown root:root "$RUNTIME_DIR/$BINARY_NAME"
-chmod 0755 "$RUNTIME_DIR/$BINARY_NAME"
+chown root:root "$RUNTIME_DIR/$BINARY_NAME" "$RUNTIME_DIR/$HOST_INSTALLED_NAME"
+chmod 0755 "$RUNTIME_DIR/$BINARY_NAME" "$RUNTIME_DIR/$HOST_INSTALLED_NAME"
 for LINK in codex codex-linux-sandbox; do
     ln -sfn "../$BINARY_NAME" "$RUNTIME_DIR/bin/$LINK"
 done

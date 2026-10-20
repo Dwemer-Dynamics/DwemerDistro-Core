@@ -16,6 +16,7 @@ ddistro changes diff|stage|status|rollback TASK | changes list    # root only
 ddistro changes apply TASK --manifest-sha256 HASH                 # root only
 ddistro agent status | agent probe                                # probe root only, see Assistant agent
 ddistro agent serve --task TASK                                   # root only, raw JSONL
+ddistro models herika                                             # root only, see Model assignments
 ```
 
 Products are the five `ddistro_server` products: `herika` (aliases `chim`, `skyrim`),
@@ -58,6 +59,7 @@ stdout and failures are `[FAIL] ...` on stderr.
 codes; `features.file_changes` and `locks` are `true` and `chat` is `false`. `features.agent`
 is `true` only when the trusted `ddistro_agent` helper is installed; it never means the
 assistant is ready. Readiness comes only from `agent status` (`installed` and `probe_passed`).
+`features.models` and `capabilities.models` describe `models herika` (roles and limits).
 
 ## Status and update
 
@@ -160,6 +162,40 @@ that is an explicit `install_assistant_runtime` run as root.
   progress text. Refusals by `ddistro` itself are one `{"error", "reason"}` line on stderr
   with exit `64` (bad arguments) or `3` (`requires_root`, `helper_unavailable`); the
   helper's own refusals and exit codes are described in ASSISTANT_RUNTIME.md.
+
+## Model assignments
+
+`models herika` (aliases `chim`, `skyrim`; other products are `unsupported`, 69) reports the
+CHIM connector assigned to each role of each configured profile. These are configured profile
+assignments, not necessarily the profile an NPC is using.
+
+```json
+{"product": "herika", "available": true, "scope": "configured_profiles",
+ "captured_at": "2026-10-19T12:00:00Z", "truncated": false, "reason": "",
+ "assignments": [{"profile_id": 1, "profile": "Default", "role": "standard", "connector_id": 3,
+                  "connector": "OpenRouter", "model": "...", "provider": "...", "driver": "..."}]}
+```
+
+- Roles are `standard`, `fast`, `powerful`, `experimental`, `formatter`, `fallback`, and
+  `diary` (`core_profiles.llm_primary_id` ... `llm_quaternary_id`, `llm_formatter_id`,
+  `llm_fallback_id`, `diary_connector_id`), ordered by profile id then role. A role whose
+  field is absent from the schema is skipped; an unset or dangling connector id gives no row.
+- The read runs as `/usr/sbin/runuser -u postgres -- /usr/bin/psql -X -A -t -q --no-password`
+  over the local socket `/var/run/postgresql`, port `DDISTRO_POSTGRES_PORT` (digits) or 5432,
+  database `dwemer`, in one read-only transaction with connect, statement, and lock timeouts
+  and a minimal environment. Both binaries are trust-checked (`psql` may be one root-owned
+  link hop to `pg_wrapper`). There are no SQL, schema, or database arguments and no PHP.
+- Only fixed SQL runs: a names-only check of `information_schema.columns` for the known
+  `public` columns, then `public.core_profiles` `id`, `label`, and the role fields joined to
+  `public.core_llm_connector` `id`, `label`, `model`, `provider`, `driver`. URLs, metadata, API
+  keys and badges, prompts, and NPC data are never selected.
+- At most 200 assignments (`truncated: true` when there are more); each string is clipped,
+  redacted like log lines (URL credentials and queries, keys, tokens), made single-line, and
+  bounded to 256 characters. A missing label or model is `""`.
+- When the read cannot be made the result is still `ok` with `available: false`, no
+  assignments, and a `reason` token: `requires_root`, `helper_unavailable`,
+  `database_unavailable`, `schema_missing`, `query_failed`, `timeout`, or
+  `unexpected_output`. `psql` stderr and SQL are never returned, and no model is guessed.
 
 ## Trust boundaries and future scope
 
