@@ -96,6 +96,8 @@ its own process group. It runs in this unprivileged bubblewrap sandbox:
 - `--bind-fd` of the account home at `/agent/home` (`CODEX_HOME`) and the scratch copy
   at `/work`. bwrap mounts the resolved path and checks that the mount's device and inode
   match the descriptor.
+- an empty read-only tmpfs at `/agent/home/tmp/arg0-linux`, so Codex uses the pinned
+  runtime binary as its sandbox helper rather than an alias under `/agent` (see below)
 - a guard runs first, before Codex or any probe command. It is root-supplied Python code,
   run by `/usr/bin/python3 -I -S` from the read-only `/usr`, as `ddagent`. It requires that
   the real, effective, and saved UID and GID are `ddagent`'s, that there are no supplementary
@@ -115,15 +117,20 @@ redefine it, sets:
 - deny: `/agent`
 - tool network: disabled
 
-Codex 0.163.0 always creates a per-session helper alias directory,
+Codex 0.163.0 tries to create a per-session helper alias directory,
 `/agent/home/tmp/arg0-linux/codex-arg0*`, holding `apply_patch`, `applypatch`, and
-`codex-linux-sandbox` symlinks to the pinned runtime binary plus a lock file. Codex adds
-that one directory as a read-only root of the active profile. It is the most specific
-entry, so it overrides the `/agent` deny for Codex itself. Nothing else under
-`/agent/home` is readable: not `auth.json`, sessions, logs, state databases, `tmp`, or a
-listing of the home. In the Linux tool sandbox the `/agent` deny is a `000` read-only
-tmpfs mounted after the read roots, so tools cannot see the helper either. Codex re-execs
-its sandbox stage through the runtime binary, not the alias.
+`codex-linux-sandbox` symlinks to the runtime binary, and would use that alias as its
+sandbox helper. When the system bwrap has no `--argv0` (Debian 12's `0.8.0`), the tool
+sandbox execs the helper by that alias path, which is under the masked `/agent`, so every
+sandboxed command and the `AGENTS.md` load at `thread/start` failed with `bwrap: execvp
+/agent/home/tmp/arg0-linux/.../codex-linux-sandbox: Permission denied`. (Ubuntu 24.04's
+bwrap `0.9.0` has `--argv0`, so the alias was never exec'd there.) The outer sandbox
+therefore mounts an empty read-only tmpfs at `/agent/home/tmp/arg0-linux`. Codex cannot
+create the alias, prints `WARNING: proceeding, even though we could not create PATH
+aliases`, and uses the pinned runtime binary under the readable runtime directory as its
+helper on every distro. No helper directory is added to the profile. Nothing under `/agent`
+is readable in the Linux tool sandbox: not `auth.json`, sessions, logs, state databases,
+`tmp`, or a listing of the home. There the `/agent` deny is a `000` read-only tmpfs.
 
 The requirements have no managed `[permissions.filesystem] deny_read`. Codex rejects
 startup if any managed `deny_read` root contains the helper directory, and it has no

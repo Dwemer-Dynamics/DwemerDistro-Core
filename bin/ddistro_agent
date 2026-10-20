@@ -70,6 +70,7 @@ SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 # Paths inside the sandbox.
 PROFILE = "dwemer-scratch"
 SANDBOX_HOME = "/agent/home"
+ARG0_ALIAS_ROOT = SANDBOX_HOME + "/tmp/arg0-linux"
 SANDBOX_WORK = "/work"
 SANDBOX_CONTEXT = "/task/task.json"
 SANDBOX_USER_HOME = "/home/ddagent"
@@ -85,7 +86,7 @@ UNMANAGED_HOME_FILES = ("config.toml", "managed_config.toml", "requirements.toml
 
 SCHEMA_VERSION = 1
 ATTESTATION_SCHEMA = 1
-LAYOUT_VERSION = "ddagent-sandbox-1"
+LAYOUT_VERSION = "ddagent-sandbox-2"
 TASK_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 PRODUCT_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}\Z")
 CLIENT_LINE_LIMIT = 8 * 1024 * 1024
@@ -118,9 +119,9 @@ LIBC = ctypes.CDLL(None, use_errno=True)
 # root, and rejects startup if any managed deny_read root contains it. A managed deny on /agent,
 # /agent/home or /agent/home/tmp therefore cannot load, and exact managed denies beneath the
 # profile's /agent deny would be nested masks under its read-only tmpfs, which the Linux sandbox
-# does not support. The only selectable profile denies /agent, so the most specific entry
-# leaves Codex itself only that helper directory readable, and the Linux sandbox masks all of
-# /agent (helper included) for tools.
+# does not support. The only selectable profile denies /agent, and the Linux sandbox masks all
+# of /agent for tools. sandbox_command makes the alias root read-only, so Codex skips the alias
+# (and its extra readable root) and uses the pinned runtime binary as its sandbox helper.
 # There is deliberately no legacy allowed_sandbox_modes either: Codex 0.163.0 classifies any
 # profile with a write entry as workspace-write, so ["read-only"] would reject dwemer-scratch and
 # fall back to a read-only profile. allowed_permission_profiles and default_permissions are the
@@ -700,7 +701,12 @@ def sandbox_command(identity, context, work_fd, home_fd, command, expect=None):
             os.close(write_fd)
         fds.append(read_fd)
         argv += ["--ro-bind-data", str(read_fd), dest]
+    # Read-only empty arg0 alias root: Codex cannot create its per-session alias directory, warns,
+    # and uses the pinned runtime binary as its sandbox helper. On a bwrap without --argv0
+    # (Debian 12's 0.8.0) the helper would otherwise be exec'd by its alias path under the denied
+    # /agent and fail inside the tool sandbox.
     argv += ["--bind-fd", str(home_fd), SANDBOX_HOME, "--bind-fd", str(work_fd), SANDBOX_WORK,
+             "--tmpfs", ARG0_ALIAS_ROOT, "--remount-ro", ARG0_ALIAS_ROOT,
              "--chdir", SANDBOX_WORK, "--"] + guard + list(command)
     return argv, fds + [home_fd, work_fd]
 
