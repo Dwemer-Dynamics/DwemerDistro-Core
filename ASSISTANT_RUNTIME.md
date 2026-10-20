@@ -277,6 +277,7 @@ The broker relays JSONL both ways and forwards only these client methods:
 | `turn/start` | `threadId` (this task), `input` (only `text` items and `image` items with a `data:image/` or `https://` URL), `model`, `effort`, `summary`, `outputSchema`, `personality`, `serviceTier`, `clientUserMessageId` |
 | `turn/interrupt` | `threadId` (this task), `turnId` |
 | `thread/archive`, `thread/unarchive`, `thread/delete` | `threadId` (this task) only; see "Thread archive and delete" |
+| `ddistro/action/decide` | `proposalId`, `threadId`, `decision` (`approve`/`cancel`); answered by the broker, never forwarded; see "ddistro_action" |
 
 For thread and turn requests, `approvalPolicy` may only be `never`, and `cwd` only
 `/work`; the broker sets both. `permissions` may only be `dwemer-scratch`.
@@ -422,6 +423,39 @@ per-turn and per-session budgets (the two tools count together). Recalled notes 
 as tool data marked `non_authoritative`; a note cannot change the policy, the sandbox, the
 declarations, or what a tool may do, and it never replaces fresh `ddistro_read` evidence.
 
+### ddistro_action live action
+
+The one live action. A client opts in with `initialize` `capabilities.ddistroActions:
+["restart_service"]` (with `experimentalApi: true`); the broker removes the field before
+Codex sees it, and any other value is refused. Only then does `thread/start` also declare
+`ACTION_SPEC`: strict `{"operation": "propose_restart", "service": "apache", "reason": <= 300
+chars}`. Threads started without it never get it, and older clients are unchanged.
+
+The model can only propose. On a valid call from one of this task's threads, with a `turnId`,
+at most one per turn and one pending per session, the broker records an in-memory proposal
+with a random id and a 60 second expiry, and sends the client `ddistro/action/proposed`
+`{proposalId, threadId, turnId, action: "restart", service, label, impact, reason, expiresAt}`.
+The tool call waits; the model never sees the id. Only the client's `ddistro/action/decide`
+for that id and thread, while it is still pending and unexpired, changes it, once, under the
+broker lock: a replay, a late or second decision, or an unknown id is refused with `-32001`
+and runs nothing. `turn/start` or `turn/interrupt` of that thread, any `thread/start` or
+`thread/resume`, client EOF, a signal, or the expiry ends a pending proposal with nothing run.
+
+After `approve`, if the session is not closing, the broker runs exactly `/usr/local/bin/ddistro
+service restart <service> --json` as root, under the same trusted-helper rules as
+`ddistro_read` (90 s, 1 MiB). It is not adopted into the session's stoppable runs: once
+started, a restart is allowed to finish, because stopping it midway could leave the service
+down. Session teardown waits for it (bounded by the 90 s run limit) so its result is still sent;
+the root CLI runs in its own session and holds the maintenance lock until it finishes either way.
+The client then gets `ddistro/action/updated` `{proposalId, threadId, state, executed,
+verified, checks}`, and the model gets `{tool, operation, service, captured_at, state,
+proposed, user_approved, executed, verified, data|error}`. `state` is `refused` (invalid or a
+second proposal this turn), `busy`, `cancelled`, `expired`, `not_executed` (approved but
+refused before running), `failed` (ran, or may have run when stopped at the 90 s limit or its
+result was unreadable; the fresh check did not pass), or `verified` (ran; a
+new process and every configured port answered). `success` is true only for `verified`. The
+model has no path to approve, choose a command, a unit, or a path, or reach any other service.
+
 ### Thread archive and delete
 
 `thread/archive`, `thread/unarchive`, and `thread/delete` (Codex 0.163.0 stable,
@@ -452,6 +486,10 @@ a static fact that adds no command and opens no database.
 - The account-home repair removes the trust entry but does not stop it from being written again (the source of the original file is unverified).
   An account-free `thread/start` with the pinned runtime did not write one (fixture), so what
   wrote it is not known; prevention through the managed config was not tested and is not done.
+- `ddistro_action` holds Codex's dynamic tool call open while the user decides (at most 60 s,
+  then up to about 75 s for the restart and its check). Whether Codex 0.163.0 bounds a dynamic
+  tool call more tightly was not measured; if it does, the turn ends first and the proposal
+  expires with nothing run.
 - The task mapping keeps the 256 most recently started threads in start order, so `thread/list`
   orders by start time and cannot list older threads. A thread started between two pages
   shifts nothing, because the cursor is a thread id, not an offset.

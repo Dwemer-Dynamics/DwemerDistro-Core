@@ -206,6 +206,36 @@ MEMORY_SPEC = {
                  "description": "remember only: one self-contained sentence"},
         "kind": {"type": "string", "enum": list(MEMORY_KINDS), "description": "remember only"}}},
 }
+# The one live action. The model can only propose it; the broker announces the proposal to the client
+# (ddistro/action/proposed, with an id the model never sees), and only the client's ddistro/action/decide approve
+# for that pending, unexpired proposal of the same thread runs fixed `ddistro service restart <service>` as root.
+# Declared only to a client that opts in with initialize capabilities.ddistroActions ["restart_service"].
+ACTION_TOOL = "ddistro_action"
+ACTION_CAPABILITY = "restart_service"
+# Mirrors ddistro SERVICE_RESTARTS; ddistro validates the name again.
+ACTION_SERVICES = {
+    "apache": ("Apache web server", "Apache is shared: CHIM (HerikaServer), STOBE and Dialectic web servers and custom "
+                                    "PHP mods stop answering for a few seconds, and requests in progress fail."),
+}
+ACTION_REASON_CHARS = 300
+# ddistro errors raised before the init script starts, or the run could not start at all: only these mean nothing ran.
+ACTION_NOT_RUN_CODES = ("failed", "helper_untrusted", "helper_unavailable", "unsafe_path", "permission_denied", "unsupported",
+                        "invalid_argument")
+ACTION_APPROVAL_SECONDS = 60
+ACTION_SPEC = {
+    "type": "function", "name": ACTION_TOOL,
+    "description": "Propose restarting one allowlisted DwemerDistro service. You cannot approve or run it: the user sees "
+                   "an Approve restart / Cancel prompt in the launcher, and only their approval runs it. The reply says "
+                   "whether it was cancelled, expired, refused, or executed, and whether a fresh check verified it; report "
+                   "exactly that. Propose only after fresh ddistro_read evidence shows the restart is warranted, at most "
+                   "once per turn.",
+    "inputSchema": {"type": "object", "additionalProperties": False, "required": ["operation", "service", "reason"],
+                    "properties": {
+                        "operation": {"type": "string", "enum": ["propose_restart"]},
+                        "service": {"type": "string", "enum": list(ACTION_SERVICES)},
+                        "reason": {"type": "string", "maxLength": ACTION_REASON_CHARS,
+                                   "description": "one plain sentence shown to the user: why the restart should help"}}},
+}
 TOOL_TIMEOUT = 90
 TOOL_STDOUT_LIMIT = 1024 * 1024
 TOOL_TEXT_BUDGET = 64 * 1024
@@ -1208,7 +1238,7 @@ def run_ddistro(argv, registry=None):
         document = json.loads(out.decode("utf-8"))
     except ValueError:
         document = None
-    expected = " ".join(argv[:2]) if argv[0] == "memory" else argv[0]
+    expected = " ".join(argv[:2]) if argv[0] in ("memory", "service") else argv[0]
     if (not isinstance(document, dict) or document.get("schema_version") != 1 or document.get("command") != expected
             or document.get("ok") not in (True, False)):
         return False, {"code": "helper_protocol", "message": "ddistro returned an unexpected document"}
@@ -1275,6 +1305,12 @@ class Broker:
         self.failure = None
         self.stop_timer = None
         self.closed = False
+        # ddistro_action: declared only after the client opts in; proposals live only in this session's memory.
+        self.actions = False
+        self.proposals = {}
+        self.proposed_turns = set()
+        # The tool thread running an approved restart, which teardown waits for (see _stop_children).
+        self.action_job = None
 
     def run(self):
         reader = threading.Thread(target=self._pump_client, daemon=True)
@@ -1303,6 +1339,7 @@ class Broker:
 
     def _stop_diagnostics(self):
         """No new runs; SIGTERM then SIGKILL exactly the adopted groups; join every tool thread."""
+        self._cancel_proposals(None, "cancelled")
         with self.state_lock:
             self.stopping = True
             first = not self.diagnostics_claimed
@@ -1329,6 +1366,12 @@ class Broker:
         for job in jobs:
             # Bounded: each remaining run was just SIGKILLed and only has to be reaped.
             job.join(TOOL_STOP_GRACE + 3)
+        with self.state_lock:
+            action = self.action_job
+        if action is not None:
+            # An approved restart is never stopped (see _run_action). Wait for its fresh check so the client still gets the
+            # result, bounded by run_ddistro's own timeout; the root CLI runs in its own session and finishes regardless.
+            action.join(TOOL_TIMEOUT + 5)
 
     def request_stop(self):
         """Signal-safe (takes no locks): no new diagnostics, then terminate only this session's process group.
@@ -1433,7 +1476,13 @@ class Broker:
                 self._reply_error(request_id, -32600, "request id prefix is reserved")
                 return
             try:
+                if method == "ddistro/action/decide":
+                    self._decide_action(request_id, message.get("params"))
+                    return
                 message["params"] = self._authorize(method, message.get("params"))
+                if method in ("turn/start", "turn/interrupt"):
+                    # A new or stopped turn ends any pending proposal: it can no longer be approved.
+                    self._cancel_proposals(message["params"].get("threadId"), "cancelled")
                 if method == "thread/list":
                     self._list_threads(request_id, message["params"])
                     return
@@ -1471,6 +1520,11 @@ class Broker:
             if experimental not in (None, True, False):
                 raise PolicyError(-32602, "invalid parameter: capabilities.experimentalApi")
             self.experimental = experimental is True
+            actions = capabilities.pop("ddistroActions", None) if isinstance(capabilities, dict) else None
+            if actions not in (None, [], [ACTION_CAPABILITY]):
+                raise PolicyError(-32602, "invalid parameter: capabilities.ddistroActions")
+            # Codex never sees this broker-only field; the action needs the dynamic tools experimentalApi enables.
+            self.actions = actions == [ACTION_CAPABILITY] and self.experimental
             return params
         if method in SIMPLE_METHODS:
             reject_unknown(params, SIMPLE_METHODS[method])
@@ -1485,7 +1539,9 @@ class Broker:
             reject_unknown(params, THREAD_START_KEYS)
             # Client tool declarations are never accepted; the broker owns the exact declaration.
             if self.experimental:
-                params["dynamicTools"] = [TOOL_SPEC] + ([MEMORY_SPEC] if self.memory else [])
+                params["dynamicTools"] = ([TOOL_SPEC] + ([MEMORY_SPEC] if self.memory else [])
+                                          + ([ACTION_SPEC] if self.actions else []))
+            self._cancel_proposals(None, "cancelled")
             return enforce_sandbox(params)
         if method == "thread/resume":
             reject_unknown(params, THREAD_RESUME_KEYS)
@@ -1494,6 +1550,7 @@ class Broker:
             if params.get("excludeTurns") not in (None, True):
                 raise PolicyError(-32602, "excludeTurns must be true; page history with thread/turns/list")
             params["excludeTurns"] = True
+            self._cancel_proposals(None, "cancelled")
             return enforce_sandbox(params)
         if method == "thread/read":
             reject_unknown(params, ("threadId", "includeTurns"))
@@ -1838,8 +1895,8 @@ class Broker:
         try:
             try:
                 tool = params.get("tool")
-                if (tool not in (TOOL_NAME, MEMORY_TOOL) or tool == MEMORY_TOOL and not self.memory
-                        or params.get("namespace") is not None):
+                if (tool not in (TOOL_NAME, MEMORY_TOOL, ACTION_TOOL) or tool == MEMORY_TOOL and not self.memory
+                        or tool == ACTION_TOOL and not self.actions or params.get("namespace") is not None):
                     raise PolicyError(-32602, "unknown tool")
                 thread_id = params.get("threadId")
                 with self.state_lock:
@@ -1847,6 +1904,9 @@ class Broker:
                     task_id = self.threads.task_id
                 if not owned:
                     raise PolicyError(-32602, "threadId does not belong to this task")
+                if tool == ACTION_TOOL:
+                    self._run_action(request_id, params, key)
+                    return
                 argv = (memory_argv(params.get("arguments"), task_id, thread_id) if tool == MEMORY_TOOL
                         else tool_argv(params.get("arguments")))
             except PolicyError as exc:
@@ -1863,6 +1923,141 @@ class Broker:
             with self.state_lock:
                 self.tool_jobs.discard(threading.current_thread())
             self.tool_slots.release()
+
+    # ddistro_action
+    def _cancel_proposals(self, thread_id, state):
+        """Ends every pending proposal (of thread_id, or all): it can no longer be approved and nothing runs."""
+        with self.state_lock:
+            for proposal in self.proposals.values():
+                if proposal["state"] == "proposed" and thread_id in (None, proposal["thread"]):
+                    proposal["state"] = state
+                    proposal["event"].set()
+
+    def _decide_action(self, request_id, params):
+        """The client's answer to one proposal. Single use: only a pending, unexpired proposal of the same thread
+        changes, under the lock, so a replayed, late, or racing decision changes nothing."""
+        if not isinstance(params, dict):
+            raise PolicyError(-32602, "params must be an object")
+        reject_unknown(params, ("proposalId", "threadId", "decision"))
+        if params.get("decision") not in ("approve", "cancel"):
+            raise PolicyError(-32602, "decision must be approve or cancel")
+        with self.state_lock:
+            proposal_id = params.get("proposalId")
+            proposal = self.proposals.get(proposal_id) if isinstance(proposal_id, str) else None
+            if proposal is None or proposal["thread"] != params.get("threadId"):
+                raise PolicyError(-32001, "no such proposal")
+            if proposal["state"] == "proposed" and (self.stopping or time.monotonic() > proposal["expires"]):
+                proposal["state"] = "expired"
+                proposal["event"].set()
+            if proposal["state"] != "proposed":
+                raise PolicyError(-32001, "proposal is no longer pending: " + proposal["state"])
+            proposal["state"] = "approved" if params["decision"] == "approve" else "cancelled"
+            proposal["event"].set()
+            state = proposal["state"]
+        self._to_client(encode({"id": request_id, "result": {"state": state}}))
+
+    def _run_action(self, request_id, params, key):
+        arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+        thread_id, turn_id = params.get("threadId"), params.get("turnId")
+        service = arguments.get("service") if arguments.get("service") in ACTION_SERVICES else None
+        try:
+            reject_unknown(arguments, ("operation", "service", "reason"))
+            if arguments.get("operation") != "propose_restart" or service is None:
+                raise PolicyError(-32602, "operation must be propose_restart and service one of " + ", ".join(ACTION_SERVICES))
+            reason = memory_value(arguments, "reason", ACTION_REASON_CHARS)
+            if not isinstance(turn_id, str) or not 0 < len(turn_id) <= 128:
+                raise PolicyError(-32602, "turnId is required")
+        except PolicyError as exc:
+            self._action_reply(request_id, service, "refused", {"code": "invalid_arguments", "message": exc.message}, key)
+            return
+        proposal = {"id": secrets.token_hex(16), "thread": thread_id, "turn": turn_id, "service": service,
+                    "state": "proposed", "event": threading.Event(),
+                    "expires": time.monotonic() + ACTION_APPROVAL_SECONDS}
+        with self.state_lock:
+            busy = self.stopping or any(p["state"] in ("proposed", "approved", "executing")
+                                        for p in self.proposals.values())
+            repeated = (thread_id, turn_id) in self.proposed_turns
+            if not (busy or repeated):
+                self.proposed_turns.add((thread_id, turn_id))
+                # Finished proposals are dropped; a decision for one is then "no such proposal", which also fails closed.
+                self.proposals = {proposal["id"]: proposal}
+        if busy or repeated:
+            self._action_reply(request_id, service, "busy" if busy else "refused", {
+                "code": "busy" if busy else "invalid_arguments",
+                "message": "another restart proposal is pending" if busy else "only one restart proposal per turn"}, key)
+            return
+        label, impact = ACTION_SERVICES[service]
+        expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + ACTION_APPROVAL_SECONDS))
+        self._to_client(encode({"method": "ddistro/action/proposed", "params": {
+            "proposalId": proposal["id"], "threadId": thread_id, "turnId": turn_id, "action": "restart",
+            "service": service, "label": label, "impact": impact, "reason": sanitize(reason), "expiresAt": expires_at}}))
+        while not proposal["event"].wait(CLIENT_POLL):
+            with self.state_lock:
+                if proposal["state"] == "proposed" and (self.stopping or time.monotonic() > proposal["expires"]):
+                    proposal["state"] = "cancelled" if self.stopping else "expired"
+                    proposal["event"].set()
+        with self.state_lock:
+            go = proposal["state"] == "approved" and not self.stopping
+            if go:
+                proposal["state"] = "executing"
+                self.action_job = threading.current_thread()
+            elif proposal["state"] == "approved":
+                proposal["state"] = "not_executed"
+            state = proposal["state"]
+        if not go:
+            self._finish_action(request_id, proposal, state, None, key)
+            return
+        # Not adopted into the session's stoppable runs: once started, a restart finishes even if the client leaves,
+        # because stopping it midway could leave the service down.
+        try:
+            ok, payload = self.run_tool(["service", "restart", service])
+        except (OSError, ValueError):
+            ok, payload = False, {"code": "failed", "message": "ddistro could not be run"}
+        code = payload.get("code") if isinstance(payload, dict) else None
+        if ok and isinstance(payload, dict) and payload.get("executed") is True:
+            verified = payload.get("verified") is True and payload.get("state") == "verified"
+            state = "verified" if verified else "failed"
+        elif code == "busy":
+            state = "busy"
+        elif code in ACTION_NOT_RUN_CODES:
+            state = "not_executed"
+        else:
+            # Stopped at its time bound or an unreadable result: the init script may have run, so never "not run".
+            state = "failed"
+        with self.state_lock:
+            proposal["state"] = state
+        self._finish_action(request_id, proposal, state, payload, key)
+
+    def _finish_action(self, request_id, proposal, state, payload, key):
+        detail = sanitize(payload) if isinstance(payload, dict) else None
+        executed = state in ("verified", "failed")
+        self._to_client(encode({"method": "ddistro/action/updated", "params": {
+            "proposalId": proposal["id"], "threadId": proposal["thread"], "state": state, "executed": executed,
+            "verified": state == "verified", "checks": detail.get("checks", []) if detail and executed else []}}))
+        if not self.stopping:
+            self._action_reply(request_id, proposal["service"], state, detail, key, approved=detail is not None)
+
+    def _action_reply(self, request_id, service, state, detail, key, approved=False):
+        """The model's view: proposed and approved are separate from executed and verified; no proposal id."""
+        executed = state in ("verified", "failed")
+        document = {"tool": ACTION_TOOL, "operation": "propose_restart", "service": service,
+                    "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "state": state,
+                    "proposed": state not in ("refused",) and not (state == "busy" and not approved),
+                    "user_approved": approved, "executed": executed, "verified": state == "verified"}
+        if executed:
+            document["data"] = {k: detail.get(k) for k in ("checks", "before", "after", "verified_at", "output_tail")}
+        elif detail is not None:
+            document["error"] = detail
+        line = bounded_line({"result": document}, TOOL_TEXT_BUDGET)
+        text = json.dumps(json.loads(line)["result"], separators=(",", ":")) if line else json.dumps(
+            {"tool": ACTION_TOOL, "state": state, "executed": executed, "verified": state == "verified"})
+        if key is not None:
+            with self.state_lock:
+                budget = self.turn_budgets.get(key)
+                if budget is not None:
+                    budget[1] += len(text)
+        self._to_server({"id": request_id, "result": {"success": state == "verified",
+                                                      "contentItems": [{"type": "inputText", "text": text}]}})
 
     def _tool_reply(self, request_id, params, ok, payload, key=None):
         arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}

@@ -7,6 +7,7 @@ only the trusted root-owned helpers below, always with explicit argument vectors
 """
 import calendar
 import errno
+import fcntl
 import json
 import os
 import pwd
@@ -115,6 +116,7 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
   health [product]              (bounded local checks: servers, ports, fixed local HTTP health, database presence, disk)
   agent serve --task TASK      (root; raw Codex App Server JSONL, no --json envelope)
   memory status|list|search|add|update|forget|reset|export|configure   (root; assistant notes, see ASSISTANT.md)
+  service restart apache       (root; restart, then verify a new process and its ports; see ASSISTANT.md)
 
 Products: herika (chim, skyrim), lorkhan, stobe (kenshi), dialectic (fnv, ttw), reign.
 --force discards local edits to tracked server files; it is never added automatically."""
@@ -387,6 +389,7 @@ def cmd_capabilities(opts, ctx):
             # Any user may run it; as another user, unreadable folders are reported as unreadable.
             {"name": "inventory", "mutates": False},
             {"name": "health", "arguments": ["[product]"], "mutates": False},
+            {"name": "service restart", "arguments": ["<service>"], "mutates": True, "requires_root": True},
         ] + [{"name": "memory " + name, "flags": list(spec[0] + spec[1]), "mutates": name not in MEMORY_READS,
               "requires_root": True} for name, spec in MEMORY_SPEC.items()],
         "global_flags": ["--json", "--request-id"],
@@ -414,7 +417,12 @@ def cmd_capabilities(opts, ctx):
                      "health": True, "assistant_tools": agent_helper_trusted(), "memory": True,
                      "log_search": True, "home_config_repair": agent_helper_trusted(), "tool_coverage": True,
                      # agent serve forwards thread/archive, unarchive and delete for this task's threads only.
-                     "thread_lifecycle": True},
+                     "thread_lifecycle": True,
+                     # agent serve offers ddistro_action (propose_restart) to a client that opts in; see ASSISTANT_RUNTIME.md.
+                     "assistant_actions": agent_helper_trusted()},
+        "service_restart": {"services": {name: {"label": spec["label"], "impact": spec["impact"]}
+                                         for name, spec in SERVICE_RESTARTS.items()},
+                            "verification": ["command", "new_process", "ports"], "lock": "maintenance"},
         "agent": {"provider": "codex", "readiness_command": "agent status", "ready_when": ["installed", "probe_passed"]},
         # Configured profile assignments only; which profile an NPC is using is not reported.
         "models": {"products": ["herika"], "scope": "configured_profiles", "roles": [role for role, _ in MODELS_ROLES],
@@ -435,7 +443,10 @@ def cmd_capabilities(opts, ctx):
                                        "max_log_lines": 400, "log_filters": ["query", "since"]},
                                       {"name": "ddistro_memory", "mutates": True, "operations": ["search", "remember"],
                                        "declared_when": "memory retrieval on at session start",
-                                       "remember_requires": "auto_learning on"}],
+                                       "remember_requires": "auto_learning on"},
+                                      {"name": "ddistro_action", "mutates": True, "operations": ["propose_restart"],
+                                       "declared_when": "initialize capabilities.ddistroActions [\"restart_service\"]",
+                                       "approval": "client ddistro/action/decide", "services": list(SERVICE_RESTARTS)}],
                             # Every reply carries coverage: result (checked, failed, skipped, refused, truncated,
                             # budget_hit) and what the turn and session budgets leave.
                             "coverage": {"results": ["checked", "failed", "skipped", "refused", "truncated", "budget_hit"],
@@ -2159,6 +2170,119 @@ def parse_memory(rest, ctx):
     return opts
 
 
+# --- Service restart ------------------------------------------------------------------
+# The only services ddistro service restart (and the Assistant's approved restart) may target. Each name maps to a
+# fixed root-owned init script, pid file, and ports file; nothing from a request becomes a path or an argument. TTS,
+# speech and MCP services start from dwemer-owned start.sh scripts and a PostgreSQL restart drops every database
+# session, so they are unsupported rather than guessed. Paths avoid /var/run, a link the trusted reads refuse.
+SERVICE_RESTARTS = {
+    "apache": {"label": "Apache web server", "init": "/etc/init.d/apache2", "pidfile": "/run/apache2/apache2.pid",
+               "ports_conf": "/etc/apache2/ports.conf", "comm": "apache2",
+               "impact": "Apache is shared: CHIM (HerikaServer), STOBE and Dialectic web servers and custom PHP mods stop "
+                         "answering for a few seconds, and requests in progress fail."},
+}
+SERVICE_RESTART_TIMEOUT = 60
+SERVICE_VERIFY_SECONDS = 15
+MAINTENANCE_LOCK = "/run/lock/dwemerdistro-maintenance.lock"
+LISTEN_LINE = re.compile(r"^\s*Listen\s+(?:(?:127\.0\.0\.1|0\.0\.0\.0|\[::\]|\*):)?([0-9]{1,5})\s*$", re.M)
+
+
+def maintenance_exclusive_fd():
+    """The fixed root-owned maintenance lock held exclusively without waiting, as ddistro changes apply holds it."""
+    try:
+        fd = os.open(MAINTENANCE_LOCK, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    except OSError:
+        raise CliError("unsafe_path", f"{MAINTENANCE_LOCK} could not be opened safely; it was not replaced.")
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_mode & 0o022:
+        os.close(fd)
+        raise CliError("unsafe_path", f"{MAINTENANCE_LOCK} is not a root-owned plain file; it was not replaced.")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise CliError("busy", "A DwemerDistro update, repair, or other change is running. Try again when it finishes.")
+    return fd
+
+
+def service_pid(spec):
+    """(pid, start time) of the live process the trusted pid file names, if it has the expected name; else (None, None)."""
+    text = health_read_small(spec["pidfile"], health_owners(False))
+    match = re.match(r"^\s*([0-9]{1,9})\s*$", text or "")
+    if not match:
+        return None, None
+    pid = int(match.group(1))
+    started = process_start(pid)
+    try:
+        with open(f"/proc/{pid}/comm", encoding="ascii", errors="replace") as handle:
+            comm = handle.read().strip()
+    except OSError:
+        return None, None
+    return (pid, started) if started and comm == spec["comm"] else (None, None)
+
+
+def process_start(pid):
+    """The start time (clock ticks since boot) of a live pid, or None; with the pid it names one process exactly."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as handle:
+            return handle.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def service_ports(spec):
+    text = health_read_small(spec["ports_conf"], health_owners(False)) or ""
+    return sorted({int(port) for port in LISTEN_LINE.findall(text) if 0 < int(port) < 65536})[:8]
+
+
+def cmd_service_restart(opts, ctx):
+    name = opts["service"]
+    spec = SERVICE_RESTARTS[name]
+    if os.geteuid() != 0:
+        raise CliError("permission_denied", "service restart must run as root. ddistro never elevates by itself.")
+    check_helper(spec["init"])
+    lock = maintenance_exclusive_fd()
+    try:
+        before = service_pid(spec)
+        try:
+            code, out, err = run_helper(["restart"], SERVICE_RESTART_TIMEOUT, OUTPUT_TAIL_BYTES, helper=spec["init"])
+            output_tail = tail_lines(out.data, 10) + tail_lines(err.data, 10)
+        except CliError as error:
+            # The script started and was stopped: report it as executed and let the fresh check decide, never as not run.
+            if error.code not in ("timeout", "cancelled"):
+                raise
+            code = error.code
+            output_tail = (error.details.get("stdout_tail", [])[-10:] + error.details.get("stderr_tail", [])[-10:])
+        # Fresh evidence only: a new process (pid and start time) behind the pid file and every configured port
+        # accepting, polled within a bound. An exit code alone is never reported as verified.
+        ports = service_ports(spec)
+        deadline = time.monotonic() + SERVICE_VERIFY_SECONDS
+        while True:
+            after = service_pid(spec)
+            open_ports = [port for port in ports if health_connect(port)[0]]
+            # The old process must be gone too, so an answering port cannot be the process the restart was meant to replace.
+            old_gone = before[0] is None or process_start(before[0]) != before[1]
+            replaced = after[0] is not None and after != before and old_gone
+            if (replaced and ports and len(open_ports) == len(ports)) or time.monotonic() > deadline:
+                break
+            time.sleep(0.5)
+    finally:
+        os.close(lock)
+    checks = [{"id": "command", "result": "passed" if code == 0 else "failed", "detail": f"exit code {code}" if isinstance(code, int) else code},
+              {"id": "new_process", "result": "passed" if replaced else "failed",
+               "detail": f"pid {before[0]} -> {after[0]}" + ("" if old_gone else "; the old process is still running")}]
+    checks += [{"id": f"port.{port}", "result": "passed" if port in open_ports else "failed"} for port in ports]
+    if not ports:
+        checks.append({"id": "ports", "result": "failed", "detail": "no Listen port found in " + spec["ports_conf"]})
+    verified = all(check["result"] == "passed" for check in checks)
+    data = {"service": name, "label": spec["label"], "action": "restart", "executed": True,
+            "state": "verified" if verified else "failed", "verified": verified, "checks": checks,
+            "before": {"pid": before[0]}, "after": {"pid": after[0]},
+            "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "output_tail": output_tail}
+    return data, f"{spec['label']} restart: {data['state']}"
+
+
 def command_words(argv):
     """The first two command tokens, skipping the global flags wherever they appear first."""
     words, index = [], 0
@@ -2176,7 +2300,8 @@ COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products"
             "status": cmd_status, "logs": cmd_logs, "server status": cmd_server_status,
             "server update": cmd_server_update, "agent status": cmd_agent_status, "agent probe": cmd_agent_probe,
             "models": cmd_models, "inventory": cmd_inventory, "health": cmd_health,
-            "agent home-config": cmd_agent_home_config, "agent home-config-repair": cmd_agent_home_config_repair}
+            "agent home-config": cmd_agent_home_config, "agent home-config-repair": cmd_agent_home_config_repair,
+            "service restart": cmd_service_restart}
 COMMANDS.update({"changes " + name: cmd_changes for name in CHANGES_SPEC})
 COMMANDS.update({"memory " + name: cmd_memory for name in MEMORY_SPEC})
 
@@ -2220,6 +2345,13 @@ def parse_command(rest, ctx):
             raise CliError("invalid_argument", "Expected agent status, agent probe, agent home-config, "
                            "agent home-config-repair --sha256 HASH, or agent serve --task TASK.")
         name, rest = "agent " + rest[1], rest[1:]
+    elif name == "service":
+        if len(rest) != 3 or rest[1] != "restart":
+            raise CliError("invalid_argument", "Expected service restart <service>.")
+        if rest[2] not in SERVICE_RESTARTS:
+            raise CliError("unsupported", "Only these services can be restarted: " + ", ".join(SERVICE_RESTARTS) + ".")
+        ctx["command"] = "service restart"
+        return {"service": rest[2]}
     if name not in COMMANDS:
         raise CliError("invalid_argument", "Unknown command.\n" + USAGE)
     ctx["command"] = name

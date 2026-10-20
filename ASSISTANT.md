@@ -19,6 +19,7 @@ ddistro agent home-config | agent home-config-repair --sha256 HASH   # root only
 ddistro agent serve --task TASK                                   # root only, raw JSONL
 ddistro models herika                                             # root only, see Model assignments
 ddistro inventory                                                 # any user, see Inventory
+ddistro service restart apache                                    # root only, see Service restart
 ```
 
 Products are the five `ddistro_server` products: `herika` (aliases `chim`, `skyrim`),
@@ -291,6 +292,30 @@ component whose startup marker is present may not be running.
   skipped, and no folder or marker `redirected`, `not_directory`, or `unreadable`; cancellation stops the helper and the
   whole command is `cancelled`. Run as a user other than root, folders that user cannot read
   are `unreadable` and database presence may be `null`; the launcher runs it as root.
+
+## Service restart
+
+`service restart <service>` (root) restarts one service from a fixed allowlist and then
+verifies it fresh. Today the allowlist is only `apache`: `/etc/init.d/apache2 restart`, the
+same root-owned init script the distro start uses. Apache is shared, so CHIM (HerikaServer),
+STOBE and Dialectic web servers and custom PHP mods stop answering for a few seconds. TTS,
+speech and MCP services start from `dwemer`-owned `start.sh` scripts and a PostgreSQL restart
+drops every database session, so any other name is `unsupported`. Nothing in the request
+becomes a path or an argument.
+
+The command takes the maintenance lock exclusively without waiting (`busy` while an update,
+repair, or `changes apply` runs). It then reads the pid in `/run/apache2/apache2.pid` (the
+process must be named `apache2`), runs the init script for at most 60 seconds, and polls for up
+to 15 seconds until a new process (different pid or start time) is behind the pid file, the
+old process is gone, and
+every `Listen` port in `/etc/apache2/ports.conf` accepts a loopback connection. `data` is
+`{service, label, action, executed: true, state: "verified"|"failed", verified, checks:
+[{id: "command"|"new_process"|"port.N"|"ports", result, detail?}], before: {pid}, after:
+{pid}, verified_at, output_tail}`. An exit code of 0 alone is never `verified`. A refusal
+before the restart (`permission_denied`, `helper_unavailable`, `unsafe_path`, `busy`,
+`unsupported`) is an error envelope and runs nothing. `capabilities` lists the allowlist with
+each service's label and impact under `service_restart`, and `features.assistant_actions`
+says the broker offers it to the Assistant (see ASSISTANT_RUNTIME.md, "ddistro_action").
 
 ## Trust boundaries and future scope
 
