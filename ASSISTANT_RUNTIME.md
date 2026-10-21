@@ -4,6 +4,10 @@
 a dedicated, attested sandbox. The model can change only the task's scratch copy.
 Applying scratch changes to a live install is a separate, trusted launcher/manual
 operation and is never done by this tool. A task ID or `--yes` grants nothing.
+The one exception is `ddistro_run` (`live_run`, below): a client that opts in lets the model
+propose commands on the LIVE distro, and each runs only after the user approves it (or a
+session grant they approved covers it). Approved, it is not a sandbox: as root it is full
+trust over the distro.
 
 ```bash
 install_assistant_runtime [--archive PATH] [--host-archive PATH] [--install-prerequisites]   # root, explicit
@@ -261,9 +265,10 @@ world-readable host secret, world-writable fake live directory, and loopback lis
 The attestation is bound to the runtime and code-mode host hashes and file identities, the policy hash, the
 `ddistro_agent` hash, the bubblewrap hash, the kernel release and version, and the
 `ddagent` UID and GID. A change to any of them makes `status` report `probe_stale` and
-makes serve refuse. When they are installed, it also binds the sha256 of `ddistro_access`,
+makes serve refuse. When they are installed, it also binds the sha256 of `ddistro_run`, `ddistro_access`,
 `ddistro_changes`, `ddistro_exec` and `ddistro` files, and it records, when its optional canary passed,
-`managed_exec_isolation: true`; `ddistro capabilities` uses those (see ASSISTANT.md). A root-owned attestation that is group- or other-writable is ignored.
+`managed_exec_isolation: true` and, when the `ddistro_run` canary passed, `live_run_isolation: true`;
+`ddistro capabilities` uses those (see ASSISTANT.md). A root-owned attestation that is group- or other-writable is ignored.
 
 ## serve
 
@@ -294,7 +299,8 @@ The broker relays JSONL both ways and forwards only these client methods:
 | `turn/start` | `threadId` (this task), `input` (only `text` items and `image` items with a `data:image/` or `https://` URL), `model`, `effort`, `summary`, `outputSchema`, `personality`, `serviceTier`, `clientUserMessageId` |
 | `turn/interrupt` | `threadId` (this task), `turnId` |
 | `thread/archive`, `thread/unarchive`, `thread/delete` | `threadId` (this task) only; see "Thread archive and delete" |
-| `ddistro/action/decide` | `proposalId`, `threadId`, `decision` (`approve`/`cancel`); answered by the broker, never forwarded; see "ddistro_action" |
+| `ddistro/action/decide` | `proposalId`, `threadId`, `decision` (`approve`/`cancel`, and for a `live_run` proposal `approve_session`), `digest` (required to approve a `live_run` proposal, refused on any other); answered by the broker, never forwarded; see "ddistro_action" and "ddistro_run" |
+| `ddistro/run/revoke`, `ddistro/run/cancel` | only after `live_run` was negotiated; see "ddistro_run" |
 
 For thread and turn requests, `approvalPolicy` may only be `never`, and `cwd` only
 `/work`; the broker sets both. `permissions` may only be `dwemer-scratch`.
@@ -559,6 +565,105 @@ the session runs nothing. The client gets `ddistro/action/updated` with `state` 
 A receipt left `executing` is reported as unknown and is never run again. Running a used receipt
 again only returns its recorded result.
 
+### ddistro_run live commands (live_run)
+
+`ddistro_run` runs code the model wrote on the LIVE distro: the real WSL filesystem, services and databases. It is
+not a sandbox and not a snapshot. It exists so the Assistant can do general work (edit a setting in a product
+database, install a package, inspect any path) that the typed tools do not cover. Its safety rests on the user's
+approval of the exact request, not on an allowlist: there is no program, path, SQL or per-mod allowlist, no
+read-only tier and no SQL preview. A command meant only to read can still change things, so a run is never let
+through because the model says it only reads; the typed read tools (`ddistro_read`, `ddistro_explore`) stay the
+automatic way to look.
+
+**Availability.** The client adds `"live_run"` to `initialize` `capabilities.ddistroActions` (with
+`experimentalApi: true`). It is honored only when, as the session starts, the attestation is current, binds the
+sha256 of `/usr/local/bin/ddistro_run`, and records its canary as `optional_checks.live_run_isolation: true`
+(see the probe below), and the file still has that digest; it is checked again before every run. Otherwise
+`live_run` is dropped silently, like `change_files`. Only then does `thread/start` declare the `ddistro_run`
+tool (`RUN_SPEC`). It is its own tool, not a `ddistro_action` operation. `ddistro capabilities` reports
+`features.live_run` and `live_run.reason`.
+
+**Tool.** `operation` `run`, `status`, `output`, `cancel` or `list`.
+
+- `run`: `interpreter` (`bash`, `python3`, `php`, `psql`), `code` (at most 128 KiB), `reason` (shown to the user),
+  and optionally `account` (default `dwemer`; any local account but `ddagent`), `cwd` (absolute; default the
+  account's home), `network` (default `false`), `timeout_seconds` (1-3600, default 300), `database` (psql only),
+  `wait_seconds` (0-60, default 20). Code with control characters other than tab, newline and CR, or with
+  bidirectional or zero-width characters, is refused, so the reviewed text is what runs.
+- `status` (`job_id`, `wait_seconds`), `output` (`job_id`, `offset`, `max_chars` up to 48 KiB), `cancel`
+  (`job_id`), `list`. A job is visible only to the thread that started it.
+
+**Approval.** With no covering grant, the broker sends `ddistro/action/proposed` with `action: "live_run"`, an
+impact text (root: full trust), `decisions: ["approve", "approve_session", "cancel"]`, and `change`: the exact
+`code`, `interpreter`, `account`, `cwd`, `network`, `timeout_seconds`, `database`, `code_sha256`, `digest` (the
+sha256 of the exact request bytes the supervisor will read), `scope`, the current `grant` and `widens_grant`. It
+expires after 600 s. The client answers `ddistro/action/decide` with that `digest` (required to approve; a
+missing or different digest is `-32602` and changes nothing). `approve` runs it once. `approve_session` (Allow for
+this task) runs it and adds its exact `(account, network)` scope to the session grant, installed under the same
+lock as the decision so a later revoke always wins: later runs that one scope covers (same account, or root, at
+the same or a wider network tier) run without a card. Scopes are never combined. A request no scope covers shows
+a new card with `widens_grant: true`; approving it with `approve_session` adds one more scope. The grant lives only in the broker's memory for
+this session and its task's threads; it is never stored and ends when the session ends or the client sends
+`ddistro/run/revoke` (`{}` -> `{revoked}`; running jobs continue). `ddistro/run/grant` `{active, scope, reason}`
+reports every change. The model has no path to approve, grant or revoke. Replay, late, unknown and foreign-thread
+decisions are refused as for other proposals, and `turn/start`, `turn/interrupt`, `thread/start`,
+`thread/resume`, expiry or the end of the session end a pending card with nothing run. One proposal of any kind is
+pending at a time.
+
+**Execution.** For an approved or covered request the broker checks the common maintenance lock
+(`/run/lock/dwemerdistro-maintenance.lock`, used as it is, never replaced) by taking it shared without waiting and
+releasing it at once: a run does not start while an exclusive change holds it (`busy`). The lock is not held for
+the job, so the command's own `ddistro` changes take it as usual. A Stop, archive or delete of the thread after
+the approval but before the job is registered means the run never starts. At most 4 jobs run at once per
+session. The broker then sends `ddistro/run/started` `{threadId, turnId, jobId,
+approval: user_once|user_task_grant|task_grant, digest, state: "starting", spec}` with the exact code, and starts
+`/usr/local/bin/ddistro_run supervise` in its own session and process group, writing the request bytes to its
+stdin. The root supervisor:
+
+- checks the request again, sets its parent-death signal (the broker's death, even SIGKILL, stops the job) and
+  puts the code in a sealed memfd, so it reaches the interpreter as `/dev/fd/9`, never on a command line;
+- forks the command, which gets a private mount namespace in which `/mnt` (Windows drives, WSLg), `/run/WSL`
+  (interop), `/init` and `/var/lib/dwemerdistro/assistant` (the Codex sign-in, memory, receipts, task and thread
+  state) are hidden, and, with `network: false`, an empty network namespace with only its own loopback (no
+  internet, no TCP to local services; Unix sockets such as PostgreSQL's work). These masks prevent accidents only:
+  a root command can undo them. Product configuration is not hidden, so it can be edited;
+- drops to the account (its groups, uid and gid) with no_new_privs unless it is root, so sudo, su and other setuid
+  programs cannot raise a non-root run; root keeps every capability;
+- runs it with stdin `/dev/null` and a fixed environment (`DEBIAN_FRONTEND=noninteractive`, `PAGER=cat`,
+  `GIT_TERMINAL_PROMPT=0`, no WSL or Windows variables), and reports `started` with the digest of what it read;
+  the broker stops the job unless that digest is the approved one;
+- on timeout or cancel sends SIGTERM to the command's process group and SIGKILL after 5 s; when the command
+  ends, whatever is left in its group is stopped too. Processes that left the group (a service started through
+  its init script, setsid or start-stop-daemon) keep running by design and should redirect their output.
+
+**Output and lifecycle.** stdout and stderr are read by the broker, redacted (ddistro_access's redaction, applied
+to whole blocks so multi-line keys are caught), control characters replaced, lines clipped at 4096 characters and
+stderr lines prefixed `[stderr] `. A job keeps the newest 512 KiB of characters; offsets are absolute. The client
+gets `ddistro/run/output` `{threadId, jobId, offset, text, notStreamed}` at most 10 times a second, 16 K
+characters each and 64 K per second (the rest stays in the ring), and `ddistro/run/updated` `{threadId, jobId,
+state, started, exitCode, signal, succeeded, verified: false, reason, durationMs, outputChars}`. States:
+`running`, `exited`, `timed_out`, `cancelled`, `killed`, `unknown` (no report from the supervisor; never treated
+as success), and `refused` / `not_started` / `busy` (nothing ran). `turn/interrupt` (Stop), `thread/archive`,
+`thread/unarchive` and `thread/delete` stop that thread's jobs, the end of the session stops all of them,
+`ddistro/run/cancel` `{threadId, jobId}` stops one; a stop is SIGTERM to the group, then SIGKILL after 10 s. Jobs
+otherwise outlive the turn, so a later turn of the same thread can ask for their status.
+
+**Model replies** say `state`, `started`, `approval` and `user_approved`, and for a job `exit_code`, `signal`,
+`succeeded` (exited 0) and `verified: false` with the note that only the exit status is known, the redacted
+output tail (24 K characters) and a `hint`. The broker never retries; a cancelled, timed-out, killed or unknown
+run may have changed things partway and is not rerun. There is no undo: the tool tells the model to back up a file
+before editing it and to read the result back. ddistro_run calls have their own budget of 32 per turn (polling a
+long job is expected), count toward the 256 per session, and run outside the diagnostic slots (at most 4 calls at
+once).
+
+**Probe canary** (`live_run_isolation`, optional like `managed_exec_isolation`, so a failure only turns
+`live_run` off): it runs the installed, bound `ddistro_run` twice as `nobody` without network, changing nothing.
+The first run must start with the expected digest, read its code from `/dev/fd/`, keep the code out of its
+command line, run as `nobody` with no_new_privs, see `/mnt`, `/run/WSL` and the assistant state empty and `/init`
+masked, have no WSL variables and an empty stdin, and reach neither the probe's host loopback listener (which the
+outer check reached) nor `1.1.1.1:443`. The second must time out after 2 s with its background child gone and
+its output closed without help from the probe.
+
 ### Thread archive and delete
 
 `thread/archive`, `thread/unarchive`, and `thread/delete` (Codex 0.163.0 stable,
@@ -575,6 +680,15 @@ unchecked by default. `ddistro capabilities` reports this as `features.thread_li
 a static fact that adds no command and opens no database.
 
 ## Known limitations
+
+- `ddistro_run` is not isolation. An approved root run can read or change anything in the distro, including
+  undoing its own masks (for example through `/proc/1/root` or by unmounting), and a non-root run has everything
+  its account has. The PID namespace is shared on purpose (services, `ps`, init scripts), so a command can see and
+  signal other processes its account may signal. Network off is all or nothing: there is no per-host rule.
+- A `ddistro_run` job's output is redacted line by line with patterns; a secret in an unusual format can pass.
+  Grant-covered runs show no card; the launcher shows them from `ddistro/run/started`.
+- A background process a job leaves in its own session keeps running after the job, and if it kept the job's
+  stdout or stderr, it gets an error writing to them once the broker stops reading.
 
 - Codex 0.163 permission profiles are beta. The probe, not the configuration, is the
   evidence. Until a passing probe exists on the target distro, serve refuses.

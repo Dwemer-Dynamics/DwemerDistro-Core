@@ -100,6 +100,15 @@ exactly `["propose_restart"]`. A false flag leaves every other capability readab
 Launcher stays on its earlier tool revision. To set the flag, `capabilities` runs `agent status`
 once. It never starts a probe, a session or a model.
 
+`features.live_run` is `true` only while `assistant_foundations` is, `/usr/local/bin/ddistro_run` is a trusted
+root-owned file, and the passing attestation records `live_run_isolation: true` with a `managed_helpers.run`
+digest equal to that file now. `capabilities.live_run` gives `available`, `reason` (`foundations_unavailable`,
+`run_helper_missing`, `run_helper_untrusted`, `attestation_invalid`, `live_run_unverified`, `run_digest_stale`)
+and static facts: interpreters, default account, network modes, masked paths, approval decisions, grant scope
+and limits. Only while it is true does `assistant_tools.tools` list `ddistro_run`. It runs approved commands on
+the LIVE distro, not in a sandbox; root is full trust. See "ddistro_run live commands" in ASSISTANT_RUNTIME.md.
+There is no `ddistro` command for it: the broker starts the `ddistro_run` supervisor itself.
+
 ## Status and update
 
 Status always comes from `/usr/local/bin/ddistro_server status <product|all> --json`.
@@ -714,9 +723,13 @@ snapshot with `live: false`. A timeout or cancel stops the whole process group.
 
 The CLI is a convenience and contract layer, not a sandbox or authorization boundary:
 anything it can do, the same user can do directly. Root-only work stays in
-`ddistro_server` and `ddistro_changes`, which own their locking. The Assistant gets no root shell,
-no raw SQL and no general service control. It can use only the typed, allowlisted operations
-described here, and every change needs approval in the Launcher. Launcher chat may come
+`ddistro_server` and `ddistro_changes`, which own their locking. Without `live_run` the Assistant gets
+no root shell, no raw SQL and no general service control: it can use only the typed, allowlisted operations
+described here, and every change needs approval in the Launcher. A Launcher that negotiates `live_run` adds
+`ddistro_run`: arbitrary commands, SQL through `psql`, and package or service work on the live distro, as
+`dwemer`, `root`, `postgres` or another account, each run approved by the user in the Launcher (or covered by a
+session grant the user approved). That is a general, full-trust path once approved, not a sandbox and not an
+allowlist; its masks only prevent accidental access to Windows and the assistant's own state. Launcher chat may come
 later and will appear in `capabilities` only when implemented. The existing CHIM-MCP `/chat` is unchanged.
 
 ## Health

@@ -96,6 +96,8 @@ if [ $? -eq 0 ]; then
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_access /usr/local/bin/ddistro_access || exit 1
     # Sandboxed command helper for read-only file snapshots; ddistro runs it only when it is root-owned.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_exec /usr/local/bin/ddistro_exec || exit 1
+    # Live command supervisor for the Assistant's approved runs; the broker starts it only while the probe attests it.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_run /usr/local/bin/ddistro_run || exit 1
     # Assistant runtime helpers. Only the scripts are installed here: the pinned Codex runtime,
     # bubblewrap, and the ddagent account come from an explicit install_assistant_runtime run.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_agent /usr/local/bin/ddistro_agent || exit 1

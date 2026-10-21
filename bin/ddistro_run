@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Root supervisor for one approved live command on this DwemerDistro (the Assistant's ddistro_run tool).
+
+  ddistro_run supervise --status-fd N --parent PID     # root; the request JSON arrives on stdin
+
+Only the assistant broker (ddistro_agent serve) starts it, after the user approved the exact request (or an
+active task grant for this session covers its account and network). It is not a sandbox: the command runs on the
+LIVE distro, with the live filesystem, services and databases, as the requested account. As root it has full
+trust over the distro; nothing here hardens root from itself.
+
+Request (stdin, one JSON object, at most REQUEST_BYTES):
+  {"schema_version": 1, "interpreter": "bash"|"python3"|"php"|"psql", "code": TEXT, "account": NAME,
+   "cwd": ABSOLUTE PATH or null, "network": bool, "timeout_seconds": 1-3600, "database": NAME or null}
+
+The code reaches the interpreter as a sealed in-memory file (/dev/fd/N), never on a command line. The command's
+stdin is /dev/null and its environment is fixed (noninteractive apt, no pager, no Windows variables). stdout and
+stderr are the pipes the broker passed in. Status events go to --status-fd, one JSON line each:
+  {"event": "refused", "reason": ...}                       nothing ran
+  {"event": "not_started", "reason": ...}                   the namespace, account, cwd or exec step failed
+  {"event": "started", "pid", "digest", "uid", "network", "masked"}   the interpreter is about to be executed
+  {"event": "exited", "exit_code", "signal", "timed_out", "cancelled", "leftovers_stopped", "duration_ms"}
+
+Before the interpreter runs, the child gets a private mount namespace that hides, to avoid accidental access
+(a root command could undo it): /mnt (Windows drives and WSLg), /run/WSL (Windows interop), /init, and the
+assistant state /var/lib/dwemerdistro/assistant (Codex sign-in, memory, receipts). Product configuration is not
+hidden. With "network": false the child also gets an empty network namespace with only its own loopback: no
+internet and no TCP to local services, while Unix sockets (PostgreSQL's) still work. Non-root accounts run
+with no_new_privs, so sudo, su and other setuid programs cannot raise them to another account.
+
+The command, its process group and whatever stays in that group are stopped on cancel (SIGTERM from the broker),
+on timeout, and when the broker dies (parent-death signal). Processes the command moved to their own session
+(services started through their init script, setsid, start-stop-daemon) keep running by design.
+"""
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+import resource
+import signal
+import socket
+import stat
+import struct
+import sys
+import time
+
+TOOL = {"name": "ddistro_run", "version": "1.0.0", "source": "DwemerDistro-Core"}
+SCHEMA_VERSION = 1
+REQUEST_BYTES = 256 * 1024
+CODE_BYTES = 128 * 1024
+TIMEOUT = (1, 3600)
+TERM_GRACE = 5.0
+LEFTOVER_GRACE = 1.0
+POLL = 0.05
+CODE_FD = 9
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# The interpreter decides how the code is read, not what may run: bash can start any installed program.
+INTERPRETERS = {
+    "bash": ("bash", ["--noprofile", "--norc"]),
+    "python3": ("python3", []),
+    "php": ("php", ["-f"]),
+    "psql": ("psql", ["-X", "--no-password", "-v", "ON_ERROR_STOP=1", "-f"]),
+}
+ACCOUNT_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
+DATABASE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_$-]{0,62}\Z")
+# The assistant's own sandbox identity; a live command never runs as it.
+REFUSED_ACCOUNTS = ("ddagent",)
+ASSISTANT_STATE = "/var/lib/dwemerdistro/assistant"
+# Hidden from the command's mount view (directories get an empty read-only tmpfs, files /dev/null).
+MASKED_DIRS = ("/mnt", "/run/WSL", ASSISTANT_STATE)
+MASKED_FILES = ("/init",)
+# Control characters other than tab, newline and carriage return, and bidirectional overrides that could make the
+# reviewed code read differently from what runs ("Trojan Source").
+HIDDEN_TEXT = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+PR_SET_PDEATHSIG = 1
+PR_SET_NO_NEW_PRIVS = 38
+CLONE_NEWNS = 0x00020000
+CLONE_NEWNET = 0x40000000
+MS_RDONLY, MS_NOSUID, MS_NODEV, MS_NOEXEC = 1, 2, 4, 8
+MS_REMOUNT, MS_BIND, MS_REC, MS_PRIVATE = 32, 4096, 16384, 1 << 18
+SIOCGIFFLAGS, SIOCSIFFLAGS, IFF_UP = 0x8913, 0x8914, 0x1
+
+
+class Refused(Exception):
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason, self.message = reason, message
+
+
+def libc():
+    return ctypes.CDLL(None, use_errno=True)
+
+
+def check_text(value, name, limit):
+    if not isinstance(value, str) or not value or len(value.encode("utf-8", "surrogatepass")) > limit:
+        raise Refused("invalid_request", "%s must be 1 to %d bytes of text" % (name, limit))
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise Refused("invalid_request", "%s must be valid UTF-8" % name)
+    if HIDDEN_TEXT.search(value):
+        raise Refused("invalid_request", "%s has control or bidirectional characters that hide what runs" % name)
+
+
+def parse_request(raw):
+    """The validated request. The broker checked the same rules; this is the authoritative check before running."""
+    if len(raw) > REQUEST_BYTES:
+        raise Refused("invalid_request", "the request is larger than %d bytes" % REQUEST_BYTES)
+    try:
+        request = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise Refused("invalid_request", "the request is not UTF-8 JSON")
+    keys = {"schema_version", "interpreter", "code", "account", "cwd", "network", "timeout_seconds", "database"}
+    if type(request) is not dict or set(request) != keys or request["schema_version"] != SCHEMA_VERSION:
+        raise Refused("invalid_request", "the request must have exactly " + ", ".join(sorted(keys)))
+    if request["interpreter"] not in INTERPRETERS:
+        raise Refused("invalid_request", "interpreter must be one of " + ", ".join(INTERPRETERS))
+    check_text(request["code"], "code", CODE_BYTES)
+    account = request["account"]
+    if not isinstance(account, str) or not ACCOUNT_PATTERN.match(account) or account in REFUSED_ACCOUNTS:
+        raise Refused("invalid_request", "account must be an existing Linux account name other than ddagent")
+    cwd = request["cwd"]
+    if cwd is not None:
+        check_text(cwd, "cwd", 1024)
+        if not cwd.startswith("/") or "\n" in cwd or "\r" in cwd or "\t" in cwd:
+            raise Refused("invalid_request", "cwd must be an absolute path on one line")
+    if type(request["network"]) is not bool:
+        raise Refused("invalid_request", "network must be true or false")
+    timeout = request["timeout_seconds"]
+    if type(timeout) is not int or not TIMEOUT[0] <= timeout <= TIMEOUT[1]:
+        raise Refused("invalid_request", "timeout_seconds must be a whole number from %d to %d" % TIMEOUT)
+    database = request["database"]
+    if database is not None and (request["interpreter"] != "psql" or not isinstance(database, str)
+                                 or not DATABASE_PATTERN.match(database)):
+        raise Refused("invalid_request", "database is only for psql and must be a plain database name")
+    return request
+
+
+def find_program(name):
+    """An executable regular file in the fixed system PATH (never the caller's)."""
+    for folder in SAFE_PATH.split(":"):
+        path = os.path.join(folder, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and os.access(path, os.X_OK):
+            return path
+    raise Refused("interpreter_missing", "%s is not installed" % name)
+
+
+def command_argv(request):
+    name, flags = INTERPRETERS[request["interpreter"]]
+    argv = [find_program(name)] + flags + ["/dev/fd/%d" % CODE_FD]
+    if request["database"] is not None:
+        argv += ["-d", request["database"]]
+    return argv
+
+
+def command_env(account):
+    """A fixed environment: nothing from the broker, WSL or Windows reaches the command."""
+    return {"PATH": SAFE_PATH, "HOME": account.pw_dir or "/", "USER": account.pw_name, "LOGNAME": account.pw_name,
+            "SHELL": "/bin/bash", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TERM": "dumb", "PAGER": "cat",
+            "SYSTEMD_PAGER": "cat", "GIT_PAGER": "cat", "NO_COLOR": "1", "DEBIAN_FRONTEND": "noninteractive",
+            "APT_LISTCHANGES_FRONTEND": "none", "GIT_TERMINAL_PROMPT": "0", "PIP_NO_INPUT": "1",
+            "COMPOSER_NO_INTERACTION": "1", "PYTHONUNBUFFERED": "1"}
+
+
+def sealed_code(code):
+    fd = os.memfd_create("ddistro-run-code", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    view = memoryview(code.encode("utf-8"))
+    while view:
+        view = view[os.write(fd, view):]
+    fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return fd
+
+
+def emit(status_fd, event):
+    try:
+        os.write(status_fd, (json.dumps(event, separators=(",", ":")) + "\n").encode())
+    except OSError:
+        pass
+
+
+def mount(lib, source, target, fstype, flags, data):
+    if lib.mount(source, target.encode(), fstype, flags, data) != 0:
+        raise OSError(ctypes.get_errno(), "mount " + target)
+
+
+def isolate(lib, network):
+    """Private mount namespace with the masks, and an empty network namespace when network is off. Returns the
+    (masked, unmasked) paths: a target that is a link or of another type is left as it is and reported, never
+    followed (the probe canary then fails, so live_run stays off). A failing mount raises and nothing runs."""
+    flags = CLONE_NEWNS | (0 if network else CLONE_NEWNET)
+    if lib.unshare(flags) != 0:
+        raise OSError(ctypes.get_errno(), "unshare")
+    mount(lib, b"none", "/", None, MS_REC | MS_PRIVATE, None)
+    masked, unmasked = [], []
+    for path in MASKED_DIRS:
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            unmasked.append(path)
+            continue
+        mount(lib, b"tmpfs", path, b"tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, b"mode=0755,size=4k")
+        masked.append(path)
+    for path in MASKED_FILES:
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            unmasked.append(path)
+            continue
+        mount(lib, b"/dev/null", path, None, MS_BIND, None)
+        mount(lib, None, path, None, MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, None)
+        masked.append(path)
+    if not network:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            request = struct.pack("16sH22x", b"lo", 0)
+            current = struct.unpack("16sH22x", fcntl.ioctl(probe, SIOCGIFFLAGS, request))[1]
+            fcntl.ioctl(probe, SIOCSIFFLAGS, struct.pack("16sH22x", b"lo", current | IFF_UP))
+        finally:
+            probe.close()
+    return masked, unmasked
+
+
+def run_child(request, argv, account, status_fd, code_fd, digest):
+    """In the forked child: isolate, drop to the account, enter cwd, report, exec. Never returns."""
+    stage = "isolate"
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGPIPE):
+            signal.signal(sig, signal.SIG_DFL)
+        null = os.open("/dev/null", os.O_RDONLY)
+        os.dup2(null, 0)
+        os.close(null)
+        os.dup2(code_fd, CODE_FD)
+        os.set_inheritable(CODE_FD, True)
+        lib = libc()
+        masked, unmasked = isolate(lib, request["network"])
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        stage = "account"
+        if account.pw_uid != 0:
+            os.setgroups(os.getgrouplist(account.pw_name, account.pw_gid))
+            os.setgid(account.pw_gid)
+            os.setuid(account.pw_uid)
+            if lib.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+                raise OSError(ctypes.get_errno(), "no_new_privs")
+        os.umask(0o022)
+        stage = "cwd"
+        os.chdir(request["cwd"] or account.pw_dir or "/")
+        stage = "exec"
+        emit(status_fd, {"event": "started", "pid": os.getpid(), "digest": digest, "uid": os.getuid(),
+                         "network": request["network"], "masked": masked, "unmasked": unmasked})
+        os.execve(argv[0], argv, command_env(account))
+    except BaseException as exc:  # nothing of the request ran
+        detail = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
+        emit(status_fd, {"event": "not_started", "reason": stage + "_failed", "detail": str(detail)[:200]})
+    os._exit(127)
+
+
+def group_members(pgid):
+    """Live pids in this process group other than the supervisor itself."""
+    members = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry, "rb") as handle:
+                fields = handle.read().rsplit(b")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if len(fields) > 3 and fields[0] != b"Z" and fields[2] == str(pgid).encode():
+            members.append(int(entry))
+    return members
+
+
+def stop_group(pgid, grace):
+    """SIGTERM the group (the supervisor ignores it), then SIGKILL whatever is left of it. Returns how many were
+    still there for SIGTERM."""
+    alive = group_members(pgid)
+    if not alive:
+        return 0
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return len(alive)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and group_members(pgid):
+        time.sleep(POLL)
+    for pid in group_members(pgid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return len(alive)
+
+
+def supervise(status_fd, parent):
+    """One request from stdin. Exit 0 once a final event was written, 2 for a refusal before anything ran."""
+    cancelled = []
+    signal.signal(signal.SIGTERM, lambda *_: cancelled.append(True))
+    signal.signal(signal.SIGINT, lambda *_: cancelled.append(True))
+    signal.signal(signal.SIGHUP, lambda *_: cancelled.append(True))
+    lib = libc()
+    # The broker's death (even SIGKILL) reaches this supervisor, which then stops the command's group.
+    lib.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    if os.getppid() != parent:
+        emit(status_fd, {"event": "refused", "reason": "parent_gone"})
+        return 2
+    # Above CODE_FD and close-on-exec, so the command can neither lose nor inherit (and forge) the status channel.
+    moved = fcntl.fcntl(status_fd, getattr(fcntl, "F_DUPFD_CLOEXEC", 1030), CODE_FD + 1)
+    os.close(status_fd)
+    status_fd = moved
+    os.set_blocking(status_fd, True)
+    raw = sys.stdin.buffer.read(REQUEST_BYTES + 1)
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        if os.geteuid() != 0:
+            raise Refused("requires_root", "ddistro_run must run as root")
+        if os.getpgrp() != os.getpid():
+            raise Refused("not_group_leader", "the broker must start ddistro_run in its own session")
+        request = parse_request(raw)
+        try:
+            account = pwd.getpwnam(request["account"])
+        except KeyError:
+            raise Refused("account_missing", "no Linux account is named %s" % request["account"])
+        argv = command_argv(request)
+        code_fd = sealed_code(request["code"])
+    except Refused as refusal:
+        emit(status_fd, {"event": "refused", "reason": refusal.reason, "message": refusal.message})
+        return 2
+    if cancelled:
+        emit(status_fd, {"event": "refused", "reason": "cancelled"})
+        return 2
+    start = time.monotonic()
+    pid = os.fork()
+    if pid == 0:
+        run_child(request, argv, account, status_fd, code_fd, digest)
+    os.close(code_fd)
+    pgid = os.getpgrp()
+    deadline = start + request["timeout_seconds"]
+    # Decided once, before any group signal: stop_group's SIGTERM also reaches this supervisor's handler.
+    stopped_by = None
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        if stopped_by is None:
+            if cancelled:
+                stopped_by = "cancelled"
+            elif os.getppid() != parent:
+                stopped_by = "parent_gone"
+            elif time.monotonic() >= deadline:
+                stopped_by = "timeout"
+            if stopped_by is not None:
+                stop_group(pgid, TERM_GRACE)
+                continue
+        time.sleep(POLL)
+    # Whatever the command left in its process group is stopped; its own sessions (services) are not.
+    leftovers = stop_group(pgid, LEFTOVER_GRACE)
+    emit(status_fd, {
+        "event": "exited", "exit_code": os.WEXITSTATUS(status) if os.WIFEXITED(status) else None,
+        "signal": os.WTERMSIG(status) if os.WIFSIGNALED(status) else None, "timed_out": stopped_by == "timeout",
+        "cancelled": stopped_by in ("cancelled", "parent_gone"), "leftovers_stopped": leftovers,
+        "duration_ms": int((time.monotonic() - start) * 1000)})
+    return 0
+
+
+def main(argv):
+    if len(argv) != 5 or argv[0] != "supervise" or argv[1] != "--status-fd" or argv[3] != "--parent" \
+            or not argv[2].isdigit() or not argv[4].isdigit():
+        sys.stderr.write("usage: ddistro_run supervise --status-fd N --parent PID (started by ddistro_agent serve)\n")
+        return 64
+    return supervise(int(argv[2]), int(argv[4]))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

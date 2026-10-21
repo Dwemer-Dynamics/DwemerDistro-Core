@@ -34,6 +34,7 @@ CHANGES_HELPER = "/usr/local/bin/ddistro_changes"
 AGENT_HELPER = "/usr/local/bin/ddistro_agent"
 ACCESS_MODULE = "/usr/local/bin/ddistro_access"  # read-only access policy library, see ASSISTANT.md
 EXEC_HELPER = "/usr/local/bin/ddistro_exec"  # sandboxed command on file snapshots
+RUN_HELPER = "/usr/local/bin/ddistro_run"  # live command supervisor, started only by the assistant broker
 HELPER_OWNER_UID = 0
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 STATUS_TIMEOUT = 120
@@ -403,6 +404,7 @@ def cmd_capabilities(opts, ctx):
         access, access_available = error.details.get("reason", "unavailable"), False
     exec_ok = exec_available(access_available)
     foundations, foundations_reason = foundations_ready(access_available)
+    live_run, live_run_reason = live_run_ready(foundations)
     tools = [{"name": "ddistro_read", "mutates": False,
               "operations": ["inventory", "status", "models", "logs", "health", "performance", "model_options",
                              "update_check"],
@@ -436,6 +438,12 @@ def cmd_capabilities(opts, ctx):
                   "declared_when": "initialize capabilities.ddistroActions [\"restart_service\"]",
                   "approval": "client ddistro/action/decide", "services": list(SERVICE_RESTARTS),
                   "capability_operations": action_operations})
+    if live_run:
+        # General commands on the LIVE distro (not a sandbox); every run is approved, or covered by a session grant.
+        tools.append({"name": "ddistro_run", "mutates": True, "live": True, "requires": "features.live_run",
+                      "declared_when": "initialize capabilities.ddistroActions [\"live_run\"]",
+                      "operations": ["run", "status", "output", "cancel", "list"],
+                      "approval": "client ddistro/action/decide approve|approve_session|cancel with digest"})
     data = {
         "commands": [
             {"name": "version", "mutates": False}, {"name": "capabilities", "mutates": False},
@@ -517,10 +525,31 @@ def cmd_capabilities(opts, ctx):
                      "service_operations": True,
                      # Every trusted helper is installed and agent status reports a passing probe; the reason is in
                      # assistant_foundations. False keeps a client on its earlier tool revision.
-                     "assistant_foundations": foundations},
+                     "assistant_foundations": foundations,
+                     # ddistro_run live commands: foundations plus the attested ddistro_run canary for the bytes
+                     # installed now; the reason is in live_run.
+                     "live_run": live_run},
         "assistant_foundations": {"available": foundations, "reason": foundations_reason,
                                   "requires": ["ddistro_agent", "ddistro_access", "ddistro_exec", "ddistro_changes",
                                                "agent status installed", "agent status probe_passed"]},
+        # Static facts from code, plus availability; see ASSISTANT_RUNTIME.md "ddistro_run live commands".
+        "live_run": {"available": live_run, "reason": live_run_reason,
+                     "requires": ["features.assistant_foundations", "ddistro_run", "attestation live_run_isolation"],
+                     "capability": "live_run", "tool": "ddistro_run", "target": "live_distro", "sandbox": False,
+                     "interpreters": ["bash", "python3", "php", "psql"], "default_account": "dwemer",
+                     "accounts": "any_local_account_except_ddagent", "root": "full_distro_trust",
+                     "non_root": "no_new_privs", "network": {"default": False, "off": "empty_network_namespace",
+                                                             "on": "host_network"},
+                     "masked": ["/mnt", "/run/WSL", "/init", "/var/lib/dwemerdistro/assistant"],
+                     "code_transport": "sealed_fd", "stdin": "empty",
+                     "approval": {"decisions": ["approve", "approve_session", "cancel"], "binds": "digest",
+                                  "proposal_seconds": 600, "grant": "session_only",
+                                  "grant_scope": "account_network_pairs", "grant_scopes_combine": False,
+                                  "revoke": "ddistro/run/revoke"},
+                     "limits": {"code_bytes": 128 * 1024, "timeout_seconds": [1, 3600], "default_timeout_seconds": 300,
+                                "wait_seconds": [0, 60], "running_jobs": 4, "kept_jobs": 32, "ring_chars": 512 * 1024,
+                                "turn_calls": 32},
+                     "lock": "maintenance_clear_at_start", "undo": None, "verification": "exit_status_only"},
         "service_operations": {"commands": ["operations targets", "operations preview", "operations apply"],
                                "preview_seconds": OPERATION_PREVIEW_SECONDS, "summary_max_lines": 8,
                                "binds": ["task", "thread"], "replay": "recorded_outcome",
@@ -1147,6 +1176,30 @@ def managed_exec_attested():
             return False, name + "_helper_untrusted"
         if not hmac.compare_digest(current, digest):
             return False, name + "_digest_stale"
+    return True, None
+
+
+def live_run_ready(foundations):
+    """(features.live_run, reason): the foundations are on, ddistro_run is a trusted root-owned file, and the passing
+    attestation records its live_run_isolation canary for exactly the bytes installed now."""
+    if not foundations:
+        return False, "foundations_unavailable"
+    try:
+        current = hashlib.sha256(read_root_file(RUN_HELPER, ATTESTED_HELPER_LIMIT)).hexdigest()
+    except CliError as error:
+        return False, "run_helper_" + error.details.get("reason", "untrusted")
+    try:
+        doc = json.loads(read_root_file(ATTESTATION_FILE, ATTESTATION_LIMIT).decode("utf-8"),
+                         parse_constant=reject_constant)
+    except (CliError, ValueError):
+        return False, "attestation_invalid"
+    optional = doc.get("optional_checks") if type(doc) is dict and doc.get("passed") is True else None
+    if type(optional) is not dict or optional.get("live_run_isolation") is not True:
+        return False, "live_run_unverified"
+    bound = doc.get("managed_helpers")
+    digest = bound.get("run") if type(bound) is dict else None
+    if type(digest) is not str or not hmac.compare_digest(current, digest):
+        return False, "run_digest_stale"
     return True, None
 
 

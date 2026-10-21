@@ -22,6 +22,7 @@ Privilege split:
   * applying scratch changes to a live install is never done here.
 """
 import argparse
+import bisect
 import calendar
 import collections
 import ctypes
@@ -408,7 +409,7 @@ EXEC_HINTS = {
 # Root-owned helpers that a probe's attestation is bound to when present, so replacing any of them invalidates it.
 # "cli" is ddistro itself: the typed service operations (operations preview|apply) live inside it, not in a helper.
 MANAGED_HELPERS = (("access", ACCESS_MODULE), ("changes", "/usr/local/bin/ddistro_changes"), ("exec", EXEC_MODULE),
-                   ("cli", "/usr/local/bin/ddistro"))
+                   ("cli", "/usr/local/bin/ddistro"), ("run", "/usr/local/bin/ddistro_run"))
 # The live actions. The model can only propose; the broker announces the proposal to the client
 # (ddistro/action/proposed, with an id the model never sees), and only the client's ddistro/action/decide approve
 # for that pending, unexpired proposal of the same thread runs its fixed root ddistro command once.
@@ -897,6 +898,261 @@ def service_targets_view(payload):
     return view
 
 
+# live_run: general commands on the LIVE distro through the trusted ddistro_run supervisor. Declared only to a client
+# that opts in with initialize capabilities.ddistroActions ["live_run"], and only when ddistro_run is a trusted
+# root-owned file whose digest the attestation binds and whose isolation canary (live_run_isolation) passed. Every run
+# needs the user's approval of the exact request (or an active task grant of this session covering its account and
+# network); the model cannot approve, and the broker sends exactly the approved request bytes to the supervisor.
+RUN_TOOL = "ddistro_run"
+RUN_CAPABILITY = "live_run"
+RUN_HELPER = "/usr/local/bin/ddistro_run"
+RUN_OPERATIONS = ("run", "status", "output", "cancel", "list")
+RUN_INTERPRETERS = ("bash", "python3", "php", "psql")
+RUN_CODE_BYTES = 128 * 1024
+RUN_TIMEOUT = (1, 3600)
+RUN_DEFAULT_TIMEOUT = 300
+RUN_WAIT = (0, 60)
+RUN_DEFAULT_WAIT = 20
+RUN_DEFAULT_ACCOUNT = "dwemer"
+RUN_ACCOUNT = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
+RUN_DATABASE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$-]{0,62}\Z")
+RUN_JOB_ID = re.compile(r"^run_[0-9a-f]{16}\Z")
+# Mirrors ddistro_run HIDDEN_TEXT: control characters (but tab, newline, CR) and bidirectional overrides.
+RUN_HIDDEN_TEXT = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+# Long enough to read a script; Codex holds the tool call open meanwhile (its own bound was not measured).
+RUN_APPROVAL_SECONDS = 600
+RUN_MAX_RUNNING = 4
+RUN_MAX_JOBS = 32
+RUN_CALL_CONCURRENCY = 4
+RUN_TURN_CALLS = 32
+RUN_RING_CHARS = 512 * 1024
+RUN_LINE_CHARS = 4096
+RUN_REPLY_CHARS = 24 * 1024
+RUN_PAGE_CHARS = (1, 48 * 1024)
+RUN_STREAM_INTERVAL = 0.1
+RUN_STREAM_CHARS = 16 * 1024
+RUN_STREAM_RATE = 64 * 1024
+RUN_START_SECONDS = 20
+# After SIGTERM the supervisor stops the group itself (5 s grace); past this the broker SIGKILLs the whole group.
+RUN_STOP_GRACE = 10.0
+# Past the request's own timeout plus this, the broker stops a supervisor that did not stop itself.
+RUN_BACKSTOP_SECONDS = 15
+RUN_DRAIN_SECONDS = 1.0
+RUN_FINAL_STATES = ("exited", "timed_out", "cancelled", "killed", "unknown")
+RUN_UNSTARTED_STATES = ("refused", "not_started", "busy")
+RUN_SPEC = {
+    "type": "function", "name": RUN_TOOL,
+    "description": "Runs code on the LIVE DwemerDistro (the real WSL Linux: live files, services and databases), not a "
+                   "sandbox or snapshot. Every run needs the user's approval of the exact code, account, folder, "
+                   "network and time limit, unless they chose Allow for this task and the run stays within that "
+                   "scope; a run as another account, as root, or with network asks again. Even a command meant only "
+                   "to read can change things, so approval never depends on what you say it does. There is no "
+                   "general undo: back up a file yourself (for example cp f f.bak) before editing it, and read the "
+                   "result back afterwards to verify. run: interpreter bash, python3, php or psql; the code is passed "
+                   "as a file, never on a command line. account defaults to dwemer; root is full trust over the "
+                   "distro; postgres runs psql with peer login (database names the database). network defaults to "
+                   "false: an empty network, no internet and no TCP to local services (Unix sockets such as "
+                   "PostgreSQL's still work); ask for true only when needed. stdin is empty and nothing is "
+                   "interactive (use apt-get -y). Windows drives (/mnt), Windows interop and the assistant's own "
+                   "state are hidden. The reply gives job_id, state, exit_code and the redacted output tail after "
+                   "waiting up to wait_seconds; a longer job keeps running: call status with job_id and wait_seconds "
+                   "to wait more, output to page older text, cancel to stop it. exit_code 0 only means the process "
+                   "exited 0 (succeeded), not that the change is verified. Never rerun a write whose outcome is "
+                   "unknown or cancelled without checking first. Processes left in the command's process group are "
+                   "stopped when it ends; start services with their init script or setsid and redirect their output.",
+    "inputSchema": {"type": "object", "additionalProperties": False, "required": ["operation"], "properties": {
+        "operation": {"type": "string", "enum": list(RUN_OPERATIONS)},
+        "interpreter": {"type": "string", "enum": list(RUN_INTERPRETERS), "description": "run only (required)"},
+        "code": {"type": "string", "maxLength": RUN_CODE_BYTES,
+                 "description": "run only (required): the whole script, shown to the user exactly"},
+        "account": {"type": "string", "maxLength": 32,
+                    "description": "run only: Linux account, default dwemer; root or postgres when needed"},
+        "cwd": {"type": "string", "maxLength": 1024,
+                "description": "run only: absolute working folder, default the account's home"},
+        "network": {"type": "boolean", "description": "run only: default false (no network at all)"},
+        "timeout_seconds": {"type": "integer", "minimum": RUN_TIMEOUT[0], "maximum": RUN_TIMEOUT[1],
+                            "description": "run only: hard limit, default 300; package installs may need 1800"},
+        "database": {"type": "string", "maxLength": 63, "description": "run with psql only: the database to open"},
+        "reason": {"type": "string", "maxLength": ACTION_REASON_CHARS,
+                   "description": "run only (required): one plain sentence shown to the user: what this does and why"},
+        "job_id": {"type": "string", "maxLength": 32, "description": "status/output/cancel (required)"},
+        "wait_seconds": {"type": "integer", "minimum": RUN_WAIT[0], "maximum": RUN_WAIT[1],
+                         "description": "run/status: wait up to this long for the job to finish, default 20"},
+        "offset": {"type": "integer", "minimum": 0,
+                   "description": "output only: first character to return (output.from/to of earlier replies)"},
+        "max_chars": {"type": "integer", "minimum": RUN_PAGE_CHARS[0], "maximum": RUN_PAGE_CHARS[1],
+                      "description": "output only: default 24576"}}},
+}
+RUN_HINTS = {
+    "running": "the job is still running; call status with this job_id and wait_seconds to wait for it",
+    "exited": "the process exited; exit_code 0 is not verification: read the result back to confirm the change",
+    "timed_out": "the job hit its time limit and was stopped; it may have changed things partway. Check before rerunning",
+    "cancelled": "the job was stopped before it finished; it may have changed things partway. Check before rerunning",
+    "killed": "the job was killed; it may have changed things partway. Check before rerunning",
+    "unknown": "the outcome is not known; do not rerun it automatically. Check the state with a read first",
+    "refused": "nothing ran; fix the request named in the message",
+    "not_started": "nothing ran; report the reason",
+    "busy": "nothing ran: another change holds the maintenance lock or too many jobs are running; try again later",
+    "cancelled_proposal": "the user did not approve it; nothing ran. Do not retry unless the user asks",
+    "expired": "the approval window passed; nothing ran. Propose again only if the user still wants it",
+}
+
+
+def run_request(arguments):
+    """(request, wait seconds, reason) for validated run arguments. The request is exactly what ddistro_run receives;
+    nothing is added to or removed from the code."""
+    reject_unknown(arguments, ("operation", "interpreter", "code", "account", "cwd", "network", "timeout_seconds",
+                               "database", "reason", "wait_seconds"))
+    interpreter = arguments.get("interpreter")
+    if interpreter not in RUN_INTERPRETERS:
+        raise PolicyError(-32602, "interpreter must be one of " + ", ".join(RUN_INTERPRETERS))
+    code = arguments.get("code")
+    if not isinstance(code, str) or not code.strip():
+        raise PolicyError(-32602, "code must be the non-empty script text")
+    try:
+        size = len(code.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise PolicyError(-32602, "code must be valid UTF-8 text")
+    if size > RUN_CODE_BYTES:
+        raise PolicyError(-32602, "code must be at most %d KiB" % (RUN_CODE_BYTES // 1024))
+    if RUN_HIDDEN_TEXT.search(code):
+        raise PolicyError(-32602, "code must not contain control or bidirectional characters (tab and newline are fine)")
+    account = arguments.get("account", RUN_DEFAULT_ACCOUNT)
+    if not isinstance(account, str) or not RUN_ACCOUNT.match(account) or account == AGENT_USER:
+        raise PolicyError(-32602, "account must be a Linux account name such as dwemer, root or postgres")
+    cwd = arguments.get("cwd")
+    if cwd is not None and (not isinstance(cwd, str) or not cwd.startswith("/") or len(cwd) > 1024
+                            or RUN_HIDDEN_TEXT.search(cwd) or any(c in cwd for c in "\t\r\n")):
+        raise PolicyError(-32602, "cwd must be an absolute folder path on one line")
+    network = arguments.get("network", False)
+    if type(network) is not bool:
+        raise PolicyError(-32602, "network must be true or false")
+    timeout = arguments.get("timeout_seconds", RUN_DEFAULT_TIMEOUT)
+    if type(timeout) is not int or not RUN_TIMEOUT[0] <= timeout <= RUN_TIMEOUT[1]:
+        raise PolicyError(-32602, "timeout_seconds must be a whole number %d-%d" % RUN_TIMEOUT)
+    database = arguments.get("database")
+    if database is not None and (interpreter != "psql" or not isinstance(database, str)
+                                 or not RUN_DATABASE.match(database)):
+        raise PolicyError(-32602, "database is only for psql and must be a plain database name like dwemer")
+    wait = run_wait(arguments)
+    reason = memory_value(arguments, "reason", ACTION_REASON_CHARS)
+    request = {"schema_version": 1, "interpreter": interpreter, "code": code, "account": account, "cwd": cwd,
+               "network": network, "timeout_seconds": timeout, "database": database}
+    return request, wait, reason
+
+
+def run_wait(arguments):
+    wait = arguments.get("wait_seconds", RUN_DEFAULT_WAIT)
+    if type(wait) is not int or not RUN_WAIT[0] <= wait <= RUN_WAIT[1]:
+        raise PolicyError(-32602, "wait_seconds must be a whole number %d-%d" % RUN_WAIT)
+    return wait
+
+
+def run_bytes(request):
+    """The exact bytes ddistro_run reads; their sha256 is the digest the user approves and the supervisor echoes."""
+    return json.dumps(request, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def run_scope(request):
+    return {"account": request["account"], "root": request["account"] == "root", "network": request["network"]}
+
+
+def run_covered(grant, request):
+    """True when one approved (account, network) scope of the session's task grant covers this request: the same
+    account, or root (which can already become any account), at the same or a wider network tier. Scopes are never
+    combined, so root without network plus dwemer with network does not allow root with network."""
+    if grant is None:
+        return False
+    return any((account == request["account"] or account == "root") and (network or not request["network"])
+               for account, network in grant["scopes"])
+
+
+def run_spec_view(request):
+    """The request as the model sees it in replies: everything but the code, which it wrote and the user saw."""
+    code = request["code"].encode("utf-8")
+    return {"interpreter": request["interpreter"], "account": request["account"], "cwd": request["cwd"],
+            "network": request["network"], "timeout_seconds": request["timeout_seconds"],
+            "database": request["database"], "code_sha256": sha256_bytes(code), "code_bytes": len(code)}
+
+
+def run_impact(request):
+    if request["account"] == "root":
+        who = ("as root: full trust over the whole distro (every file, account, service and database, and the "
+               "masks below can be undone by root)")
+    else:
+        who = "as %s, with that account's permissions (sudo and other setuid programs cannot raise it)" % request["account"]
+    net = ("with network: internet and local services are reachable" if request["network"] else
+           "without network (Unix sockets such as PostgreSQL's still work)")
+    return ("Runs this code on the LIVE DwemerDistro %s, %s, for at most %d seconds. A command meant only to read can "
+            "still change things, and there is no general undo. Windows drives, Windows interop and the assistant's "
+            "sign-in and state are hidden from it; product configuration is not." % (who, net, request["timeout_seconds"]))
+
+
+class RunJob:
+    """One live command: its supervisor, its redacted output ring, and its state. All fields change under lock."""
+
+    def __init__(self, job_id, thread_id, turn_id, request, digest, approval):
+        self.id, self.thread, self.turn = job_id, thread_id, turn_id
+        self.request, self.digest, self.approval = request, digest, approval
+        self.lock = threading.Condition()
+        self.state = "starting"
+        self.started = False
+        self.child = None
+        self.exit = {}
+        self.reason = None
+        self.started_at = self.finished_at = None
+        self.clock = time.monotonic()
+        self.duration_ms = None
+        # The ring: redacted lines with their absolute start offsets; lines before head were dropped.
+        self.lines, self.starts, self.head = [], [], 0
+        self.base = self.end = 0
+        self.partial = {"stdout": b"", "stderr": b""}
+        self.unsent = []
+        self.not_streamed = 0
+        self.window = None
+        self.stop_reason = None
+        self.stop_at = None
+        self.message = None
+        self.worker = None
+
+    def finished(self):
+        return self.state in RUN_FINAL_STATES + RUN_UNSTARTED_STATES
+
+    def append(self, line):
+        """Adds one redacted line; the oldest whole lines are dropped once the ring holds more than RUN_RING_CHARS."""
+        self.lines.append(line)
+        self.starts.append(self.end)
+        self.end += len(line)
+        self.unsent.append(line)
+        while self.end - self.base > RUN_RING_CHARS and self.head < len(self.lines) - 1:
+            self.base += len(self.lines[self.head])
+            self.lines[self.head] = None
+            self.head += 1
+        if self.head > 4096:
+            del self.lines[:self.head], self.starts[:self.head]
+            self.head = 0
+
+    def page(self, offset, limit):
+        """(text, from, to) of at most limit characters starting at offset (clamped to what the ring still holds)."""
+        start = max(offset, self.base)
+        index = max(self.head, bisect.bisect_right(self.starts, start, self.head) - 1)
+        parts, size, cursor = [], 0, start
+        while index < len(self.lines) and size < limit:
+            line = self.lines[index]
+            piece = line[cursor - self.starts[index]:][:limit - size]
+            parts.append(piece)
+            size += len(piece)
+            cursor = self.starts[index] + len(line)
+            index += 1
+        text = "".join(parts)
+        return text, start, start + len(text)
+
+    def tail(self, limit):
+        if not limit:
+            return "", self.end, self.end
+        return self.page(max(self.base, self.end - limit), limit)
+
+
 TOOL_TIMEOUT = 90
 TOOL_STDOUT_LIMIT = 1024 * 1024
 TOOL_TEXT_BUDGET = 64 * 1024
@@ -1276,7 +1532,8 @@ def attestation_matches(attestation, binding):
 
 def verified_session_identity():
     """Full verification for a session: fresh runtime hash plus a matching attestation. Also returns whether that
-    attestation records the managed exec canary passing for the exec and access helper bytes installed now."""
+    attestation records the managed exec canary passing for the exec and access helper bytes installed now, and the
+    ddistro_run digest it bound when its live_run canary passed (None otherwise)."""
     identity, binding = installation(None)
     attestation = read_attestation()
     if attestation is None:
@@ -1287,7 +1544,8 @@ def verified_session_identity():
     helpers = binding.get("managed_helpers", {})
     managed_exec = (isinstance(optional, dict) and optional.get("managed_exec_isolation") is True
                     and "exec" in helpers and "access" in helpers)
-    return identity, managed_exec
+    live_run = helpers.get("run") if isinstance(optional, dict) and optional.get("live_run_isolation") is True else None
+    return identity, managed_exec, live_run
 
 
 # ---------------------------------------------------------------- task and account state
@@ -2061,6 +2319,14 @@ class DiagnosticChild:
             self.reaped = True
 
 
+def child_exited(proc):
+    """True once the child has exited, without reaping it (DiagnosticChild.reap does that under its lock)."""
+    try:
+        return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        return True
+
+
 def ddistro_timeout(argv):
     """run_ddistro's time bound: an approved service operation gets SERVICE_APPLY_TIMEOUT, everything else TOOL_TIMEOUT."""
     return SERVICE_APPLY_TIMEOUT if list(argv[:2]) == ["operations", "apply"] else TOOL_TIMEOUT
@@ -2143,6 +2409,88 @@ def run_ddistro(argv, registry=None):
     return False, failure
 
 
+MAINTENANCE_LOCK = "/run/lock/dwemerdistro-maintenance.lock"
+
+
+def run_helper_check(expected):
+    """ddistro_run must still be the trusted root-owned file whose digest the attestation bound at session start."""
+    st = trusted_chain(RUN_HELPER, "helper_untrusted")
+    if not stat.S_ISREG(st.st_mode) or sha256_file(RUN_HELPER) != expected:
+        raise Refusal("helper_changed")
+
+
+def maintenance_clear():
+    """A live job starts only while no exclusive maintenance change (changes apply or undo, a service restart, a model
+    apply) holds the common maintenance lock: it is taken shared without waiting and released at once, never held for
+    the job and never inherited by it. So the job's own ddistro commands take the lock as they always do (an
+    exclusive one is busy only if another process holds it), and nothing waits on the broker. The existing file is
+    used as it is, never replaced; it is created (root 0644) only when missing, as ddistro does."""
+    try:
+        fd = os.open(MAINTENANCE_LOCK, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    except OSError:
+        raise Refusal("maintenance_lock_unsafe")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_nlink != 1 or st.st_mode & 0o022:
+            raise Refusal("maintenance_lock_unsafe")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            raise Refusal("maintenance_busy")
+    finally:
+        os.close(fd)  # releases the shared lock taken above
+
+
+def spawn_run(payload):
+    """Starts the trusted ddistro_run supervisor in its own session and process group (so the broker can signal the
+    whole group) and hands it the exact approved request on stdin. Returns (process, status read descriptor).
+    Must be called from the thread that lives as long as the job: the supervisor's parent-death signal follows it."""
+    read_fd, write_fd = os.pipe()
+    try:
+        proc = subprocess.Popen([RUN_HELPER, "supervise", "--status-fd", str(write_fd), "--parent", str(os.getpid())],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                pass_fds=(write_fd,), close_fds=True, start_new_session=True,
+                                env={"PATH": SAFE_PATH, "LANG": "C.UTF-8"}, cwd="/")
+    except BaseException:
+        os.close(read_fd)
+        raise
+    finally:
+        os.close(write_fd)
+    try:
+        proc.stdin.write(payload)
+        proc.stdin.close()
+    except OSError:
+        pass  # the supervisor refused before reading; its status event says why
+    return proc, read_fd
+
+
+def run_events(buffer):
+    """(complete status events, rest of the buffer). Malformed lines are skipped."""
+    events = []
+    while b"\n" in buffer:
+        line, buffer = buffer.split(b"\n", 1)
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and isinstance(event.get("event"), str):
+            events.append(event)
+    return events, buffer[-65536:]
+
+
+def run_redactor(access_module):
+    """The line redaction for live output: ddistro_access's when it loaded, otherwise the diagnostic patterns."""
+    redact = getattr(access_module, "redact_text", None) if access_module is not None else None
+    if callable(redact):
+        def apply(text):
+            try:
+                return redact(text)[0]
+            except Exception:  # never let a policy bug pass text through unredacted
+                return DIAG_SECRETS.sub("[redacted]", DIAG_URL_QUERY.sub(r"\1?[redacted]", text))
+        return apply
+    return lambda text: DIAG_SECRETS.sub("[redacted]", DIAG_URL_QUERY.sub(r"\1?[redacted]", text))
+
+
 THREAD_START_KEYS = ("model", "approvalPolicy", "approvalsReviewer", "cwd", "sandbox", "permissions",
                      "developerInstructions", "ephemeral", "serviceName", "personality", "serviceTier")
 THREAD_RESUME_KEYS = ("threadId", "model", "approvalPolicy", "approvalsReviewer", "cwd", "sandbox", "permissions",
@@ -2166,7 +2514,8 @@ class Broker:
     """Bidirectional JSONL relay that only forwards the launcher's allowed method surface."""
 
     def __init__(self, proc, client_in, client_out, threads, err_sink=None, run_tool=run_ddistro, memory=False,
-                 access=False, change_roots=(), managed_exec=False):
+                 access=False, change_roots=(), managed_exec=False, live_run=None, redact=None, spawn=spawn_run,
+                 run_lock=maintenance_clear):
         self.proc = proc
         self.client_in = client_in
         self.client_out = client_out
@@ -2215,6 +2564,20 @@ class Broker:
         self.proposed_turns = set()
         # The tool thread running an approved restart, which teardown waits for (see _stop_children).
         self.action_job = None
+        # live_run: the ddistro_run digest the attestation bound with a passing canary at session start (None: not
+        # offered), whether the client negotiated it, the session-only task grant, and this session's jobs.
+        self.run_digest = live_run
+        self.live_run = False
+        self.redact = redact or run_redactor(None)
+        self.spawn = spawn
+        self.run_lock = run_lock
+        self.run_grant = None
+        # Per thread, how often its jobs were stopped (Stop, archive, delete): a run approved before a stop of its
+        # thread must not start after it.
+        self.run_stops = {}
+        self.jobs = collections.OrderedDict()
+        self.run_workers = set()
+        self.run_slots = threading.Semaphore(RUN_CALL_CONCURRENCY)
 
     def run(self):
         reader = threading.Thread(target=self._pump_client, daemon=True)
@@ -2242,18 +2605,28 @@ class Broker:
             self.children.discard(child)
 
     def _stop_diagnostics(self):
-        """No new runs; SIGTERM then SIGKILL exactly the adopted groups; join every tool thread."""
+        """No new runs; SIGTERM then SIGKILL exactly the adopted groups; join every tool thread. Live jobs are stopped
+        too (their supervisors stop their groups) and the session's task grant ends."""
         self._cancel_proposals(None, "cancelled")
         with self.state_lock:
             self.stopping = True
             first = not self.diagnostics_claimed
             self.diagnostics_claimed = True
             children, jobs = list(self.children), list(self.tool_jobs)
+            had_grant, self.run_grant = self.run_grant is not None, None
         if not first:
             self.diagnostics_stopped.wait()
             return
         try:
+            self._stop_jobs(None, "session_end")
+            if had_grant:
+                self._run_grant_notice("session_end")
             self._stop_children(children, jobs)
+            with self.state_lock:
+                workers = list(self.run_workers)
+            for worker in workers:
+                # Bounded: the supervisor stops its group within its grace, and the worker SIGKILLs it after RUN_STOP_GRACE.
+                worker.join(RUN_STOP_GRACE + RUN_DRAIN_SECONDS + 5)
         finally:
             self.diagnostics_stopped.set()
 
@@ -2383,10 +2756,16 @@ class Broker:
                 if method == "ddistro/action/decide":
                     self._decide_action(request_id, message.get("params"))
                     return
+                if method in ("ddistro/run/revoke", "ddistro/run/cancel"):
+                    self._run_client(request_id, method, message.get("params"))
+                    return
                 message["params"] = self._authorize(method, message.get("params"))
                 if method in ("turn/start", "turn/interrupt"):
                     # A new or stopped turn ends any pending proposal: it can no longer be approved.
                     self._cancel_proposals(message["params"].get("threadId"), "cancelled")
+                if method in ("turn/interrupt",) + THREAD_LIFECYCLE_METHODS:
+                    # Stop, archive or delete also stops that thread's live jobs (their whole process groups).
+                    self._stop_jobs(message["params"].get("threadId"), "interrupted")
                 if method == "thread/list":
                     self._list_threads(request_id, message["params"])
                     return
@@ -2425,12 +2804,17 @@ class Broker:
                 raise PolicyError(-32602, "invalid parameter: capabilities.experimentalApi")
             self.experimental = experimental is True
             actions = capabilities.pop("ddistroActions", None) if isinstance(capabilities, dict) else None
-            if actions is not None and (not isinstance(actions, list) or len(actions) > len(ACTION_OPERATIONS)
-                                        or any(not isinstance(name, str) or name not in ACTION_OPERATIONS for name in actions)
+            known = tuple(ACTION_OPERATIONS) + (RUN_CAPABILITY,)
+            if actions is not None and (not isinstance(actions, list) or len(actions) > len(known)
+                                        or any(not isinstance(name, str) or name not in known for name in actions)
                                         or len(set(actions)) != len(actions)):
                 raise PolicyError(-32602, "invalid parameter: capabilities.ddistroActions")
+            # live_run declares its own tool (ddistro_run), not a ddistro_action operation. Like change_files it is
+            # dropped silently where this installation cannot honor it (no attested ddistro_run canary).
+            self.live_run = bool(self.experimental and actions and RUN_CAPABILITY in actions and self.run_digest)
+            actions = [name for name in actions or () if name != RUN_CAPABILITY]
             # Codex never sees this broker-only field; the action needs the dynamic tools experimentalApi enables.
-            self.actions = frozenset(actions or ()) if self.experimental else frozenset()
+            self.actions = frozenset(actions) if self.experimental else frozenset()
             # File changes need the trusted access policy as the session started; otherwise they are not offered.
             if not self.access:
                 self.actions -= {ACTION_FILES_CAPABILITY}
@@ -2462,7 +2846,8 @@ class Broker:
                                           + ([explore_spec(self._checkout(), self._services())]
                                              if EXPLORE_CAPABILITY in self.tools else [])
                                           + ([EXEC_SPEC] if EXEC_CAPABILITY in self.tools else [])
-                                          + ([action_spec(self.actions)] if self.actions else []))
+                                          + ([action_spec(self.actions)] if self.actions else [])
+                                          + ([RUN_SPEC] if self.live_run else []))
             self._cancel_proposals(None, "cancelled")
             return enforce_sandbox(params)
         if method == "thread/resume":
@@ -2802,6 +3187,9 @@ class Broker:
 
     def _start_tool(self, message):
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        if params.get("tool") == RUN_TOOL and self.live_run and params.get("namespace") is None:
+            self._start_run_call(message["id"], params)
+            return
         if self.stopping:
             self._tool_reply(message["id"], params, False, {"code": "cancelled", "message": "the session is closing"})
             return
@@ -2874,30 +3262,47 @@ class Broker:
         changes, under the lock, so a replayed, late, or racing decision changes nothing."""
         if not isinstance(params, dict):
             raise PolicyError(-32602, "params must be an object")
-        reject_unknown(params, ("proposalId", "threadId", "decision"))
-        if params.get("decision") not in ("approve", "cancel"):
-            raise PolicyError(-32602, "decision must be approve or cancel")
+        reject_unknown(params, ("proposalId", "threadId", "decision", "digest"))
+        decision = params.get("decision")
+        if decision not in ("approve", "approve_session", "cancel"):
+            raise PolicyError(-32602, "decision must be approve, approve_session or cancel")
         with self.state_lock:
             proposal_id = params.get("proposalId")
             proposal = self.proposals.get(proposal_id) if isinstance(proposal_id, str) else None
             if proposal is None or proposal["thread"] != params.get("threadId"):
                 raise PolicyError(-32001, "no such proposal")
+            # A live run is approved only with the digest of the exact request the card showed; approve_session (Allow
+            # for this task) exists only for live runs. Checked before anything changes, so a bad decision is inert.
+            if proposal["action"] == "live_run":
+                if decision != "cancel" and params.get("digest") != proposal["digest"]:
+                    raise PolicyError(-32602, "digest must be the proposal's digest")
+            elif decision == "approve_session" or "digest" in params:
+                raise PolicyError(-32602, "approve_session and digest apply only to live_run proposals")
             if proposal["state"] == "proposed" and (self.stopping or time.monotonic() > proposal["expires"]):
                 proposal["state"] = "expired"
                 proposal["event"].set()
             if proposal["state"] != "proposed":
                 raise PolicyError(-32001, "proposal is no longer pending: " + proposal["state"])
-            proposal["state"] = "approved" if params["decision"] == "approve" else "cancelled"
+            proposal["state"] = {"approve": "approved", "approve_session": "approved_session"}.get(decision, "cancelled")
             proposal["event"].set()
             state = proposal["state"]
+            granted = decision == "approve_session"
+            if granted:
+                # Installed here, under the same lock as the decision, so a revoke that follows always wins; one more
+                # exact (account, network) scope, never a union of separate ones.
+                current = self.run_grant
+                self.run_grant = {"scopes": (current["scopes"] if current else frozenset()) | {proposal["scope"]},
+                                  "granted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         self._to_client(encode({"id": request_id, "result": {"state": state}}))
+        if granted:
+            self._run_grant_notice("approved")
 
     def _reserve_proposal(self, proposal):
         """Takes the session's one proposal slot unless another proposal is preparing, pending or running, or this turn
         already proposed this operation. Returns (busy, repeated); the slot is taken only when both are false."""
         with self.state_lock:
-            busy = self.stopping or any(p["state"] in ("preparing", "proposed", "approved", "executing")
-                                        for p in self.proposals.values())
+            busy = self.stopping or any(p["state"] in ("preparing", "proposed", "approved", "approved_session",
+                                                       "executing", "starting") for p in self.proposals.values())
             repeated = (proposal["thread"], proposal["turn"], proposal["operation"]) in self.proposed_turns
             if not (busy or repeated):
                 # Finished proposals are dropped; a decision for one is then "no such proposal", which also fails closed.
@@ -3363,6 +3768,573 @@ class Broker:
             document["hint"] = hint
         self._reply_action_document(request_id, document, state == "verified", key)
 
+    # ddistro_run (live_run)
+    def _start_run_call(self, request_id, params):
+        """A ddistro_run call runs in its own thread (it may wait for approval or for its job), never in a diagnostic
+        slot, bounded by RUN_CALL_CONCURRENCY and its own per-turn budget."""
+        key, refusal = self._charge_run(params)
+        if refusal is None and self.stopping:
+            refusal = {"code": "cancelled", "message": "the session is closing"}
+        if refusal is None and not self.run_slots.acquire(blocking=False):
+            refusal = {"code": "busy", "message": "other ddistro_run calls are still waiting; wait for them first"}
+        if refusal is not None:
+            self._run_reply(request_id, {"tool": RUN_TOOL, "operation": None, "state": "refused", "started": False,
+                                         "error": refusal}, False)
+            return
+        job = threading.Thread(target=self._run_call, args=(request_id, params, key), daemon=True)
+        with self.state_lock:
+            started = not self.stopping
+            if started:
+                self.tool_jobs.add(job)
+                job.start()
+        if not started:
+            self.run_slots.release()
+
+    def _charge_run(self, params):
+        """Counts one ddistro_run call against the session total and its own per-turn budget (polling a long job is
+        expected, so it does not use the read tools' 16 calls)."""
+        thread_id, turn_id = params.get("threadId"), params.get("turnId")
+        key = (thread_id, turn_id, RUN_TOOL) if isinstance(thread_id, str) and isinstance(turn_id, str) \
+            and 0 < len(turn_id) <= 128 else None
+        with self.state_lock:
+            self.session_calls += 1
+            if self.session_calls > TOOL_SESSION_CALLS:
+                return key, {"code": "session_tool_limit", "message": (
+                    "assistant tools are limited to %d calls per session; answer from what you have and start a new "
+                    "session for more" % TOOL_SESSION_CALLS)}
+            if key is None:
+                return None, None  # refused as invalid by _run_call
+            budget = self.turn_budgets.get(key)
+            if budget is None:
+                budget = self.turn_budgets[key] = [0, 0, False]
+                while len(self.turn_budgets) > TOOL_TRACKED_TURNS:
+                    self.turn_budgets.popitem(last=False)
+            budget[0] += 1
+            if budget[0] <= RUN_TURN_CALLS:
+                return key, None
+        return None, {"code": "turn_tool_limit", "message": (
+            "ddistro_run is limited to %d calls per turn; stop polling, tell the user the job id and its state, and "
+            "let them ask again" % RUN_TURN_CALLS)}
+
+    def _run_call(self, request_id, params, key):
+        operation = None
+        try:
+            arguments = params.get("arguments")
+            try:
+                if not isinstance(arguments, dict):
+                    raise PolicyError(-32602, "arguments must be an object")
+                operation = arguments.get("operation")
+                thread_id, turn_id = params.get("threadId"), params.get("turnId")
+                with self.state_lock:
+                    owned = isinstance(thread_id, str) and thread_id in self.threads
+                if not owned:
+                    raise PolicyError(-32602, "threadId does not belong to this task")
+                if operation not in RUN_OPERATIONS:
+                    raise PolicyError(-32602, "operation must be one of " + ", ".join(RUN_OPERATIONS))
+                if operation == "run":
+                    if not isinstance(turn_id, str) or not 0 < len(turn_id) <= 128:
+                        raise PolicyError(-32602, "turnId is required")
+                    request, wait, reason = run_request(arguments)
+                    self._run_start(request_id, request, wait, reason, thread_id, turn_id, key)
+                    return
+                if operation == "list":
+                    reject_unknown(arguments, ("operation",))
+                    with self.state_lock:
+                        jobs = [job for job in self.jobs.values() if job.thread == thread_id]
+                    self._run_reply(request_id, {"tool": RUN_TOOL, "operation": "list",
+                                                 "jobs": [self._run_view(job, 0) for job in jobs[-RUN_MAX_JOBS:]]}, True)
+                    return
+                allowed = {"status": ("operation", "job_id", "wait_seconds"), "cancel": ("operation", "job_id"),
+                           "output": ("operation", "job_id", "offset", "max_chars")}[operation]
+                reject_unknown(arguments, allowed)
+                job = self._run_job(arguments.get("job_id"), thread_id)
+                if operation == "cancel":
+                    self._stop_job(job, "model_cancel")
+                    self._run_wait(job, RUN_STOP_GRACE + RUN_DRAIN_SECONDS + 2)
+                elif operation == "status":
+                    self._run_wait(job, run_wait(arguments))
+                if operation == "output":
+                    self._run_reply(request_id, self._run_page(job, arguments), True)
+                    return
+                view = self._run_view(job, RUN_REPLY_CHARS)
+                self._run_reply(request_id, {"tool": RUN_TOOL, "operation": operation, "job": view,
+                                             "state": view["state"], "hint": RUN_HINTS.get(view["state"])},
+                                view["state"] == "running" or view["succeeded"])
+            except PolicyError as exc:
+                self._run_reply(request_id, {"tool": RUN_TOOL, "operation": operation if operation in RUN_OPERATIONS
+                                             else None, "state": "refused", "started": False,
+                                             "error": {"code": "invalid_arguments", "message": exc.message}}, False)
+        finally:
+            with self.state_lock:
+                self.tool_jobs.discard(threading.current_thread())
+            self.run_slots.release()
+
+    def _run_job(self, job_id, thread_id):
+        """Only a job of this session and of the calling thread; any other id is unknown."""
+        with self.state_lock:
+            job = self.jobs.get(job_id) if isinstance(job_id, str) and RUN_JOB_ID.match(job_id) else None
+        if job is None or job.thread != thread_id:
+            raise PolicyError(-32602, "no job with that job_id in this chat; call list for this chat's jobs")
+        return job
+
+    def _run_start(self, request_id, request, wait, reason, thread_id, turn_id, key):
+        """Runs under the session's task grant when it covers the request; otherwise shows the user the exact request
+        and waits for approve (once), approve_session (Allow for this task) or cancel."""
+        digest = sha256_bytes(run_bytes(request))
+        with self.state_lock:
+            covered = run_covered(self.run_grant, request)
+            grant = self._grant_view()
+            epoch = self.run_stops.get(thread_id, 0)
+        if covered:
+            job, failure = self._run_launch(thread_id, turn_id, request, digest, "task_grant", epoch)
+            self._run_started_reply(request_id, job, failure, wait, "task_grant", False)
+            return
+        proposal = {"id": secrets.token_hex(16), "thread": thread_id, "turn": turn_id, "service": None,
+                    "operation": "run", "action": "live_run", "state": "proposed", "event": threading.Event(),
+                    "expires": time.monotonic() + RUN_APPROVAL_SECONDS, "digest": digest,
+                    "scope": (request["account"], request["network"])}
+        busy, _ = self._reserve_proposal(proposal)
+        if busy:
+            self._run_reply(request_id, {"tool": RUN_TOOL, "operation": "run", "state": "busy", "started": False,
+                                         "proposed": False, "hint": "another approval is pending; wait for the user",
+                                         "error": {"code": "busy", "message": "another proposal is pending"}}, False)
+            return
+        widens = grant is not None
+        change = dict(request, code_sha256=sha256_bytes(request["code"].encode("utf-8")), digest=digest,
+                      scope=run_scope(request), grant=grant, widens_grant=widens)
+        change.pop("schema_version")
+        expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + RUN_APPROVAL_SECONDS))
+        self._to_client(encode({"method": "ddistro/action/proposed", "params": {
+            "proposalId": proposal["id"], "threadId": thread_id, "turnId": turn_id, "action": "live_run",
+            "label": "Run on the live distro as " + request["account"], "impact": run_impact(request),
+            "reason": sanitize(reason), "expiresAt": expires_at,
+            "decisions": ["approve", "approve_session", "cancel"], "change": change}}))
+        go, state = self._await_run_decision(proposal)
+        job = failure = None
+        approval = "user_task_grant" if state == "approved_session" else "user_once"
+        if go:
+            # The grant itself was installed by the decision (see _decide_action), so a later revoke always wins.
+            job, failure = self._run_launch(thread_id, turn_id, request, digest, approval, epoch)
+            state = "started" if job is not None else "not_executed"
+        with self.state_lock:
+            proposal["state"] = state
+        self._to_client(encode({"method": "ddistro/action/updated", "params": {
+            "proposalId": proposal["id"], "threadId": thread_id, "action": "live_run", "state": state,
+            "executed": job is not None, "verified": False, "checks": [], "jobId": job.id if job else None}}))
+        if self.stopping:
+            return
+        if go:
+            self._run_started_reply(request_id, job, failure, wait, approval, True)
+            return
+        hint = RUN_HINTS["expired" if state == "expired" else "cancelled_proposal"]
+        self._run_reply(request_id, {"tool": RUN_TOOL, "operation": "run", "state": state, "proposed": True,
+                                     "user_approved": False, "started": False, "spec": run_spec_view(request),
+                                     "hint": hint}, False)
+
+    def _await_run_decision(self, proposal):
+        """Like _await_decision, but an approved run is not an action teardown waits for: it becomes a job that
+        teardown stops. Returns (go, decision state)."""
+        while not proposal["event"].wait(CLIENT_POLL):
+            with self.state_lock:
+                if proposal["state"] == "proposed" and (self.stopping or time.monotonic() > proposal["expires"]):
+                    proposal["state"] = "cancelled" if self.stopping else "expired"
+                    proposal["event"].set()
+        with self.state_lock:
+            state = proposal["state"]
+            go = state in ("approved", "approved_session") and not self.stopping
+            proposal["state"] = "starting" if go else ("not_executed" if state.startswith("approved") else state)
+            return go, state if go else proposal["state"]
+
+    def _grant_view(self):
+        grant = self.run_grant
+        if grant is None:
+            return None
+        return {"scopes": [{"account": account, "network": network} for account, network in sorted(grant["scopes"])],
+                "root": any(account == "root" for account, _ in grant["scopes"]), "granted_at": grant["granted_at"]}
+
+    def _run_grant_notice(self, reason):
+        with self.state_lock:
+            view = self._grant_view()
+        self._to_client(encode({"method": "ddistro/run/grant", "params": {
+            "active": view is not None, "scope": view, "reason": reason}}))
+
+    def _run_launch(self, thread_id, turn_id, request, digest, approval, epoch):
+        """Starts one job for exactly this request. (job, None), or (None, failure) when nothing was started. epoch is
+        the thread's stop count when the call began: a Stop of the thread since then means nothing starts."""
+        with self.state_lock:
+            if self.stopping:
+                return None, {"state": "cancelled", "code": "cancelled", "message": "the session is closing"}
+            running = sum(1 for job in self.jobs.values() if not job.finished())
+            if running >= RUN_MAX_RUNNING:
+                return None, {"state": "busy", "code": "busy", "message": "%d live jobs are already running; wait for "
+                              "one or cancel it" % RUN_MAX_RUNNING}
+        try:
+            if self.spawn is spawn_run:
+                run_helper_check(self.run_digest)
+        except (Refusal, OSError):
+            return None, {"state": "not_started", "code": "helper_changed", "message": (
+                "ddistro_run changed since the isolation check; nothing ran. The user must run the isolation check")}
+        try:
+            self.run_lock()
+        except Refusal as exc:
+            if exc.reason == "maintenance_busy":
+                return None, {"state": "busy", "code": "busy", "message": (
+                    "a DwemerDistro change or service restart holds the maintenance lock; nothing ran")}
+            return None, {"state": "not_started", "code": exc.reason, "message": "the maintenance lock is unusable"}
+        job = RunJob("run_" + secrets.token_hex(8), thread_id, turn_id, request, digest, approval)
+        payload = run_bytes(request)
+        worker = threading.Thread(target=self._run_worker, args=(job, payload), daemon=True)
+        job.worker = worker
+        with self.state_lock:
+            if self.stopping or self.run_stops.get(thread_id, 0) != epoch:
+                return None, {"state": "cancelled", "code": "cancelled", "message": (
+                    "the chat was stopped before the run started; nothing ran")}
+            self.jobs[job.id] = job
+            finished = [key for key, old in self.jobs.items() if old.finished()]
+            while len(self.jobs) > RUN_MAX_JOBS and finished:
+                self.jobs.pop(finished.pop(0), None)
+            self.run_workers.add(worker)
+        spec = dict(run_spec_view(request), code=request["code"])
+        self._to_client(encode({"method": "ddistro/run/started", "params": {
+            "threadId": thread_id, "turnId": turn_id, "jobId": job.id, "approval": approval, "digest": digest,
+            "state": "starting", "spec": spec}}))
+        worker.start()
+        with job.lock:
+            job.lock.wait_for(lambda: job.state != "starting", RUN_START_SECONDS + 5)
+        return job, None
+
+    def _run_started_reply(self, request_id, job, failure, wait, approval, user):
+        if job is None:
+            state = failure["state"]
+            self._run_reply(request_id, {"tool": RUN_TOOL, "operation": "run", "state": state, "proposed": user,
+                                         "user_approved": user, "approval": approval, "started": False,
+                                         "error": {"code": failure["code"], "message": failure["message"]},
+                                         "hint": RUN_HINTS.get(state)}, False)
+            return
+        self._run_wait(job, wait)
+        view = self._run_view(job, RUN_REPLY_CHARS)
+        self._run_reply(request_id, {"tool": RUN_TOOL, "operation": "run", "state": view["state"], "proposed": user,
+                                     "user_approved": user, "approval": approval, "started": view["started"],
+                                     "job": view, "hint": RUN_HINTS.get(view["state"])},
+                        view["state"] == "running" or view["succeeded"])
+
+    def _run_wait(self, job, seconds):
+        with job.lock:
+            job.lock.wait_for(lambda: job.finished() or self.stopping, seconds)
+
+    def _stop_jobs(self, thread_id, reason):
+        with self.state_lock:
+            if thread_id is not None:
+                self.run_stops[thread_id] = self.run_stops.get(thread_id, 0) + 1
+            jobs = [job for job in self.jobs.values() if thread_id in (None, job.thread)]
+        for job in jobs:
+            self._stop_job(job, reason)
+
+    def _stop_job(self, job, reason):
+        """Asks the job's worker to stop it: SIGTERM to the group now, SIGKILL after RUN_STOP_GRACE."""
+        with job.lock:
+            if not job.finished() and job.stop_reason is None:
+                job.stop_reason = reason
+            job.lock.notify_all()
+
+    def _run_client(self, request_id, method, params):
+        """ddistro/run/revoke ends the session's task grant (running jobs continue; stop them with cancel or Stop);
+        ddistro/run/cancel stops one job of the named thread."""
+        if not self.live_run:
+            raise PolicyError(-32601, "method not available in DwemerDistro assistant: " + method)
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise PolicyError(-32602, "params must be an object")
+        if method == "ddistro/run/revoke":
+            reject_unknown(params, ())
+            with self.state_lock:
+                revoked, self.run_grant = self.run_grant is not None, None
+            self._to_client(encode({"id": request_id, "result": {"revoked": revoked}}))
+            if revoked:
+                self._run_grant_notice("revoked")
+            return
+        reject_unknown(params, ("threadId", "jobId"))
+        self._require_thread(params)
+        job = self._run_job(params.get("jobId"), params.get("threadId"))
+        self._stop_job(job, "user_cancel")
+        with job.lock:
+            state = job.state
+        self._to_client(encode({"id": request_id, "result": {"jobId": job.id, "state": state,
+                                                              "stopping": not job.finished()}}))
+
+    def _run_worker(self, job, payload):
+        """Owns one supervisor for its whole life (its parent-death signal is tied to this thread): relays redacted
+        output, enforces stop requests and the backstop, and records the outcome from the supervisor's own events."""
+        final, events_seen, streams = None, [], {}
+        proc = status_fd = None
+        try:
+            with job.lock:
+                stopped = job.stop_reason
+            if stopped is not None:
+                final = {"event": "not_started", "reason": stopped}
+                return
+            try:
+                proc, status_fd = self.spawn(payload)
+            except OSError:
+                final = {"event": "not_started", "reason": "start_failed"}
+                return
+            child = DiagnosticChild(proc)
+            with job.lock:
+                job.child = child
+            streams = {proc.stdout.fileno(): "stdout", proc.stderr.fileno(): "stderr", status_fd: "status"}
+            buffer = b""
+            launch = time.monotonic()
+            backstop = drain = killed_at = None
+            last_flush = 0.0
+            while streams:
+                now = time.monotonic()
+                with job.lock:
+                    stop = job.stop_reason
+                    if stop is None and self.stopping:
+                        stop = job.stop_reason = "session_end"
+                    if stop is None and job.state == "starting" and now > launch + RUN_START_SECONDS:
+                        stop = job.stop_reason = "start_timeout"
+                    if stop is None and backstop is not None and now > backstop:
+                        stop = job.stop_reason = "backstop"
+                    if stop is not None and job.stop_at is None and final is None:
+                        job.stop_at = now
+                        child.signal(signal.SIGTERM)
+                    if job.stop_at is not None and killed_at is None and final is None \
+                            and now > job.stop_at + RUN_STOP_GRACE:
+                        killed_at = now
+                        child.signal(signal.SIGKILL)
+                if drain is not None and now > drain:
+                    break
+                if killed_at is not None and now > killed_at + 3 and child_exited(proc):
+                    break
+                try:
+                    ready = select.select(list(streams), [], [], RUN_STREAM_INTERVAL)[0]
+                except (OSError, ValueError):
+                    break
+                for fd in ready:
+                    try:
+                        chunk = os.read(fd, 65536)
+                    except OSError:
+                        chunk = b""
+                    name = streams[fd]
+                    if not chunk:
+                        del streams[fd]
+                        continue
+                    if name != "status":
+                        self._run_output(job, name, chunk)
+                        continue
+                    events, buffer = run_events(buffer + chunk)
+                    for event in events:
+                        events_seen.append(event)
+                        if event["event"] == "started" and final is None:
+                            if event.get("digest") != job.digest:
+                                # Not the approved bytes: stop it at once; never reported as the approved run, but
+                                # reported as started, because something did start.
+                                with job.lock:
+                                    job.started = True
+                                    job.stop_reason = job.stop_reason or "digest_mismatch"
+                                continue
+                            backstop = time.monotonic() + job.request["timeout_seconds"] + RUN_BACKSTOP_SECONDS
+                            self._run_settle(job, "running", None, started=True)
+                        elif event["event"] in ("refused", "not_started") and final is None:
+                            final = event
+                            drain = time.monotonic() + RUN_DRAIN_SECONDS
+                        elif event["event"] == "exited" and final is None:
+                            final = event
+                            drain = time.monotonic() + RUN_DRAIN_SECONDS
+                if status_fd not in streams and final is None and drain is None and child_exited(proc):
+                    drain = time.monotonic() + RUN_DRAIN_SECONDS
+                if time.monotonic() - last_flush >= RUN_STREAM_INTERVAL:
+                    last_flush = time.monotonic()
+                    self._run_flush(job)
+            if final is None or final["event"] != "exited":
+                # No final report: make sure nothing of this group is left before the supervisor is reaped.
+                child.signal(signal.SIGKILL)
+        finally:
+            for name in ("stdout", "stderr"):
+                with job.lock:
+                    rest, job.partial[name] = job.partial[name], b""
+                if rest:
+                    lines = self._run_lines(name, rest + b"\n")
+                    with job.lock:
+                        for line in lines:
+                            job.append(line)
+            self._run_flush(job)
+            if proc is not None:
+                for handle in (proc.stdout, proc.stderr):
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+                with job.lock:
+                    child = job.child
+                if child is not None:
+                    child.reap()
+            if status_fd is not None:
+                os.close(status_fd)
+            self._run_conclude(job, final, events_seen)
+            with self.state_lock:
+                self.run_workers.discard(threading.current_thread())
+
+    def _run_conclude(self, job, final, events):
+        """The outcome from the supervisor's events only; never inferred from silence as success. A supervisor that
+        was launched but sent no definitive event may have run the code (its status can be lost after exec), so that
+        is unknown, never not_started."""
+        with job.lock:
+            started, stop, launched = job.started, job.stop_reason, job.child is not None
+        if final is None:
+            if stop == "digest_mismatch":
+                self._run_settle(job, "killed", "digest_mismatch")
+            elif started:
+                self._run_settle(job, "killed" if stop else "unknown", stop or "supervisor_lost")
+            elif launched:
+                self._run_settle(job, "unknown", stop or "supervisor_lost")
+            else:
+                self._run_settle(job, "not_started", stop or "supervisor_failed")
+            return
+        if final["event"] == "refused":
+            self._run_settle(job, "refused", str(final.get("reason") or "refused")[:64],
+                             message=str(final.get("message") or "")[:300])
+            return
+        if final["event"] == "not_started":
+            self._run_settle(job, "not_started", str(final.get("reason") or "failed")[:64],
+                             message=str(final.get("detail") or "")[:200], started=False)
+            return
+        exit_code = final.get("exit_code") if type(final.get("exit_code")) is int else None
+        sig = final.get("signal") if type(final.get("signal")) is int else None
+        if final.get("timed_out") is True:
+            state = "timed_out"
+        elif final.get("cancelled") is True or stop is not None:
+            state = "cancelled"
+        elif sig is not None or exit_code is None:
+            state = "killed"
+        else:
+            state = "exited"
+        leftovers = final.get("leftovers_stopped") if type(final.get("leftovers_stopped")) is int else None
+        self._run_settle(job, state, stop if state == "cancelled" else None, exit_code=exit_code, signal_number=sig,
+                         leftovers=leftovers)
+
+    def _run_settle(self, job, state, reason, started=None, message=None, exit_code=None, signal_number=None,
+                    leftovers=None):
+        with job.lock:
+            if started is not None:
+                job.started = started
+            job.state, job.reason = state, reason
+            if message:
+                job.message = message
+            if state == "running":
+                job.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            if job.finished():
+                job.finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                job.duration_ms = int((time.monotonic() - job.clock) * 1000)
+                job.exit = {"exit_code": exit_code, "signal": signal_number, "leftovers_stopped": leftovers}
+            job.lock.notify_all()
+        view = self._run_view(job, 0)
+        self._to_client(encode({"method": "ddistro/run/updated", "params": {
+            "threadId": job.thread, "jobId": job.id, "state": view["state"], "started": view["started"],
+            "exitCode": view["exit_code"], "signal": view["signal"], "succeeded": view["succeeded"],
+            "verified": False, "reason": view["reason"], "durationMs": view["duration_ms"],
+            "outputChars": view["output"]["total_chars"]}}))
+
+    def _run_output(self, job, stream, chunk):
+        """Adds a stream's complete lines to the job's ring, redacted as one block (so a multi-line secret such as a
+        private key is caught and a flood costs one pass per read); a line without a newline waits for the rest,
+        up to 4 lines' worth, then is cut."""
+        with job.lock:
+            data = job.partial[stream] + chunk
+            cut = data.rfind(b"\n") + 1
+            block, rest = data[:cut], data[cut:]
+            if len(rest) > RUN_LINE_CHARS * 4:
+                block, rest = block + rest + b"\n", b""
+            job.partial[stream] = rest
+        if not block:
+            return
+        lines = self._run_lines(stream, block)
+        with job.lock:
+            for line in lines:
+                job.append(line)
+
+    def _run_lines(self, stream, block):
+        """Redacted display lines (each ending in a newline) for a block of complete lines."""
+        text = block.decode("utf-8", "replace").replace("\r\n", "\n")
+        text = self.redact(re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "?", text))
+        prefix = "[stderr] " if stream == "stderr" else ""
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        shown = []
+        for line in lines:
+            if len(line) > RUN_LINE_CHARS:
+                line = line[:RUN_LINE_CHARS] + CLIP_MARK % (len(line) - RUN_LINE_CHARS, len(line))
+            shown.append(prefix + line + "\n")
+        return shown
+
+    def _run_flush(self, job):
+        """Streams new output to the client: at most every RUN_STREAM_INTERVAL, RUN_STREAM_CHARS per notification and
+        RUN_STREAM_RATE per second; the rest stays in the ring and is counted as notStreamed."""
+        with job.lock:
+            if not job.unsent:
+                return
+            text = "".join(job.unsent)
+            offset = job.end - len(text)
+            job.unsent = []
+            now = time.monotonic()
+            window = job.window
+            if window is None or now - window[0] >= 1.0:
+                window = job.window = [now, 0]
+            allowed = max(0, min(RUN_STREAM_CHARS, RUN_STREAM_RATE - window[1]))
+            sent = text[:allowed]
+            window[1] += len(sent)
+            job.not_streamed += len(text) - len(sent)
+            skipped = job.not_streamed
+        if sent:
+            self._to_client(encode({"method": "ddistro/run/output", "params": {
+                "threadId": job.thread, "jobId": job.id, "offset": offset, "text": sent, "notStreamed": skipped}}))
+
+    def _run_view(self, job, tail_chars):
+        with job.lock:
+            text, start, end = job.tail(tail_chars)
+            exit_code, sig = job.exit.get("exit_code"), job.exit.get("signal")
+            view = {"job_id": job.id, "state": job.state, "started": job.started, "finished": job.finished(),
+                    "exit_code": exit_code, "signal": sig,
+                    "succeeded": job.state == "exited" and exit_code == 0,
+                    "verified": False, "approval": job.approval, "reason": job.reason,
+                    "message": job.message, "spec": run_spec_view(job.request),
+                    "started_at": job.started_at, "finished_at": job.finished_at, "duration_ms": job.duration_ms,
+                    "leftovers_stopped": job.exit.get("leftovers_stopped"),
+                    "output": {"text": text, "from": start, "to": end, "total_chars": job.end,
+                               "available_from": job.base, "earlier_text": start > 0}}
+        if view["finished"] and view["started"]:
+            view["verification"] = ("process exit status only: read the result back to verify a change; nothing was "
+                                    "checked independently")
+        return view
+
+    def _run_page(self, job, arguments):
+        offset = arguments.get("offset", 0)
+        limit = arguments.get("max_chars", RUN_REPLY_CHARS)
+        if type(offset) is not int or offset < 0:
+            raise PolicyError(-32602, "offset must be a whole number of characters, 0 or more")
+        if type(limit) is not int or not RUN_PAGE_CHARS[0] <= limit <= RUN_PAGE_CHARS[1]:
+            raise PolicyError(-32602, "max_chars must be a whole number %d-%d" % RUN_PAGE_CHARS)
+        with job.lock:
+            text, start, end = job.page(offset, limit)
+            total, base, state = job.end, job.base, job.state
+        return {"tool": RUN_TOOL, "operation": "output", "job_id": job.id, "state": state,
+                "output": {"text": text, "from": start, "to": end, "total_chars": total, "available_from": base,
+                           "dropped_before": max(0, base - offset) if offset < base else 0, "more": end < total}}
+
+    def _run_reply(self, request_id, document, success):
+        """The model's view: redacted output, the state and what it means; never a proposal id or the code."""
+        if self.stopping:
+            return  # Codex is going away; as for the other tools, an unfinished call is not answered
+        document = dict(document, captured_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        line = bounded_line({"result": document}, TOOL_TEXT_BUDGET)
+        text = json.dumps(json.loads(line)["result"], separators=(",", ":")) if line else json.dumps(
+            {"tool": RUN_TOOL, "state": document.get("state"), "error": {"code": "output_too_large"}})
+        self._to_server({"id": request_id, "result": {"success": bool(success),
+                                                      "contentItems": [{"type": "inputText", "text": text}]}})
+
     def _tool_reply(self, request_id, params, ok, payload, key=None):
         arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
         tool = (MEMORY_TOOL if params.get("tool") == MEMORY_TOOL and self.memory
@@ -3660,20 +4632,25 @@ def refuse_session(reason):
     return 3
 
 
-def policy_change_roots():
-    """The root ids the trusted, root-owned access library marks change true, loaded once at session start (the same
-    trust check ddistro_changes makes before loading it). Any failure offers no root; nothing else adds one."""
+def load_access_policy():
+    """The trusted, root-owned access library, loaded once at session start (the same trust check ddistro_changes
+    makes before loading it), or None."""
     try:
         st = trusted_chain(ACCESS_MODULE, "helper_untrusted")
         if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o022:
-            return ()
+            return None
         spec = importlib.util.spec_from_loader("ddistro_access", importlib.machinery.SourceFileLoader(
             "ddistro_access", ACCESS_MODULE))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        roots = getattr(module, "ACCESS_ROOTS", None)
-    except Exception:  # an unreadable or broken policy leaves file checkout unavailable, not the session
-        return ()
+        return module
+    except Exception:  # an unreadable or broken policy leaves its features unavailable, not the session
+        return None
+
+
+def policy_change_roots(module):
+    """The root ids the access library marks change true. Any failure offers no root; nothing else adds one."""
+    roots = getattr(module, "ACCESS_ROOTS", None) if module is not None else None
     if not isinstance(roots, dict):
         return ()
     return tuple(root for root in EXPLORE_ROOTS if isinstance(roots.get(root), dict)
@@ -3687,7 +4664,7 @@ def cmd_serve(task_id):
             raise Refusal("task_id_invalid")
         # Task errors are reported even when the runtime still needs a probe.
         context, work_fd = load_task(task_id, agent_identity())
-        identity, managed_exec = verified_session_identity()
+        identity, managed_exec, live_run = verified_session_identity()
         lock = SingletonLock()
         home_fd = open_account_home(identity)
         threads = ThreadStore(task_id)
@@ -3697,7 +4674,14 @@ def cmd_serve(task_id):
             access = stat.S_ISREG(trusted_chain(ACCESS_MODULE, "helper_untrusted").st_mode)
         except (Refusal, OSError):
             access = False
-        change_roots = policy_change_roots() if access else ()
+        policy = load_access_policy() if access else None
+        change_roots = policy_change_roots(policy)
+        # live_run is offered only while ddistro_run is still the file whose canary the attestation recorded.
+        if live_run is not None:
+            try:
+                run_helper_check(live_run)
+            except (Refusal, OSError):
+                live_run = None
         # The memory tool is declared only if retrieval is on now; any failure leaves it undeclared.
         try:
             ok, memory = run_ddistro(["memory", "status"])
@@ -3716,7 +4700,8 @@ def cmd_serve(task_id):
         return refuse_session("state_untrusted")
     # ddistro_exec also needs the attested canary for the installed helper bytes; ddistro checks the helper per call.
     broker = Broker(proc, sys.stdin.buffer, sys.stdout.buffer, threads, sys.stderr.buffer, memory=memory,
-                    access=access, change_roots=change_roots, managed_exec=access and managed_exec)
+                    access=access, change_roots=change_roots, managed_exec=access and managed_exec,
+                    live_run=live_run, redact=run_redactor(policy))
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, lambda *_: broker.request_stop())
     returncode = broker.run()
@@ -4435,6 +5420,125 @@ def probe_managed_exec(identity, binding, base, port, listener_reached, diagnost
         remove_exec_task(task_id, created)
 
 
+# Runs through the installed ddistro_run as nobody, without network, on the live distro; prints only key=0/1 lines and
+# changes nothing. @UID@ and @PORT@ are filled in as code text: nothing reaches the command line.
+PROBE_RUN_SCRIPT = r"""
+import os, socket, sys
+def flag(name, value):
+    print("%s=%d" % (name, 1 if value else 0))
+def empty(path):
+    try:
+        return os.listdir(path) == []
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+def reach(host, port):
+    try:
+        socket.create_connection((host, port), timeout=3).close()
+        return True
+    except Exception:
+        return False
+status = open("/proc/self/status").read()
+flag("ran", True)
+flag("code_from_fd", sys.argv[0].startswith("/dev/fd/"))
+flag("cmdline_clean", b"ddistro-run-canary" not in open("/proc/self/cmdline", "rb").read())
+flag("account", os.getresuid() == (@UID@,) * 3)
+flag("no_new_privs", "NoNewPrivs:\t1" in status)
+flag("mnt_masked", empty("/mnt"))
+flag("wsl_masked", empty("/run/WSL"))
+flag("init_masked", not os.path.exists("/init") or os.path.getsize("/init") == 0)
+flag("state_masked", empty("/var/lib/dwemerdistro/assistant"))
+flag("env_clean", not any(key.startswith("WSL") for key in os.environ)
+     and os.environ.get("DEBIAN_FRONTEND") == "noninteractive")
+flag("stdin_empty", sys.stdin.read() == "")
+flag("host_listener", reach("127.0.0.1", @PORT@))
+flag("internet", reach("1.1.1.1", 443))
+"""
+PROBE_RUN_EXPECT = {"ran": True, "code_from_fd": True, "cmdline_clean": True, "account": True, "no_new_privs": True,
+                    "mnt_masked": True, "wsl_masked": True, "init_masked": True, "state_masked": True,
+                    "env_clean": True, "stdin_empty": True, "host_listener": False, "internet": False}
+
+
+def run_helper_once(request, timeout):
+    """(status events, stdout) of one ddistro_run supervisor; its group is killed if it outlives timeout."""
+    proc, status_fd = spawn_run(run_bytes(request))
+    child = DiagnosticChild(proc)
+    out_fd = proc.stdout.fileno()
+    data = {out_fd: bytearray(), proc.stderr.fileno(): bytearray(), status_fd: bytearray()}
+    open_fds = set(data)
+    deadline = time.monotonic() + timeout
+    try:
+        while open_fds and time.monotonic() < deadline:
+            for fd in select.select(list(open_fds), [], [], 0.2)[0]:
+                chunk = os.read(fd, 65536)
+                if chunk:
+                    data[fd] += chunk[:262144 - len(data[fd])]
+                else:
+                    open_fds.discard(fd)
+    finally:
+        # Only a run that did not finish by itself is killed here, so the canary sees the supervisor's own cleanup.
+        complete = not open_fds
+        if not complete:
+            child.signal(signal.SIGKILL)
+        for handle in (proc.stdout, proc.stderr):
+            handle.close()
+        os.close(status_fd)
+        child.reap()
+    return run_events(bytes(data[status_fd]))[0], bytes(data[out_fd]), complete
+
+
+def probe_live_run(binding, port, listener_reached, diagnostics):
+    """ddistro_run's canary: the attested helper really runs code from a sealed descriptor as the requested account
+    with no_new_privs, with /mnt, Windows interop and the assistant state masked, a fixed environment, empty stdin
+    and, without network, no route to a host loopback listener (reachable from the host, which the earlier outer
+    check proved) or the internet. Then a timed-out run must leave no process of its group behind. Returns whether
+    it passed; a failure only leaves live_run off."""
+    report = diagnostics["live_run"] = {"result": "failed"}
+    digest = binding.get("managed_helpers", {}).get("run")
+    if digest is None:
+        report.update(result="unsupported", failure="helper_unavailable")
+        return False
+    try:
+        run_helper_check(digest)
+        nobody = pwd.getpwnam("nobody")
+        code = PROBE_RUN_SCRIPT.replace("@UID@", str(nobody.pw_uid)).replace("@PORT@", port)
+        code += "# ddistro-run-canary\n"
+        request = {"schema_version": 1, "interpreter": "python3", "code": code, "account": "nobody", "cwd": "/",
+                   "network": False, "timeout_seconds": 30, "database": None}
+        events, out, complete = run_helper_once(request, 45)
+        flags = parse_flags(out)
+        started = [e for e in events if e.get("event") == "started"]
+        exited = [e for e in events if e.get("event") == "exited"]
+        report.update(events=[e.get("event") for e in events][:8],
+                      unexpected=sorted(k for k, v in PROBE_RUN_EXPECT.items() if flags.get(k) is not v))
+        isolated = (complete and len(started) == 1 and started[0].get("digest") == sha256_bytes(run_bytes(request))
+                    and len(exited) == 1 and exited[0].get("exit_code") == 0 and not report["unexpected"]
+                    and listener_reached)
+        # A timed-out run: the supervisor itself stops the whole group, including a background child that holds
+        # stdout open (so the run completes on its own only if that child is gone).
+        request = {"schema_version": 1, "interpreter": "bash", "code": "sleep 300 &\necho \"bg=$!\"\nsleep 300\n",
+                   "account": "nobody", "cwd": "/", "network": False, "timeout_seconds": 2, "database": None}
+        events, out, complete = run_helper_once(request, 30)
+        exited = [e for e in events if e.get("event") == "exited"]
+        match = re.search(rb"bg=([0-9]+)", out)
+        stopped = (complete and len(exited) == 1 and exited[0].get("timed_out") is True and match is not None
+                   and not os.path.exists("/proc/%s" % match.group(1).decode()))
+        report.update(isolated=isolated, timeout_cleanup=stopped)
+        run_helper_check(digest)
+        passed = isolated and stopped
+        report["result"] = "passed" if passed else "failed"
+        if not passed:
+            report["failure"] = "isolation_unverified"
+        return passed
+    except Refusal as exc:
+        report.update(failure=exc.reason)
+        return False
+    except Exception as exc:  # any setup problem leaves live_run off, never the legacy probe
+        report.update(failure="setup_failed", error=type(exc).__name__[:64])
+        return False
+
+
 def cmd_probe():
     checks = {}
     diagnostics = {}
@@ -4537,6 +5641,8 @@ def run_probe(identity, checks, diagnostics, binding=None, optional=None):
         if optional is not None and checks and all(checks.values()):
             optional["managed_exec_isolation"] = probe_managed_exec(
                 identity, binding or {}, base, port, outer.get("host_listener_reachable") is True, diagnostics)
+            optional["live_run_isolation"] = probe_live_run(
+                binding or {}, port, outer.get("host_listener_reachable") is True, diagnostics)
         return True
     finally:
         listener.close()
