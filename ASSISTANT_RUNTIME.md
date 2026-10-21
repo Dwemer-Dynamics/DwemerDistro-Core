@@ -142,6 +142,16 @@ and history in the account home are not touched. The file is moved, not edited, 
 simply no longer marked trusted for Codex. The model has no path to this command; the launcher runs
 it only after the user confirms its inline proposal.
 
+The App Server writes that same trust entry during normal use, so serve also repairs it on its own:
+once per start, while holding `serve.lock` and before the strict managed open, it inspects the home
+exactly as `home-config` status does and, only if the state is `repairable` and no `ddagent`
+process remains (waiting at most 5 seconds), runs the same quarantine (pending guard, byte-identical
+move, receipt). It does not retry. Any other state, including an unknown, symlinked, or wrongly owned config,
+other unmanaged files, a pending guard, or a failed or partial repair, changes nothing more, and
+the strict open refuses as before (`account_home_unmanaged_config` or
+`home_config_repair_pending`), so the launcher's manual path still applies. No setting is ever
+allowed through, and sign-in and thread state are not touched.
+
 ## Sandbox
 
 Serve and probe run as root only to validate state, open `work` and the account home as

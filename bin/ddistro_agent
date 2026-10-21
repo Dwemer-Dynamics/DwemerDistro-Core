@@ -4666,6 +4666,7 @@ def cmd_serve(task_id):
         context, work_fd = load_task(task_id, agent_identity())
         identity, managed_exec, live_run = verified_session_identity()
         lock = SingletonLock()
+        repair_runtime_trust_config(identity)
         home_fd = open_account_home(identity)
         threads = ThreadStore(task_id)
         # ddistro_explore can be declared only if the access library is a trusted root-owned file now; ddistro
@@ -4854,6 +4855,26 @@ def quarantine_home_config(home_fd, fd, st, found):
         for handle in (entry_fd, root_fd, agent_fd):
             if handle is not None:
                 os.close(handle)
+
+
+def repair_runtime_trust_config(identity):
+    """Serve's automatic cleanup of the project-trust entry the App Server writes into config.toml during normal
+    use, which the next serve's managed home would otherwise refuse. Called once under the serve lock: only a file
+    inspect_home_config calls repairable, with no ddagent process left, is quarantined unchanged with its receipt.
+    Anything else, or any failure, changes nothing more and the strict open that follows refuses as before."""
+    home_fd = fd = None
+    try:
+        home_fd = open_account_home(identity, managed=False)
+        found, fd, st = inspect_home_config(identity, home_fd)
+        if found["state"] == "repairable" and no_agent_processes(identity):
+            return quarantine_home_config(home_fd, fd, st, found)
+    except (Refusal, OSError):
+        pass
+    finally:
+        for handle in (fd, home_fd):
+            if handle is not None:
+                os.close(handle)
+    return None
 
 
 def cmd_home_config(repair=False, expected=None):
