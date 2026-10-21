@@ -340,7 +340,7 @@ else is refused), every `thread/start` gets the broker's own declaration
 `dynamicTools: [ddistro_read]`. Clients cannot send `dynamicTools`; older clients that do not
 opt in get no tool and are otherwise unchanged. Codex 0.163.0 refuses `dynamicTools` without
 that capability. The declaration (`TOOL_SPEC` in `bin/ddistro_agent`) is one function with
-strict input `{"operation": "inventory"|"status"|"models"|"logs"|"health"|"performance", "product"?,
+strict input `{"operation": "inventory"|"status"|"models"|"logs"|"health"|"performance"|"model_options"|"update_check", "product"?,
 "log_source"?: "apache"|"postgres", "log"?, "lines"?: 1-400, "query"?: <= 200 chars,
 "since"?: "YYYY-MM-DDTHH:MM:SSZ"}` and `additionalProperties: false`. `product` lists servers only
 (`herika`, `lorkhan`, `stobe`, `dialectic`, `reign`); the shared Apache and PostgreSQL logs are
@@ -351,8 +351,9 @@ accept), so pairing rules are checked at run time. Threads started before `log_s
 The broker answers `item/tool/call` itself and never forwards it, so a client cannot see or
 answer the request. It checks that the call is for `ddistro_read` with no namespace, from one
 of this task's threads, and that the arguments match exactly: `inventory` takes nothing;
-`status`/`health`/`performance` take an optional server product (`apache` or `postgres` there is
-refused with a message pointing to `logs` with `log_source`); `models` takes only `herika`; `logs`
+`status`/`health`/`performance`/`update_check` take an optional server product (`apache` or
+`postgres` there is refused with a message pointing to `logs` with `log_source`); `models` and
+`model_options` (`ddistro models options herika`) take only `herika`; `logs`
 needs a server product or a `log_source` (not both; the older `product` `apache`/`postgres` form
 is still accepted), an optional log name from that target's
 `ddistro logs` allowlist, `lines` (default 50), and the optional `query` (one line of plain text,
@@ -436,14 +437,32 @@ declarations, or what a tool may do, and it never replaces fresh `ddistro_read` 
 
 ### ddistro_action live action
 
-The one live action. A client opts in with `initialize` `capabilities.ddistroActions:
-["restart_service"]` (with `experimentalApi: true`); the broker removes the field before
-Codex sees it, and any other value is refused. Only then does `thread/start` also declare
-`ACTION_SPEC`: strict `{"operation": "propose_restart", "service": "apache", "reason": <= 300
-chars}`. Threads started without it never get it, and older clients are unchanged.
+The live actions. A client opts in with `initialize` `capabilities.ddistroActions`, a list of
+distinct names from `"restart_service"` and `"configure_model"` (with `experimentalApi: true`);
+the broker removes the field before Codex sees it, and any other value is refused. Only then
+does `thread/start` also declare `ddistro_action`. A client that sends only
+`["restart_service"]` gets exactly `ACTION_SPEC`: strict `{"operation": "propose_restart",
+"service": "apache", "reason": <= 300 chars}`, and can never be sent a model proposal.
+`configure_model` adds `propose_model_change` (`profile_id`, `role`, `connector_id`, `reason`) and
+`propose_model_rollback` (`reason` only) to a flat schema whose per-operation fields are checked
+at run time. Threads started without the opt-in never get the tool, and older clients are
+unchanged.
+
+A model proposal assigns one fixed CHIM profile role to an existing connector and nothing else.
+The broker, not the model, runs the root `ddistro models preview herika ... --task T --thread TH`
+(or `rollback-preview --task T --thread TH`, the undo of this thread's own latest change; the
+model never supplies or sees a receipt id or `plan_sha256`) and sends the client the validated
+diff in `ddistro/action/proposed` `change`. After `approve`, it runs exactly `ddistro models
+apply|rollback herika --receipt ID --plan-sha256 HASH` once; the preview's 120 s expiry and its
+compare-and-swap still apply, so an approval after a concurrent edit is a `conflict` and writes
+nothing. Approval, expiry, cancellation, and one-per-turn rules are as below. The model gets
+`verified`, `unverified`, `conflict`, `not_executed`, `unknown`, or a refusal; a reply whose
+receipt id does not match the proposal is `unknown`. `verified` means a fresh database read
+shows the assignment: the provider, the model, and in-game replies are not tested.
 
 The model can only propose. On a valid call from one of this task's threads, with a `turnId`,
-at most one per turn and one pending per session, the broker records an in-memory proposal
+at most one `propose_restart` per turn, one of each permitted model operation per turn, and
+one pending per session, the broker records an in-memory proposal
 with a random id and a 60 second expiry, and sends the client `ddistro/action/proposed`
 `{proposalId, threadId, turnId, action: "restart", service, label, impact, reason, expiresAt}`.
 The tool call waits; the model never sees the id. Only the client's `ddistro/action/decide`

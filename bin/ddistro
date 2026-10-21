@@ -8,10 +8,13 @@ only the trusted root-owned helpers below, always with explicit argument vectors
 import calendar
 import errno
 import fcntl
+import hashlib
+import hmac
 import json
 import os
 import pwd
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -56,7 +59,7 @@ ERRORS = {
     "failed": 1, "internal_error": 1, "helper_failed": 1, "helper_protocol": 1,
     "partial": 10, "conflict": 11, "rollback": 12,
     "invalid_argument": 64, "not_found": 66, "unsupported": 69, "helper_unavailable": 69,
-    "refused": 65, "limit_reached": 65, "disabled": 69,
+    "refused": 65, "limit_reached": 65, "expired": 65, "disabled": 69,
     "busy": 75, "permission_denied": 77, "unsafe_path": 77,
     "update_blocked_tracked": 79, "update_blocked_untracked": 80,
     "timeout": 124, "cancelled": 130,
@@ -112,6 +115,12 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
   agent status | agent probe                                    (probe: root)
   agent home-config | agent home-config-repair --sha256 HASH    (root; account-home config status or quarantine)
   models herika                 (root; configured CHIM profile model assignments, read-only)
+  models options herika         (root; read-only: profiles with their role connectors, and the existing LLM connectors)
+  models preview herika --profile ID --role ROLE --connector ID   (root; no database write: a receipt with the exact diff)
+  models apply herika --receipt ID --plan-sha256 HASH             (root; one previewed change, compare-and-swap)
+  models rollback-preview herika --receipt ID                     (root; the exact undo of an applied change)
+  models rollback herika --receipt ID --plan-sha256 HASH          (root; that undo, compare-and-swap)
+  update-check [product]        (read-only local update blockers; never fetches, updates or discards anything)
   inventory                     (read-only presence snapshot: servers, ext folders, components, custom mods)
   health [product]              (bounded local checks: servers, ports, fixed local HTTP health, database presence, disk)
   performance [product]         (bounded local timings now: fixed local HTTP health, PostgreSQL SELECT 1, host load/memory, recent Herika [PERF] records)
@@ -387,6 +396,16 @@ def cmd_capabilities(opts, ctx):
             {"name": "agent serve", "flags": ["--task"], "mutates": False, "requires_root": True,
              "transport": "jsonl"},
             {"name": "models", "arguments": ["herika"], "mutates": False, "requires_root": True},
+            {"name": "models options", "arguments": ["herika"], "mutates": False, "requires_root": True},
+            {"name": "models preview", "arguments": ["herika"], "flags": ["--profile", "--role", "--connector", "--task", "--thread"],
+             "mutates": False, "requires_root": True},
+            {"name": "models apply", "arguments": ["herika"], "flags": ["--receipt", "--plan-sha256"], "mutates": True,
+             "requires_root": True},
+            {"name": "models rollback-preview", "arguments": ["herika"], "flags": ["--receipt", "--task", "--thread"],
+             "mutates": False, "requires_root": True},
+            {"name": "models rollback", "arguments": ["herika"], "flags": ["--receipt", "--plan-sha256"], "mutates": True,
+             "requires_root": True},
+            {"name": "update-check", "arguments": ["[product]"], "mutates": False},
             # Any user may run it; as another user, unreadable folders are reported as unreadable.
             {"name": "inventory", "mutates": False},
             {"name": "health", "arguments": ["[product]"], "mutates": False},
@@ -422,7 +441,16 @@ def cmd_capabilities(opts, ctx):
                      # agent serve forwards thread/archive, unarchive and delete for this task's threads only.
                      "thread_lifecycle": True,
                      # agent serve offers ddistro_action (propose_restart) to a client that opts in; see ASSISTANT_RUNTIME.md.
-                     "assistant_actions": agent_helper_trusted(), "performance": True},
+                     "assistant_actions": agent_helper_trusted(), "performance": True,
+                     # models options/preview/apply/rollback; the broker offers it as configure_model (ASSISTANT_RUNTIME.md).
+                     "model_settings": True, "update_check": True},
+        "model_settings": {"products": ["herika"], "setting": "profile_role_connector",
+                           "roles": [role for role, _ in MODELS_ROLES], "writes": ["core_profiles.<role field>"],
+                           "concurrency": "row_version_compare_and_swap", "preview_seconds": MODEL_PREVIEW_SECONDS,
+                           "undo": "exact_previous_value", "verification": "database_assignment",
+                           "receipts": {"max": MODEL_RECEIPTS_MAX, "days": MODEL_RECEIPT_DAYS}, "lock": "maintenance"},
+        "update_check": {"scope": "local_only", "network": False, "remote_changes_checked": False,
+                         "assessments": list(UPDATE_CHECK_ASSESSMENTS), "max_paths": UPDATE_CHECK_PATHS},
         "service_restart": {"services": {name: {"label": spec["label"], "impact": spec["impact"]}
                                          for name, spec in SERVICE_RESTARTS.items()},
                             "verification": ["command", "new_process", "ports"], "lock": "maintenance"},
@@ -452,7 +480,8 @@ def cmd_capabilities(opts, ctx):
         # The broker declares and runs this one tool itself; see ASSISTANT_RUNTIME.md.
         "assistant_tools": {"requires": "initialize capabilities.experimentalApi true", "declared_on": "thread/start",
                             "tools": [{"name": "ddistro_read", "mutates": False,
-                                       "operations": ["inventory", "status", "models", "logs", "health", "performance"],
+                                       "operations": ["inventory", "status", "models", "logs", "health", "performance",
+                                                      "model_options", "update_check"],
                                        "max_log_lines": 400, "log_filters": ["query", "since"],
                                        # Shared logs are read with log_source; product is a server only (older
                                        # threads may still send product apache/postgres for logs, which stays valid).
@@ -460,9 +489,14 @@ def cmd_capabilities(opts, ctx):
                                       {"name": "ddistro_memory", "mutates": True, "operations": ["search", "remember"],
                                        "declared_when": "memory retrieval on at session start",
                                        "remember_requires": "auto_learning on"},
+                                      # operations stays exactly the restart a client gets by default; a client that also
+                                      # opts into configure_model gets the operations listed for it.
                                       {"name": "ddistro_action", "mutates": True, "operations": ["propose_restart"],
                                        "declared_when": "initialize capabilities.ddistroActions [\"restart_service\"]",
-                                       "approval": "client ddistro/action/decide", "services": list(SERVICE_RESTARTS)}],
+                                       "approval": "client ddistro/action/decide", "services": list(SERVICE_RESTARTS),
+                                       "capability_operations": {"restart_service": ["propose_restart"],
+                                                                 "configure_model": ["propose_model_change",
+                                                                                     "propose_model_rollback"]}}],
                             # Every reply carries coverage: result (checked, failed, skipped, refused, truncated,
                             # budget_hit) and what the turn and session budgets leave.
                             "coverage": {"results": ["checked", "failed", "skipped", "refused", "truncated", "budget_hit"],
@@ -1043,6 +1077,9 @@ MODELS_RUNUSER = "/usr/sbin/runuser"
 MODELS_PSQL = "/usr/bin/psql"
 MODELS_SOCKET = "/var/run/postgresql"
 MODELS_DATABASE = "dwemer"
+# Model settings (options, preview, readback, apply, undo) always use the production socket and port: the write and
+# every read it is checked against reach the same database, whatever DDISTRO_POSTGRES_PORT says.
+MODEL_SETTINGS_PORT = "5432"
 MODELS_TIMEOUT = 30
 MODELS_MAX = 200
 MODELS_STRING_CHARS = 256
@@ -1071,10 +1108,12 @@ def check_system_binary(path):
     check_helper(path)
 
 
-def models_psql(sql, keep, timeout=MODELS_TIMEOUT, appname="ddistro-models"):
-    """Run one fixed read-only query; returns (exit code, stdout bytes). stderr is never returned."""
-    port = os.environ.get("DDISTRO_POSTGRES_PORT", "")
-    port = port if re.match(r"^[0-9]{1,5}\Z", port) and 0 < int(port) < 65536 else "5432"
+def models_psql(sql, keep, timeout=MODELS_TIMEOUT, appname="ddistro-models", port=None):
+    """Run one fixed read-only query; returns (exit code, stdout bytes). stderr is never returned.
+    Without port, the port is DDISTRO_POSTGRES_PORT when valid (the read-only models listing), else 5432."""
+    if port is None:
+        port = os.environ.get("DDISTRO_POSTGRES_PORT", "")
+        port = port if re.match(r"^[0-9]{1,5}\Z", port) and 0 < int(port) < 65536 else "5432"
     env = {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PGCONNECT_TIMEOUT": "5",
            "PGAPPNAME": appname, "PGTZ": "UTC",
            "PGOPTIONS": "-c default_transaction_read_only=on -c statement_timeout=10000 -c lock_timeout=2000 "
@@ -1180,6 +1219,880 @@ def cmd_models(opts, ctx):
     if truncated:
         lines.append(f"  ... truncated to {MODELS_MAX} assignments")
     return data, "\n".join(lines)
+
+
+# --- Model assignment settings ---------------------------------------------------------
+# ddistro models options|preview|apply|rollback-preview|rollback herika: the one setting the Assistant can change.
+# A change points one MODELS_ROLES field of one CHIM profile (public.core_profiles) at an existing
+# public.core_llm_connector id. Connector rows (model, URL, keys), conf.php and every other column are never written.
+# SQL is fixed: only a field from MODELS_ROLES, validated integers and xmin digits are formatted into it, and labels
+# and models are only read. A preview writes nothing to the database. It stores a root-private receipt with the exact
+# before and after values and both rows' versions (xmin, which every committed UPDATE changes), and apply and rollback
+# use them as compare-and-swap conditions in one transaction, so any edit in between, even one that restores the
+# same value, is a conflict and is never overwritten. Receipts hold ids, labels, models and versions, never whole rows.
+MODEL_RECEIPTS_DIR_NAME = "model-receipts"
+MODEL_RECEIPTS_LOCK = "receipts.lock"
+MODEL_RECEIPT_ID = re.compile(r"^[0-9a-f]{32}\Z")
+MODEL_ID_TEXT = re.compile(r"^[1-9][0-9]{0,9}\Z")
+MODEL_VERSION = re.compile(r"^[0-9]{1,10}\Z")
+MODEL_ID_MAX = 2147483647
+MODEL_VALUE_MAX = 2 ** 63 - 1
+MODEL_PREVIEW_SECONDS = 120
+MODEL_RECEIPT_DAYS = 30
+MODEL_RECEIPTS_MAX = 200
+# The receipt directory holds at most this many entries of any kind (receipts, the lock, leftover temporaries);
+# more means it was not written by us, so the whole store is refused rather than partly read.
+MODEL_RECEIPTS_ENTRIES = 4 * MODEL_RECEIPTS_MAX
+# A write that may be in progress or whose outcome is unknown: its receipt is never dropped to make room.
+MODEL_RECEIPTS_PROTECTED = ("applying", "rolling_back", "unknown")
+MODEL_RECEIPT_BYTES = 16 * 1024
+MODEL_LOCK_WAIT = 5.0
+MODEL_INTEGER_TYPES = ("integer", "smallint", "bigint")
+MODEL_ROLE_FIELDS = dict(MODELS_ROLES)
+MODEL_SUBCOMMANDS = ("options", "preview", "apply", "rollback-preview", "rollback")
+MODEL_RECEIPT_STATES = ("previewed", "applying", "applied", "conflict", "not_executed", "unknown", "rolling_back",
+                        "rolled_back")
+MODEL_RECEIPT_KEYS = {"schema", "id", "kind", "product", "created_at", "expires_at", "task_id", "thread_id", "profile",
+                      "role", "field", "before", "after", "versions", "plan_sha256", "state", "applied", "rollback"}
+# Write sessions get the same bounds as reads, without read-only. psql exits 0 only when COMMIT succeeded; any other
+# ending is resolved from a fresh read (model_settle), never guessed.
+MODEL_WRITE_OPTIONS = ("-c statement_timeout=10000 -c lock_timeout=2000 -c idle_in_transaction_session_timeout=10000 "
+                       "-c search_path=pg_catalog")
+
+
+def model_untrusted(what):
+    return CliError("unsafe_path", f"The model change receipts {what} is not private to root; nothing was read or "
+                    "changed.", {"reason": "receipts_untrusted", "location": what})
+
+
+def model_settings_ready():
+    if os.geteuid() != 0:
+        raise CliError("permission_denied", "ddistro model changes must run as root. ddistro never elevates by itself.")
+    try:
+        check_system_binary(MODELS_PSQL)
+        pwd.getpwnam("postgres")
+    except (CliError, KeyError, OSError):
+        raise CliError("helper_unavailable", "psql or the postgres account is not available.",
+                       {"reason": "helper_unavailable"})
+
+
+def model_psql_ok(code):
+    if code == 2:
+        raise CliError("failed", "The CHIM database is not reachable.", {"reason": "database_unavailable"})
+    if code != 0:
+        raise CliError("failed", "The CHIM database read failed.", {"reason": "query_failed"})
+
+
+def model_read(sql):
+    """One read-only query that returns a single JSON object."""
+    code, raw = models_psql(sql, MODELS_STDOUT_LIMIT, appname="ddistro-model-settings", port=MODEL_SETTINGS_PORT)
+    model_psql_ok(code)
+    try:
+        doc = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+    except ValueError:
+        doc = None
+    if type(doc) is not dict:
+        raise CliError("helper_protocol", "The CHIM database returned an unexpected result.", {"reason": "unexpected_output"})
+    return doc
+
+
+def model_fields():
+    """[(role, field)] whose field exists with an integer type; the profile and connector tables must exist."""
+    names = ", ".join(f"'{name.split('.')[1]}'" for name in sorted(MODELS_COLUMNS))
+    code, raw = models_psql("SELECT table_name || '.' || column_name || ':' || data_type FROM information_schema.columns "
+                            "WHERE table_schema = 'public' AND table_name IN ('core_profiles', 'core_llm_connector') "
+                            f"AND column_name IN ({names})", 64 * 1024, appname="ddistro-model-settings",
+                            port=MODEL_SETTINGS_PORT)
+    model_psql_ok(code)
+    types = {}
+    for line in raw.decode("utf-8", "replace").split("\n"):
+        name, _, kind = line.partition(":")
+        if name in MODELS_COLUMNS:
+            types[name] = kind
+    if not MODELS_REQUIRED <= set(types) or any(types[key] not in MODEL_INTEGER_TYPES
+                                                for key in ("core_profiles.id", "core_llm_connector.id")):
+        raise CliError("unsupported", "This CHIM database does not have the expected profile and connector tables.",
+                       {"reason": "schema_missing"})
+    return [(role, field) for role, field in MODELS_ROLES if types.get("core_profiles." + field) in MODEL_INTEGER_TYPES]
+
+
+def model_field(role):
+    field = dict(model_fields()).get(role)
+    if field is None:
+        raise CliError("unsupported", f"This CHIM database has no {role} role field that can be set.",
+                       {"reason": "role_unsupported", "role": role})
+    return field
+
+
+def model_sql_value(value):
+    """An integer or NULL for SQL, from a value already typed as int or None; anything else is an internal error."""
+    if value is None:
+        return "NULL"
+    if type(value) is not int or abs(value) > MODEL_VALUE_MAX:
+        raise CliError("internal_error", "invalid model value")
+    return "%d" % value
+
+
+def model_sql_version(version):
+    if type(version) is not str or not MODEL_VERSION.match(version):
+        raise CliError("internal_error", "invalid row version")
+    return version
+
+
+def model_connector_sql(alias):
+    text = ", ".join(f"'{name}', left({alias}.{name}::text, {MODELS_FIELD_CHARS})"
+                     for name in ("label", "model", "provider", "driver"))
+    return f"json_build_object('id', {alias}.id, {text}, 'version', {alias}.xmin::text)"
+
+
+def model_connector(value, versioned=False):
+    """The displayed, non-secret fields of one connector row; None for null; anything else is unexpected output."""
+    if value is None:
+        return None
+    keys = {"id", "label", "model", "provider", "driver", "version"}
+    if (type(value) is not dict or set(value) != keys or type(value["id"]) is not int
+            or any(value[key] is not None and type(value[key]) is not str for key in keys - {"id"})
+            or type(value["version"]) is not str or not MODEL_VERSION.match(value["version"])):
+        raise CliError("helper_protocol", "The CHIM database returned an unexpected connector.", {"reason": "unexpected_output"})
+    view = {"id": value["id"], "label": models_text(value["label"]), "model": models_text(value["model"]),
+            "provider": models_text(value["provider"]), "driver": models_text(value["driver"])}
+    if versioned:
+        view["version"] = value["version"]
+    return view
+
+
+def model_snapshot(field, profile_id, connector_id):
+    """The profile's role value and row version, the connector it uses now, and connector_id's row (if any), read in
+    one read-only snapshot. profile is None when there is no such profile."""
+    p = model_sql_value(profile_id)
+    doc = model_read(
+        "SELECT json_build_object("
+        f"'profile', (SELECT json_build_object('id', p.id, 'label', left(p.label::text, {MODELS_FIELD_CHARS}), "
+        f"'value', p.{field}, 'version', p.xmin::text) FROM public.core_profiles AS p WHERE p.id = {p}), "
+        f"'current', (SELECT {model_connector_sql('c')} FROM public.core_profiles AS p "
+        f"JOIN public.core_llm_connector AS c ON c.id = p.{field} WHERE p.id = {p}), "
+        f"'target', (SELECT {model_connector_sql('c')} FROM public.core_llm_connector AS c "
+        f"WHERE c.id = {model_sql_value(connector_id)}))")
+    profile = doc.get("profile")
+    if set(doc) != {"profile", "current", "target"} or profile is not None and (
+            type(profile) is not dict or set(profile) != {"id", "label", "value", "version"} or profile["id"] != profile_id
+            or profile["label"] is not None and type(profile["label"]) is not str
+            or profile["value"] is not None and (type(profile["value"]) is not int or abs(profile["value"]) > MODEL_VALUE_MAX)
+            or type(profile["version"]) is not str or not MODEL_VERSION.match(profile["version"])):
+        raise CliError("helper_protocol", "The CHIM database returned an unexpected profile.", {"reason": "unexpected_output"})
+    if profile is not None:
+        profile = dict(profile, label=models_text(profile["label"]))
+    return {"profile": profile, "current": model_connector(doc["current"], True),
+            "target": model_connector(doc["target"], True)}
+
+
+def model_assign(field, profile_id, expected, value, profile_version, connector=None):
+    """The one database write. In one transaction it sets one role field of one profile to value, only while the
+    profile row is still exactly profile_version with the expected value and, when connector (id, version) is given,
+    that connector row is still exactly that version, share-locked against change or deletion until commit.
+    Returns ("committed", new row version), ("conflict", None) or ("error", None); the caller resolves an error."""
+    if field not in MODEL_ROLE_FIELDS.values() or type(profile_id) is not int or not 0 < profile_id <= MODEL_ID_MAX:
+        raise CliError("internal_error", "invalid model change")
+    guard, prefix = "", "WITH "
+    if connector is not None:
+        prefix = (f"WITH target AS (SELECT c.id FROM public.core_llm_connector AS c WHERE c.id = "
+                  f"{model_sql_value(connector[0])} AND c.xmin::text = '{model_sql_version(connector[1])}' FOR SHARE), ")
+        guard = " AND EXISTS (SELECT 1 FROM target)"
+    sql = (prefix + f"changed AS (UPDATE public.core_profiles AS p SET {field} = {model_sql_value(value)} "
+           f"WHERE p.id = {profile_id} AND p.xmin::text = '{model_sql_version(profile_version)}' "
+           f"AND p.{field} IS NOT DISTINCT FROM {model_sql_value(expected)}{guard} RETURNING p.xmin::text AS version) "
+           "SELECT json_build_object('updated', (SELECT count(*) FROM changed), 'version', (SELECT min(version) FROM changed))")
+    env = {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PGCONNECT_TIMEOUT": "5",
+           "PGAPPNAME": "ddistro-model-settings", "PGTZ": "UTC", "PGOPTIONS": MODEL_WRITE_OPTIONS}
+    args = ["-u", "postgres", "--", MODELS_PSQL, "-X", "-A", "-t", "-q", "--no-password", "-v", "ON_ERROR_STOP=1",
+            "-h", MODELS_SOCKET, "-p", MODEL_SETTINGS_PORT, "-d", MODELS_DATABASE, "-1", "-c", sql]
+    try:
+        code, out, _ = run_helper(args, MODELS_TIMEOUT, 4096, helper=MODELS_RUNUSER, env=env)
+    except CliError as error:
+        if error.code == "cancelled":
+            raise
+        return "error", None
+    try:
+        doc = json.loads(bytes(out.data).decode("utf-8"), parse_constant=reject_constant) if code == 0 else None
+    except ValueError:
+        doc = None
+    if type(doc) is dict and doc.get("updated") == 0 and doc.get("version") is None:
+        return "conflict", None
+    if type(doc) is dict and doc.get("updated") == 1 and type(doc.get("version")) is str and MODEL_VERSION.match(doc["version"]):
+        return "committed", doc["version"]
+    return "error", None
+
+
+def model_settle(field, profile_id, expected, version, value, outcome):
+    """The state of one attempted write: verified or unverified (committed; a fresh read does or does not show value),
+    conflict (the compare-and-swap matched nothing), not_executed (an error, and a fresh read proves nothing was
+    committed to the row since: same version and value), or unknown."""
+    kind, new_version = outcome
+    if kind == "conflict":
+        return "conflict", None
+    try:
+        fresh = model_snapshot(field, profile_id, None)["profile"]
+    except CliError as error:
+        if error.code == "cancelled":
+            raise
+        fresh = None
+    if kind == "committed":
+        verified = fresh is not None and fresh["value"] == value and type(fresh["value"]) is type(value)
+        return ("verified" if verified else "unverified"), new_version
+    if fresh is not None and fresh["version"] == version and fresh["value"] == expected:
+        return "not_executed", None
+    return "unknown", None
+
+
+def model_plan_sha256(receipt, rollback=None):
+    """The confirmation for exactly one previewed write: the receipt id, row, field, both values and versions, expiry."""
+    if rollback is None:
+        plan = ["apply", receipt["id"], receipt["profile"]["id"], receipt["field"], receipt["before"]["value"],
+                receipt["after"]["value"], receipt["versions"], receipt["expires_at"]]
+    else:
+        plan = ["rollback", receipt["id"], receipt["profile"]["id"], receipt["field"], receipt["after"]["value"],
+                receipt["before"]["value"], receipt["applied"]["version"], rollback["connector_version"],
+                rollback["expires_at"]]
+    return hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def model_receipt_valid(receipt, receipt_id):
+    def side(value):
+        return (type(value) is dict and set(value) == {"value", "connector"}
+                and (value["value"] is None or type(value["value"]) is int)
+                and (value["connector"] is None or type(value["connector"]) is dict))
+    return (type(receipt) is dict and set(receipt) == MODEL_RECEIPT_KEYS and receipt["schema"] == 1
+            and receipt["id"] == receipt_id and receipt["kind"] == "model_assignment" and receipt["product"] == "herika"
+            and type(receipt["created_at"]) is int and type(receipt["expires_at"]) is int
+            and receipt["state"] in MODEL_RECEIPT_STATES and MODEL_ROLE_FIELDS.get(receipt["role"]) == receipt["field"]
+            and type(receipt["profile"]) is dict and type(receipt["profile"].get("id")) is int
+            and side(receipt["before"]) and side(receipt["after"]) and type(receipt["after"]["value"]) is int
+            and type(receipt["versions"]) is dict and type(receipt["plan_sha256"]) is str
+            and (receipt["applied"] is None or type(receipt["applied"]) is dict)
+            and (receipt["rollback"] is None or type(receipt["rollback"]) is dict))
+
+
+class ModelReceipts:
+    """The root-private receipt directory, held under its own lock file for every read-check-write.
+
+    The directory is root's with mode 0700 below root-owned parents (memory_directory's checks), each receipt is a
+    root-owned 0600 single-link regular file opened without following links, and writes replace it atomically."""
+
+    def __init__(self, create):
+        self.create = create
+        self.directory = None
+        self.lock = None
+
+    def __enter__(self):
+        old_umask = os.umask(0o077)
+        try:
+            self.directory = memory_directory(self.create, name=MODEL_RECEIPTS_DIR_NAME, untrusted=model_untrusted)
+            if self.directory is None:
+                return self
+            try:
+                self.lock = os.open(self.directory + "/" + MODEL_RECEIPTS_LOCK,
+                                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            except OSError:
+                raise model_untrusted("lock file")
+            if not memory_file_ok(os.fstat(self.lock)):
+                raise model_untrusted("lock file")
+            deadline = time.monotonic() + MODEL_LOCK_WAIT
+            while True:
+                try:
+                    fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() > deadline:
+                        raise CliError("busy", "Another model change is being prepared or applied. Try again.")
+                    time.sleep(0.1)
+            # The lock only serializes writers if every one locked the same file: the path must still name it.
+            held = os.fstat(self.lock)
+            try:
+                named = os.lstat(self.directory + "/" + MODEL_RECEIPTS_LOCK)
+            except OSError:
+                raise model_untrusted("lock file")
+            if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino) or not memory_file_ok(held):
+                raise model_untrusted("lock file")
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        finally:
+            os.umask(old_umask)
+
+    def __exit__(self, *exc):
+        if self.lock is not None:
+            os.close(self.lock)
+            self.lock = None
+        return False
+
+    def path(self, receipt_id):
+        return f"{self.directory}/{receipt_id}.json"
+
+    def load(self, receipt_id):
+        if self.directory is None or not MODEL_RECEIPT_ID.match(receipt_id):
+            return None
+        try:
+            fd = os.open(self.path(receipt_id), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise model_untrusted("receipt")
+        try:
+            if not memory_file_ok(os.fstat(fd)):
+                raise model_untrusted("receipt")
+            raw = os.read(fd, MODEL_RECEIPT_BYTES + 1)
+        finally:
+            os.close(fd)
+        try:
+            receipt = json.loads(raw.decode("utf-8"), parse_constant=reject_constant) if len(raw) <= MODEL_RECEIPT_BYTES else None
+        except ValueError:
+            receipt = None
+        if not model_receipt_valid(receipt, receipt_id):
+            raise model_untrusted("receipt")
+        return receipt
+
+    def save(self, receipt):
+        data = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(data) > MODEL_RECEIPT_BYTES:
+            raise CliError("internal_error", "receipt too large")
+        temporary = f"{self.directory}/.{receipt['id']}.{os.getpid()}.tmp"
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temporary, self.path(receipt["id"]))
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+        directory = os.open(self.directory, INVENTORY_DIR_FLAGS)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def receipts(self):
+        """Every receipt, newest first; a file that is not a valid receipt, or a directory with more than
+        MODEL_RECEIPTS_ENTRIES entries, stops the scan as untrusted, so no receipt is ever silently left out."""
+        names = []
+        with os.scandir(self.directory) as entries:
+            for count, entry in enumerate(entries):
+                if count >= MODEL_RECEIPTS_ENTRIES:
+                    raise model_untrusted("receipt directory")
+                if entry.name.endswith(".json") and MODEL_RECEIPT_ID.match(entry.name[:-5]):
+                    names.append(entry.name[:-5])
+        found = [self.load(name) for name in sorted(names)]
+        return sorted((r for r in found if r is not None), key=lambda r: (r["created_at"], r["id"]), reverse=True)
+
+    def next_write(self):
+        """The sequence number for a write starting now: one past every write recorded in the store. It is taken while
+        the store lock is held, and writes are also serialized by the maintenance lock, so no two writes share one and
+        a later write always has the larger, whatever the clock or the receipt ids say."""
+        return 1 + max((model_write_order(r) or 0 for r in self.receipts()), default=0)
+
+    def prune(self, now):
+        """Makes room for one new receipt. Drops unused previews once expired and finished receipts after
+        MODEL_RECEIPT_DAYS, then, past MODEL_RECEIPTS_MAX, the oldest that are not protected. A receipt whose write may be
+        in progress (applying, rolling_back) is never dropped by age, and no protected receipt (those two and unknown) is
+        dropped for room: when they alone fill the store, nothing is deleted and the new preview is refused."""
+        kept = []
+        for receipt in self.receipts():
+            unused = receipt["state"] in ("previewed", "conflict", "not_executed") and receipt["expires_at"] < now
+            old = receipt["created_at"] < now - MODEL_RECEIPT_DAYS * 86400 and receipt["state"] not in ("applying", "rolling_back")
+            if unused or old:
+                os.unlink(self.path(receipt["id"]))
+            else:
+                kept.append(receipt)
+        excess = len(kept) - (MODEL_RECEIPTS_MAX - 1)
+        if excess <= 0:
+            return
+        # kept is newest first, so the oldest removable receipts are taken from its end.
+        removable = [r for r in reversed(kept) if r["state"] not in MODEL_RECEIPTS_PROTECTED][:excess]
+        if len(removable) < excess:
+            raise CliError("busy", "Too many model changes are unfinished or have an unknown outcome to record another. "
+                           "No model setting was changed.", {"reason": "receipts_full"})
+        for receipt in removable:
+            os.unlink(self.path(receipt["id"]))
+
+
+def model_write_order(receipt):
+    """The store sequence of the receipt's latest write attempt (its apply, or its undo once that started), or None for
+    a receipt saved before sequences were recorded. It lives in the receipt's applied and rollback metadata."""
+    orders = [part.get("seq") for part in (receipt["applied"], receipt["rollback"]) if type(part) is dict]
+    orders = [order for order in orders if type(order) is int and order > 0]
+    return max(orders) if orders else None
+
+
+def model_last_change(receipts):
+    """The latest write among one task's and thread's receipts, by store sequence only: never by preview time, which
+    has whole-second ties and is not apply order, and never by the random receipt id. With more than one candidate, any
+    receipt without a sequence (an older receipt) or a repeated sequence makes the order unknowable, so it is refused."""
+    if len(receipts) < 2:
+        return receipts[0] if receipts else None
+    orders = [model_write_order(r) for r in receipts]
+    if None in orders or len(set(orders)) != len(orders):
+        raise CliError("refused", "The order of this conversation's model changes is not known, so its last change "
+                       "cannot be picked safely. Nothing was prepared.", {"reason": "history_ambiguous"})
+    return max(zip(orders, receipts), key=lambda pair: pair[0])[1]
+
+
+def model_change_view(receipt, undo=False):
+    """The exact change a receipt makes (or, with undo, reverses): profile, role and both assignments, plus plain diff lines."""
+    before, after = (receipt["after"], receipt["before"]) if undo else (receipt["before"], receipt["after"])
+
+    def line(sign, side):
+        connector, value = side["connector"], side["value"]
+        if value is None:
+            return f"{sign} unset (no connector)"
+        if connector is None:
+            return f"{sign} connector {value}: no such connector"
+        return (f"{sign} connector {value}: {connector['label'] or '-'} ({connector['model'] or '-'}; "
+                f"{connector['provider'] or '-'}/{connector['driver'] or '-'})")
+    profile = receipt["profile"]
+    return {"profile": {"id": profile["id"], "label": profile["label"]}, "role": receipt["role"], "field": receipt["field"],
+            "before": before, "after": after,
+            "diff": [f"CHIM profile {profile['id']} ({profile['label'] or '-'}), {receipt['role']} role ({receipt['field']})",
+                     line("-", before), line("+", after)]}
+
+
+def model_stamp(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def cmd_models_options(opts, ctx):
+    model_settings_ready()
+    roles = model_fields()
+    if not roles:
+        raise CliError("unsupported", "This CHIM database has no role field that can be set.", {"reason": "schema_missing"})
+    pairs = ", ".join(f"'{role}', p.{field}" for role, field in roles)
+    fields = ", ".join(field for _, field in roles)
+    doc = model_read(
+        "SELECT json_build_object("
+        f"'profiles', (SELECT coalesce(json_agg(json_build_object('id', p.id, 'label', left(p.label::text, "
+        f"{MODELS_FIELD_CHARS}), 'roles', json_build_object({pairs})) ORDER BY p.id), '[]'::json) "
+        f"FROM (SELECT id, label, {fields} FROM public.core_profiles ORDER BY id LIMIT {MODELS_MAX + 1}) AS p), "
+        f"'connectors', (SELECT coalesce(json_agg({model_connector_sql('c')} ORDER BY c.id), '[]'::json) "
+        f"FROM (SELECT id, label, model, provider, driver, xmin FROM public.core_llm_connector ORDER BY id "
+        f"LIMIT {MODELS_MAX + 1}) AS c))")
+    profiles, connectors = doc.get("profiles"), doc.get("connectors")
+    names = [role for role, _ in roles]
+    if type(profiles) is not list or type(connectors) is not list or any(
+            type(p) is not dict or set(p) != {"id", "label", "roles"} or type(p["id"]) is not int
+            or p["label"] is not None and type(p["label"]) is not str or type(p["roles"]) is not dict
+            or list(p["roles"]) != names or any(v is not None and type(v) is not int for v in p["roles"].values())
+            for p in profiles):
+        raise CliError("helper_protocol", "The CHIM database returned an unexpected result.", {"reason": "unexpected_output"})
+    data = {"product": "herika", "available": True, "scope": "configured_profiles",
+            "captured_at": model_stamp(time.time()), "roles": names,
+            "profiles": [{"id": p["id"], "label": models_text(p["label"]), "roles": p["roles"]} for p in profiles[:MODELS_MAX]],
+            "connectors": [model_connector(c) for c in connectors[:MODELS_MAX]],
+            "truncated": {"profiles": len(profiles) > MODELS_MAX, "connectors": len(connectors) > MODELS_MAX}}
+    lines = ["CHIM profiles (role: connector id):"]
+    lines += [f"  {p['id']:>4} {p['label'] or '-'}: " + ", ".join(f"{role} {value if value is not None else '-'}"
+                                                             for role, value in p["roles"].items()) for p in data["profiles"]]
+    lines += ["LLM connectors:"] + [f"  {c['id']:>4} {c['label'] or '-'} ({c['model'] or '-'}; {c['provider'] or '-'}/"
+                                    f"{c['driver'] or '-'})" for c in data["connectors"]]
+    return data, "\n".join(lines)
+
+
+def cmd_models_preview(opts, ctx):
+    model_settings_ready()
+    role, profile_id, connector_id = opts["role"], opts["profile"], opts["connector"]
+    field = model_field(role)
+    state = model_snapshot(field, profile_id, connector_id)
+    profile, target = state["profile"], state["target"]
+    if profile is None:
+        raise CliError("not_found", f"There is no CHIM profile with id {profile_id}.", {"reason": "profile_not_found"})
+    if target is None:
+        raise CliError("not_found", f"There is no CHIM LLM connector with id {connector_id}.", {"reason": "connector_not_found"})
+    if profile["value"] == connector_id:
+        raise CliError("refused", f"Profile {profile_id} already uses connector {connector_id} for its {role} role; "
+                       "nothing to change.", {"reason": "no_change"})
+    now = int(time.time())
+    current = state["current"]
+    receipt = {"schema": 1, "id": secrets.token_hex(16), "kind": "model_assignment", "product": "herika",
+               "created_at": now, "expires_at": now + MODEL_PREVIEW_SECONDS,
+               "task_id": opts.get("task"), "thread_id": opts.get("thread"),
+               "profile": {"id": profile_id, "label": profile["label"]}, "role": role, "field": field,
+               "before": {"value": profile["value"],
+                          "connector": {k: v for k, v in current.items() if k != "version"} if current else None},
+               "after": {"value": connector_id, "connector": {k: v for k, v in target.items() if k != "version"}},
+               "versions": {"profile": profile["version"], "connector": target["version"]},
+               "state": "previewed", "applied": None, "rollback": None}
+    receipt["plan_sha256"] = model_plan_sha256(receipt)
+    with ModelReceipts(True) as store:
+        store.prune(now)
+        store.save(receipt)
+    data = dict(model_change_view(receipt), product="herika", receipt_id=receipt["id"],
+                plan_sha256=receipt["plan_sha256"], expires_at=model_stamp(receipt["expires_at"]), state="previewed")
+    return data, "\n".join(data["diff"] + [f"Apply within {MODEL_PREVIEW_SECONDS} seconds: ddistro models apply herika "
+                                           f"--receipt {receipt['id']} --plan-sha256 {receipt['plan_sha256']}"])
+
+
+def model_confirm(receipt, rollback, expected_sha):
+    """The receipt's plan is still pending, unexpired and confirmed by exactly its sha256; raises otherwise."""
+    plan = rollback if rollback is not None else receipt
+    if plan.get("state") != "previewed":
+        raise CliError("refused", "This preview was already used or ended; preview again.", {"reason": "not_pending"})
+    if type(plan.get("expires_at")) is not int or int(time.time()) > plan["expires_at"]:
+        raise CliError("expired", "This preview expired; nothing was changed. Preview again.", {"reason": "expired"})
+    if (type(plan.get("plan_sha256")) is not str or not hmac.compare_digest(plan["plan_sha256"], expected_sha)
+            or plan["plan_sha256"] != model_plan_sha256(receipt, rollback)):
+        raise CliError("refused", "The confirmation does not match this preview; nothing was changed.",
+                       {"reason": "plan_mismatch"})
+
+
+def model_result(receipt, state, undo, saved=True):
+    executed = {"verified": True, "unverified": True, "conflict": False, "not_executed": False}.get(state)
+    data = dict(model_change_view(receipt, undo), product="herika", receipt_id=receipt["id"],
+                action="rollback" if undo else "apply", state=state, executed=executed, verified=state == "verified",
+                verification="database_assignment", checked_at=model_stamp(time.time()),
+                undo_available=saved and not undo and state in ("verified", "unverified"))
+    if not saved:
+        data["receipt_saved"] = False
+    return data
+
+
+def model_execute(opts, ctx, undo):
+    """apply and rollback: maintenance lock, the confirmed pending plan, the prestate saved before the write, then the
+    write, its fresh resolution and the final receipt state. A receipt that cannot be saved after the write is unknown."""
+    model_settings_ready()
+    ctx["operation_id"] = str(uuid.uuid4())
+    lock = maintenance_exclusive_fd()
+    try:
+        with ModelReceipts(False) as store:
+            receipt = store.load(opts["receipt"])
+            if receipt is None:
+                raise CliError("not_found", "There is no model change receipt with that id.", {"reason": "receipt_not_found"})
+            rollback = receipt["rollback"] if undo else None
+            if undo and (receipt["state"] != "applied" or rollback is None or type(receipt["applied"]) is not dict):
+                raise CliError("refused", "Preview the undo first: ddistro models rollback-preview herika --receipt ID.",
+                               {"reason": "not_pending"})
+            model_confirm(receipt, rollback, opts["plan-sha256"])
+            if model_field(receipt["role"]) != receipt["field"]:
+                raise CliError("unsupported", "The CHIM database role fields changed; nothing was changed.",
+                               {"reason": "role_unsupported"})
+            # The write's place in apply order, taken under the store lock and saved with the prestate below, so an
+            # unknown outcome keeps its place too.
+            seq = store.next_write()
+            if undo:
+                expected, value = receipt["after"]["value"], receipt["before"]["value"]
+                version = receipt["applied"]["version"]
+                connector = (value, rollback["connector_version"]) if rollback["connector_version"] else None
+                receipt["state"], rollback["state"], rollback["seq"] = "rolling_back", "used", seq
+            else:
+                expected, value = receipt["before"]["value"], receipt["after"]["value"]
+                version = receipt["versions"]["profile"]
+                connector = (value, receipt["versions"]["connector"])
+                receipt["state"], receipt["applied"] = "applying", {"seq": seq}
+            # Saved before the write: if this process ends during it, the receipt stays applying (outcome unknown).
+            store.save(receipt)
+            outcome = model_assign(receipt["field"], receipt["profile"]["id"], expected, value, version, connector)
+            state, new_version = model_settle(receipt["field"], receipt["profile"]["id"], expected, version, value, outcome)
+            if state == "unknown":
+                receipt["state"] = "unknown"
+            elif undo:
+                receipt["state"] = "rolled_back" if state in ("verified", "unverified") else "applied"
+                if receipt["state"] == "applied":
+                    del rollback["seq"]  # nothing was written, so the apply stays this receipt's latest write
+            elif state in ("verified", "unverified"):
+                receipt["state"], receipt["applied"] = "applied", {"at": int(time.time()), "version": new_version,
+                                                                  "verified": state == "verified", "seq": seq}
+            else:
+                receipt["state"], receipt["applied"] = state, None
+            if undo:
+                rollback.update(result=state, at=int(time.time()))
+            try:
+                store.save(receipt)
+            except (OSError, CliError):
+                return model_result(receipt, "unknown", undo, saved=False)
+            return model_result(receipt, state, undo)
+    finally:
+        os.close(lock)
+
+
+def model_human(data):
+    words = {"verified": "done; a fresh database read shows the new assignment",
+             "unverified": "written, but a fresh read did not show it", "not_executed": "not changed",
+             "conflict": "not changed: the profile or connector changed since the preview",
+             "unknown": "outcome unknown: check the profile before trying again"}
+    return "\n".join(data["diff"] + [f"{data['action']}: {words.get(data['state'], data['state'])}"])
+
+
+def cmd_models_apply(opts, ctx):
+    data = model_execute(opts, ctx, False)
+    return data, model_human(data)
+
+
+def cmd_models_rollback(opts, ctx):
+    data = model_execute(opts, ctx, True)
+    return data, model_human(data)
+
+
+def cmd_models_rollback_preview(opts, ctx):
+    """The exact undo of one applied change: by --receipt, or the latest write of --task/--thread by store sequence (the
+    Assistant's own last applied change; model_last_change). It must still be the profile's latest write and the original connector must still exist."""
+    model_settings_ready()
+    with ModelReceipts(False) as store:
+        if store.directory is None:
+            receipt = None
+        elif "receipt" in opts:
+            receipt = store.load(opts["receipt"])
+        else:
+            receipt = model_last_change([r for r in store.receipts() if r["task_id"] == opts["task"]
+                                         and r["thread_id"] == opts["thread"] and r["state"] in
+                                         ("applied", "applying", "unknown", "rolling_back", "rolled_back")])
+        if receipt is None:
+            raise CliError("not_found", "There is no applied model change to undo.", {"reason": "nothing_to_undo"})
+        if receipt["state"] == "rolled_back":
+            raise CliError("refused", "That change was already undone.", {"reason": "already_undone"})
+        if receipt["state"] != "applied" or type(receipt["applied"]) is not dict:
+            raise CliError("refused", "That change's outcome is not known, so it cannot be undone automatically. Check the "
+                           "profile in CHIM.", {"reason": "outcome_unknown"})
+        if model_field(receipt["role"]) != receipt["field"]:
+            raise CliError("unsupported", "The CHIM database role fields changed; nothing was prepared.",
+                           {"reason": "role_unsupported"})
+        before = receipt["before"]["value"]
+        state = model_snapshot(receipt["field"], receipt["profile"]["id"], before)
+        profile, original = state["profile"], state["target"]
+        if (profile is None or profile["version"] != receipt["applied"]["version"]
+                or profile["value"] != receipt["after"]["value"]):
+            raise CliError("conflict", "The profile changed after this change was applied; undoing it would overwrite "
+                           "that edit, so nothing was prepared.", {"reason": "changed_since"})
+        if receipt["before"]["connector"] is not None and original is None:
+            raise CliError("conflict", "The original connector no longer exists, so the change cannot be undone exactly.",
+                           {"reason": "original_missing"})
+        now = int(time.time())
+        rollback = {"state": "previewed", "expires_at": now + MODEL_PREVIEW_SECONDS,
+                    "connector_version": original["version"] if original else None}
+        rollback["plan_sha256"] = model_plan_sha256(receipt, rollback)
+        receipt["rollback"] = rollback
+        if original is not None:
+            receipt["before"]["connector"] = {k: v for k, v in original.items() if k != "version"}
+        store.save(receipt)
+    data = dict(model_change_view(receipt, True), product="herika", receipt_id=receipt["id"],
+                plan_sha256=rollback["plan_sha256"], expires_at=model_stamp(rollback["expires_at"]), state="previewed")
+    return data, "\n".join(data["diff"] + [f"Undo within {MODEL_PREVIEW_SECONDS} seconds: ddistro models rollback herika "
+                                           f"--receipt {receipt['id']} --plan-sha256 {rollback['plan_sha256']}"])
+
+
+def parse_models(rest, ctx):
+    """models herika, or models <subcommand> herika with exactly that subcommand's typed flags."""
+    if len(rest) == 2 and rest[1] not in MODEL_SUBCOMMANDS:
+        ctx["command"] = "models"
+        return {"product": resolve_product(rest[1])}
+    if len(rest) < 3 or rest[1] not in MODEL_SUBCOMMANDS:
+        ctx["command"] = "models"
+        raise CliError("invalid_argument", "Expected models herika or models " + "|".join(MODEL_SUBCOMMANDS) + " herika.")
+    name = rest[1]
+    ctx["command"] = "models " + name
+    if resolve_product(rest[2]) != "herika":
+        raise CliError("unsupported", "Model settings support only herika (chim, skyrim).", {"product": rest[2][:40]})
+    flags = {"options": (), "preview": ("--profile", "--role", "--connector", "--task", "--thread"),
+             "apply": ("--receipt", "--plan-sha256"), "rollback": ("--receipt", "--plan-sha256"),
+             "rollback-preview": ("--receipt", "--task", "--thread")}[name]
+    opts, args, index = {}, rest[3:], 0
+    while index < len(args):
+        token = args[index]
+        if token not in flags or index + 1 >= len(args):
+            raise CliError("invalid_argument", f"Unsupported or incomplete argument for models {name}.")
+        if token[2:] in opts:
+            raise CliError("invalid_argument", f"{token} was given more than once.")
+        opts[token[2:]] = args[index + 1]
+        index += 2
+    for key in ("profile", "connector"):
+        if key in opts:
+            if not MODEL_ID_TEXT.match(opts[key]) or int(opts[key]) > MODEL_ID_MAX:
+                raise CliError("invalid_argument", f"--{key} must be a positive whole number id.")
+            opts[key] = int(opts[key])
+    if "role" in opts and opts["role"] not in MODEL_ROLE_FIELDS:
+        raise CliError("invalid_argument", "--role must be one of " + ", ".join(MODEL_ROLE_FIELDS) + ".")
+    if "receipt" in opts and not MODEL_RECEIPT_ID.match(opts["receipt"]):
+        raise CliError("invalid_argument", "--receipt must be the 32-hex receipt id from the preview.")
+    if "plan-sha256" in opts and not HASH.match(opts["plan-sha256"]):
+        raise CliError("invalid_argument", "--plan-sha256 must be the 64-hex hash from the preview.")
+    if "task" in opts and not TASK_ID.match(opts["task"]) or "thread" in opts and not THREAD_ID.match(opts["thread"]):
+        raise CliError("invalid_argument", "--task must be a task UUID and --thread a thread id.")
+    if ("task" in opts) != ("thread" in opts):
+        raise CliError("invalid_argument", "--task and --thread go together.")
+    required = {"options": (), "preview": ("profile", "role", "connector"), "apply": ("receipt", "plan-sha256"),
+                "rollback": ("receipt", "plan-sha256"), "rollback-preview": ()}[name]
+    if any(key not in opts for key in required):
+        raise CliError("invalid_argument", f"models {name} needs " + ", ".join("--" + key for key in required) + ".")
+    if name == "rollback-preview" and ("receipt" in opts) == ("task" in opts):
+        raise CliError("invalid_argument", "models rollback-preview needs --receipt, or --task and --thread.")
+    return opts
+
+
+# ddistro update-check [product]: what on this machine would stop a server update, read-only and local only. It never
+# fetches, updates, forces, discards or cleans anything and reads no file content: git reports only which tracked paths
+# differ and which untracked paths exist. Without the remote it cannot know whether an update exists or would touch
+# those paths, so a clean result is no_local_blockers, never ready or up to date.
+UPDATE_CHECK_ROOTS = {"herika": "/var/www/html/HerikaServer", "lorkhan": "/opt/dwemerdistro/sources/LorkhanServer",
+                      "stobe": "/var/www/html/StobeServer", "dialectic": "/var/www/html/DialecticServer",
+                      "reign": "/var/www/html/ReignServer"}
+UPDATE_CHECK_GIT = "/usr/bin/git"
+UPDATE_CHECK_STATUS_TIMEOUT = 30
+UPDATE_CHECK_GIT_TIMEOUT = 20
+UPDATE_CHECK_STDOUT = 4 * 1024 * 1024
+UPDATE_CHECK_PATHS = 20
+UPDATE_CHECK_PATH_CHARS = 200
+UPDATE_CHECK_ASSESSMENTS = ("no_local_blockers", "blocked", "unknown", "not_installed")
+# An unfinished git operation: an update would stop on it.
+UPDATE_CHECK_IN_PROGRESS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
+# Command-line config outranks the repository's own: no fsmonitor command, hooks, pager, colour or untracked cache.
+# System and global config are not read, and --no-optional-locks keeps status from rewriting the index.
+UPDATE_CHECK_GIT_ARGS = ("--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                         "-c", "core.untrackedCache=false", "-c", "core.attributesFile=/dev/null", "-c", "core.pager=cat",
+                         "-c", "color.ui=false", "-c", "core.quotePath=false")
+UPDATE_CHECK_GIT_ENV = {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "HOME": "/", "GIT_CONFIG_NOSYSTEM": "1",
+                        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
+                        "GIT_ATTR_NOSYSTEM": "1", "GIT_NO_REPLACE_OBJECTS": "1"}
+
+
+def update_check_args(root):
+    """The hardened git arguments for root: its own .git and root itself, given explicitly, so neither repository
+    discovery nor a core.worktree or GIT_DIR-style redirect in the repository config can point git anywhere else."""
+    return list(UPDATE_CHECK_GIT_ARGS) + ["-c", "safe.directory=" + root, "--git-dir=" + root + "/.git",
+                                          "--work-tree=" + root, "-C", root]
+
+
+def update_check_filters(root):
+    """Refuses before status when any filter driver is configured for root. status can run a configured clean or
+    process filter on a path .gitattributes assigns to it, so filter.* keys are never allowed. git itself resolves
+    the repository config with its includes and conditional includes, under the same hardened arguments and environment
+    as status; with --name-only only key names are printed, never values (filter commands). Exit 1 with no output (no
+    such key) is the only pass; anything else, including output cut short, is a refusal or a failure."""
+    args = update_check_args(root) + ["config", "--null", "--name-only", "--get-regexp", r"^filter\."]
+    code, out, _ = run_helper(args, UPDATE_CHECK_GIT_TIMEOUT, 64, helper=UPDATE_CHECK_GIT, env=dict(UPDATE_CHECK_GIT_ENV))
+    if code == 1 and out.total == 0:
+        return
+    if code == 0:
+        raise CliError("refused", "The repository configures a git filter.", {"reason": "git_filter_configured"})
+    raise CliError("helper_failed", "git config failed.", {"reason": "git_config_failed"})
+
+
+def update_check_git(root):
+    """(tracked paths, untracked paths, complete) from one bounded, read-only git status of root, run only after
+    update_check_filters found no filter that status could execute."""
+    check_system_binary(UPDATE_CHECK_GIT)
+    update_check_filters(root)
+    args = update_check_args(root) + ["status", "--porcelain=v1", "-z",
+                                          "--untracked-files=all", "--ignore-submodules=all", "--no-renames"]
+    code, out, _ = run_helper(args, UPDATE_CHECK_GIT_TIMEOUT, UPDATE_CHECK_STDOUT + 1, helper=UPDATE_CHECK_GIT,
+                              env=dict(UPDATE_CHECK_GIT_ENV))
+    if code != 0:
+        raise CliError("helper_failed", "git status failed.", {"reason": "git_failed"})
+    complete = out.total <= UPDATE_CHECK_STDOUT
+    tracked, untracked = [], []
+    entries = bytes(out.data).split(b"\0")
+    for entry in entries if complete else entries[1:-1]:
+        if not entry:
+            continue
+        if len(entry) < 4 or entry[2:3] != b" ":
+            if complete:
+                raise CliError("helper_protocol", "git status returned an unexpected entry.", {"reason": "git_output"})
+            continue
+        path = CONTROL.sub("?", entry[3:].decode("utf-8", "replace"))[:UPDATE_CHECK_PATH_CHARS]
+        if entry[:2] == b"??":
+            untracked.append(path)
+        elif entry[:2] != b"!!":
+            tracked.append(path)
+    return tracked, untracked, complete
+
+
+def update_check_product(record):
+    product = record["product"]
+    root = UPDATE_CHECK_ROOTS[product]
+    result = {"product": product, "state": record["state"], "repository_state": record["repository_state"],
+              "branch": record["branch"], "version": record["version"], "assessment": "unknown", "reasons": [],
+              "inspected": False, "tracked_changes": None, "untracked_files": None, "tracked_paths": [],
+              "untracked_paths": [], "paths_truncated": False}
+    if record["state"] == "not-installed" or record["repository_state"] == "absent":
+        result.update(assessment="not_installed", inspected=True)
+        return result
+    if record["repository_state"] != "managed":
+        result["reasons"].append("unmanaged_install")
+        return result
+    if record["root"] != root:
+        result["reasons"].append("unexpected_root")
+        return result
+    try:
+        for path, wanted in ((root, stat.S_ISDIR), (root + "/.git", stat.S_ISDIR), (root + "/.git/config", stat.S_ISREG)):
+            st = os.lstat(path)
+            if not wanted(st.st_mode) or st.st_mode & 0o022 and path.endswith("config"):
+                result["reasons"].append("unexpected_repository_layout")
+                return result
+        # A linked worktree's commondir would take the config and objects from another repository.
+        if os.path.lexists(root + "/.git/commondir"):
+            result["reasons"].append("unexpected_repository_layout")
+            return result
+        busy = os.path.lexists(root + "/.git/index.lock")
+        in_progress = [name for name in UPDATE_CHECK_IN_PROGRESS if os.path.lexists(root + "/.git/" + name)]
+    except FileNotFoundError:
+        result["reasons"].append("repository_missing")
+        return result
+    except OSError:
+        result["reasons"].append("repository_unreadable")
+        return result
+    if busy:
+        result["reasons"].append("git_busy")
+        return result
+    try:
+        tracked, untracked, complete = update_check_git(root)
+    except CliError as error:
+        if error.code == "cancelled":
+            raise
+        reason = {"timeout": "git_timeout", "helper_unavailable": "git_unavailable"}.get(error.code, "git_failed")
+        if error.details.get("reason") in ("git_filter_configured", "git_config_failed"):
+            reason = error.details["reason"]
+        result["reasons"].append(reason)
+        return result
+    result.update(inspected=complete, tracked_changes=len(tracked), untracked_files=len(untracked),
+                  tracked_paths=tracked[:UPDATE_CHECK_PATHS], untracked_paths=untracked[:UPDATE_CHECK_PATHS],
+                  paths_truncated=not complete or len(tracked) > UPDATE_CHECK_PATHS or len(untracked) > UPDATE_CHECK_PATHS)
+    if tracked:
+        result["reasons"].append("tracked_changes")
+    if in_progress:
+        result["reasons"].append("git_operation_in_progress")
+    if untracked:
+        result["reasons"].append("untracked_files")
+    if not complete:
+        result["reasons"].append("status_truncated")
+    if tracked or in_progress:
+        result["assessment"] = "blocked"
+    elif not untracked and complete:
+        result["assessment"] = "no_local_blockers"
+    return result
+
+
+def cmd_update_check(opts, ctx):
+    product = opts.get("product")
+    captured_at = model_stamp(time.time())
+    try:
+        records = helper_status(product, UPDATE_CHECK_STATUS_TIMEOUT)
+        products = [update_check_product(record) for record in records]
+    except CliError as error:
+        if error.code == "cancelled":
+            raise
+        products = [{"product": key, "assessment": "unknown", "reasons": ["status_unavailable"], "inspected": False}
+                    for key in ([product] if product else PRODUCTS)]
+    summary = {name: sum(1 for p in products if p["assessment"] == name) for name in UPDATE_CHECK_ASSESSMENTS}
+    data = {"scope": "local_only", "captured_at": captured_at, "network_queried": False, "remote_changes_checked": False,
+            "conflicts": "unknown", "changed_anything": False, "products": products, "summary": summary,
+            "complete": all(p["inspected"] for p in products),
+            "note": "Local files only: whether an update exists, or would touch these paths, was not checked."}
+    lines = [f"{p['product']:<10} {p['assessment']}" + (" (" + ", ".join(p["reasons"]) + ")" if p["reasons"] else "")
+             for p in products]
+    return data, "\n".join(lines + [data["note"]])
 
 
 # ddistro inventory: one fresh, read-only snapshot of what is installed, for the launcher's assistant.
@@ -2070,18 +2983,21 @@ def memory_now(offset_days=0):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + offset_days * 86400))
 
 
-def memory_directory(create):
-    """The private memory directory, or None when it is absent and create is False.
+def memory_directory(create, parent=None, name=MEMORY_DIR_NAME, untrusted=None):
+    """The private memory directory (or another root-private directory name under parent), or None when it is
+    absent and create is False.
 
     Every component is opened without following links and must be root-owned and not group- or
-    other-writable; the memory directory itself must be root's with mode 0700. Nothing is repaired."""
+    other-writable; the directory itself must be root's with mode 0700. Nothing is repaired."""
+    parent = parent or MEMORY_PARENT
+    untrusted = untrusted or memory_untrusted
     fd = os.open("/", INVENTORY_DIR_FLAGS)
     try:
-        parts = [p for p in MEMORY_PARENT.split("/") if p] + [MEMORY_DIR_NAME]
+        parts = [p for p in parent.split("/") if p] + [name]
         for index, part in enumerate(parts):
             st = os.fstat(fd)
             if st.st_uid != 0 or st.st_mode & 0o022:
-                raise memory_untrusted("parent directory")
+                raise untrusted("parent directory")
             last = index == len(parts) - 1
             try:
                 next_fd = os.open(part, INVENTORY_DIR_FLAGS, dir_fd=fd)
@@ -2094,13 +3010,13 @@ def memory_directory(create):
                 os.mkdir(part, 0o700, dir_fd=fd)
                 next_fd = os.open(part, INVENTORY_DIR_FLAGS, dir_fd=fd)
             except OSError:
-                raise memory_untrusted("directory" if last else "parent directory")
+                raise untrusted("directory" if last else "parent directory")
             os.close(fd)
             fd = next_fd
         st = os.fstat(fd)
         if st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o700:
-            raise memory_untrusted("directory")
-        return MEMORY_PARENT + "/" + MEMORY_DIR_NAME
+            raise untrusted("directory")
+        return parent + "/" + name
     finally:
         os.close(fd)
 
@@ -2640,7 +3556,9 @@ COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products"
             "server update": cmd_server_update, "agent status": cmd_agent_status, "agent probe": cmd_agent_probe,
             "models": cmd_models, "inventory": cmd_inventory, "health": cmd_health, "performance": cmd_performance,
             "agent home-config": cmd_agent_home_config, "agent home-config-repair": cmd_agent_home_config_repair,
-            "service restart": cmd_service_restart}
+            "service restart": cmd_service_restart, "update-check": cmd_update_check,
+            "models options": cmd_models_options, "models preview": cmd_models_preview, "models apply": cmd_models_apply,
+            "models rollback-preview": cmd_models_rollback_preview, "models rollback": cmd_models_rollback}
 COMMANDS.update({"changes " + name: cmd_changes for name in CHANGES_SPEC})
 COMMANDS.update({"memory " + name: cmd_memory for name in MEMORY_SPEC})
 
@@ -2675,6 +3593,8 @@ def parse_command(rest, ctx):
         return parse_changes(rest, ctx)
     if name == "memory":
         return parse_memory(rest, ctx)
+    if name == "models":
+        return parse_models(rest, ctx)
     if name == "server":
         if len(rest) < 2 or rest[1] not in ("status", "update"):
             raise CliError("invalid_argument", "Expected server status or server update.")
@@ -2714,8 +3634,8 @@ def parse_command(rest, ctx):
         else:
             positional.append(token)
         index += 1
-    required = {"logs": 1, "server update": 1, "models": 1}.get(name, 0)
-    allowed = 1 if name in ("status", "health", "performance", "server status", "logs", "server update", "models") else 0
+    required = {"logs": 1, "server update": 1}.get(name, 0)
+    allowed = 1 if name in ("status", "health", "performance", "server status", "logs", "server update", "update-check") else 0
     if not required <= len(positional) <= allowed:
         raise CliError("invalid_argument", f"Wrong number of arguments for {name}.\n" + USAGE)
     if name == "logs":

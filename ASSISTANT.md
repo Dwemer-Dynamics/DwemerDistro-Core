@@ -64,6 +64,9 @@ codes; `features.file_changes` and `locks` are `true` and `chat` is `false`. `fe
 is `true` only when the trusted `ddistro_agent` helper is installed; it never means the
 assistant is ready. Readiness comes only from `agent status` (`installed` and `probe_passed`).
 `features.models` and `capabilities.models` describe `models herika` (roles and limits).
+`features.model_settings` and `capabilities.model_settings` describe the root model-assignment
+change commands (role field, preview seconds, compare-and-swap, exact undo, receipt limits), and
+`features.update_check` and `capabilities.update_check` the local, network-free `update-check`.
 `features.inventory` and `capabilities.inventory` describe `inventory` (scope, the products
 with an extension folder, component ids, and limits). `features.memory` and
 `capabilities.memory` describe `memory` (scope, kinds, defaults, limits) from constants only;
@@ -90,6 +93,21 @@ root user. The CLI never calls `sudo` and never prompts. It reads status first, 
 line is validated and returned as `error.details.blocker` (or `null` if invalid), with
 sanitized stdout/stderr tails. Progress text is only shown (on stderr) in human mode.
 Timeout or cancellation stops the helper's whole process group (TERM, then KILL).
+
+`update-check [product]` is read-only and local only: it never fetches, pulls, updates,
+forces, discards, or cleans anything, so it cannot know whether an update exists or would touch
+local paths (`network_queried`, `remote_changes_checked` are `false`, `conflicts` is `unknown`).
+A clean product is `no_local_blockers`, never ready or up to date; the others are `blocked`
+(tracked changes or an unfinished merge/rebase), `unknown`, or `not_installed`. Only the known
+product root is inspected, as a plain `.git` directory (a linked worktree's `commondir` is
+`unexpected_repository_layout`); git gets that `.git` and root explicitly (`--git-dir`,
+`--work-tree`), so a `core.worktree` redirect in the repository config is not followed. System
+and global config, hooks, fsmonitor, pager, and attributes files are off. Before status, a
+`git config --name-only --get-regexp ^filter\.` scan (the repository config with its includes
+and conditional includes) refuses any filter driver as `git_filter_configured`; only key names
+are printed, never the configured command. Any other exit or output is `git_config_failed`.
+Status output past 4 MiB is cut, and then the result is `unknown` with `status_truncated` unless
+a tracked change already makes it `blocked`; at most 20 paths of each kind are listed.
 
 ## Logs
 
@@ -234,6 +252,37 @@ assignments, not necessarily the profile an NPC is using.
   assignments, and a `reason` token: `requires_root`, `helper_unavailable`,
   `database_unavailable`, `schema_missing`, `query_failed`, `timeout`, or
   `unexpected_output`. `psql` stderr and SQL are never returned, and no model is guessed.
+
+`models options|preview|apply|rollback-preview|rollback herika` (root only; `ddistro` never
+elevates) change one thing: which existing `core_llm_connector` one role of one
+`core_profiles` row uses. Connectors, keys, URLs, other fields, and other profiles are never
+written, and no connector is created.
+
+- `options` lists profiles with their role ids and connectors (at most 200 each, flagged in
+  `truncated`). `preview --profile ID --role ROLE --connector ID [--task T --thread TH]` reads the
+  row and connector, refuses `no_change`, and saves a receipt bound to that task and thread with
+  both row versions and a `plan_sha256`; it expires after 120 seconds.
+- `apply --receipt ID --plan-sha256 HASH` runs only that unexpired, unused preview, under the
+  maintenance lock, as one compare-and-swap on the profile row's version and value and the
+  connector's version (`conflict` when either changed). The prestate is saved before the write;
+  a fresh read then gives `verified`, `unverified`, `conflict`, `not_executed`, or `unknown`.
+  `verified` means only that the database holds the new assignment: no provider, model, or game
+  reply is tested.
+- `rollback-preview` prepares the exact undo of an `applied` receipt (120 s, its own
+  `plan_sha256`): `--receipt ID`, or `--task T --thread TH` for that thread's latest change. The
+  latest change is the receipt with the highest write sequence, a number the store assigns to
+  each apply or undo under its lock just before the write; preview time and receipt ids are never
+  used as order. If that latest write's outcome is unknown, or the thread's receipts include one
+  saved before sequences existed, or two share a sequence, nothing is prepared (`outcome_unknown`,
+  `history_ambiguous`); an older change is never picked instead. The undo is refused as
+  `changed_since` when the profile changed after the apply, and `original_missing` when the
+  previous connector is gone. `rollback --receipt ID --plan-sha256 HASH` runs it like `apply`.
+- Receipts are root `0600` single-link files in a root `0700` directory, read without following
+  links and replaced atomically under a lock file whose identity is checked after locking. Any
+  receipt that fails validation makes the store `receipts_untrusted`. Unused previews are dropped
+  after expiry, receipts whose write is not in progress after 30 days, and the oldest past 200; a
+  receipt whose write may be in progress or whose outcome is unknown is never dropped for room
+  (`receipts_full`).
 
 ## Inventory
 

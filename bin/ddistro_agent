@@ -158,7 +158,7 @@ TOOL_LOGS = {
     "apache": ("error.log", "other_vhosts_access.log", "stobe_error.log", "dialectic_error.log"),
     "postgres": ("main",),
 }
-TOOL_OPERATIONS = ("inventory", "status", "models", "logs", "health", "performance")
+TOOL_OPERATIONS = ("inventory", "status", "models", "logs", "health", "performance", "model_options", "update_check")
 # Shared logs, not servers: the schema offers them only as log_source. Threads started before log_source existed were
 # declared product apache/postgres for logs, so tool_argv still accepts that form for logs (and only for logs).
 TOOL_LOG_SOURCES = ("apache", "postgres")
@@ -168,13 +168,14 @@ TOOL_SPEC = {
     "description": "Read-only DwemerDistro diagnostics captured now on this machine: inventory (installed presence), "
                    "status (managed servers), models (configured CHIM model assignments), logs (redacted tail of an "
                    "allowlisted log), health (bounded local checks), performance (bounded local timings, host load, and "
-                   "recent Herika request stage timings; not provider latency or time to first token). It cannot "
-                   "change, repair, or update anything.",
+                   "recent Herika request stage timings; not provider latency or time to first token), model_options "
+                   "(CHIM profiles with each role's connector id, and the existing LLM connectors), update_check (local "
+                   "blockers to a server update; the network is not checked). It cannot change, repair, or update anything.",
     "inputSchema": {"type": "object", "additionalProperties": False, "required": ["operation"], "properties": {
         "operation": {"type": "string", "enum": list(TOOL_OPERATIONS)},
         "product": {"type": "string", "enum": list(TOOL_PRODUCTS),
-                    "description": "a server only. status/health/performance: optional (omit for all); models: herika; "
-                                   "logs: that server's logs (or use log_source instead)"},
+                    "description": "a server only. status/health/performance/update_check: optional (omit for all); "
+                                   "models/model_options: herika; logs: that server's logs (or use log_source instead)"},
         "log_source": {"type": "string", "enum": list(TOOL_LOG_SOURCES),
                        "description": "logs only, instead of product: the shared Apache or PostgreSQL logs"},
         "log": {"type": "string", "enum": sorted({name for names in TOOL_LOGS.values() for name in names}),
@@ -218,12 +219,30 @@ MEMORY_SPEC = {
                  "description": "remember only: one self-contained sentence"},
         "kind": {"type": "string", "enum": list(MEMORY_KINDS), "description": "remember only"}}},
 }
-# The one live action. The model can only propose it; the broker announces the proposal to the client
+# The live actions. The model can only propose; the broker announces the proposal to the client
 # (ddistro/action/proposed, with an id the model never sees), and only the client's ddistro/action/decide approve
-# for that pending, unexpired proposal of the same thread runs fixed `ddistro service restart <service>` as root.
-# Declared only to a client that opts in with initialize capabilities.ddistroActions ["restart_service"].
+# for that pending, unexpired proposal of the same thread runs its fixed root ddistro command once.
+# Declared only to a client that opts in with initialize capabilities.ddistroActions: "restart_service" (fixed
+# `ddistro service restart <service>`) and, separately, "configure_model" (a CHIM profile role's connector, through
+# `ddistro models preview|apply|rollback-preview|rollback herika`). A client without configure_model gets exactly the
+# restart-only declaration below and can never be sent a model proposal.
 ACTION_TOOL = "ddistro_action"
 ACTION_CAPABILITY = "restart_service"
+ACTION_MODEL_CAPABILITY = "configure_model"
+ACTION_OPERATIONS = {ACTION_CAPABILITY: ("propose_restart",),
+                     ACTION_MODEL_CAPABILITY: ("propose_model_change", "propose_model_rollback")}
+# Mirrors ddistro MODELS_ROLES; ddistro validates the role, its field, and both ids again.
+ACTION_MODEL_ROLES = ("standard", "fast", "powerful", "experimental", "formatter", "fallback", "diary")
+ACTION_ID_MAX = 2147483647
+ACTION_MODEL_LABEL = "CHIM model assignment"
+ACTION_MODEL_IMPACT = ("Only which existing connector this CHIM profile role uses changes, in the CHIM database. Connector "
+                       "settings, API keys and other profiles stay as they are. New replies use it; nothing is tested in game.")
+ACTION_MODEL_ROLLBACK_IMPACT = ("Puts back exactly the connector this profile role used before the Assistant's last change, "
+                                "in the CHIM database. Nothing else changes.")
+# What ddistro models apply/rollback reports after reaching the database; refusals before it are error codes.
+ACTION_MODEL_STATES = ("verified", "unverified", "conflict", "not_executed", "unknown")
+MODEL_RECEIPT_PATTERN = re.compile(r"^[0-9a-f]{32}\Z")
+MODEL_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}\Z")
 # Mirrors ddistro SERVICE_RESTARTS; ddistro validates the name again.
 ACTION_SERVICES = {
     "apache": ("Apache web server", "Apache is shared: CHIM (HerikaServer), STOBE and Dialectic web servers and custom "
@@ -234,6 +253,8 @@ ACTION_REASON_CHARS = 300
 ACTION_NOT_RUN_CODES = ("failed", "helper_untrusted", "helper_unavailable", "unsafe_path", "permission_denied", "unsupported",
                         "invalid_argument")
 ACTION_APPROVAL_SECONDS = 60
+# ddistro models apply/rollback refusals raised before the database write: nothing changed.
+ACTION_MODEL_NOT_RUN_CODES = ACTION_NOT_RUN_CODES + ("not_found", "refused")
 ACTION_SPEC = {
     "type": "function", "name": ACTION_TOOL,
     "description": "Propose restarting one allowlisted DwemerDistro service. You cannot approve or run it: the user sees "
@@ -248,6 +269,99 @@ ACTION_SPEC = {
                         "reason": {"type": "string", "maxLength": ACTION_REASON_CHARS,
                                    "description": "one plain sentence shown to the user: why the restart should help"}}},
 }
+
+
+def action_spec(capabilities):
+    """The ddistro_action declaration for the client's opted-in capabilities. restart_service alone is exactly
+    ACTION_SPEC, so an older client keeps its schema; the schema is flat and per-operation fields are runtime checks."""
+    if capabilities == {ACTION_CAPABILITY}:
+        return ACTION_SPEC
+    operations = [name for capability in (ACTION_CAPABILITY, ACTION_MODEL_CAPABILITY) if capability in capabilities
+                  for name in ACTION_OPERATIONS[capability]]
+    properties = {"operation": {"type": "string", "enum": operations}}
+    if ACTION_CAPABILITY in capabilities:
+        properties["service"] = {"type": "string", "enum": list(ACTION_SERVICES), "description": "propose_restart only"}
+    properties.update({
+        "profile_id": {"type": "integer", "minimum": 1, "maximum": ACTION_ID_MAX,
+                       "description": "propose_model_change only: a CHIM profile id from ddistro_read model_options"},
+        "role": {"type": "string", "enum": list(ACTION_MODEL_ROLES), "description": "propose_model_change only"},
+        "connector_id": {"type": "integer", "minimum": 1, "maximum": ACTION_ID_MAX,
+                         "description": "propose_model_change only: an existing LLM connector id from model_options"},
+        "reason": {"type": "string", "maxLength": ACTION_REASON_CHARS,
+                   "description": "one plain sentence shown to the user: why this should help"}})
+    return {"type": "function", "name": ACTION_TOOL,
+            "description": "Propose one live change; you cannot approve or run it. The user sees the exact change with "
+                           "Approve or Cancel in the launcher, and only their approval runs it, once. "
+                           + ("propose_restart restarts one allowlisted service. " if ACTION_CAPABILITY in capabilities else "")
+                           + "propose_model_change points one role of one CHIM profile at an existing LLM connector "
+                           "(ids from ddistro_read model_options; it never edits connectors, keys or files). "
+                           "propose_model_rollback undoes this chat's last applied model change exactly. The reply says "
+                           "whether it was refused, cancelled, expired, a conflict, not executed, unknown or executed, and "
+                           "whether a fresh read verified it; report exactly that. At most one of each operation per turn.",
+            "inputSchema": {"type": "object", "additionalProperties": False, "required": ["operation", "reason"],
+                            "properties": properties}}
+
+
+def action_id(arguments, key):
+    """A positive integer id that fits PostgreSQL integer; booleans, floats, strings and overflow are refused."""
+    value = arguments.get(key)
+    if type(value) is not int or not 0 < value <= ACTION_ID_MAX:
+        raise PolicyError(-32602, "%s must be a positive whole number id" % key)
+    return value
+
+
+def model_plan(payload, undo):
+    """The private plan (receipt id and confirmation) and the public view of a ddistro models preview, or None."""
+    if not isinstance(payload, dict) or payload.get("state") != "previewed":
+        return None
+    receipt, confirm, diff = payload.get("receipt_id"), payload.get("plan_sha256"), payload.get("diff")
+    profile, role = payload.get("profile"), payload.get("role")
+
+    def side(value):
+        connector = value.get("connector") if isinstance(value, dict) else None
+        if (not isinstance(value, dict) or value.get("value") is not None and type(value.get("value")) is not int
+                or connector is not None and not isinstance(connector, dict)):
+            raise ValueError("side")
+        return {"connector_id": value.get("value"), "connector": None if connector is None else {
+            key: str(connector.get(key) or "")[:256] for key in ("label", "model", "provider", "driver")}}
+    try:
+        if (not isinstance(receipt, str) or not MODEL_RECEIPT_PATTERN.match(receipt) or not isinstance(confirm, str)
+                or not MODEL_HASH_PATTERN.match(confirm) or not isinstance(diff, list) or len(diff) != 3
+                or not all(isinstance(line, str) and len(line) <= 1200 for line in diff)
+                or not isinstance(profile, dict) or type(profile.get("id")) is not int or role not in ACTION_MODEL_ROLES):
+            return None
+        view = {"product": "herika", "profile": {"id": profile["id"], "label": str(profile.get("label") or "")[:256]},
+                "role": role, "before": side(payload.get("before")), "after": side(payload.get("after")), "diff": diff}
+    except ValueError:
+        return None
+    if not undo and view["after"]["connector"] is None:
+        return None
+    return {"receipt_id": receipt, "plan_sha256": confirm, "view": sanitize(view)}
+
+
+def model_outcome(ok, payload, plan):
+    """The proposal's state from ddistro models apply/rollback: its own reported state for this receipt, busy or expired,
+    not_executed for a refusal before the write, and unknown for anything else (a timeout, a lost or odd result)."""
+    if ok:
+        if (isinstance(payload, dict) and payload.get("receipt_id") == plan["receipt_id"]
+                and payload.get("state") in ACTION_MODEL_STATES):
+            if payload["state"] == "verified" and payload.get("verified") is not True:
+                return "unknown"
+            return payload["state"]
+        return "unknown"
+    code = payload.get("code") if isinstance(payload, dict) else None
+    if code in ("busy", "expired"):
+        return code
+    return "not_executed" if code in ACTION_MODEL_NOT_RUN_CODES else "unknown"
+
+
+def model_executed(state):
+    """True when a model change was written, False when it was not, None when that is not known."""
+    if state in ("verified", "unverified"):
+        return True
+    return None if state == "unknown" else False
+
+
 TOOL_TIMEOUT = 90
 TOOL_STDOUT_LIMIT = 1024 * 1024
 TOOL_TEXT_BUDGET = 64 * 1024
@@ -1104,19 +1218,20 @@ def tool_argv(arguments):
         if "product" in arguments:
             raise PolicyError(-32602, "inventory takes no product")
         return ["inventory"]
-    if operation in ("status", "health", "performance"):
+    if operation in ("status", "health", "performance", "update_check"):
+        command = "update-check" if operation == "update_check" else operation
         if product is None and "product" not in arguments:
-            return [operation]
+            return [command]
         if product in TOOL_LOG_SOURCES:
             raise PolicyError(-32602, "%s has logs only: use operation logs with log_source %s; %s takes a server "
                                       "product (%s) or none" % (product, product, operation, ", ".join(TOOL_PRODUCTS)))
         if product not in TOOL_PRODUCTS:
             raise PolicyError(-32602, "product must be one of " + ", ".join(TOOL_PRODUCTS))
-        return [operation, product]
-    if operation == "models":
+        return [command, product]
+    if operation in ("models", "model_options"):
         if arguments.get("product", "herika") != "herika":
-            raise PolicyError(-32602, "models supports only herika")
-        return ["models", "herika"]
+            raise PolicyError(-32602, "%s supports only herika" % operation)
+        return ["models", "herika"] if operation == "models" else ["models", "options", "herika"]
     if "log_source" in arguments:
         if "product" in arguments:
             raise PolicyError(-32602, "logs takes product or log_source, not both")
@@ -1260,7 +1375,8 @@ def run_ddistro(argv, registry=None):
         document = json.loads(out.decode("utf-8"))
     except ValueError:
         document = None
-    expected = " ".join(argv[:2]) if argv[0] in ("memory", "service") else argv[0]
+    expected = (" ".join(argv[:2]) if argv[0] in ("memory", "service") or argv[0] == "models" and argv[1] != "herika"
+                else argv[0])
     if (not isinstance(document, dict) or document.get("schema_version") != 1 or document.get("command") != expected
             or document.get("ok") not in (True, False)):
         return False, {"code": "helper_protocol", "message": "ddistro returned an unexpected document"}
@@ -1327,8 +1443,9 @@ class Broker:
         self.failure = None
         self.stop_timer = None
         self.closed = False
-        # ddistro_action: declared only after the client opts in; proposals live only in this session's memory.
-        self.actions = False
+        # ddistro_action: the capabilities the client opted into (none until it does); proposals live only in this
+        # session's memory.
+        self.actions = frozenset()
         self.proposals = {}
         self.proposed_turns = set()
         # The tool thread running an approved restart, which teardown waits for (see _stop_children).
@@ -1543,10 +1660,12 @@ class Broker:
                 raise PolicyError(-32602, "invalid parameter: capabilities.experimentalApi")
             self.experimental = experimental is True
             actions = capabilities.pop("ddistroActions", None) if isinstance(capabilities, dict) else None
-            if actions not in (None, [], [ACTION_CAPABILITY]):
+            if actions is not None and (not isinstance(actions, list) or len(actions) > len(ACTION_OPERATIONS)
+                                        or any(not isinstance(name, str) or name not in ACTION_OPERATIONS for name in actions)
+                                        or len(set(actions)) != len(actions)):
                 raise PolicyError(-32602, "invalid parameter: capabilities.ddistroActions")
             # Codex never sees this broker-only field; the action needs the dynamic tools experimentalApi enables.
-            self.actions = actions == [ACTION_CAPABILITY] and self.experimental
+            self.actions = frozenset(actions or ()) if self.experimental else frozenset()
             return params
         if method in SIMPLE_METHODS:
             reject_unknown(params, SIMPLE_METHODS[method])
@@ -1562,7 +1681,7 @@ class Broker:
             # Client tool declarations are never accepted; the broker owns the exact declaration.
             if self.experimental:
                 params["dynamicTools"] = ([TOOL_SPEC] + ([MEMORY_SPEC] if self.memory else [])
-                                          + ([ACTION_SPEC] if self.actions else []))
+                                          + ([action_spec(self.actions)] if self.actions else []))
             self._cancel_proposals(None, "cancelled")
             return enforce_sandbox(params)
         if method == "thread/resume":
@@ -1951,7 +2070,7 @@ class Broker:
         """Ends every pending proposal (of thread_id, or all): it can no longer be approved and nothing runs."""
         with self.state_lock:
             for proposal in self.proposals.values():
-                if proposal["state"] == "proposed" and thread_id in (None, proposal["thread"]):
+                if proposal["state"] in ("preparing", "proposed") and thread_id in (None, proposal["thread"]):
                     proposal["state"] = state
                     proposal["event"].set()
 
@@ -1978,41 +2097,20 @@ class Broker:
             state = proposal["state"]
         self._to_client(encode({"id": request_id, "result": {"state": state}}))
 
-    def _run_action(self, request_id, params, key):
-        arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-        thread_id, turn_id = params.get("threadId"), params.get("turnId")
-        service = arguments.get("service") if arguments.get("service") in ACTION_SERVICES else None
-        try:
-            reject_unknown(arguments, ("operation", "service", "reason"))
-            if arguments.get("operation") != "propose_restart" or service is None:
-                raise PolicyError(-32602, "operation must be propose_restart and service one of " + ", ".join(ACTION_SERVICES))
-            reason = memory_value(arguments, "reason", ACTION_REASON_CHARS)
-            if not isinstance(turn_id, str) or not 0 < len(turn_id) <= 128:
-                raise PolicyError(-32602, "turnId is required")
-        except PolicyError as exc:
-            self._action_reply(request_id, service, "refused", {"code": "invalid_arguments", "message": exc.message}, key)
-            return
-        proposal = {"id": secrets.token_hex(16), "thread": thread_id, "turn": turn_id, "service": service,
-                    "state": "proposed", "event": threading.Event(),
-                    "expires": time.monotonic() + ACTION_APPROVAL_SECONDS}
+    def _reserve_proposal(self, proposal):
+        """Takes the session's one proposal slot unless another proposal is preparing, pending or running, or this turn
+        already proposed this operation. Returns (busy, repeated); the slot is taken only when both are false."""
         with self.state_lock:
-            busy = self.stopping or any(p["state"] in ("proposed", "approved", "executing")
+            busy = self.stopping or any(p["state"] in ("preparing", "proposed", "approved", "executing")
                                         for p in self.proposals.values())
-            repeated = (thread_id, turn_id) in self.proposed_turns
+            repeated = (proposal["thread"], proposal["turn"], proposal["operation"]) in self.proposed_turns
             if not (busy or repeated):
-                self.proposed_turns.add((thread_id, turn_id))
                 # Finished proposals are dropped; a decision for one is then "no such proposal", which also fails closed.
                 self.proposals = {proposal["id"]: proposal}
-        if busy or repeated:
-            self._action_reply(request_id, service, "busy" if busy else "refused", {
-                "code": "busy" if busy else "invalid_arguments",
-                "message": "another restart proposal is pending" if busy else "only one restart proposal per turn"}, key)
-            return
-        label, impact = ACTION_SERVICES[service]
-        expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + ACTION_APPROVAL_SECONDS))
-        self._to_client(encode({"method": "ddistro/action/proposed", "params": {
-            "proposalId": proposal["id"], "threadId": thread_id, "turnId": turn_id, "action": "restart",
-            "service": service, "label": label, "impact": impact, "reason": sanitize(reason), "expiresAt": expires_at}}))
+        return busy, repeated
+
+    def _await_decision(self, proposal):
+        """Waits for the client's decision or the expiry. Returns (go, state); go means approved, now executing."""
         while not proposal["event"].wait(CLIENT_POLL):
             with self.state_lock:
                 if proposal["state"] == "proposed" and (self.stopping or time.monotonic() > proposal["expires"]):
@@ -2025,7 +2123,46 @@ class Broker:
                 self.action_job = threading.current_thread()
             elif proposal["state"] == "approved":
                 proposal["state"] = "not_executed"
-            state = proposal["state"]
+            return go, proposal["state"]
+
+    def _run_action(self, request_id, params, key):
+        arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+        thread_id, turn_id = params.get("threadId"), params.get("turnId")
+        operation = arguments.get("operation")
+        if operation in ACTION_OPERATIONS[ACTION_MODEL_CAPABILITY] and ACTION_MODEL_CAPABILITY in self.actions:
+            self._run_model_action(request_id, arguments, thread_id, turn_id, key)
+            return
+        service = arguments.get("service") if arguments.get("service") in ACTION_SERVICES else None
+        try:
+            offered = [name for capability in sorted(self.actions) for name in ACTION_OPERATIONS[capability]]
+            if operation not in offered:
+                raise PolicyError(-32602, "operation must be one of " + ", ".join(offered))
+            reject_unknown(arguments, ("operation", "service", "reason"))
+            if service is None:
+                raise PolicyError(-32602, "operation must be propose_restart and service one of " + ", ".join(ACTION_SERVICES))
+            reason = memory_value(arguments, "reason", ACTION_REASON_CHARS)
+            if not isinstance(turn_id, str) or not 0 < len(turn_id) <= 128:
+                raise PolicyError(-32602, "turnId is required")
+        except PolicyError as exc:
+            self._action_reply(request_id, service, "refused", {"code": "invalid_arguments", "message": exc.message}, key)
+            return
+        proposal = {"id": secrets.token_hex(16), "thread": thread_id, "turn": turn_id, "service": service,
+                    "operation": "propose_restart", "action": "restart", "state": "proposed", "event": threading.Event(),
+                    "expires": time.monotonic() + ACTION_APPROVAL_SECONDS}
+        busy, repeated = self._reserve_proposal(proposal)
+        if busy or repeated:
+            self._action_reply(request_id, service, "busy" if busy else "refused", {
+                "code": "busy" if busy else "invalid_arguments",
+                "message": "another proposal is pending" if busy else "only one restart proposal per turn"}, key)
+            return
+        with self.state_lock:
+            self.proposed_turns.add((thread_id, turn_id, "propose_restart"))
+        label, impact = ACTION_SERVICES[service]
+        expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + ACTION_APPROVAL_SECONDS))
+        self._to_client(encode({"method": "ddistro/action/proposed", "params": {
+            "proposalId": proposal["id"], "threadId": thread_id, "turnId": turn_id, "action": "restart",
+            "service": service, "label": label, "impact": impact, "reason": sanitize(reason), "expiresAt": expires_at}}))
+        go, state = self._await_decision(proposal)
         if not go:
             self._finish_action(request_id, proposal, state, None, key)
             return
@@ -2054,8 +2191,9 @@ class Broker:
         detail = sanitize(payload) if isinstance(payload, dict) else None
         executed = state in ("verified", "failed")
         self._to_client(encode({"method": "ddistro/action/updated", "params": {
-            "proposalId": proposal["id"], "threadId": proposal["thread"], "state": state, "executed": executed,
-            "verified": state == "verified", "checks": detail.get("checks", []) if detail and executed else []}}))
+            "proposalId": proposal["id"], "threadId": proposal["thread"], "action": "restart", "state": state,
+            "executed": executed, "verified": state == "verified",
+            "checks": detail.get("checks", []) if detail and executed else []}}))
         if not self.stopping:
             self._action_reply(request_id, proposal["service"], state, detail, key, approved=detail is not None)
 
@@ -2070,16 +2208,118 @@ class Broker:
             document["data"] = {k: detail.get(k) for k in ("checks", "before", "after", "verified_at", "output_tail")}
         elif detail is not None:
             document["error"] = detail
+        self._reply_action_document(request_id, document, state == "verified", key)
+
+    def _reply_action_document(self, request_id, document, success, key):
         line = bounded_line({"result": document}, TOOL_TEXT_BUDGET)
         text = json.dumps(json.loads(line)["result"], separators=(",", ":")) if line else json.dumps(
-            {"tool": ACTION_TOOL, "state": state, "executed": executed, "verified": state == "verified"})
+            {"tool": ACTION_TOOL, "state": document["state"], "executed": document["executed"],
+             "verified": document["verified"]})
         if key is not None:
             with self.state_lock:
                 budget = self.turn_budgets.get(key)
                 if budget is not None:
                     budget[1] += len(text)
-        self._to_server({"id": request_id, "result": {"success": state == "verified",
+        self._to_server({"id": request_id, "result": {"success": success,
                                                       "contentItems": [{"type": "inputText", "text": text}]}})
+
+    def _run_model_action(self, request_id, arguments, thread_id, turn_id, key):
+        """propose_model_change and propose_model_rollback. The broker, not the model, runs the root preview (which
+        binds the receipt to this task and thread) and keeps its receipt id and confirmation; the client sees the
+        exact diff, and only its approval of this proposal runs the matching apply or rollback once."""
+        operation = arguments.get("operation")
+        undo = operation == "propose_model_rollback"
+        try:
+            if undo:
+                reject_unknown(arguments, ("operation", "reason"))
+            else:
+                reject_unknown(arguments, ("operation", "profile_id", "role", "connector_id", "reason"))
+                profile_id, connector_id = action_id(arguments, "profile_id"), action_id(arguments, "connector_id")
+                if arguments.get("role") not in ACTION_MODEL_ROLES:
+                    raise PolicyError(-32602, "role must be one of " + ", ".join(ACTION_MODEL_ROLES))
+            reason = memory_value(arguments, "reason", ACTION_REASON_CHARS)
+            if not isinstance(turn_id, str) or not 0 < len(turn_id) <= 128:
+                raise PolicyError(-32602, "turnId is required")
+            with self.state_lock:
+                task_id = self.threads.task_id
+            if not isinstance(task_id, str):
+                raise PolicyError(-32602, "a model change needs a task session")
+        except PolicyError as exc:
+            self._model_reply(request_id, operation, "refused", None, {"code": "invalid_arguments", "message": exc.message}, key)
+            return
+        if undo:
+            preview = ["models", "rollback-preview", "herika", "--task", task_id, "--thread", thread_id]
+        else:
+            preview = ["models", "preview", "herika", "--profile", str(profile_id), "--role", arguments["role"],
+                       "--connector", str(connector_id), "--task", task_id, "--thread", thread_id]
+        proposal = {"id": secrets.token_hex(16), "thread": thread_id, "turn": turn_id, "service": None,
+                    "operation": operation, "action": "model_rollback" if undo else "model_change", "state": "preparing",
+                    "event": threading.Event(), "expires": 0.0}
+        busy, repeated = self._reserve_proposal(proposal)
+        if busy or repeated:
+            self._model_reply(request_id, operation, "busy" if busy else "refused", None, {
+                "code": "busy" if busy else "invalid_arguments",
+                "message": "another proposal is pending" if busy else "only one %s per turn" % operation}, key)
+            return
+        try:
+            ok, payload = self.run_tool(preview, self) if self.run_tool is run_ddistro else self.run_tool(preview)
+        except (OSError, ValueError):
+            ok, payload = False, {"code": "failed", "message": "ddistro could not be run"}
+        plan = model_plan(payload, undo) if ok else None
+        with self.state_lock:
+            shown = plan is not None and proposal["state"] == "preparing" and not self.stopping
+            if shown:
+                proposal["state"] = "proposed"
+                proposal["expires"] = time.monotonic() + ACTION_APPROVAL_SECONDS
+                self.proposed_turns.add((thread_id, turn_id, operation))
+            elif proposal["state"] == "preparing":
+                proposal["state"] = "refused"
+            state = proposal["state"]
+        if not shown:
+            error = payload if not ok else {"code": "helper_protocol", "message": "ddistro returned an unexpected preview"}
+            self._model_reply(request_id, operation, state, None, sanitize(error) if plan is None else None, key)
+            return
+        expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + ACTION_APPROVAL_SECONDS))
+        self._to_client(encode({"method": "ddistro/action/proposed", "params": {
+            "proposalId": proposal["id"], "threadId": thread_id, "turnId": turn_id, "action": proposal["action"],
+            "label": ACTION_MODEL_LABEL, "impact": ACTION_MODEL_ROLLBACK_IMPACT if undo else ACTION_MODEL_IMPACT,
+            "reason": sanitize(reason), "expiresAt": expires_at, "change": plan["view"]}}))
+        go, state = self._await_decision(proposal)
+        payload = None
+        if go:
+            # Not adopted into the session's stoppable runs, like a restart: once the write starts it finishes and is
+            # resolved by the CLI, so its outcome is never cut off mid-transaction by the session's end.
+            argv = ["models", "rollback" if undo else "apply", "herika", "--receipt", plan["receipt_id"],
+                    "--plan-sha256", plan["plan_sha256"]]
+            try:
+                ok, payload = self.run_tool(argv)
+            except (OSError, ValueError):
+                ok, payload = False, {"code": "failed", "message": "ddistro could not be run"}
+            state = model_outcome(ok, payload, plan)
+            with self.state_lock:
+                proposal["state"] = state
+        executed = model_executed(state)
+        self._to_client(encode({"method": "ddistro/action/updated", "params": {
+            "proposalId": proposal["id"], "threadId": thread_id, "action": proposal["action"], "state": state,
+            "executed": executed, "verified": state == "verified", "checks": []}}))
+        if not self.stopping:
+            error = sanitize(payload) if go and not ok and isinstance(payload, dict) else None
+            self._model_reply(request_id, operation, state, plan["view"], error, key, approved=go)
+
+    def _model_reply(self, request_id, operation, state, view, error, key, approved=False):
+        """The model's view of a model change: the exact change and its state, never the receipt id or confirmation."""
+        document = {"tool": ACTION_TOOL, "operation": operation if operation in ACTION_OPERATIONS[ACTION_MODEL_CAPABILITY] else None,
+                    "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "state": state,
+                    "proposed": state != "refused" and not (state == "busy" and not approved),
+                    "user_approved": approved, "executed": model_executed(state), "verified": state == "verified"}
+        if view is not None:
+            document["change"] = {k: view[k] for k in ("profile", "role", "before", "after")}
+        if state in ("verified", "unverified"):
+            document["verification"] = ("database_assignment: a fresh read of the CHIM database; provider and in-game "
+                                        "replies were not tested")
+        if error is not None:
+            document["error"] = {"code": str(error.get("code", "failed"))[:64], "message": str(error.get("message", ""))[:1024]}
+        self._reply_action_document(request_id, document, state == "verified", key)
 
     def _tool_reply(self, request_id, params, ok, payload, key=None):
         arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
@@ -2149,8 +2389,13 @@ class Broker:
                 items = extensions.get("items") if isinstance(extensions, dict) else None
                 sections = [data.get("custom_mods")] + [
                     item for item in (items if isinstance(items, list) else []) if isinstance(item, dict)]
+            # model_options flags its two lists; update_check is complete only when every product was fully inspected.
+            truncated = data.get("truncated")
             incomplete = (isinstance(search, dict) and search.get("complete") is not True
-                          or operation == "models" and data.get("truncated") is not False
+                          or operation == "models" and truncated is not False
+                          or operation == "model_options" and (not isinstance(truncated, dict) or not truncated
+                                                               or any(value is not False for value in truncated.values()))
+                          or operation == "update_check" and data.get("complete") is not True
                           or operation == "inventory" and (data.get("complete") is not True or any(
                               isinstance(section, dict) and section.get("truncated") is True for section in sections)))
             if operation == "logs" and data.get("available") is False:
