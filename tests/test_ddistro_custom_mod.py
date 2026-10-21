@@ -385,8 +385,9 @@ class RegistryLifecycleTests(unittest.TestCase):
     def install_with(self, state_setup):
         calls = []
         saved = (mod.require_root, mod.acquire_lock, mod.inspect_repository, mod.restore_entry,
-                 mod.ensure_mod_root, mod.require_existing_role, mod.database_exists)
+                 mod.ensure_mod_root, mod.require_existing_role, mod.database_exists, mod.require_php_security)
         mod.require_root = mod.acquire_lock = mod.ensure_mod_root = mod.require_existing_role = lambda: None
+        mod.require_php_security = lambda: calls.append("php-security")
         policy = {"default": "main", "allowed": ["main"]}
         mod.inspect_repository = lambda source, local: (mod.parse_manifest(manifest()), "main", "b" * 40, policy)
         mod.restore_entry = lambda entry, manifest_, commit, policy_: calls.append((entry["id"], commit))
@@ -396,12 +397,12 @@ class RegistryLifecycleTests(unittest.TestCase):
             mod.command_install({"url": self.SOURCE, "expect_commit": "b" * 40})
         finally:
             (mod.require_root, mod.acquire_lock, mod.inspect_repository, mod.restore_entry,
-             mod.ensure_mod_root, mod.require_existing_role, mod.database_exists) = saved
+             mod.ensure_mod_root, mod.require_existing_role, mod.database_exists, mod.require_php_security) = saved
         return calls
 
     def test_install_restores_only_own_tombstone(self):
         mod.write_entry(mod.unregistered_entry(self.entry()))
-        self.assertEqual(self.install_with(lambda: None), [("example-server", "b" * 40)])
+        self.assertEqual(self.install_with(lambda: None), ["php-security", ("example-server", "b" * 40)])
 
     def test_install_rejects_registered_conflicting_and_unrelated_existing(self):
         def other_source():
@@ -437,7 +438,7 @@ class RegistryLifecycleTests(unittest.TestCase):
         mod.write_entry(entry)
         git_calls = []
         names = ("require_root", "acquire_lock", "checked_folder", "inspect_repository", "update_checkout",
-                 "git", "apply_permissions", "check_health")
+                 "git", "apply_permissions", "check_health", "require_php_security")
         saved = {name: getattr(mod, name) for name in names}
 
         def update_checkout(entry_, folder, source, local, branch, progress, expect_commit=None):
@@ -450,7 +451,7 @@ class RegistryLifecycleTests(unittest.TestCase):
             if failure:
                 raise mod.ModError("The mod's database migration failed.")
 
-        mod.require_root = mod.acquire_lock = mod.apply_permissions = lambda *a, **k: None
+        mod.require_root = mod.acquire_lock = mod.apply_permissions = mod.require_php_security = lambda *a, **k: None
         mod.checked_folder = lambda e: mod.MOD_ROOT + "/example-server"
         mod.inspect_repository = lambda source, local, branch=None, policy_only=False: (
             mod.parse_manifest(manifest()), branch, "d" * 40, {"default": "main", "allowed": ["main", "dev"]})
