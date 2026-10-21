@@ -264,8 +264,9 @@ EXPLORE_SPEC = {
                    "inside one root (secrets, VCS, dependency, runtime and media paths are masked; search is literal, "
                    "case-insensitive and redacted). config: parsed values of a root's config files, never executed "
                    "(effective values are uncertain). db_schema: a server's reviewed tables and columns, plus for herika "
-                   "the playthrough profiles (chim_profile_* schemas, is_active marks the current one). db_query: one "
-                   "structured read-only query on a reviewed table; run db_schema first. Herika's public schema is the "
+                   "the playthrough profiles (chim_profile_* schemas; is_active names the stored backup of the loaded "
+                   "playthrough, which may lag public, never the live state). db_query: one structured read-only "
+                   "query on a reviewed table; run db_schema first. Herika's public schema is the "
                    "current shared state; each chim_profile_* schema is a stored playthrough snapshot, so name the "
                    "schema for memories, events or NPC memory categories of a given playthrough. Results report "
                    "complete/reason; a cut is never absence. It cannot change anything and takes no SQL.",
@@ -1753,8 +1754,8 @@ def sanitize(value, key=None):
     """Tool output strings: no control characters, URL queries, or secret-shaped values."""
     if isinstance(value, str):
         value = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "?", value)
-        # The component catalog's sha256 is a digest ddistro computed, not a secret.
-        if key == "sha256" and re.match(r"^[0-9a-f]{64}\Z", value):
+        # The component catalog's sha256 and ddistro_exec's snapshot receipts are digests ddistro computed, not secrets.
+        if key in ("sha256", "snapshot_sha256", "source_sha256") and re.match(r"^[0-9a-f]{64}\Z", value):
             return value
         # Ids and inventory's validated 40-hex commits would otherwise match the hex-token shape.
         return value if key in CLIP_KEYS + ("commit",) else DIAG_SECRETS.sub("[redacted]", DIAG_URL_QUERY.sub(r"\1?[redacted]", value))
@@ -1928,7 +1929,8 @@ def explore_argv(arguments, checkout=None, services=False):
     argv = {"list": ["files", "list"], "search": ["files", "search"], "read": ["files", "read"],
             "config": ["config", "get"], "db_schema": ["db", "schema"], "db_query": ["db", "query"]}[operation]
     argv = argv + [target]
-    if "path" in arguments:
+    # An empty optional list/search path is the root itself, as if omitted; read's required path must name a file.
+    if "path" in arguments and not (arguments["path"] == "" and "path" in optional):
         path = memory_value(arguments, "path", EXPLORE_PATH_CHARS)
         if path.startswith("/") or "\\" in path or ".." in path.split("/"):
             raise PolicyError(-32602, "path must be relative to the root, with / separators and no .. parts")
