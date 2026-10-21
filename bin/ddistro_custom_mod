@@ -83,6 +83,7 @@ MAX_TEMPLATE_BYTES = 256 * 1024
 CHECK_TIMEOUT = 300
 CLONE_TIMEOUT = 900
 MIGRATE_TIMEOUT = 600
+PHP_SECURITY_HELPERS = ("/usr/local/bin/ensure_php_security", "/home/dwemer/dwemerdistro/bin/ensure_php_security")
 
 
 class ModError(Exception):
@@ -501,6 +502,25 @@ def git(args, *, cwd=None, local_source=False, timeout=120, check=True, message=
 def require_root():
     if os.geteuid() != 0:
         raise ModError("This command must run as root.")
+
+
+def require_php_security():
+    """Install, update, and switch deploy and migrate mod PHP; require the fixed shared PHP first.
+
+    The helper does no APT or network work when PHP is already fixed. Its progress goes to
+    stderr so stdout stays reserved for JSON results.
+    """
+    helper = next((path for path in PHP_SECURITY_HELPERS if os.access(path, os.X_OK)), None)
+    if helper is None:
+        raise ModError("The PHP security helper is unavailable. Update DwemerDistro first.")
+    sys.stderr.flush()
+    # No timeout here: the helper bounds its own APT lock waits, and killing it mid-upgrade
+    # would leave APT running unseen.
+    result = subprocess.run([helper], env={"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+                            cwd="/", stdin=subprocess.DEVNULL, stdout=sys.stderr)
+    if result.returncode != 0:
+        raise ModError("The PHP security update is incomplete, so the mod files and data were not updated. "
+                       "Shared PHP may still need repair or a restart; see the messages above.")
 
 
 def validate_local_source(path):
@@ -1142,6 +1162,7 @@ def command_install(args):
     if not local and expected is None:
         raise ModError("Check the repository first; install needs the checked commit.")
     acquire_lock()
+    require_php_security()
     manifest, branch, commit, policy = inspect_repository(source, local)
     if expected and commit != expected:
         raise ModError("The repository changed after it was checked. Check it again.")
@@ -1245,6 +1266,7 @@ def refresh_policy(entry, source, local):
 def command_update(args):
     require_root()
     acquire_lock()
+    require_php_security()
     entry = read_entry(args["id"])
     folder = checked_folder(entry)
     source, local = entry_source(entry)
@@ -1314,6 +1336,7 @@ def command_switch(args):
     if not expected or not SHA_PATTERN.match(expected):
         raise ModError("Review the branch first; switch needs the reviewed commit.")
     acquire_lock()
+    require_php_security()
     entry = read_entry(args["id"])
     folder = checked_folder(entry)
     source, local = entry_source(entry)

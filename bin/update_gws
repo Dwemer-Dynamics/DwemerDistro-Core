@@ -665,16 +665,36 @@ update_installed_server() {
     return 1
 }
 
-update_installed_server herika "$UPDATE_HERIKA" /var/www/html/HerikaServer || COMPONENT_UPDATE_FAILED=1
-update_installed_server lorkhan "$UPDATE_LORKHAN" /opt/dwemerdistro/sources/LorkhanServer || COMPONENT_UPDATE_FAILED=1
-update_installed_server stobe "$UPDATE_STOBE" /var/www/html/StobeServer || COMPONENT_UPDATE_FAILED=1
-update_installed_server reign "$UPDATE_REIGN" /var/www/html/ReignServer || COMPONENT_UPDATE_FAILED=1
-if ! update_installed_server dialectic "$UPDATE_DIALECTIC" /var/www/html/DialecticServer; then
-    DIALECTIC_UPDATE_FAILED=1
+# Server and Dashboard updates deploy PHP code, so the shared PHP runtime must be fixed first.
+# After update.sh this is a quick check without APT or network use.
+PHP_SECURITY_READY=0
+PHP_SECURITY_HELPER="/usr/local/bin/ensure_php_security"
+if [ ! -x "$PHP_SECURITY_HELPER" ]; then
+    PHP_SECURITY_HELPER="/home/dwemer/dwemerdistro/bin/ensure_php_security"
+fi
+print_header "VERIFYING PHP SECURITY UPDATE"
+if [ -x "$PHP_SECURITY_HELPER" ] && echo "$PASSWORD" | sudo -S -p '' "$PHP_SECURITY_HELPER"; then
+    PHP_SECURITY_READY=1
+    print_success "PHP security update verified"
+else
+    COMPONENT_UPDATE_FAILED=1
+    print_warning "The PHP security update is incomplete; server and Dwemer Dashboard updates were skipped."
+fi
+
+if [ "$PHP_SECURITY_READY" -eq 1 ]; then
+    update_installed_server herika "$UPDATE_HERIKA" /var/www/html/HerikaServer || COMPONENT_UPDATE_FAILED=1
+    update_installed_server lorkhan "$UPDATE_LORKHAN" /opt/dwemerdistro/sources/LorkhanServer || COMPONENT_UPDATE_FAILED=1
+    update_installed_server stobe "$UPDATE_STOBE" /var/www/html/StobeServer || COMPONENT_UPDATE_FAILED=1
+    update_installed_server reign "$UPDATE_REIGN" /var/www/html/ReignServer || COMPONENT_UPDATE_FAILED=1
+    if ! update_installed_server dialectic "$UPDATE_DIALECTIC" /var/www/html/DialecticServer; then
+        DIALECTIC_UPDATE_FAILED=1
+    fi
 fi
 
 # Dwemer Dashboard update/install. Propagate failures without discarding local files.
-if (
+if [ "$PHP_SECURITY_READY" -ne 1 ]; then
+    print_warning "Dwemer Dashboard update skipped until the PHP security update succeeds."
+elif (
     if [ ! -d /var/www/html/Dwemer-Dashboard/.git ]; then
         print_header "INSTALLING DWEMER DASHBOARD"
         printf ">> Cloning Dwemer Dashboard repository...\n"
