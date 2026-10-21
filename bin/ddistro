@@ -379,6 +379,7 @@ def cmd_version(opts, ctx):
 
 
 def cmd_capabilities(opts, ctx):
+    legacy_ids, legacy_reason = catalog_legacy_ids()
     data = {
         "commands": [
             {"name": "version", "mutates": False}, {"name": "capabilities", "mutates": False},
@@ -435,7 +436,7 @@ def cmd_capabilities(opts, ctx):
         # agent means the commands and a trusted helper are present; readiness (runtime installed
         # and a passing probe on this distro) is only ever reported by agent status.
         "features": {"file_changes": True, "locks": True, "agent": agent_helper_trusted(), "chat": False,
-                     "models": True, "inventory": True,
+                     "models": True, "inventory": True, "component_catalog": True,
                      "health": True, "assistant_tools": agent_helper_trusted(), "memory": True,
                      "log_search": True, "home_config_repair": agent_helper_trusted(), "tool_coverage": True,
                      # agent serve forwards thread/archive, unarchive and delete for this task's threads only.
@@ -459,9 +460,23 @@ def cmd_capabilities(opts, ctx):
         "models": {"products": ["herika"], "scope": "configured_profiles", "roles": [role for role, _ in MODELS_ROLES],
                    "max_assignments": MODELS_MAX, "string_chars": MODELS_STRING_CHARS},
         "inventory": {"scope": "presence_only", "extension_products": list(INVENTORY_EXTENSION_ROOTS),
-                      "components": [c[0] for c in INVENTORY_COMPONENTS], "max_entries": INVENTORY_MAX_ENTRIES,
+                      # Legacy ids of the inventory components section, kept for older clients. They come from the
+                      # catalog file's metadata alone (no component path is checked); [] with the reason if unusable.
+                      "components": legacy_ids,
+                      "components_source": {"basis": "component_catalog", "available": not legacy_reason,
+                                            "reason": legacy_reason},
+                      "max_entries": INVENTORY_MAX_ENTRIES,
                       "scan_limit": INVENTORY_SCAN_LIMIT, "max_custom_mods": INVENTORY_MAX_MODS,
-                      "string_chars": INVENTORY_STRING_CHARS},
+                      "string_chars": INVENTORY_STRING_CHARS,
+                      # Declared from code; installed and startup state are evaluated only by inventory and health.
+                      "component_catalog": {"file": COMPONENT_CATALOG, "schema_version": CATALOG_SCHEMA,
+                                            "max_entries": CATALOG_MAX_ENTRIES, "max_bytes": CATALOG_MAX_BYTES,
+                                            "max_legacy_components": CATALOG_MAX_STARTUP,
+                                            "installed_states": list(CATALOG_STATES),
+                                            "unknown_reasons": list(CATALOG_UNKNOWN),
+                                            "unavailable_reasons": list(CATALOG_REASONS),
+                                            "roles": list(CATALOG_ROLES),
+                                            "checks": ["presence", "port", "http"]}},
         "health": {"scope": "local_bounded", "results": ["passed", "failed", "skipped"], "overall_verdict": False,
                    "scope_limits": HEALTH_SCOPE_LIMITS,
                    "application_checks": {"servers": {name: path for name, (path, _) in HEALTH_SERVER_HTTP.items()},
@@ -2108,26 +2123,33 @@ INVENTORY_MAX_MODS = 100
 INVENTORY_STRING_CHARS = 128
 # Products whose repositories load add-ons from an ext/ folder; the others have no known root.
 INVENTORY_EXTENSION_ROOTS = {"herika": "/var/www/html/HerikaServer", "dialectic": "/var/www/html/DialecticServer"}
-# The startup markers start_env and update_gws check, in that order. "all" markers must all be
-# present, "any" needs one. A marker present means startup would try the component, not that it runs.
-INVENTORY_COMPONENTS = (
-    ("dashboard", "Dwemer Dashboard", "dashboard", "all", ("/var/www/html/Dwemer-Dashboard/.git",)),
-    ("minime_t5", "Minime-T5 / TXT2VEC", "embeddings", "all", ("/home/dwemer/minime-t5/start.sh",)),
-    ("mimic3", "Mimic3", "tts", "all", ("/home/dwemer/mimic3/start.sh",)),
-    ("melotts", "MeloTTS", "tts", "all", ("/home/dwemer/MeloTTS/start.sh",)),
-    ("parakeet", "Parakeet", "stt", "all", ("/home/dwemer/parakeet-api-server/start.sh",)),
-    ("chatterbox", "Chatterbox", "tts", "all", ("/home/dwemer/chatterbox/start.sh",)),
-    ("pockettts_audiocpp", "PocketTTS (audio.cpp)", "tts", "all", ("/home/dwemer/audio.cpp/start.sh",)),
-    ("pocket_tts", "pocket-tts", "tts", "all", ("/home/dwemer/pocket-tts/start.sh",)),
-    ("piper", "Piper TTS", "tts", "all", ("/home/dwemer/piper/cuda-keyring_1.1-1_all.deb",
-                                         "/home/dwemer/piper/start.sh")),
-    ("localwhisper", "LocalWhisper", "stt", "all", ("/home/dwemer/remote-faster-whisper/start.sh",)),
-    ("xtts", "CHIM XTTS", "tts", "all", ("/home/dwemer/xtts-api-server/start.sh",)),
-    ("higgs", "Higgs TTS", "tts", "all", ("/home/dwemer/higgs-tts/service.sh",)),
-    ("omnivoice", "OmniVoice TTS", "tts", "all", ("/home/dwemer/omnivoice-tts/start-gpu.sh",)),
-    ("chim_mcp", "CHIM MCP Server", "mcp", "any", ("/home/dwemer/CHIM-MCP/start.sh",
-                                                   "/home/dwemer/chim-mcp-server/start.sh")),
-)
+# The shared component catalog (identity and presence rules only; contract in ASSISTANT.md, Component catalog).
+# It is data from one fixed root-owned file: a closed set of path predicates, never a command, expression,
+# environment value, port, or log path. Missing or invalid means unavailable, never a built-in fallback list.
+COMPONENT_CATALOG = "/etc/dwemerdistro-components.json"
+CATALOG_SCHEMA = 1
+CATALOG_MAX_BYTES = 64 * 1024
+CATALOG_MAX_ENTRIES = 48
+CATALOG_MAX_STARTUP = 32  # rows in the legacy components section; older launchers accept at most 32
+CATALOG_MAX_ALIASES = 4
+CATALOG_MAX_LEAVES = 4
+CATALOG_MAX_SEGMENTS = 10
+CATALOG_GLOB_SCAN = 256  # directory entries examined for the one glob segment
+CATALOG_LINK_HOPS = 8
+CATALOG_ROOTS = ("/home/dwemer/", "/var/www/html/", "/usr/")
+CATALOG_ROLES = ("llm", "embeddings", "tts", "stt", "mcp", "dashboard", "gpu_runtime")
+CATALOG_LEAVES = ("exists", "file", "dir", "glob", "which")
+CATALOG_STATES = ("present", "absent", "unknown")
+CATALOG_UNKNOWN = ("unreadable", "unsafe", "unsafe_redirect", "redirect_limit", "scan_limit")
+CATALOG_REASONS = ("catalog_missing", "catalog_unreadable", "catalog_unsafe", "catalog_invalid")
+# which: a program name from this closed set, looked up in this fixed PATH (never the caller's) and never run.
+CATALOG_WHICH = ("nvcc",)
+CATALOG_WHICH_PATH = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin", "/usr/local/cuda/bin")
+CATALOG_ITEM_KEYS = {"id", "aliases", "name", "role", "listed", "installed", "startup"}
+CATALOG_ID = re.compile(r"^[a-z][a-z0-9_]{1,31}\Z")
+CATALOG_VERSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,31}\Z")
+CATALOG_SEGMENT = re.compile(r"^[A-Za-z0-9._+-]{1,64}\Z")
+CATALOG_LABEL_CHARS = 64
 INVENTORY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+()@,=~-]{0,127}\Z")
 INVENTORY_MOD_ID = re.compile(r"^[a-z][a-z0-9-]{1,30}[a-z0-9]\Z")
 INVENTORY_COMMIT = re.compile(r"^(?:[0-9a-f]{40})?\Z")
@@ -2205,6 +2227,338 @@ def inventory_component(component_id, name, role, mode, markers):
     else:
         state = next((s for s in states if s not in ("present", "absent")), "absent")
     return {"id": component_id, "name": name, "role": role, "state": state}
+
+
+def catalog_label(value):
+    """A display label only (never a path or token): printable, trimmed, short, and unchanged by redaction."""
+    return (type(value) is str and 0 < len(value) <= CATALOG_LABEL_CHARS and value == value.strip()
+            and value.isprintable() and redact(value) == value)
+
+
+def catalog_path(value, glob=False):
+    """A normalized absolute path below an allowlisted root; glob paths have exactly one '*' in one segment."""
+    if (type(value) is not str or len(value) > 255 or not value.startswith(CATALOG_ROOTS) or value.endswith("/")
+            or "//" in value or "\\" in value or value.count("*") != (1 if glob else 0)):
+        return False
+    parts = value[1:].split("/")
+    if len(parts) > CATALOG_MAX_SEGMENTS:
+        return False
+    for part in parts:
+        prefix, star, suffix = part.partition("*")
+        if part in (".", "..") or not CATALOG_SEGMENT.match(prefix) or prefix.startswith(".") and star:
+            return False
+        if star and suffix and not CATALOG_SEGMENT.match(suffix):
+            return False
+    return True
+
+
+def catalog_predicate(value, startup):
+    """A leaf, or all/any over 1..CATALOG_MAX_LEAVES leaves (no nesting); startup uses exists leaves only."""
+    if type(value) is not dict or len(value) != 1:
+        raise ValueError("predicate")
+    (key, inner), = value.items()
+    leaves = inner if key in ("all", "any") else [value]
+    if type(leaves) is not list or not 1 <= len(leaves) <= CATALOG_MAX_LEAVES:
+        raise ValueError("predicate")
+    for leaf in leaves:
+        if type(leaf) is not dict or len(leaf) != 1:
+            raise ValueError("leaf")
+        (kind, arg), = leaf.items()
+        if kind not in CATALOG_LEAVES or startup and kind != "exists":
+            raise ValueError("leaf")
+        if not (arg in CATALOG_WHICH if kind == "which" else catalog_path(arg, kind == "glob")):
+            raise ValueError("leaf")
+    return ("any" if key == "any" else "all"), [next(iter(leaf.items())) for leaf in leaves]
+
+
+def catalog_parse(raw):
+    """Validated catalog entries from the raw file bytes; ValueError for anything outside the contract."""
+    if len(raw) > CATALOG_MAX_BYTES:
+        raise ValueError("size")
+
+    def unique(pairs):
+        if len({key for key, _ in pairs}) != len(pairs):
+            raise ValueError("duplicate key")
+        return dict(pairs)
+    doc = json.loads(raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=reject_constant)
+    if (type(doc) is not dict or set(doc) != {"schema_version", "catalog_version", "components"}
+            or type(doc["schema_version"]) is not int or doc["schema_version"] != CATALOG_SCHEMA
+            or type(doc["catalog_version"]) is not str or not CATALOG_VERSION.match(doc["catalog_version"])
+            or type(doc["components"]) is not list or not 1 <= len(doc["components"]) <= CATALOG_MAX_ENTRIES):
+        raise ValueError("document")
+    seen, items = set(), []
+    for item in doc["components"]:
+        if type(item) is not dict or not CATALOG_ITEM_KEYS - {"startup"} <= set(item) <= CATALOG_ITEM_KEYS:
+            raise ValueError("entry keys")
+        aliases = item["aliases"]
+        if type(aliases) is not list or len(aliases) > CATALOG_MAX_ALIASES:
+            raise ValueError("aliases")
+        for name in [item["id"]] + aliases:
+            if type(name) is not str or not CATALOG_ID.match(name) or name in seen:
+                raise ValueError("id")
+            seen.add(name)
+        if not catalog_label(item["name"]) or item["role"] not in CATALOG_ROLES or type(item["listed"]) is not bool:
+            raise ValueError("entry")
+        items.append({"id": item["id"], "aliases": list(aliases), "name": item["name"], "role": item["role"],
+                      "listed": item["listed"], "installed": catalog_predicate(item["installed"], False),
+                      "startup": catalog_predicate(item["startup"], True) if "startup" in item else None})
+    if sum(item["startup"] is not None for item in items) > CATALOG_MAX_STARTUP:
+        raise ValueError("startup")
+    return {"catalog_version": doc["catalog_version"], "items": items}
+
+
+def catalog_read():
+    """(bytes, "") or (None, reason) for COMPONENT_CATALOG, opened from / without following a link.
+
+    "/", every folder, and the file must be root-owned and not group/other writable; the file must be a
+    regular file of at most CATALOG_MAX_BYTES before and after a non-blocking open. 0644 lets any user read it."""
+    parent, name = COMPONENT_CATALOG.rsplit("/", 1)
+    file_flags = (os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOCTTY", 0)
+                  | getattr(os, "O_CLOEXEC", 0))
+
+    def trusted(info):
+        return info.st_uid == 0 and not info.st_mode & 0o022
+    fd = file_fd = None
+    try:
+        fd = os.open("/", INVENTORY_DIR_FLAGS)
+        for part in [p for p in parent.split("/") if p]:
+            if not trusted(os.fstat(fd)):
+                return None, "catalog_unsafe"
+            next_fd, state = inventory_step(fd, part)
+            os.close(fd)
+            fd = next_fd
+            if fd is None:
+                return None, {"absent": "catalog_missing", "unreadable": "catalog_unreadable"}.get(state, "catalog_unsafe")
+        if not trusted(os.fstat(fd)):
+            return None, "catalog_unsafe"
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except OSError as error:
+            return None, "catalog_missing" if error.errno == errno.ENOENT else "catalog_unreadable"
+        if not stat.S_ISREG(info.st_mode) or not trusted(info):
+            return None, "catalog_unsafe"
+        if info.st_size > CATALOG_MAX_BYTES:
+            return None, "catalog_invalid"
+        file_fd = os.open(name, file_flags, dir_fd=fd)
+        opened = os.fstat(file_fd)
+        if (not stat.S_ISREG(opened.st_mode) or not trusted(opened)
+                or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)):
+            return None, "catalog_unsafe"
+        raw = b""
+        while len(raw) <= CATALOG_MAX_BYTES:
+            chunk = os.read(file_fd, CATALOG_MAX_BYTES + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+        return (raw, "") if len(raw) <= CATALOG_MAX_BYTES else (None, "catalog_invalid")
+    except OSError as error:
+        return None, "catalog_unsafe" if error.errno == errno.ELOOP else "catalog_unreadable"
+    finally:
+        for handle in (file_fd, fd):
+            if handle is not None:
+                os.close(handle)
+
+
+def catalog_load():
+    """(catalog or None, reason, sha256 of the bytes read or "")."""
+    raw, reason = catalog_read()
+    if raw is None:
+        return None, reason, ""
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        return catalog_parse(raw), "", digest
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None, "catalog_invalid", digest
+
+
+# Installed presence is metadata only (lstat, readlink, and listing the one glob folder; no file content). A link
+# is followed only within its zone: a system link (under /usr, /etc/alternatives, or a top-level /bin, /sbin, /lib*)
+# may point into the system zone, and a link inside /home/dwemer/<name> or /var/www/html/<name> may point into that
+# same folder or the system zone (a venv's bin/python -> /usr/bin/python3). Anything else, more than
+# CATALOG_LINK_HOPS links, an other-writable entry, or an owner outside the zone's owners is unknown, never present.
+def catalog_lstat(path):
+    return os.lstat(path)
+
+
+def catalog_readlink(path):
+    return os.readlink(path)
+
+
+def catalog_listdir(path, limit):
+    names = []
+    with os.scandir(path) as scan:
+        for entry in scan:
+            if len(names) >= limit:
+                return names, True
+            names.append(entry.name)
+    return names, False
+
+
+def catalog_uid(account):
+    try:
+        return pwd.getpwnam(account).pw_uid
+    except KeyError:
+        return None
+
+
+def catalog_zone(parts):
+    if parts[:1] == ["usr"] or parts[:2] == ["etc", "alternatives"] or len(parts) == 1 and parts[0] in (
+            "bin", "sbin", "lib", "lib32", "lib64"):
+        return ("system",)
+    if parts[:2] == ["home", "dwemer"] and len(parts) > 2:
+        return ("home", parts[2])
+    if parts[:3] == ["var", "www", "html"] and len(parts) > 3:
+        return ("www", parts[3])
+    return None
+
+
+def catalog_owners(parts):
+    if parts[:2] == ["home", "dwemer"]:
+        return {0, catalog_uid("dwemer")}
+    if parts[:3] == ["var", "www", "html"]:
+        return {0, catalog_uid("dwemer"), catalog_uid("www-data")}
+    return {0}
+
+
+def catalog_walk(path):
+    """("present", stat) or (state, reason) for a fixed absolute path, one name at a time from /."""
+    pending, done, hops = path.strip("/").split("/"), [], 0
+    try:
+        info = catalog_lstat("/")
+    except OSError:
+        return "unknown", "unreadable"
+    if info.st_uid != 0 or info.st_mode & 0o002:
+        return "unknown", "unsafe"
+    while pending:
+        current = done + [pending.pop(0)]
+        try:
+            info = catalog_lstat("/" + "/".join(current))
+        except OSError as error:
+            if error.errno in (errno.ENOENT, errno.ENOTDIR):
+                return "absent", ""
+            return "unknown", "unreadable"
+        if stat.S_ISLNK(info.st_mode):
+            hops += 1
+            if hops > CATALOG_LINK_HOPS:
+                return "unknown", "redirect_limit"
+            if info.st_uid not in catalog_owners(current):
+                return "unknown", "unsafe"
+            try:
+                target = catalog_readlink("/" + "/".join(current))
+            except OSError:
+                return "unknown", "unreadable"
+            resolved = [] if target.startswith("/") else list(done)
+            for part in target.split("/"):
+                if part == "..":
+                    if not resolved:
+                        return "unknown", "unsafe_redirect"
+                    resolved.pop()
+                elif part not in ("", "."):
+                    resolved.append(part)
+            zone = catalog_zone(current)
+            if (zone is None or len(resolved) > 32 or not resolved
+                    or catalog_zone(resolved) not in (("system",), zone)):
+                return "unknown", "unsafe_redirect"
+            pending, done = resolved + pending, []
+            continue
+        if info.st_mode & 0o002 or info.st_uid not in catalog_owners(current):
+            return "unknown", "unsafe"
+        if pending and not stat.S_ISDIR(info.st_mode):
+            return "absent", ""
+        done = current
+    return "present", info
+
+
+def catalog_leaf_path(kind, path):
+    state, detail = catalog_walk(path)
+    if state != "present":
+        return state, detail
+    mode = detail.st_mode
+    found = {"exists": True, "file": stat.S_ISREG(mode), "dir": stat.S_ISDIR(mode),
+             "program": stat.S_ISREG(mode) and bool(mode & 0o111)}[kind]
+    return ("present", "") if found else ("absent", "")
+
+
+def catalog_combine(mode, results):
+    """Three-valued all/any: a deciding leaf wins, otherwise the first unknown leaf, otherwise the other value."""
+    deciding = "absent" if mode == "all" else "present"
+    if any(state == deciding for state, _ in results):
+        return deciding, ""
+    unknown = next((result for result in results if result[0] == "unknown"), None)
+    if unknown:
+        return unknown
+    return ("present" if mode == "all" else "absent"), ""
+
+
+def catalog_glob(path):
+    parts = path.strip("/").split("/")
+    index = next(i for i, part in enumerate(parts) if "*" in part)
+    prefix, _, suffix = parts[index].partition("*")
+    parent = "/" + "/".join(parts[:index])
+    state, detail = catalog_walk(parent)
+    if state != "present":
+        return state, detail
+    if not stat.S_ISDIR(detail.st_mode):
+        return "absent", ""
+    try:
+        names, truncated = catalog_listdir(parent, CATALOG_GLOB_SCAN)
+    except OSError:
+        return "unknown", "unreadable"
+    results = [catalog_leaf_path("exists", "/".join([parent, name] + parts[index + 1:]))
+               for name in sorted(names) if CATALOG_SEGMENT.match(name) and name not in (".", "..")
+               and len(name) >= len(prefix) + len(suffix) and name.startswith(prefix) and name.endswith(suffix)]
+    return catalog_combine("any", results + ([("unknown", "scan_limit")] if truncated else []))
+
+
+def catalog_installed(predicate):
+    mode, leaves = predicate
+    results = []
+    for kind, arg in leaves:
+        if kind == "which":
+            results.append(catalog_combine("any", [catalog_leaf_path("program", folder + "/" + arg)
+                                                   for folder in CATALOG_WHICH_PATH]))
+        elif kind == "glob":
+            results.append(catalog_glob(arg))
+        else:
+            results.append(catalog_leaf_path(kind, arg))
+    return catalog_combine(mode, results)
+
+
+def catalog_checks(component_id):
+    """What the assistant can check for a component, from the code-owned health tables only."""
+    def owned(table):
+        return any(HEALTH_COMPONENT_CATALOG_IDS.get(key, key) == component_id for key in table)
+    return ["presence"] + (["port"] if owned(HEALTH_COMPONENT_PORTS) else []) + (
+        ["http"] if owned(HEALTH_COMPONENT_HTTP) else [])
+
+
+def catalog_legacy_id(item):
+    return (item["aliases"] or [item["id"]])[0]
+
+
+def catalog_legacy_ids():
+    """(legacy component ids, reason) from the catalog metadata only: startup entries, in catalog order."""
+    loaded, reason, _ = catalog_load()
+    return ([catalog_legacy_id(item) for item in loaded["items"] if item["startup"]] if loaded else []), reason
+
+
+def catalog_components(catalog):
+    """(legacy startup-marker rows, catalog rows) for a loaded catalog."""
+    legacy, rows = [], []
+    for item in catalog["items"] if catalog else []:
+        installed, installed_reason = catalog_installed(item["installed"])
+        startup, startup_reason = "n/a", ""
+        if item["startup"]:
+            mode, leaves = item["startup"]
+            row = inventory_component(catalog_legacy_id(item), item["name"], item["role"], mode,
+                                      [path for _, path in leaves])
+            legacy.append(row)
+            startup = row["state"] if row["state"] in ("present", "absent") else "unknown"
+            startup_reason = "" if startup != "unknown" else row["state"]
+        rows.append({"id": item["id"], "aliases": item["aliases"], "name": item["name"], "role": item["role"],
+                     "listed": item["listed"], "installed": installed, "installed_reason": installed_reason,
+                     "startup": startup, "startup_reason": startup_reason, "checks": catalog_checks(item["id"])})
+    return legacy, rows
 
 
 def inventory_extensions(product, root):
@@ -2300,14 +2654,23 @@ def cmd_inventory(opts, ctx):
         servers["reason"] = inventory_reason(error)
     extensions = {"items": [inventory_extensions(product, root) for product, root in INVENTORY_EXTENSION_ROOTS.items()],
                   "no_known_root": [product for product in PRODUCTS if product not in INVENTORY_EXTENSION_ROOTS]}
-    components = {"basis": "startup_markers", "items": [inventory_component(*c) for c in INVENTORY_COMPONENTS]}
+    loaded, reason, digest = catalog_load()
+    legacy, rows = catalog_components(loaded)
+    # components keeps its older shape (legacy ids, startup markers) for older launchers; catalog is the full list.
+    components = {"basis": "startup_markers", "items": legacy}
+    catalog = {"available": loaded is not None, "reason": reason, "schema_version": CATALOG_SCHEMA if loaded else None,
+               "catalog_version": loaded["catalog_version"] if loaded else "", "sha256": digest,
+               "basis": "installed_markers", "items": rows}
     custom_mods = inventory_custom_mods()
     complete = (servers["available"] and custom_mods["available"] and not custom_mods["truncated"]
+                and catalog["available"]
                 and all(item["state"] in ("listed", "absent", "product_absent") and not item["truncated"]
                         and not item["skipped"] for item in extensions["items"])
-                and all(item["state"] in ("present", "absent") for item in components["items"]))
+                and all(item["state"] in ("present", "absent") for item in components["items"])
+                and all(item["installed"] != "unknown" for item in rows))
     data = {"captured_at": captured_at, "scope": "presence_only", "read_as": current_user(), "complete": complete,
-            "servers": servers, "extensions": extensions, "components": components, "custom_mods": custom_mods}
+            "servers": servers, "extensions": extensions, "components": components, "catalog": catalog,
+            "custom_mods": custom_mods}
     lines = [f"DwemerDistro inventory at {captured_at} (presence only; not enabled, running, or healthy state)"]
     lines += ["Servers:"] + ([f"  {r['product']:<10} {r['state']:<15} branch={r['branch'] or '-'} "
                              f"version={r['version'] or '-'} database={DATABASE_WORDS[r['database_present']]}"
@@ -2317,6 +2680,9 @@ def cmd_inventory(opts, ctx):
         lines.append(f"{item['product']} ext ({item['state']}{', truncated' if item['truncated'] else ''}"
                      f"{', %d names skipped' % item['skipped'] if item['skipped'] else ''}): {names}")
     lines.append("Components: " + ", ".join(f"{c['id']}={c['state']}" for c in components["items"]))
+    lines.append(f"Component catalog {catalog['catalog_version']} (installed presence only): " + (", ".join(
+        f"{c['id']}={c['installed']}" + (f"({c['installed_reason']})" if c["installed_reason"] else "") for c in rows)
+        or "-") if catalog["available"] else f"Component catalog: unavailable: {reason}")
     lines.append("Custom mods: " + (", ".join(f"{m['id']} ({m['state']})" for m in custom_mods["items"]) or "-")
                  if custom_mods["available"] else f"Custom mods: unavailable: {custom_mods['reason']}")
     return data, "\n".join(lines)
@@ -2338,6 +2704,8 @@ HEALTH_COMPONENT_PORTS = {
     "pocket_tts": (None, 8020, "/home/dwemer/pocket-tts/.dwemerdistro-port"),
     "pockettts_audiocpp": ("POCKETTTS_AUDIOCPP_PORT", 8086, None),
 }
+# The health tables use the legacy inventory ids; these are the catalog ids they belong to (others are the same).
+HEALTH_COMPONENT_CATALOG_IDS = {"pocket_tts": "pockettts", "pockettts_audiocpp": "audiocpp"}
 # Fixed local application contracts, each defined by the service's own source and already relied on by DwemerDistro:
 # DialecticServer/health.php and StobeServer/health.php ({"service", "status": "ok"|...}), OmniVoice GET /health
 # ({"status": "ok"|"no_voices"}), and the TTS identity GET /provider_info ({"provider"}) that ddistro_doctor checks.
@@ -2563,8 +2931,20 @@ def cmd_health(opts, ctx):
     port_check("postgres.port", "postgres", pg_port, "DDISTRO_POSTGRES_PORT" if pg_port != 5432 else "default")
     if product is None:
         conf = health_services_conf()
-        for component_id, name, role, mode, markers in INVENTORY_COMPONENTS:
-            state = inventory_component(component_id, name, role, mode, markers)["state"]
+        loaded, reason, _ = catalog_load()
+        if loaded is None:
+            add("component.catalog", "components", "skipped", "component catalog unavailable", reason)
+        for item in loaded["items"] if loaded else []:
+            if not item["startup"]:
+                # No startup marker means no known local port contract; installed presence is reported as evidence.
+                installed, why = catalog_installed(item["installed"])
+                add(f"component.{item['id']}.port", item["id"], "skipped",
+                    f"installed {installed}" + (f" ({why})" if why else ""), "no known local port contract")
+                continue
+            mode, leaves = item["startup"]
+            component_id = (item["aliases"] or [item["id"]])[0]
+            state = inventory_component(component_id, item["name"], item["role"], mode,
+                                        [path for _, path in leaves])["state"]
             if state != "present":
                 add(f"component.{component_id}.port", component_id, "skipped", f"startup marker {state}",
                     "not installed" if state == "absent" else "marker could not be checked")

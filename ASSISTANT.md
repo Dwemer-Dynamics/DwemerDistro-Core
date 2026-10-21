@@ -68,7 +68,11 @@ assistant is ready. Readiness comes only from `agent status` (`installed` and `p
 change commands (role field, preview seconds, compare-and-swap, exact undo, receipt limits), and
 `features.update_check` and `capabilities.update_check` the local, network-free `update-check`.
 `features.inventory` and `capabilities.inventory` describe `inventory` (scope, the products
-with an extension folder, component ids, and limits). `features.memory` and
+with an extension folder, and limits); `features.component_catalog` and
+`capabilities.inventory.component_catalog` declare catalog support, file, schema, limits, and
+states from code. `capabilities.inventory.components` still lists the legacy component ids
+(startup entries, from the catalog file's metadata only; no component path is checked), with
+`components_source.available`/`reason`; an unusable catalog gives `[]` and its reason. `features.memory` and
 `capabilities.memory` describe `memory` (scope, kinds, defaults, limits) from constants only;
 `capabilities` never opens or creates the memory database. `features.thread_lifecycle` is
 `true`: `agent serve` forwards `thread/archive`, `thread/unarchive`, and `thread/delete` with
@@ -304,6 +308,11 @@ component whose startup marker is present may not be running.
                 "no_known_root": ["lorkhan", "stobe", "reign"]},
  "components": {"basis": "startup_markers", "items": [{"id": "xtts", "name": "CHIM XTTS", "role": "tts",
                                                         "state": "present"}]},
+ "catalog": {"available": true, "reason": "", "schema_version": 1, "catalog_version": "2026.10.20-1",
+             "sha256": "...", "basis": "installed_markers",
+             "items": [{"id": "pockettts", "aliases": ["pocket_tts"], "name": "Pocket-TTS (CPU / Python)",
+                        "role": "tts", "listed": true, "installed": "present", "installed_reason": "",
+                        "startup": "present", "startup_reason": "", "checks": ["presence", "port", "http"]}]},
  "custom_mods": {"available": true, "reason": "", "truncated": false,
                  "items": [{"id": "example-server", "name": "...", "state": "ready", "branch": "main", "commit": "..."}]}}
 ```
@@ -330,7 +339,24 @@ component whose startup marker is present may not be running.
   `/home/dwemer/xtts-api-server/start.sh`, the Dwemer Dashboard's `.git`), without
   following links: `present`, `absent`, `redirected` (the marker or any folder above it is a
   link), or `unreadable`. Present means startup
-  would try the component, not that it runs or is healthy. Paths are never returned.
+  would try the component, not that it runs or is healthy. Paths are never returned. Its rows
+  are the catalog entries that declare startup markers, under their older ids (the first
+  alias, such as `pocket_tts` or `chim_mcp`), so older launchers read it unchanged.
+- `catalog` is every component in the component catalog (below), under the launcher's ids:
+  `{"available", "reason", "schema_version", "catalog_version", "sha256", "basis":
+  "installed_markers", "items": [{"id", "aliases", "name", "role", "listed", "installed",
+  "installed_reason", "startup", "startup_reason", "checks"}]}`. `installed` uses the same
+  rules as the launcher's Install Components window and is `present`, `absent`, or `unknown`
+  with a reason (`unreadable`, `unsafe`, `unsafe_redirect`, `redirect_limit`, `scan_limit`).
+  `startup` is the marker state above (`present`, `absent`, `unknown`, or `n/a` when the entry
+  declares no markers). Installed is not running: neither says the component runs or works.
+  `checks` comes from code only: always `presence`, plus `port` and `http` when `health`
+  has a fixed local check for it. Components are not tool targets: there are no component
+  logs, restarts, configuration, or edits through the assistant. Paths and the rules
+  themselves are never returned. When the catalog is missing or invalid, `available` is false
+  with `reason` `catalog_missing`, `catalog_unreadable`, `catalog_unsafe`, or
+  `catalog_invalid`, both `catalog.items` and `components.items` are empty, and `complete` is
+  false; there is no built-in fallback list.
 - `custom_mods` runs the trusted `/usr/local/bin/ddistro_custom_mod status --json` (no
   `--check-health`, no network, 10 seconds) and keeps only `id`, `name`, `state`, `branch`,
   and a 40-hex `commit` for at most 100 mods; repository, URLs, folders, databases, and
@@ -338,9 +364,48 @@ component whose startup marker is present may not be running.
 - A section that cannot be read is still `ok`: `available: false` with a `reason` token
   (`helper_unavailable`, `helper_failed`, `helper_protocol`, `timeout`, or `failed`). `complete`
   is true only when every section was read in full: nothing unavailable, truncated, or
-  skipped, and no folder or marker `redirected`, `not_directory`, or `unreadable`; cancellation stops the helper and the
+  skipped, and no folder or marker `redirected`, `not_directory`, or `unreadable`, the catalog
+  available, and no catalog component `unknown`; cancellation stops the helper and the
   whole command is `cancelled`. Run as a user other than root, folders that user cannot read
   are `unreadable` and database presence may be `null`; the launcher runs it as root.
+
+### Component catalog
+
+`/etc/dwemerdistro-components.json` (from `etc/` in this repository, installed by `update.sh`
+as a root-owned 0644 file) lists each component's identity and how to tell it is installed.
+It is data, not code: it cannot name a command, expression, environment value, port, log, or
+action, and nothing in it is run. Install commands, ports, and health checks stay in code. A
+new entry appears in `inventory` and `health` (all) without any code or prompt change, but
+gets presence only until code adds a check for it.
+
+- The file must be a regular file of at most 64 KiB, opened from `/` without following a
+  link; it, `/`, and `/etc` must be root-owned and not group- or other-writable. There is no
+  option or environment variable to read another file.
+- `{"schema_version": 1, "catalog_version", "components": [...]}`, 1 to 48 entries. Each entry
+  has exactly `id`, `aliases` (0 to 4), `name`, `role`, `listed`, `installed`, and optionally
+  `startup`; unknown keys, duplicate keys, and an id or alias used twice make the whole file
+  invalid. Ids and aliases match `^[a-z][a-z0-9_]{1,31}$`. `role` is one of `llm`,
+  `embeddings`, `tts`, `stt`, `mcp`, `dashboard`, `gpu_runtime`. `name` is a display label
+  only (1 to 64 printable characters, no control characters, unchanged by secret
+  redaction) and is never used as a path. At most 32 entries may declare `startup`.
+- A rule is one test, or `{"all": [...]}` / `{"any": [...]}` over 1 to 4 tests (no nesting).
+  Tests: `exists`, `file`, `dir` on a path; `glob` on a path whose one `*` is inside one
+  folder name after a literal prefix (`.../lib/python*/site-packages/...`); `which` with
+  `nvcc`, the only allowed name, looked up as an executable regular file in the fixed folders
+  `/usr/local/sbin`, `/usr/local/bin`, `/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`, and
+  `/usr/local/cuda/bin` (never the caller's PATH, never run). `startup` uses `exists` only.
+- Paths are absolute, below `/home/dwemer/`, `/var/www/html/`, or `/usr/`, at most 10 names,
+  with no `.`, `..`, empty name, or backslash.
+- Installed checks read metadata only (no file contents). A link is followed only within its
+  zone: a system link (under `/usr`, `/etc/alternatives`, or a top-level `/bin`, `/sbin`,
+  `/lib*`) may point into the system zone, and a link inside `/home/dwemer/<name>` or
+  `/var/www/html/<name>` may point into that same folder or the system zone (so CUDA's
+  `/usr/local/cuda` and a venv's `bin/python` count). Every entry passed must not be
+  other-writable and must be owned by root (system zone), root or dwemer (`/home/dwemer`),
+  or root, dwemer or www-data (`/var/www/html`). Anything else, or more than 8 links, is
+  `unknown`, never present. `all` is absent when any test is absent, `any` is present when
+  any test is present, otherwise an unknown test makes the result unknown. A glob examines
+  at most 256 names.
 
 ## Service restart
 

@@ -118,6 +118,8 @@ find /home/dwemer/dwemerdistro/etc/ -type f ! -name "php.ini" ! -name "dwemerdis
 if [ $? -eq 0 ]; then
     # The LM Studio helper runs as dwemer and must read the public model catalog.
     install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/dwemerdistro-lmstudio.json /etc/dwemerdistro-lmstudio.json || exit 1
+    # ddistro inventory refuses a component catalog that is not a plain root-owned file only root can change.
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/dwemerdistro-components.json /etc/dwemerdistro-components.json || exit 1
     # Keep the existing service ports, including CUSTOM_MODS_PORT; only a missing file gets the defaults.
     # start_env sources it as root, so an existing file must be a plain root-owned file only root can change.
     SERVICES_CONF=/etc/dwemerdistro_services.conf
@@ -130,6 +132,10 @@ if [ $? -eq 0 ]; then
     fi
     if ! runuser -u dwemer -- python3 -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1]))["models"], list))' /etc/dwemerdistro-lmstudio.json; then
         printf "${RED}[ERROR] LM Studio model catalog is not readable by dwemer${NC}\n"
+        exit 1
+    fi
+    if ! runuser -u dwemer -- python3 -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1]))["components"], list))' /etc/dwemerdistro-components.json; then
+        printf "${RED}[ERROR] Component catalog is not readable by dwemer${NC}\n"
         exit 1
     fi
     printf "${GREEN}[SUCCESS] Configuration files successfully copied to /etc/${NC}\n"

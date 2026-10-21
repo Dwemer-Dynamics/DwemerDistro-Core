@@ -143,6 +143,7 @@ HISTORY_METHODS = ("thread/read", "thread/turns/list", "thread/items/list")
 # answers item/tool/call itself by running fixed read-only ddistro argv as root, outside the model sandbox.
 DDISTRO = "/usr/local/bin/ddistro"
 TOOL_NAME = "ddistro_read"
+# The only status/logs/health/models/update_check targets; components are reached through inventory and health (all).
 TOOL_PRODUCTS = ("herika", "lorkhan", "stobe", "dialectic", "reign")
 # Mirrors ddistro LOG_SOURCES; ddistro validates the name again.
 TOOL_LOGS = {
@@ -165,7 +166,9 @@ TOOL_LOG_SOURCES = ("apache", "postgres")
 # A flat schema (no oneOf/if-then): the native tool API rejects conditional JSON Schema, so pairing rules are runtime checks.
 TOOL_SPEC = {
     "type": "function", "name": TOOL_NAME,
-    "description": "Read-only DwemerDistro diagnostics captured now on this machine: inventory (installed presence), "
+    "description": "Read-only DwemerDistro diagnostics captured now on this machine: inventory (installed presence of "
+                   "servers, ext entries, custom mods, and every component in the distro component catalog; components "
+                   "get presence plus, where listed in checks, port/http health only, and are not product targets), "
                    "status (managed servers), models (configured CHIM model assignments), logs (redacted tail of an "
                    "allowlisted log), health (bounded local checks), performance (bounded local timings, host load, and "
                    "recent Herika request stage timings; not provider latency or time to first token), model_options "
@@ -1195,6 +1198,9 @@ def sanitize(value, key=None):
     """Tool output strings: no control characters, URL queries, or secret-shaped values."""
     if isinstance(value, str):
         value = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "?", value)
+        # The component catalog's sha256 is a digest ddistro computed, not a secret.
+        if key == "sha256" and re.match(r"^[0-9a-f]{64}\Z", value):
+            return value
         # Ids and inventory's validated 40-hex commits would otherwise match the hex-token shape.
         return value if key in CLIP_KEYS + ("commit",) else DIAG_SECRETS.sub("[redacted]", DIAG_URL_QUERY.sub(r"\1?[redacted]", value))
     if isinstance(value, list):
@@ -2387,7 +2393,7 @@ class Broker:
             if operation == "inventory":
                 extensions = data.get("extensions")
                 items = extensions.get("items") if isinstance(extensions, dict) else None
-                sections = [data.get("custom_mods")] + [
+                sections = [data.get("custom_mods"), data.get("catalog")] + [
                     item for item in (items if isinstance(items, list) else []) if isinstance(item, dict)]
             # model_options flags its two lists; update_check is complete only when every product was fully inspected.
             truncated = data.get("truncated")
@@ -2396,7 +2402,9 @@ class Broker:
                           or operation == "model_options" and (not isinstance(truncated, dict) or not truncated
                                                                or any(value is not False for value in truncated.values()))
                           or operation == "update_check" and data.get("complete") is not True
-                          or operation == "inventory" and (data.get("complete") is not True or any(
+                          or operation == "inventory" and (data.get("complete") is not True
+                                                           or not isinstance(data.get("catalog"), dict)
+                                                           or data["catalog"].get("available") is not True or any(
                               isinstance(section, dict) and section.get("truncated") is True for section in sections)))
             if operation == "logs" and data.get("available") is False:
                 result = "skipped"
