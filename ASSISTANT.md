@@ -80,6 +80,26 @@ states from code. `capabilities.inventory.components` still lists the legacy com
 task's change receipts or backups (see "Thread archive and delete" in `ASSISTANT_RUNTIME.md`).
 It is a static fact, like the others, and adds no command.
 
+`features.explore` is `true` when the trusted `ddistro_access` library loads. `features.exec` is
+`true` when the trusted `ddistro_exec` helper is installed as well. Each feature lists its
+Assistant tool (`ddistro_explore`, `ddistro_exec`) under `assistant_tools.tools` only while it is
+true. `features.service_operations` and `capabilities.service_operations` describe the typed
+service operations (below) from code.
+
+`features.assistant_foundations` is `true` only when `ddistro_agent`, `ddistro_access`,
+`ddistro_exec` and `ddistro_changes` are all trusted and `agent status` reports the runtime
+installed with a passing probe whose attestation records the optional managed exec canary
+(`managed_exec_isolation: true`) and sha256 digests equal to the installed `ddistro_access`,
+`ddistro_changes`, `ddistro_exec` and `ddistro` files. Reinstalling any of them makes it false
+until the probe runs again. When it is false, `capabilities.assistant_foundations.reason`
+says why (for example `exec_helper_untrusted`, `probe_required` or
+`agent_status_helper_protocol`, `managed_exec_unverified` or `<helper>_digest_stale`). Only while it is true does
+`ddistro_action.capability_operations` list `change_files` (`propose_file_change`,
+`propose_file_undo`) and `service_control` (`propose_service`). `ddistro_action.operations` stays
+exactly `["propose_restart"]`. A false flag leaves every other capability readable, and the
+Launcher stays on its earlier tool revision. To set the flag, `capabilities` runs `agent status`
+once. It never starts a probe, a session or a model.
+
 ## Status and update
 
 Status always comes from `/usr/local/bin/ddistro_server status <product|all> --json`.
@@ -182,6 +202,19 @@ at `/var/www/html/HerikaServer` is editable; other products are `unsupported`.
 - `status` and `list` report `prepared`, `staged`, `applied`, `partial`, `failed`,
   `no_changes`, `interrupted`, `rolled_back`, and similar states from immutable receipts and
   journals. An interrupted apply or rollback is never replayed or repaired automatically.
+
+Schema 2 tasks can hold files from several roots and are named with `--task`:
+
+- `changes checkout --task T --root R --path P [--path P2] [--root R2 --path P3]` copies the named
+  files into the task's scratch folder (`work/<root>/<path>`). It never writes to a live root. A
+  root is usable only when `access roots` lists it with `change: true`. Config files, secrets,
+  files with inline credentials and non-text file types are refused.
+- `diff`, `stage` and `apply` work as described above across all of the task's roots. Each file is
+  written back to its own root.
+- `changes rollback-preview --task T` returns the exact undo of the last applied round, with its
+  `preview_sha256` (or `nothing_to_undo`). `changes undo --task T --preview-sha256 H` writes that
+  undo under the same checks as `apply`. If a live file changed after the apply, the result is
+  `conflict` and nothing is written.
 
 `/run/lock/dwemerdistro-maintenance.lock` (root, `0644`) is one common lock: `update.sh`,
 `update_gws`, `ddistro_server` mutations, and `ddistro_doctor --repair` hold it shared (so
@@ -431,11 +464,259 @@ before the restart (`permission_denied`, `helper_unavailable`, `unsafe_path`, `b
 each service's label and impact under `service_restart`, and `features.assistant_actions`
 says the broker offers it to the Assistant (see ASSISTANT_RUNTIME.md, "ddistro_action").
 
+## Typed service operations
+
+`operations` is a fixed matrix of code-owned handlers. It never takes a command, script, argument
+or environment from a request.
+
+```
+operations targets
+operations preview --target T --verb V [--branch B] [--task UUID --thread ID]   (root)
+operations apply --receipt ID --plan-sha256 HASH [--task UUID --thread ID]      (root)
+```
+
+- `apache`: `restart` only, through `service restart apache` with its lock and checks.
+- `herika`, `lorkhan`, `stobe`, `dialectic`, `reign`:
+  - `install` needs the server to be `not-installed`.
+  - `update` needs it to be `installed` and `managed`.
+  - Both run the trusted `ddistro_server` with exactly `<verb> <product> --branch <choice>`. The
+    branch must be one the product lists (default `main`).
+  - `--force`, `repair` and `uninstall` are never used.
+- `start` and `stop` are not operations. PostgreSQL and every component (TTS, STT, LLM, MCP and
+  others) are `unsupported`. `operations targets` and `capabilities.service_operations` list each
+  unsupported verb and target with its reason.
+
+`preview` changes nothing. It saves a root-private receipt that expires after 120 seconds and
+holds:
+
+- at most 8 plain summary lines
+- the captured baseline: Apache's process, or the server's state, branch and commit
+- the helper's sha256
+- `plan_sha256`
+
+`apply` runs that plan at most once:
+
+1. It checks the hash, the task and thread binding, and the expiry.
+2. It captures the baseline and the helper hash again. If either changed, the result is `stale`
+   and nothing runs.
+3. It runs the plan. An install or update is `verified` only when, afterwards, the server is
+   installed and managed on the resolved branch and its `HEAD` equals its local origin ref. Exit
+   0 alone is `unverified`. No health check is claimed (`result.health: "not_checked"`).
+
+States: `verified`, `unverified`, `failed`, `busy`, `not_executed`, `stale`, `expired`, and
+`executing` (outcome unknown). Applying an already used receipt again returns its recorded outcome
+with `replayed: true` and runs nothing, even after a failure. Receipts are kept in
+`/var/lib/dwemerdistro/assistant/operation-receipts/` (at most 200, for 30 days).
+
+## Read-only access: files, config, database
+
+These root-only, read-only commands come from `ddistro_access`, a library installed root-owned
+next to `ddistro`. ddistro loads it only when the file and its folder are root-owned and only root
+can change them. There is no path or environment override. When the library is missing or
+untrusted, these commands fail with `helper_unavailable`, `features.explore` is false, and
+`capabilities.access` is `{available: false, reason}`. Every other command works as before.
+
+```
+access roots
+files list ROOT [--path P] [--depth 1-3] [--limit <=500]
+files search ROOT [--query TEXT] [--name-glob GLOB] [--path P] [--limit <=100]
+files read ROOT --path P [--start N] [--lines <=400]
+config get ROOT [--key KEY]
+db schema PRODUCT [--schema S] [--table T]
+db query PRODUCT --query-json OBJECT
+```
+
+**Roots** are ids from a table in code: the five servers and the 18 catalog component ids. The
+catalog supplies no paths and grants nothing. Python components point at their fixed service source
+folder (for example minime `/home/dwemer/minime-t5`, xtts `/home/dwemer/xtts-api-server`, pipertts
+`/home/dwemer/piper`, localwhisper `/home/dwemer/remote-faster-whisper`, melotts
+`/home/dwemer/MeloTTS`, mimic3 `/home/dwemer/mimic3`), not their virtualenv. `present` only means that
+folder exists as a real directory; it says nothing about install health. `change` is true for the
+roots in the code-owned `CHANGE_ROOTS` set (the five servers and every component with a fixed
+folder); ddistro_changes reads that flag and still applies these exclusions and its own file-type
+rules. `cuda` (`gpu_global_mount`) and `lmstudio`
+(`account_state_folder`) have no readable root and are `unsupported`. Paths are relative to a root.
+`..`, absolute paths, backslashes and control characters are `invalid_argument`. Every folder is
+opened from `/` without following links. Symbolic links are listed but never followed or read.
+Hard-linked files are refused. These are never listed into, searched, or read:
+
+- Git metadata
+- dependencies (`venv`, `.venv`, `node_modules`, `site-packages`, `.tox`, `.eggs`)
+- nested worktrees (`.worktrees`, `.codex-worktrees`) and tool caches (`.mypy_cache`, `.pytest_cache`,
+  `.ruff_cache`)
+- runtime data (`log(s)`, caches, `uploads`, `voices`, `models`, backups)
+- media, model weights and archives
+- likely secret files (`.env`, keys, certificates, anything named like a token, password or
+  credential)
+- the PHP servers' `conf/conf.php`, per-NPC `conf/conf_*` files and `data/pictures`
+
+Reading one of these is `refused` with `details.reason` `secret_path`, `excluded_vcs`,
+`excluded_dependency`, `excluded_runtime` or `excluded_media`.
+
+Text is UTF-8 only; binary files are `refused` (`binary`). Every returned line is redacted
+(key/value secrets, PHP `$GLOBALS[...]` keys, URL user info and queries, bearer tokens, token
+shapes, JWTs, private keys, DSN passwords) and clipped to 4096 characters. `files search` is
+literal and case-insensitive. It matches the redacted line, so it cannot be used to probe secret
+values. It reads files up to 1 MiB and stops at 32 MiB, 5000 files, 20,000 entries or 20 seconds.
+With only `--name-glob` it searches names. Links and hard-linked files are never read; they are
+counted in `coverage.skipped` (`link`, `hard_link`), as are unreadable files.
+
+**Config** is parsed as data and never executed. It reads the PHP servers' `conf/conf.php` as plain
+`$NAME[...] = literal;` assignments, plus JSON, INI/CFG/CONF and TOML files in the root, `conf/`
+and `config/`. YAML is listed as `unsupported_format`. Concatenation, function calls,
+interpolation and array literals are listed under `unparsed` by key and line only. A key that names
+a secret shows `<set>` or `<unset>`, and opaque token-like values become `[redacted]`.
+`effective_value` is always `uncertain`, because loaders, profiles and database settings can
+override file values.
+
+**Database** reads run as the dedicated PostgreSQL role and OS account `ddreader` over local
+peer authentication (`runuser -u ddreader -- psql -X --no-password`), never as `postgres`. Each
+read is one `BEGIN TRANSACTION READ ONLY` with a 5-second statement timeout. Root provisions the
+reader with `install_assistant_runtime --db-reader`. A regular `install_assistant_runtime` run does
+the same step itself when PostgreSQL is running and `ddistro_access` is installed. It downloads
+nothing for this step. If the step cannot run, the installer prints a warning and the runtime
+install still stands. The step:
+
+- creates or validates the account and role (no superuser, createdb, createrole, replication,
+  bypassrls, memberships or owned objects)
+- sets read-only defaults, timeouts and `CONNECTION LIMIT 2`
+- drops every table, column and schema privilege ddreader itself holds in each reviewed database
+  (column grants are revoked by name, because `REVOKE ALL ON TABLE` leaves them), then grants
+  `CONNECT`, `USAGE` and `SELECT` on reviewed base-table columns only, in one transaction per database
+- creates or refreshes one managed view per granted herika schema whose `core_npc_master` has
+  `id`, `npc_name` and a json/jsonb `extended_data`: `ddreader_core_npc_master` (`security_barrier`,
+  owned by `postgres`, labelled with a fixed comment, `PUBLIC` revoked on that view only). It exposes
+  `id`, `npc_name`, `middle_term_memory_count`, `middle_term_memory_type` and
+  `middle_term_memory_present`, never raw JSON. ddreader gets `SELECT` on the view, not on
+  `extended_data`. A same-named object that is not this labelled view stops the run for that database
+  with nothing changed. This is the only metadata the installer writes; no row, table, other role,
+  owner or `PUBLIC` default changes.
+
+Privileges granted to ddreader by a role other than the object owner, and views left in snapshot
+schemas that are no longer listed (their grants are removed), are not cleaned up. The view depends on
+`core_npc_master.extended_data`: dropping that table or altering that column without `CASCADE` fails
+while it exists. `DROP VIEW <schema>.ddreader_core_npc_master` removes it; rerunning the installer (or the automatic
+refresh described below, for `public`) recreates it.
+
+The reviewed columns are:
+
+- herika: `memory`, `memory_summary`, `eventlog`, `quests`, `questlog`, `core_npc_master` (id,
+  npc_name), in `public` and in the `chim_profile_*` schemas listed in
+  `chim_meta.playthrough_profiles`. Only that table's `id`, `schema_name` and `is_active` are
+  readable. `public` is the current live game and the default. Each `chim_profile_*` schema is a
+  stored snapshot that CHIM clones back into `public` when a playthrough loads, so it can lag the live
+  game, including the one `is_active` names. Snapshot answers are labelled as snapshots; an
+  `is_active` snapshot is never picked as live. Zero rows in `public` is a valid live answer.
+- dialectic: the same tables in `public`, except `questlog` and `core_npc_master`.
+- stobe: `memory`, `memory_summary`, `eventlog`, `diarylog` and `core_npc` descriptors.
+- lorkhan and reign: `unsupported` (`no_reviewed_tables`).
+
+No connector, configuration, auth, settings or blob table, and no vector column, is granted.
+CHIM's playthrough clone copies tables and data only, never views or grants. Loading a playthrough
+drops `public` with `CASCADE` and clones the snapshot back, so it removes the view and every ddreader
+grant in `public`. Saving creates a snapshot schema without grants or the view.
+
+`ddistro db` repairs this itself. When a read hits exactly one of these gaps (`not_granted`,
+`projection_missing`, or `db schema` finding `public` ungranted or its view missing), it runs the
+installer's refresh script once, as `postgres`, for the one reviewed database being read. Then it
+retries the read once. The script is `ddistro_access --emit-refresh-sql DATABASE`, which the
+installer also runs:
+
+- The script is fixed in code. No model text, SQL, argv or environment reaches it.
+- It runs in one transaction with a 10-second statement timeout and a 2-second lock timeout, inside a
+  20-second process-group timeout. psql and runuser must be trusted root-owned programs.
+- It first checks that `ddreader` is already the dedicated role the installer made: its comment,
+  no privileged attributes, `NOINHERIT`, read-only default, no memberships or owned objects, and
+  `CONNECT`. Otherwise it stops with nothing changed (`role_not_dedicated` or `db_reader_missing`).
+  It never creates an account or role, and never touches `pg_hba`, services, rows, other roles or
+  `PUBLIC` defaults.
+
+Every `db query` and `db schema` result has `coverage.refresh`:
+`{count: 0|1, trigger, ok, metadata_changed, schemas, reason, database}`.
+`metadata_changed` compares fingerprints of ddreader's privileges and the managed views taken
+before and after the refresh.
+
+If the refresh fails, the read keeps its original error, with `details.refresh` saying why. The
+reasons are `view_collision`, `lock_timeout` (for example, CHIM is in the middle of a load),
+`statement_timeout`, `role_not_dedicated`, `not_root`, `helper_unavailable` and `failed`. On a
+failed refresh, `db schema` stays incomplete (`public_not_granted`, with `coverage.recovery`). A
+`core_npc_master` entry without the view keeps `derived: "projection_missing"`. Nothing is reported
+as empty or zero. Root then reruns `install_assistant_runtime --db-reader`.
+
+A request refreshes at most once. Asking about a snapshot schema never triggers a refresh, because
+only gaps in `public` do. A query whose grant stays missing after a successful refresh is still
+`permission_denied` (`not_granted`). A reader that was never provisioned is `unsupported`
+(`db_reader_missing` or `unsupported_auth`).
+
+Future CHIM migrations are not verified. A migration that drops `core_npc_master` without
+`CASCADE`, or changes the type of `extended_data`, `id` or `npc_name`, would fail while the view
+exists. The current load path (`DROP SCHEMA public CASCADE`) and the known `db_updates.php`
+migrations are safe.
+
+`db query` takes a JSON object and never SQL. Raw SQL and `--sql` are `refused` (`raw_sql_refused`).
+
+```
+{"schema": "public" | "chim_profile_*", "table": T, "columns": [C...],
+ "aggregates": [{"fn": "count"|"count_distinct"|"sum"|"min"|"max"|"avg", "column": C?, "as": ALIAS?}],
+ "filters": [{"column": C, "op": "eq"|"ne"|"lt"|"le"|"gt"|"ge"|"contains"|"starts_with", "value": V}
+             | {"column": C, "op": "in"|"not_in", "values": [V...]} | {"column": C, "op": "is_null"|"not_null"}],
+ "group_by": [C...], "order_by": [{"key": C|ALIAS, "dir": "asc"|"desc"}], "limit": 1-500, "offset": 0-100000}
+```
+
+Rules for the query object:
+
+- Filters are joined with AND.
+- Identifiers come only from the reviewed policy and are quoted.
+- Text values are passed as psql variables. Numbers and booleans are validated literals.
+- The builder generates no functions besides the aggregates and its own text clipping and
+  matching.
+- herika `core_npc_master` adds three derived columns from `extended_data.middle_term_memory`:
+  `middle_term_memory_count` (array length or object key count, 0 when absent, NULL for text),
+  `middle_term_memory_type` and `middle_term_memory_present` (1 for a non-empty value). A query that
+  uses any of them reads the managed `ddreader_core_npc_master` view in the same schema instead of
+  the table; other `core_npc_master` queries read the table. The view name is fixed in code.
+  `extended_data` itself is never selectable or granted. A schema without the view is `unsupported`
+  (`projection_missing`).
+
+The result is `{columns, rows (arrays), row_count, redactions, ms, transaction: "read_only"}`.
+Text cells are clipped to 512 characters and redacted, and the output is capped at 1 MiB.
+
+`db schema` lists the granted columns, planner row estimates and the playthroughs. Its `notes`
+explain the memory categories. Dialogue memory rows, summaries, events and NPC middle-term memory
+are different things and are never one total.
+
+Every result carries `captured_at`, `complete`, `truncated`, `reason` (for example `entry_limit`,
+`time_limit`, `byte_limit`, `row_limit`, `line_window`, `playthroughs_unavailable`) and `coverage`.
+A cut is never reported as absence.
+
+## Sandboxed exec on snapshots
+
+`exec --task UUID --request-json JSON` (root) runs `/usr/local/bin/ddistro_exec` with exactly
+those arguments. The request is `{argv, files, timeout}`, at most 64 KiB:
+
+- `argv[0]` is one of a fixed list of tools (`grep`, `sed`, `awk`, `diff`, `python3`, `sh` and
+  others).
+- `files` lists up to 20 `{root, path}` files, read through the `ddistro_access` policy.
+- `timeout` is 1 to 30 seconds.
+
+Each file becomes a redacted, read-only snapshot at `/inspect/<root>/<path>`, captured when the
+command starts. The sandbox has no network, no live root, no home folder and no database socket.
+Only the task's scratch folder (`/work`) and a private `/tmp` are writable.
+
+Snapshots are sanitized copies, not the live system, and a redacted snapshot can differ from the
+file on disk. Whether a service is running, and what the WSL host actually holds, come from
+`status`, `logs`, `health`, `performance` and `access` instead.
+
+`data` reports the exit status, stdout and stderr (redacted, capped at 64 KiB and 16 KiB), and each
+snapshot with `live: false`. A timeout or cancel stops the whole process group.
+
 ## Trust boundaries and future scope
 
 The CLI is a convenience and contract layer, not a sandbox or authorization boundary:
 anything it can do, the same user can do directly. Root-only work stays in
-`ddistro_server` and `ddistro_changes`, which own their locking. Launcher chat may come
+`ddistro_server` and `ddistro_changes`, which own their locking. The Assistant gets no root shell,
+no raw SQL and no general service control. It can use only the typed, allowlisted operations
+described here, and every change needs approval in the Launcher. Launcher chat may come
 later and will appear in `capabilities` only when implemented. The existing CHIM-MCP `/chat` is unchanged.
 
 ## Health

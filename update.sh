@@ -92,6 +92,10 @@ if [ $? -eq 0 ]; then
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro /usr/local/bin/ddistro || exit 1
     # Root-only file changes helper; ddistro checks it is root-owned before running it.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_changes /usr/local/bin/ddistro_changes || exit 1
+    # Read-only access policy library; ddistro loads it only when it is root-owned and root-writable only.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_access /usr/local/bin/ddistro_access || exit 1
+    # Sandboxed command helper for read-only file snapshots; ddistro runs it only when it is root-owned.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_exec /usr/local/bin/ddistro_exec || exit 1
     # Assistant runtime helpers. Only the scripts are installed here: the pinned Codex runtime,
     # bubblewrap, and the ddagent account come from an explicit install_assistant_runtime run.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_agent /usr/local/bin/ddistro_agent || exit 1
@@ -157,6 +161,10 @@ else
     printf "${RED}[ERROR] Error updating PHP configuration${NC}\n"
     exit 1
 fi
+
+# The new helpers make an existing probe stale; rerun it once now that every Core file is in place.
+# Skipped without the runtime; busy or failed only warns, so it never fails this update.
+/usr/local/bin/install_assistant_runtime --reprobe 7<&- || true
 
 printf "\n${BOLD}=======================================================${NC}\n"
 printf "${BOLD}${GREEN}        CORE SYSTEM UPDATED SUCCESSFULLY!          ${NC}\n"

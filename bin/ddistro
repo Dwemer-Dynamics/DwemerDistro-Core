@@ -24,12 +24,16 @@ import sys
 import threading
 import time
 import uuid
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
 
 TOOL = {"name": "ddistro", "version": "1.0.0", "source": "DwemerDistro-Core"}
 SCHEMA_VERSION = 1
 SERVER_HELPER = "/usr/local/bin/ddistro_server"
 CHANGES_HELPER = "/usr/local/bin/ddistro_changes"
 AGENT_HELPER = "/usr/local/bin/ddistro_agent"
+ACCESS_MODULE = "/usr/local/bin/ddistro_access"  # read-only access policy library, see ASSISTANT.md
+EXEC_HELPER = "/usr/local/bin/ddistro_exec"  # sandboxed command on file snapshots
 HELPER_OWNER_UID = 0
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 STATUS_TIMEOUT = 120
@@ -127,6 +131,19 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
   agent serve --task TASK      (root; raw Codex App Server JSONL, no --json envelope)
   memory status|list|search|add|update|forget|reset|export|configure   (root; assistant notes, see ASSISTANT.md)
   service restart apache       (root; restart, then verify a new process and its ports; see ASSISTANT.md)
+  access roots                                   (root; read-only access policy: roots, presence, db/config support)
+  files list ROOT [--path P] [--depth 1-3] [--limit N]                    (root; read-only, no links followed)
+  files search ROOT [--query TEXT] [--name-glob GLOB] [--path P] [--limit N]   (root; literal, redacted, bounded)
+  files read ROOT --path P [--start N] [--lines N]                        (root; UTF-8 text, redacted, N <= 400)
+  config get ROOT [--key KEY]                    (root; parsed public config values, never executed)
+  db schema PRODUCT [--schema S] [--table T]     (root; approved tables and granted columns, as ddreader)
+  db query PRODUCT --query-json OBJECT           (root; structured read-only query, no raw SQL)
+  changes checkout --task TASK --root R --path P [--path P2] [--root R2 --path P3]   (root; scratch workspace only)
+  changes rollback-preview --task TASK | changes undo --task TASK --preview-sha256 HASH   (root; undo writes live)
+  exec --task TASK --request-json JSON           (root; one sandboxed command on redacted snapshots, see ddistro_exec)
+  operations targets                             (root; read-only: typed service operations and their branches)
+  operations preview --target T --verb V [--branch B] [--task TASK --thread ID]   (root; a 120 s receipt, no change)
+  operations apply --receipt ID --plan-sha256 HASH   (root; runs that one reviewed operation at most once)
 
 Products: herika (chim, skyrim), lorkhan, stobe (kenshi), dialectic (fnv, ttw), reign.
 --force discards local edits to tracked server files; it is never added automatically."""
@@ -380,6 +397,45 @@ def cmd_version(opts, ctx):
 
 def cmd_capabilities(opts, ctx):
     legacy_ids, legacy_reason = catalog_legacy_ids()
+    try:
+        access, access_available = load_access(), True
+    except CliError as error:
+        access, access_available = error.details.get("reason", "unavailable"), False
+    exec_ok = exec_available(access_available)
+    foundations, foundations_reason = foundations_ready(access_available)
+    tools = [{"name": "ddistro_read", "mutates": False,
+              "operations": ["inventory", "status", "models", "logs", "health", "performance", "model_options",
+                             "update_check"],
+              "max_log_lines": 400, "log_filters": ["query", "since"],
+              # Shared logs are read with log_source; product is a server only (older
+              # threads may still send product apache/postgres for logs, which stays valid).
+              "log_sources": ["apache", "postgres"]},
+             {"name": "ddistro_memory", "mutates": True, "operations": ["search", "remember"],
+              "declared_when": "memory retrieval on at session start",
+              "remember_requires": "auto_learning on"}]
+    if access_available:
+        # access/files/config/db through ddistro_access; checkout (a copy into the task's scratch folder, never a
+        # live root) is added only for a session that also negotiated change_files.
+        tools.append({"name": "ddistro_explore", "mutates": False, "requires": "features.explore",
+                      "declared_when": "initialize capabilities.ddistroTools [\"explore\"]",
+                      "operations": ["roots", "list", "search", "read", "config", "db_schema", "db_query"],
+                      "capability_operations": {"change_files": ["checkout"]}, "checkout_writes": "scratch_workspace"})
+    if exec_ok:
+        # A no-network sandbox over redacted read-only snapshots; only the task's scratch folder and /tmp are writable.
+        tools.append({"name": "ddistro_exec", "mutates": False, "writes": "scratch_workspace", "requires": "features.exec",
+                      "declared_when": "initialize capabilities.ddistroTools [\"exec\"]",
+                      "snapshots": "redacted_read_only", "network": False, "max_seconds": 30})
+    # operations stays exactly the restart a client gets by default; a client that also opts into configure_model
+    # (and, with the foundations, change_files or service_control) gets the operations listed for it.
+    action_operations = {"restart_service": ["propose_restart"],
+                         "configure_model": ["propose_model_change", "propose_model_rollback"]}
+    if foundations:
+        action_operations.update({"change_files": ["propose_file_change", "propose_file_undo"],
+                                  "service_control": ["propose_service"]})
+    tools.append({"name": "ddistro_action", "mutates": True, "operations": ["propose_restart"],
+                  "declared_when": "initialize capabilities.ddistroActions [\"restart_service\"]",
+                  "approval": "client ddistro/action/decide", "services": list(SERVICE_RESTARTS),
+                  "capability_operations": action_operations})
     data = {
         "commands": [
             {"name": "version", "mutates": False}, {"name": "capabilities", "mutates": False},
@@ -413,8 +469,16 @@ def cmd_capabilities(opts, ctx):
             # Root measures the PostgreSQL SELECT 1; other users get it skipped (requires_root).
             {"name": "performance", "arguments": ["[product]"], "mutates": False},
             {"name": "service restart", "arguments": ["<service>"], "mutates": True, "requires_root": True},
+            {"name": "exec", "flags": ["--task", "--request-json"], "mutates": False, "requires_root": True},
+            {"name": "operations targets", "mutates": False},
+            {"name": "operations preview", "flags": ["--target", "--verb", "--branch", "--task", "--thread"],
+             "mutates": False, "requires_root": True},
+            {"name": "operations apply", "flags": ["--receipt", "--plan-sha256", "--task", "--thread"], "mutates": True,
+             "requires_root": True},
         ] + [{"name": "memory " + name, "flags": list(spec[0] + spec[1]), "mutates": name not in MEMORY_READS,
-              "requires_root": True} for name, spec in MEMORY_SPEC.items()],
+              "requires_root": True} for name, spec in MEMORY_SPEC.items()]
+          + [{"name": name, "arguments": list(spec[0]), "flags": list(spec[1]), "mutates": False, "requires_root": True}
+             for name, spec in ACCESS_SPEC.items()],
         "global_flags": ["--json", "--request-id"],
         "aliases": ALIASES,
         "log_targets": {target: names for target, (_, names) in LOG_SOURCES.items()},
@@ -444,7 +508,28 @@ def cmd_capabilities(opts, ctx):
                      # agent serve offers ddistro_action (propose_restart) to a client that opts in; see ASSISTANT_RUNTIME.md.
                      "assistant_actions": agent_helper_trusted(), "performance": True,
                      # models options/preview/apply/rollback; the broker offers it as configure_model (ASSISTANT_RUNTIME.md).
-                     "model_settings": True, "update_check": True},
+                     "model_settings": True, "update_check": True,
+                     # access/files/config/db commands; false when ddistro_access is missing or untrusted.
+                     "explore": access_available,
+                     # exec --task --request-json: the trusted ddistro_exec helper and its policy module are installed.
+                     "exec": exec_ok,
+                     # operations targets/preview/apply: the code-owned matrix in service_operations.
+                     "service_operations": True,
+                     # Every trusted helper is installed and agent status reports a passing probe; the reason is in
+                     # assistant_foundations. False keeps a client on its earlier tool revision.
+                     "assistant_foundations": foundations},
+        "assistant_foundations": {"available": foundations, "reason": foundations_reason,
+                                  "requires": ["ddistro_agent", "ddistro_access", "ddistro_exec", "ddistro_changes",
+                                               "agent status installed", "agent status probe_passed"]},
+        "service_operations": {"commands": ["operations targets", "operations preview", "operations apply"],
+                               "preview_seconds": OPERATION_PREVIEW_SECONDS, "summary_max_lines": 8,
+                               "binds": ["task", "thread"], "replay": "recorded_outcome",
+                               "targets": {target: list(verbs) for target, verbs in OPERATION_VERBS.items()},
+                               "branches": {product: list(spec["branches"]) for product, spec in PRODUCTS.items()},
+                               "unsupported": {"verbs": OPERATION_UNSUPPORTED_VERBS,
+                                               "targets": OPERATION_UNSUPPORTED_TARGETS},
+                               "verification": OPERATION_VERIFICATION,
+                               "receipts": {"max": OPERATION_RECEIPTS_MAX, "days": OPERATION_RECEIPT_DAYS}},
         "model_settings": {"products": ["herika"], "setting": "profile_role_connector",
                            "roles": [role for role, _ in MODELS_ROLES], "writes": ["core_profiles.<role field>"],
                            "concurrency": "row_version_compare_and_swap", "preview_seconds": MODEL_PREVIEW_SECONDS,
@@ -494,28 +579,13 @@ def cmd_capabilities(opts, ctx):
                         "scope_limits": PERFORMANCE_SCOPE_LIMITS},
         # The broker declares and runs this one tool itself; see ASSISTANT_RUNTIME.md.
         "assistant_tools": {"requires": "initialize capabilities.experimentalApi true", "declared_on": "thread/start",
-                            "tools": [{"name": "ddistro_read", "mutates": False,
-                                       "operations": ["inventory", "status", "models", "logs", "health", "performance",
-                                                      "model_options", "update_check"],
-                                       "max_log_lines": 400, "log_filters": ["query", "since"],
-                                       # Shared logs are read with log_source; product is a server only (older
-                                       # threads may still send product apache/postgres for logs, which stays valid).
-                                       "log_sources": ["apache", "postgres"]},
-                                      {"name": "ddistro_memory", "mutates": True, "operations": ["search", "remember"],
-                                       "declared_when": "memory retrieval on at session start",
-                                       "remember_requires": "auto_learning on"},
-                                      # operations stays exactly the restart a client gets by default; a client that also
-                                      # opts into configure_model gets the operations listed for it.
-                                      {"name": "ddistro_action", "mutates": True, "operations": ["propose_restart"],
-                                       "declared_when": "initialize capabilities.ddistroActions [\"restart_service\"]",
-                                       "approval": "client ddistro/action/decide", "services": list(SERVICE_RESTARTS),
-                                       "capability_operations": {"restart_service": ["propose_restart"],
-                                                                 "configure_model": ["propose_model_change",
-                                                                                     "propose_model_rollback"]}}],
+                            "tools": tools,
                             # Every reply carries coverage: result (checked, failed, skipped, refused, truncated,
                             # budget_hit) and what the turn and session budgets leave.
                             "coverage": {"results": ["checked", "failed", "skipped", "refused", "truncated", "budget_hit"],
                                          "turn_calls": 16, "turn_output_kib": 512, "session_calls": 256}},
+        # Static policy facts only: nothing is scanned and no SQL runs for capabilities.
+        "access": access_capabilities(access),
         # Static facts only: capabilities never opens or creates the memory database.
         "memory": {"scope": "installation", "authority": "non_authoritative", "kinds": list(MEMORY_KINDS),
                    "assistant_kinds": list(MEMORY_ASSISTANT_KINDS), "defaults": MEMORY_DEFAULTS,
@@ -805,7 +875,13 @@ CHANGES_SPEC = {
     "status": {"arguments": ["TASK"], "mutates": False},
     "rollback": {"arguments": ["TASK"], "mutates": True},
     "list": {"mutates": False},
+    # Schema 2 tasks (ddistro_changes CONTRACT) name the task with --task. checkout writes only the task's scratch
+    # workspace, never a live root; undo writes live files back to the state its rollback-preview hash reviewed.
+    "checkout": {"flags": ["--task", "--root", "--path"], "mutates": False, "writes": "scratch_workspace"},
+    "rollback-preview": {"flags": ["--task"], "mutates": False},
+    "undo": {"flags": ["--task", "--preview-sha256"], "mutates": True},
 }
+CHANGES_ROOT = re.compile(r"^[a-z][a-z0-9]{0,31}\Z")  # a root id as ddistro_changes and ddistro_access accept it
 TASK_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
 HASH = re.compile(r"^[0-9a-f]{64}\Z")
 
@@ -835,6 +911,13 @@ def changes_human(name, data):
         return f"Prepared task {data['task_id']} for {data['product']}.\nWorkspace: {data['workspace']}"
     if name in ("diff", "stage"):
         return (data["diff"] or "(no changes)\n") + f"manifest-sha256: {data['manifest_sha256']}"
+    if name == "checkout":
+        return "\n".join([f"Task {data['task_id']} round {data.get('round')}: workspace {data.get('workspace')}"]
+                         + [f"  {f.get('state')}: {f.get('root')}:{f.get('path')}" for f in data.get("files") or []])
+    if name == "rollback-preview":
+        if not data.get("preview_sha256"):
+            return f"{data['task_id']}: nothing to undo"
+        return (data.get("diff") or "") + f"preview-sha256: {data['preview_sha256']}"
     if name == "list":
         return "\n".join(f"{t['task_id']}  {t['state']:<20} {t['product'] or '-'}" for t in data["tasks"])
     return f"{data['task_id']}: {data['state']} ({len(data.get('files') or [])} files)"
@@ -845,10 +928,18 @@ def cmd_changes(opts, ctx):
     if os.geteuid() != 0:
         raise CliError("permission_denied", "ddistro changes must run as root (for example with sudo). "
                        "ddistro never elevates by itself.")
-    if name in ("apply", "rollback"):
+    if name in ("apply", "rollback", "undo"):
         ctx["operation_id"] = str(uuid.uuid4())
     args = [name]
-    if name == "prepare":
+    if name in ("checkout", "rollback-preview", "undo"):
+        args += ["--task", opts["task"]]
+        for root, paths in opts["targets"]:
+            args += ["--root", root]
+            for path in paths:
+                args += ["--path", path]
+        if name == "undo":
+            args += ["--preview-sha256", opts["preview-sha256"]]
+    elif name == "prepare":
         args += ["--product", opts["product"]]
         for path in opts["paths"]:
             args += ["--path", path]
@@ -875,13 +966,21 @@ def parse_changes(rest, ctx):
     name = rest[1]
     ctx["command"] = "changes " + name
     flags = CHANGES_SPEC[name].get("flags", [])
-    opts, positional, args, index = {"paths": []}, [], rest[2:], 0
+    opts, positional, args, index = {"paths": [], "targets": []}, [], rest[2:], 0
     while index < len(args):
         token = args[index]
         if token in flags:
             if index + 1 >= len(args):
                 raise CliError("invalid_argument", f"{token} needs a value.")
-            if token == "--path":
+            if token == "--root":
+                if not CHANGES_ROOT.match(args[index + 1]):
+                    raise CliError("invalid_argument", "--root must be a root id from ddistro access roots.")
+                opts["targets"].append((args[index + 1], []))
+            elif token == "--path" and name == "checkout":
+                if not opts["targets"]:
+                    raise CliError("invalid_argument", "Each --path must follow the --root it belongs to.")
+                opts["targets"][-1][1].append(args[index + 1])
+            elif token == "--path":
                 opts["paths"].append(args[index + 1])
             elif token[2:] in opts:
                 raise CliError("invalid_argument", f"{token} was given more than once.")
@@ -905,6 +1004,16 @@ def parse_changes(rest, ctx):
         opts["product"] = resolve_product(opts["product"])
         if len(opts["paths"]) > 200 or any(len(path) > 512 or "\0" in path for path in opts["paths"]):
             raise CliError("invalid_argument", "At most 200 --path values of up to 512 characters are allowed.")
+    if name in ("checkout", "rollback-preview", "undo") and not TASK_ID.match(opts.get("task", "")):
+        raise CliError("invalid_argument", f"changes {name} requires --task with the lowercase task UUID.")
+    if name == "checkout":
+        paths = [path for _, group in opts["targets"] for path in group]
+        if not opts["targets"] or any(not group for _, group in opts["targets"]):
+            raise CliError("invalid_argument", "changes checkout requires --root ROOT followed by at least one --path.")
+        if len(paths) > 200 or any(not path or len(path) > 512 or "\0" in path for path in paths):
+            raise CliError("invalid_argument", "At most 200 --path values of 1 to 512 characters are allowed.")
+    if name == "undo" and not HASH.match(opts.get("preview-sha256", "")):
+        raise CliError("invalid_argument", "changes undo requires --preview-sha256 with the 64-hex hash from rollback-preview.")
     if name == "apply" and not HASH.match(opts.get("manifest-sha256", "")):
         raise CliError("invalid_argument", "changes apply requires --manifest-sha256 with the 64-hex hash from stage.")
     return opts
@@ -922,6 +1031,123 @@ def agent_helper_trusted():
         return True
     except CliError:
         return False
+
+
+FOUNDATION_HELPERS = (("agent", AGENT_HELPER), ("changes", CHANGES_HELPER), ("exec", EXEC_HELPER))
+FOUNDATION_COMMANDS = ("exec", "changes checkout", "changes undo", "operations targets", "operations preview",
+                       "operations apply")
+
+
+def foundations_ready(access_available):
+    """(features.assistant_foundations, reason): every helper trusted, the commands present here, and agent status
+    reporting the runtime installed with a passing probe. Only agent status runs; never a probe or a model."""
+    if not access_available:
+        return False, "access_helper_untrusted"
+    for name, path in FOUNDATION_HELPERS:
+        try:
+            check_helper(path)
+        except CliError:
+            return False, name + "_helper_untrusted"
+    if not all(name in COMMANDS for name in FOUNDATION_COMMANDS):
+        return False, "commands_missing"
+    try:
+        status = agent_status()
+    except CliError as error:
+        return False, "agent_status_" + error.code
+    if not (status["installed"] and status["probe_passed"]):
+        return False, status["reason"]
+    # probe_passed can mean the legacy session only; managed exec needs its own attested canary.
+    attested, reason = managed_exec_attested()
+    if not attested:
+        return False, reason
+    return True, status["reason"]
+
+
+# The root-owned probe attestation ddistro_agent writes (0644). Its optional managed exec canary counts only when it
+# is bound to the helper bytes installed now, the CLI included, so replacing any of them needs a new probe.
+ATTESTATION_FILE = "/var/lib/dwemerdistro/assistant/agent/attestation.json"
+ATTESTATION_LIMIT = 64 * 1024
+CLI_PATH = "/usr/local/bin/ddistro"
+ATTESTED_HELPERS = (("access", ACCESS_MODULE), ("changes", CHANGES_HELPER), ("exec", EXEC_HELPER), ("cli", CLI_PATH))
+ATTESTED_HELPER_LIMIT = 4 * 1024 * 1024
+
+
+def read_root_file(path, limit):
+    """Bytes of a root-owned, single-link regular file that only root can change, reached from / through root-owned
+    directories only root can change, never following a link. Raises CliError with reason missing, untrusted or
+    too_large."""
+    def refuse(reason):
+        return CliError("unsafe_path", f"{os.path.basename(path)} is not a trusted root-owned file.",
+                        {"path": path, "reason": reason})
+
+    def root_only(info):
+        return info.st_uid == HELPER_OWNER_UID and not info.st_mode & 0o022
+
+    parts = path.strip("/").split("/")
+    directory = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open("/", directory)
+    try:
+        for index, part in enumerate(parts):
+            last = index == len(parts) - 1
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC if last else directory
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                raise refuse("missing")
+            except OSError:
+                raise refuse("untrusted")
+            os.close(fd)
+            fd = child
+            info = os.fstat(fd)
+            if not root_only(info):
+                raise refuse("untrusted")
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise refuse("untrusted")
+        if info.st_size > limit:
+            raise refuse("too_large")
+        raw = bytearray()
+        while len(raw) <= limit:
+            chunk = os.read(fd, limit + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+        if len(raw) > limit:
+            raise refuse("too_large")
+        return bytes(raw)
+    finally:
+        os.close(fd)
+
+
+def managed_exec_attested():
+    """(True, None) only when the attestation passed, records managed_exec_isolation true, and binds sha256 digests
+    equal to the access, changes, exec and CLI files installed now; otherwise (False, reason)."""
+    try:
+        raw = read_root_file(ATTESTATION_FILE, ATTESTATION_LIMIT)
+    except CliError as error:
+        return False, "attestation_" + error.details["reason"]
+    try:
+        doc = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+    except ValueError:
+        doc = None
+    if type(doc) is not dict or doc.get("passed") is not True:
+        return False, "attestation_invalid"
+    optional = doc.get("optional_checks")
+    if type(optional) is not dict or optional.get("managed_exec_isolation") is not True:
+        return False, "managed_exec_unverified"
+    bound = doc.get("managed_helpers")
+    if type(bound) is not dict:
+        return False, "attestation_helpers_missing"
+    for name, path in ATTESTED_HELPERS:
+        digest = bound.get(name)
+        if type(digest) is not str or not HASH.match(digest):
+            return False, name + "_digest_missing"
+        try:
+            current = hashlib.sha256(read_root_file(path, ATTESTED_HELPER_LIMIT)).hexdigest()
+        except CliError:
+            return False, name + "_helper_untrusted"
+        if not hmac.compare_digest(current, digest):
+            return False, name + "_digest_stale"
+    return True, None
 
 
 def agent_document(out, keys):
@@ -1493,6 +1719,11 @@ class ModelReceipts:
     The directory is root's with mode 0700 below root-owned parents (memory_directory's checks), each receipt is a
     root-owned 0600 single-link regular file opened without following links, and writes replace it atomically."""
 
+    # Subclasses (OperationReceipts) override these four to keep a separate store with its own receipt shape.
+    DIR_NAME, MAX_BYTES = MODEL_RECEIPTS_DIR_NAME, MODEL_RECEIPT_BYTES
+    BUSY = "Another model change is being prepared or applied. Try again."
+    untrusted, valid = staticmethod(model_untrusted), staticmethod(model_receipt_valid)
+
     def __init__(self, create):
         self.create = create
         self.directory = None
@@ -1501,16 +1732,16 @@ class ModelReceipts:
     def __enter__(self):
         old_umask = os.umask(0o077)
         try:
-            self.directory = memory_directory(self.create, name=MODEL_RECEIPTS_DIR_NAME, untrusted=model_untrusted)
+            self.directory = memory_directory(self.create, name=self.DIR_NAME, untrusted=self.untrusted)
             if self.directory is None:
                 return self
             try:
                 self.lock = os.open(self.directory + "/" + MODEL_RECEIPTS_LOCK,
                                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             except OSError:
-                raise model_untrusted("lock file")
+                raise self.untrusted("lock file")
             if not memory_file_ok(os.fstat(self.lock)):
-                raise model_untrusted("lock file")
+                raise self.untrusted("lock file")
             deadline = time.monotonic() + MODEL_LOCK_WAIT
             while True:
                 try:
@@ -1518,16 +1749,16 @@ class ModelReceipts:
                     break
                 except BlockingIOError:
                     if time.monotonic() > deadline:
-                        raise CliError("busy", "Another model change is being prepared or applied. Try again.")
+                        raise CliError("busy", self.BUSY)
                     time.sleep(0.1)
             # The lock only serializes writers if every one locked the same file: the path must still name it.
             held = os.fstat(self.lock)
             try:
                 named = os.lstat(self.directory + "/" + MODEL_RECEIPTS_LOCK)
             except OSError:
-                raise model_untrusted("lock file")
+                raise self.untrusted("lock file")
             if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino) or not memory_file_ok(held):
-                raise model_untrusted("lock file")
+                raise self.untrusted("lock file")
             return self
         except BaseException:
             self.__exit__(None, None, None)
@@ -1552,24 +1783,24 @@ class ModelReceipts:
         except FileNotFoundError:
             return None
         except OSError:
-            raise model_untrusted("receipt")
+            raise self.untrusted("receipt")
         try:
             if not memory_file_ok(os.fstat(fd)):
-                raise model_untrusted("receipt")
-            raw = os.read(fd, MODEL_RECEIPT_BYTES + 1)
+                raise self.untrusted("receipt")
+            raw = os.read(fd, self.MAX_BYTES + 1)
         finally:
             os.close(fd)
         try:
-            receipt = json.loads(raw.decode("utf-8"), parse_constant=reject_constant) if len(raw) <= MODEL_RECEIPT_BYTES else None
+            receipt = json.loads(raw.decode("utf-8"), parse_constant=reject_constant) if len(raw) <= self.MAX_BYTES else None
         except ValueError:
             receipt = None
-        if not model_receipt_valid(receipt, receipt_id):
-            raise model_untrusted("receipt")
+        if not self.valid(receipt, receipt_id):
+            raise self.untrusted("receipt")
         return receipt
 
     def save(self, receipt):
         data = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        if len(data) > MODEL_RECEIPT_BYTES:
+        if len(data) > self.MAX_BYTES:
             raise CliError("internal_error", "receipt too large")
         temporary = f"{self.directory}/.{receipt['id']}.{os.getpid()}.tmp"
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -1601,7 +1832,7 @@ class ModelReceipts:
         with os.scandir(self.directory) as entries:
             for count, entry in enumerate(entries):
                 if count >= MODEL_RECEIPTS_ENTRIES:
-                    raise model_untrusted("receipt directory")
+                    raise self.untrusted("receipt directory")
                 if entry.name.endswith(".json") and MODEL_RECEIPT_ID.match(entry.name[:-5]):
                     names.append(entry.name[:-5])
         found = [self.load(name) for name in sorted(names)]
@@ -3918,6 +4149,585 @@ def cmd_service_restart(opts, ctx):
     return data, f"{spec['label']} restart: {data['state']}"
 
 
+# --- Read-only access (ddistro_access) --------------------------------------------------
+
+# command: (positional names, valued flags). Every one is read-only and root-only.
+ACCESS_SPEC = {
+    "access roots": ((), ()),
+    "files list": (("root",), ("--path", "--depth", "--limit")),
+    "files search": (("root",), ("--query", "--name-glob", "--path", "--limit")),
+    "files read": (("root",), ("--path", "--start", "--lines")),
+    "config get": (("root",), ("--key",)),
+    "db schema": (("product",), ("--schema", "--table")),
+    "db query": (("product",), ("--query-json",)),
+}
+_ACCESS = None
+
+
+def load_access():
+    """The installed policy module, only when it is a trusted root-owned file in a root-owned folder.
+    There is no environment or path override; tests load a source copy themselves."""
+    global _ACCESS
+    if _ACCESS is None:
+        try:
+            check_helper(ACCESS_MODULE)
+        except CliError as error:
+            raise CliError("helper_unavailable", "ddistro_access is not installed as a trusted root-owned file.",
+                           {"helper": ACCESS_MODULE, "reason": error.details.get("reason", "untrusted")})
+        try:
+            spec = spec_from_loader("ddistro_access", SourceFileLoader("ddistro_access", ACCESS_MODULE))
+            module = module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception:  # a broken module must not break capabilities or other commands
+            raise CliError("helper_unavailable", "ddistro_access could not be loaded.",
+                           {"helper": ACCESS_MODULE, "reason": "unloadable"})
+        _ACCESS = module
+    return _ACCESS
+
+
+def access_capabilities(access):
+    if isinstance(access, str):
+        return {"available": False, "reason": access}
+    operators = sorted(access.OPERATORS) + ["in", "not_in", "is_null", "not_null", "contains", "starts_with"]
+    return {"available": True, "policy_version": access.POLICY_VERSION, "roots": sorted(access.ACCESS_ROOTS),
+            "unsupported_roots": {key: spec["unsupported"] for key, spec in access.ACCESS_ROOTS.items()
+                                  if spec.get("unsupported")},
+            "db_products": {key: "unsupported" if spec.get("unsupported") else "structured"
+                            for key, spec in access.DB_POLICY.items()},
+            "db_role": access.DB_ROLE,
+            "query": {"fields": sorted(access.QUERY_KEYS), "aggregates": list(access.AGGREGATES),
+                      "operators": operators, "raw_sql": False},
+            "config": {"execution": "none", "formats": ["json", "ini", "toml", "php_assign"],
+                       "effective_value": "uncertain"},
+            "limits": dict(access.LIMITS)}
+
+
+def parse_access(rest, ctx):
+    if len(rest) < 2:
+        raise CliError("invalid_argument", "Expected one of: " + ", ".join(ACCESS_SPEC) + ".")
+    name = rest[0] + " " + rest[1]
+    if rest[0] == "db" and "--sql" in rest:
+        ctx["command"] = name if name in ACCESS_SPEC else "db query"
+        raise CliError("refused", "Raw SQL is not accepted. Use db query PRODUCT --query-json with a structured "
+                       "object; run db schema first.", {"reason": "raw_sql_refused"})
+    if name not in ACCESS_SPEC:
+        raise CliError("invalid_argument", "Expected one of: " + ", ".join(ACCESS_SPEC) + ".")
+    ctx["command"] = name
+    names, valued = ACCESS_SPEC[name]
+    opts, positional, index, args = {}, [], 0, rest[2:]
+    while index < len(args):
+        token = args[index]
+        if token in valued:
+            key = token[2:].replace("-", "_")
+            if index + 1 >= len(args) or key in opts:
+                raise CliError("invalid_argument", f"{token} needs exactly one value.")
+            opts[key] = args[index + 1]
+            index += 1
+        elif token.startswith("-"):
+            raise CliError("invalid_argument", f"Unsupported option for {name}: {token[:40]}")
+        else:
+            positional.append(token)
+        index += 1
+    if len(positional) != len(names):
+        raise CliError("invalid_argument", f"Wrong number of arguments for {name}.\n" + USAGE)
+    for key, value in zip(names, positional):
+        opts[key] = resolve_product(value) if key == "product" else value
+    if name == "db query" and "query_json" not in opts:
+        raise CliError("invalid_argument", "db query needs --query-json with a structured query object.")
+    return opts
+
+
+def cmd_access(opts, ctx):
+    if os.geteuid() != 0:
+        raise CliError("permission_denied", "Read-only access commands run as root (wsl -u root).")
+    access = load_access()
+    o = opts
+    calls = {
+        "access roots": lambda: access.roots(),
+        "files list": lambda: access.list_files(o["root"], o.get("path"), o.get("depth"), o.get("limit")),
+        "files search": lambda: access.search_files(o["root"], o.get("query"), o.get("path"), o.get("name_glob"),
+                                                    o.get("limit")),
+        "files read": lambda: access.read_file(o["root"], o.get("path"), o.get("start"), o.get("lines")),
+        "config get": lambda: access.config_get(o["root"], o.get("key")),
+        "db schema": lambda: access.db_schema(o["product"], o.get("schema"), o.get("table")),
+        "db query": lambda: access.db_query(o["product"], o["query_json"]),
+    }
+    try:
+        data = calls[ctx["command"]]()
+    except access.AccessError as error:
+        raise CliError(error.code if error.code in ERRORS else "failed", error.message, error.details)
+    note = "" if data.get("complete") else f" (incomplete: {data.get('reason')})"
+    return data, f"{ctx['command']}: done{note}. Use --json for the full result."
+
+
+# --- Sandboxed exec (ddistro_exec) --------------------------------------------------------
+# A fixed wrapper: the task and the request object go to the trusted helper as exactly its five arguments. Programs,
+# files, roots and the sandbox are the helper's and ddistro_access's to check; nothing here adds a root, path or config.
+EXEC_TIMEOUT = 35  # the helper's 30 s maximum, its 2 s kill grace, and start-up; then the process group is stopped
+EXEC_STDOUT_LIMIT = 512 * 1024  # 64 KiB stdout + 16 KiB stderr, JSON-escaped, plus snapshot facts
+EXEC_REQUEST_BYTES = 64 * 1024
+EXEC_ENVELOPE = {"schema_version", "ok", "command", "request_id", "tool", "data", "error", "warnings"}
+EXEC_ERRORS = ("invalid_argument", "limit_reached", "not_found", "unsupported", "permission_denied", "unsafe_path",
+               "refused", "cancelled", "failed")
+
+
+def exec_available(access_available):
+    """features.exec: the installed helper and the policy module it loads are both trusted root-owned files."""
+    if not access_available:
+        return False
+    try:
+        check_helper(EXEC_HELPER)
+    except CliError:
+        return False
+    return True
+
+
+def exec_result(code, out):
+    """(data, warnings) from the helper's one envelope; its error is passed on with its own code, anything else is
+    helper_protocol."""
+    if out.total > EXEC_STDOUT_LIMIT:
+        raise CliError("helper_protocol", "ddistro_exec returned too much output.", {"helper_exit": code})
+    try:
+        doc = json.loads(bytes(out.data).decode("utf-8"), parse_constant=reject_constant)
+    except ValueError:
+        doc = None
+    if (type(doc) is dict and EXEC_ENVELOPE <= set(doc) <= EXEC_ENVELOPE | {"operation_id"}
+            and type(doc["schema_version"]) is int and doc["schema_version"] == 1 and doc["command"] == "exec"
+            and type(doc["tool"]) is dict and doc["tool"].get("name") == "ddistro_exec"
+            and type(doc["warnings"]) is list and all(type(w) is str for w in doc["warnings"][:100])):
+        error = doc["error"]
+        if doc["ok"] is True and code == 0 and type(doc["data"]) is dict and error is None:
+            return doc["data"], doc["warnings"][:100]
+        if doc["ok"] is False and doc["data"] is None and code != 0 and type(error) is dict \
+                and error.get("code") in EXEC_ERRORS and type(error.get("message")) is str \
+                and type(error.get("details")) is dict:
+            raise CliError(error["code"], error["message"][:4096], error["details"])
+    raise CliError("helper_protocol", "ddistro_exec returned an unexpected result.", {"helper_exit": code})
+
+
+def cmd_exec(opts, ctx):
+    if os.geteuid() != 0:
+        raise CliError("permission_denied", "exec must run as root. ddistro never elevates by itself.")
+    code, out, _ = run_helper(["--task", opts["task"], "--request-json", opts["request_json"], "--json"], EXEC_TIMEOUT,
+                              EXEC_STDOUT_LIMIT + 1, helper=EXEC_HELPER, echo_stdout=False)
+    data, warnings = exec_result(code, out)
+    for warning in dict.fromkeys(redact(w[:300]) for w in warnings):
+        ctx["warnings"].append(warning)
+    return data, f"exec: {data.get('status')} (exit {data.get('exit_code')}). Use --json for the output."
+
+
+def parse_exec(rest, ctx):
+    ctx["command"] = "exec"
+    opts, args, index = {}, rest[1:], 0
+    while index < len(args):
+        token = args[index]
+        if token not in ("--task", "--request-json") or index + 1 >= len(args):
+            raise CliError("invalid_argument", "exec takes only --task TASK --request-json JSON.")
+        key = token[2:].replace("-", "_")
+        if key in opts:
+            raise CliError("invalid_argument", f"{token} was given more than once.")
+        opts[key] = args[index + 1]
+        index += 2
+    if not TASK_ID.match(opts.get("task", "")):
+        raise CliError("invalid_argument", "exec needs --task with the lowercase task UUID.")
+    request = opts.get("request_json")
+    if request is None or len(request.encode("utf-8", "surrogatepass")) > EXEC_REQUEST_BYTES:
+        raise CliError("invalid_argument", f"exec needs --request-json with a JSON object of at most {EXEC_REQUEST_BYTES} bytes.")
+    try:
+        parsed = json.loads(request, parse_constant=reject_constant)
+    except ValueError:
+        parsed = None
+    if type(parsed) is not dict:
+        raise CliError("invalid_argument", "--request-json must be one JSON object (argv, files, timeout).")
+    return opts
+
+
+# --- Typed service operations --------------------------------------------------------------
+# operations targets|preview|apply: a fixed matrix of code-owned handlers, never a command, script, argument or
+# environment from a request. apache restart is cmd_service_restart (its own lock and fresh verification); a server
+# install or update is the trusted ddistro_server with exactly <verb> <product> --branch <allowlisted choice>, never
+# --force, repair or uninstall. The name avoids the existing service restart parser. Preview saves a root-private
+# receipt with the plan hash, the captured baseline and the helper's sha256; apply recomputes all three and runs the
+# plan at most once, recording its outcome (failures too) for any replay.
+OPERATION_PREVIEW_SECONDS = 120
+OPERATION_RECEIPTS_DIR_NAME = "operation-receipts"
+OPERATION_RECEIPTS_MAX = 200
+OPERATION_RECEIPT_DAYS = 30
+OPERATION_RECEIPT_BYTES = 32 * 1024
+OPERATION_TARGET = re.compile(r"^[a-z][a-z0-9_-]{0,31}\Z")
+OPERATION_VERB = re.compile(r"^[a-z][a-z-]{0,15}\Z")
+OPERATION_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}\Z")
+OPERATION_COMMIT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
+OPERATION_HELPER_BYTES = 4 * 1024 * 1024
+OPERATION_VERBS = dict({"apache": ("restart",)}, **{product: ("install", "update") for product in PRODUCTS})
+OPERATION_STATES = ("previewed", "executing", "verified", "unverified", "failed", "busy", "not_executed", "stale",
+                    "expired", "unknown")
+OPERATION_UNSUPPORTED_VERBS = {
+    "start": "not a typed operation; Apache and the servers start with DwemerDistro",
+    "stop": "not a typed operation; stopping a shared service affects every server",
+    "repair": "not offered to the Assistant: repair can reinstall over a partial install",
+    "uninstall": "never offered to the Assistant: it deletes the server and its database",
+    "force": "never offered: --force discards local edits to tracked server files",
+}
+OPERATION_UNSUPPORTED_TARGETS = {
+    "postgresql": "restarting PostgreSQL drops every database session of every server",
+    "components": "TTS, STT, LLM, MCP and other components have no code-owned operation; they are unsupported",
+}
+OPERATION_VERIFICATION = {"restart": "new_process_and_ports", "install": "git_identity", "update": "git_identity",
+                          "health": "not_checked"}
+OPERATION_RECEIPT_KEYS = {"schema", "id", "kind", "target", "verb", "branch", "resolved_branch", "created_at",
+                          "expires_at", "task_id", "thread_id", "baseline", "helper", "summary", "plan_sha256", "state",
+                          "executed", "verified", "result"}
+
+
+def operation_untrusted(what):
+    return CliError("unsafe_path", f"The service operation receipts {what} is not private to root; nothing was read or "
+                    "changed.", {"reason": "receipts_untrusted", "location": what})
+
+
+def operation_receipt_valid(receipt, receipt_id):
+    return (type(receipt) is dict and set(receipt) == OPERATION_RECEIPT_KEYS and receipt["schema"] == 1
+            and receipt["id"] == receipt_id and receipt["kind"] == "service_operation"
+            and receipt["verb"] in OPERATION_VERBS.get(receipt["target"], ()) and receipt["state"] in OPERATION_STATES
+            and type(receipt["created_at"]) is int and type(receipt["expires_at"]) is int
+            and type(receipt["plan_sha256"]) is str and HASH.match(receipt["plan_sha256"]) is not None
+            and type(receipt["baseline"]) is dict and type(receipt["helper"]) is dict
+            and type(receipt["summary"]) is list and receipt["executed"] in (True, False, None)
+            and type(receipt["verified"]) is bool and (receipt["result"] is None or type(receipt["result"]) is dict))
+
+
+class OperationReceipts(ModelReceipts):
+    """The same root-private store and lock rules as the model receipts, in its own directory and receipt shape."""
+    DIR_NAME, MAX_BYTES = OPERATION_RECEIPTS_DIR_NAME, OPERATION_RECEIPT_BYTES
+    BUSY = "Another service operation is being prepared or recorded. Try again."
+    untrusted, valid = staticmethod(operation_untrusted), staticmethod(operation_receipt_valid)
+
+    def prune(self, now):
+        """Drops unused expired previews and finished receipts after OPERATION_RECEIPT_DAYS. One that is executing is
+        never dropped; when the rest still fill the store the new preview is refused and nothing else is deleted."""
+        kept = []
+        for receipt in self.receipts():
+            unused = receipt["state"] in ("previewed", "expired", "stale") and receipt["expires_at"] < now
+            old = receipt["created_at"] < now - OPERATION_RECEIPT_DAYS * 86400 and receipt["state"] != "executing"
+            if unused or old:
+                os.unlink(self.path(receipt["id"]))
+            else:
+                kept.append(receipt)
+        excess = len(kept) - (OPERATION_RECEIPTS_MAX - 1)
+        removable = [r for r in reversed(kept) if r["state"] not in ("executing", "unknown")][:max(excess, 0)]
+        if len(removable) < excess:
+            raise CliError("busy", "Too many service operations are unfinished to record another; nothing was prepared.",
+                           {"reason": "receipts_full"})
+        for receipt in removable:
+            os.unlink(self.path(receipt["id"]))
+
+
+def operation_helper(target):
+    """{path, sha256} of the trusted program the plan runs: the init script for apache, else ddistro_server."""
+    path = SERVICE_RESTARTS["apache"]["init"] if target == "apache" else SERVER_HELPER
+    check_helper(path)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        raise CliError("helper_unavailable", "The operation helper cannot be read.", {"helper": path, "reason": "unreadable"})
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_size > OPERATION_HELPER_BYTES:
+            raise CliError("helper_unavailable", "The operation helper is not a trusted root-owned file.",
+                           {"helper": path, "reason": "untrusted"})
+        digest, left = hashlib.sha256(), OPERATION_HELPER_BYTES + 1
+        while left > 0:
+            chunk = os.read(fd, min(65536, left))
+            if not chunk:
+                break
+            digest.update(chunk)
+            left -= len(chunk)
+    finally:
+        os.close(fd)
+    return {"path": path, "sha256": digest.hexdigest()}
+
+
+def operation_rev(product, record, rev):
+    """A full commit id for rev in the product's managed checkout, read-only and offline, or None when not known."""
+    root = UPDATE_CHECK_ROOTS[product]
+    if record["repository_state"] != "managed" or record["root"] != root:
+        return None
+    try:
+        check_system_binary(UPDATE_CHECK_GIT)
+        code, out, _ = run_helper(update_check_args(root) + ["rev-parse", "--verify", "--quiet", rev],
+                                  UPDATE_CHECK_GIT_TIMEOUT, 256, helper=UPDATE_CHECK_GIT, env=dict(UPDATE_CHECK_GIT_ENV))
+    except CliError as error:
+        if error.code == "cancelled":
+            raise
+        return None
+    text = bytes(out.data).decode("ascii", "replace").strip()
+    return text if code == 0 and OPERATION_COMMIT.match(text) else None
+
+
+def operation_baseline(target):
+    """What the plan was reviewed against: the live apache process, or the server's install state, branch and commit."""
+    if target == "apache":
+        pid, started = service_pid(SERVICE_RESTARTS["apache"])
+        return {"running": pid is not None, "pid": pid, "started": started}
+    record = helper_status(target)[0]
+    baseline = {key: record[key] for key in ("state", "repository_state", "branch", "version", "database_present",
+                                             "production_branch", "development_branch")}
+    baseline["head"] = operation_rev(target, record, "HEAD^{commit}")
+    return baseline
+
+
+def operation_resolved_branch(choice, baseline):
+    """The git branch ddistro_server's resolve_branch will check out for this channel choice."""
+    if choice == "main":
+        return baseline["production_branch"]
+    if choice == "dev":
+        return baseline["development_branch"]
+    return choice
+
+
+def operation_plan_sha256(receipt):
+    plan = {key: receipt[key] for key in ("id", "kind", "target", "verb", "branch", "resolved_branch", "task_id",
+                                          "thread_id", "baseline", "helper", "summary", "expires_at")}
+    return hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def operation_summary(target, verb, branch, resolved, baseline):
+    """At most 8 plain lines for the approval card (launcher service card); no command string is shown."""
+    if target == "apache":
+        spec = SERVICE_RESTARTS["apache"]
+        now = f"running as pid {baseline['pid']}" if baseline["running"] else "no running Apache process found"
+        return [f"Restart {spec['label']} (apache)", spec["impact"], f"Now: {now}",
+                "Verified only by a new Apache process and every configured Listen port answering."]
+    name = PRODUCTS[target]["name"]
+    commit = (baseline["head"] or "unknown")[:12]
+    lines = [f"{verb.capitalize()} {name} from origin/{resolved} (channel {branch})",
+             f"Now: {baseline['state']}, branch {baseline['branch'] or '-'}, commit {commit}",
+             "Runs the trusted ddistro_server only; never --force, repair or uninstall.",
+             "Downloads from the server's GitHub repository and updates its database schema.",
+             "Apache and PostgreSQL are shared: other servers can be briefly affected."]
+    if verb == "update":
+        lines.append("Local edits to tracked files stop the update; they are never discarded.")
+    lines.append("Verified only by install state, branch and commit afterwards, not by a health check.")
+    return lines
+
+
+def operations_ready():
+    if os.geteuid() != 0:
+        raise CliError("permission_denied", "operations preview and apply must run as root. ddistro never elevates by itself.")
+
+
+def cmd_operations_targets(opts, ctx):
+    targets = [{"id": "apache", "kind": "service", "label": SERVICE_RESTARTS["apache"]["label"], "verbs": ["restart"],
+                "handler": "service restart", "impact": SERVICE_RESTARTS["apache"]["impact"]}]
+    targets += [{"id": product, "kind": "server", "label": spec["name"], "verbs": list(OPERATION_VERBS[product]),
+                 "handler": "ddistro_server", "branches": list(spec["branches"]), "default_branch": "main",
+                 "install_requires": "not-installed", "update_requires": "installed"}
+                for product, spec in PRODUCTS.items()]
+    data = {"schema": 1, "preview_seconds": OPERATION_PREVIEW_SECONDS, "targets": targets,
+            "unsupported": {"verbs": OPERATION_UNSUPPORTED_VERBS, "targets": OPERATION_UNSUPPORTED_TARGETS},
+            "verification": OPERATION_VERIFICATION}
+    return data, "\n".join(f"{t['id']:<10} {', '.join(t['verbs'])}" for t in targets)
+
+
+def cmd_operations_preview(opts, ctx):
+    operations_ready()
+    target, verb = opts["target"], opts["verb"]
+    if target not in OPERATION_VERBS:
+        raise CliError("unsupported", f"{target} has no typed operation. Supported targets: " + ", ".join(OPERATION_VERBS)
+                       + ".", {"reason": "unsupported_target", "target": target})
+    if verb not in OPERATION_VERBS[target]:
+        raise CliError("unsupported", f"{verb} is not offered for {target}.",
+                       {"reason": "unsupported_verb", "verb": verb,
+                        "why": OPERATION_UNSUPPORTED_VERBS.get(verb, "not a typed operation for this target")})
+    branch = opts.get("branch")
+    if target == "apache":
+        if branch is not None:
+            raise CliError("invalid_argument", "apache restart takes no --branch.")
+    else:
+        branch = branch or "main"
+        if branch not in PRODUCTS[target]["branches"]:
+            raise CliError("invalid_argument", f"Unsupported branch for {target}. Expected one of: "
+                           + ", ".join(PRODUCTS[target]["branches"]) + ".", {"reason": "branch_not_allowed"})
+    helper = operation_helper(target)
+    baseline = operation_baseline(target)
+    resolved = None
+    if target != "apache":
+        resolved = operation_resolved_branch(branch, baseline)
+        if verb == "install" and baseline["state"] != "not-installed":
+            raise CliError("refused", f"{target} is {baseline['state']}; install runs only when it is not installed.",
+                           {"reason": "not_installable", "state": baseline["state"]})
+        if verb == "update" and (baseline["state"] != "installed" or baseline["repository_state"] != "managed"):
+            raise CliError("refused", f"{target} is {baseline['state']}; update runs only on a managed installed server.",
+                           {"reason": "not_updatable", "state": baseline["state"]})
+        if not OPERATION_BRANCH.match(resolved or "") or ".." in resolved:
+            raise CliError("helper_protocol", "ddistro_server reported an unexpected branch name.")
+    now = int(time.time())
+    receipt = {"schema": 1, "id": secrets.token_hex(16), "kind": "service_operation", "target": target, "verb": verb,
+               "branch": branch, "resolved_branch": resolved, "created_at": now,
+               "expires_at": now + OPERATION_PREVIEW_SECONDS, "task_id": opts.get("task"), "thread_id": opts.get("thread"),
+               "baseline": baseline, "helper": helper, "state": "previewed", "executed": None, "verified": False,
+               "result": None}
+    receipt["summary"] = operation_summary(target, verb, branch, resolved, baseline)
+    receipt["plan_sha256"] = operation_plan_sha256(receipt)
+    with OperationReceipts(True) as store:
+        store.prune(now)
+        store.save(receipt)
+    data = operation_view(receipt)
+    return data, "\n".join(data["summary"] + [f"Apply within {OPERATION_PREVIEW_SECONDS} seconds: ddistro operations apply "
+                                              f"--receipt {receipt['id']} --plan-sha256 {receipt['plan_sha256']}"])
+
+
+def operation_view(receipt, replayed=False):
+    data = {key: receipt[key] for key in ("target", "verb", "branch", "resolved_branch", "baseline", "summary", "state",
+                                          "executed", "verified", "result", "task_id", "thread_id")}
+    data.update(receipt_id=receipt["id"], plan_sha256=receipt["plan_sha256"], helper_sha256=receipt["helper"]["sha256"],
+                expires_at=model_stamp(receipt["expires_at"]), replayed=replayed)
+    return data
+
+
+def operation_clip(lines):
+    return [redact(clean_line(str(line)))[:300] for line in lines][-20:]
+
+
+def operation_run_server(receipt):
+    """(state, executed, result) for ddistro_server <verb> <product> --branch <choice>, then a fresh identity check."""
+    target, verb = receipt["target"], receipt["verb"]
+    try:
+        code, out, err = run_helper([verb, target, "--branch", receipt["branch"]], UPDATE_TIMEOUT, OUTPUT_TAIL_BYTES,
+                                    watch_blocker=verb == "update")
+        tail = operation_clip(tail_lines(out.data, 10) + tail_lines(err.data, 10))
+    except CliError as error:
+        if error.code not in ("timeout", "cancelled"):
+            return "not_executed", False, {"error": error.code}
+        # Started and stopped: the outcome is decided by the fresh check below, never reported as not run.
+        code, tail = error.code, operation_clip(error.details.get("stdout_tail", [])[-10:]
+                                                + error.details.get("stderr_tail", [])[-10:])
+    result = {"exit": code, "output_tail": tail, "health": "not_checked"}
+    if code == 75:
+        return "busy", False, dict(result, reason="maintenance_busy")
+    if code in BLOCKER_REASONS:
+        result["reason"] = "update_blocked_tracked" if code == 79 else "update_blocked_untracked"
+    try:
+        record = helper_status(target)[0]
+        after = {key: record[key] for key in ("state", "repository_state", "branch", "version", "database_present")}
+        after["head"] = operation_rev(target, record, "HEAD^{commit}")
+        expected = operation_rev(target, record, "refs/remotes/origin/" + receipt["resolved_branch"])
+    except CliError as error:
+        if error.code == "cancelled":
+            raise
+        after, expected = None, None
+    checks = [{"id": "command", "result": "passed" if code == 0 else "failed", "detail": f"exit {code}"}]
+    if after is None:
+        checks.append({"id": "status", "result": "failed", "detail": "fresh status unavailable"})
+    else:
+        checks += [{"id": "installed", "result": "passed" if after["state"] == "installed"
+                    and after["repository_state"] == "managed" else "failed", "detail": after["state"]},
+                   {"id": "branch", "result": "passed" if after["branch"] == receipt["resolved_branch"] else "failed",
+                    "detail": after["branch"] or "-"},
+                   {"id": "commit", "result": "passed" if after["head"] and after["head"] == expected else "failed",
+                    "detail": f"{(after['head'] or 'unknown')[:12]} vs origin/{receipt['resolved_branch']} "
+                              f"{(expected or 'unknown')[:12]}"}]
+    result.update(checks=checks, after=after)
+    if code != 0:
+        return "failed", True, result
+    return ("verified" if all(c["result"] == "passed" for c in checks) else "unverified"), True, result
+
+
+def operation_run_restart(ctx):
+    try:
+        data, _ = cmd_service_restart({"service": "apache"}, ctx)
+    except CliError as error:
+        state = "busy" if error.code == "busy" else "not_executed"
+        return state, False, {"error": error.code}
+    result = {"checks": data["checks"], "before": data["before"], "after": data["after"],
+              "output_tail": operation_clip(data["output_tail"]), "health": "apache_only"}
+    return data["state"], True, result
+
+
+def cmd_operations_apply(opts, ctx):
+    operations_ready()
+    ctx["operation_id"] = str(uuid.uuid4())
+    with OperationReceipts(False) as store:
+        receipt = store.load(opts["receipt"])
+        if receipt is None:
+            raise CliError("not_found", "There is no service operation receipt with that id.", {"reason": "receipt_not_found"})
+        if receipt["task_id"] is not None and (opts.get("task"), opts.get("thread")) != (receipt["task_id"], receipt["thread_id"]):
+            raise CliError("refused", "This receipt belongs to another conversation; nothing was run.",
+                           {"reason": "binding_mismatch"})
+        if not hmac.compare_digest(receipt["plan_sha256"], opts["plan-sha256"]):
+            raise CliError("refused", "The confirmation does not match this preview; nothing was run.",
+                           {"reason": "plan_mismatch"})
+        if receipt["state"] != "previewed":
+            # One execution per receipt: a replay reports the recorded outcome, failures included, and runs nothing.
+            data = operation_view(receipt, replayed=True)
+            return data, f"{receipt['target']} {receipt['verb']}: {receipt['state']} (recorded)"
+        if int(time.time()) > receipt["expires_at"]:
+            receipt["state"], receipt["executed"] = "expired", False
+            store.save(receipt)
+            return operation_view(receipt), "This preview expired; nothing was run. Preview again."
+        fresh = dict(receipt, baseline=operation_baseline(receipt["target"]), helper=operation_helper(receipt["target"]))
+        if fresh["baseline"] != receipt["baseline"] or fresh["helper"] != receipt["helper"] \
+                or operation_plan_sha256(fresh) != receipt["plan_sha256"]:
+            receipt["state"], receipt["executed"] = "stale", False
+            receipt["result"] = {"reason": "stale_plan", "baseline_changed": fresh["baseline"] != receipt["baseline"],
+                                 "helper_changed": fresh["helper"] != receipt["helper"]}
+            store.save(receipt)
+            return operation_view(receipt), "The target changed since the preview; nothing was run. Preview again."
+        # Claimed before the run: a process that ends during it leaves the receipt executing, never runnable again.
+        receipt["state"] = "executing"
+        store.save(receipt)
+    # The store lock is not held during the run, and no maintenance lock is held here: the restart takes it
+    # exclusively itself and ddistro_server takes it shared, so neither waits on a lock this process holds.
+    if receipt["target"] == "apache":
+        state, executed, result = operation_run_restart(dict(ctx, warnings=[]))
+    else:
+        state, executed, result = operation_run_server(receipt)
+    result["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    receipt.update(state=state, executed=executed, verified=state == "verified", result=result)
+    try:
+        with OperationReceipts(False) as store:
+            store.save(receipt)
+    except (OSError, CliError):
+        ctx["warnings"].append("The outcome could not be recorded; the receipt stays executing.")
+    data = operation_view(receipt)
+    words = {"verified": "done and verified", "unverified": "ran, but the fresh check did not confirm it (executed_unverified)",
+             "failed": "failed", "busy": "not run: another maintenance task is running", "not_executed": "not run"}
+    return data, "\n".join(receipt["summary"] + [f"{receipt['verb']}: {words.get(state, state)}"])
+
+
+def parse_operations(rest, ctx):
+    names = ("targets", "preview", "apply")
+    if len(rest) < 2 or rest[1] not in names:
+        ctx["command"] = "operations"
+        raise CliError("invalid_argument", "Expected operations targets|preview|apply.")
+    name = rest[1]
+    ctx["command"] = "operations " + name
+    flags = {"targets": (), "preview": ("--target", "--verb", "--branch", "--task", "--thread"),
+             "apply": ("--receipt", "--plan-sha256", "--task", "--thread")}[name]
+    opts, args, index = {}, rest[2:], 0
+    while index < len(args):
+        token = args[index]
+        if token not in flags or index + 1 >= len(args):
+            raise CliError("invalid_argument", f"Unsupported or incomplete argument for operations {name}: {token[:40]}")
+        if token[2:] in opts:
+            raise CliError("invalid_argument", f"{token} was given more than once.")
+        opts[token[2:]] = args[index + 1]
+        index += 2
+    checks = (("target", OPERATION_TARGET), ("verb", OPERATION_VERB), ("branch", OPERATION_BRANCH),
+              ("task", TASK_ID), ("thread", THREAD_ID), ("receipt", MODEL_RECEIPT_ID), ("plan-sha256", HASH))
+    for key, pattern in checks:
+        if key in opts and not pattern.match(opts[key]):
+            raise CliError("invalid_argument", f"--{key} has an invalid value.")
+    if ".." in opts.get("branch", ""):
+        raise CliError("invalid_argument", "--branch has an invalid value.")
+    if ("task" in opts) != ("thread" in opts):
+        raise CliError("invalid_argument", "--task and --thread go together.")
+    required = {"targets": (), "preview": ("target", "verb"), "apply": ("receipt", "plan-sha256")}[name]
+    if any(key not in opts for key in required):
+        raise CliError("invalid_argument", f"operations {name} needs " + ", ".join("--" + key for key in required) + ".")
+    return opts
+
+
 def command_words(argv):
     """The first two command tokens, skipping the global flags wherever they appear first."""
     words, index = [], 0
@@ -3941,6 +4751,9 @@ COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products"
             "models rollback-preview": cmd_models_rollback_preview, "models rollback": cmd_models_rollback}
 COMMANDS.update({"changes " + name: cmd_changes for name in CHANGES_SPEC})
 COMMANDS.update({"memory " + name: cmd_memory for name in MEMORY_SPEC})
+COMMANDS.update({name: cmd_access for name in ACCESS_SPEC})
+COMMANDS.update({"exec": cmd_exec, "operations targets": cmd_operations_targets,
+                 "operations preview": cmd_operations_preview, "operations apply": cmd_operations_apply})
 
 
 # --- Arguments and output -------------------------------------------------------------
@@ -3975,6 +4788,12 @@ def parse_command(rest, ctx):
         return parse_memory(rest, ctx)
     if name == "models":
         return parse_models(rest, ctx)
+    if name in ("access", "files", "config", "db"):
+        return parse_access(rest, ctx)
+    if name == "exec":
+        return parse_exec(rest, ctx)
+    if name == "operations":
+        return parse_operations(rest, ctx)
     if name == "server":
         if len(rest) < 2 or rest[1] not in ("status", "update"):
             raise CliError("invalid_argument", "Expected server status or server update.")

@@ -48,8 +48,23 @@ features, not its version: distro builds backport `--bind-fd` (Ubuntu 24.04's 0.
 Debian 12's `0.8.0-2+deb12u1` both list it). Without them the installer stops and `status`
 reports `bwrap_unsupported`. Only a passing probe on the target distro shows the sandbox
 works there. `/usr/bin/python3` (root-owned, under `/usr`) runs the in-sandbox guard. `update.sh` installs
-`ddistro_agent` and `install_assistant_runtime` as root-owned `0755` scripts but never runs
-the installer, downloads the runtime, or installs packages.
+`ddistro_agent` and `install_assistant_runtime` as root-owned `0755` scripts but never
+downloads the runtime or installs packages.
+
+Replacing the runtime or any helper the attestation is bound to (the `ddistro` CLI included)
+makes the probe `probe_stale`. So a regular installer run (last, after the database reader and
+every runtime file are final) and `update.sh` (after every Core file is copied) each run
+`install_assistant_runtime --reprobe` once. It does nothing without the installed runtime and
+`ddagent`, and runs only the fixed root-owned `/usr/local/bin/ddistro agent probe`, under that
+command's existing 600 s bound and process-group handling. It never downloads, signs in, or
+touches provider credentials. The probe takes `serve.lock` without waiting, so a running session
+is never stopped or replaced: the probe reports `busy` (exit `75`) and is not retried. A busy,
+failed, or skipped probe only prints a warning and never fails the install or update. The
+Assistant and its new tools stay off until the user ends the session and presses **Run
+isolation check** (or runs `ddistro agent probe` as root). A passing probe re-enables the
+legacy session, but `managed_exec_isolation` is optional, so `ddistro capabilities` is still what
+shows whether the Assistant foundations tools are on. `--db-reader` exits before this step and
+never probes.
 
 ## Identity and state
 
@@ -246,7 +261,9 @@ world-readable host secret, world-writable fake live directory, and loopback lis
 The attestation is bound to the runtime and code-mode host hashes and file identities, the policy hash, the
 `ddistro_agent` hash, the bubblewrap hash, the kernel release and version, and the
 `ddagent` UID and GID. A change to any of them makes `status` report `probe_stale` and
-makes serve refuse. A root-owned attestation that is group- or other-writable is ignored.
+makes serve refuse. When they are installed, it also binds the sha256 of `ddistro_access`,
+`ddistro_changes`, `ddistro_exec` and `ddistro` files, and it records, when its optional canary passed,
+`managed_exec_isolation: true`; `ddistro capabilities` uses those (see ASSISTANT.md). A root-owned attestation that is group- or other-writable is ignored.
 
 ## serve
 
@@ -486,6 +503,62 @@ result was unreadable; the fresh check did not pass), or `verified` (ran; a
 new process and every configured port answered). `success` is true only for `verified`. The
 model has no path to approve, choose a command, a unit, or a path, or reach any other service.
 
+### Assistant foundations (tool revisions 11/12)
+
+The Launcher uses tool revision 11 (12 with memory) only when `ddistro capabilities` reports
+`features.assistant_foundations: true` and lists `ddistro_explore` and `ddistro_exec`. The flag
+needs every helper trusted and a passing probe (see ASSISTANT.md). Otherwise the Launcher stays on
+revision 9/10 or lower, and those revisions behave exactly as described above.
+
+**Negotiation.** With `experimentalApi: true`, a revision 11/12 client sends
+`capabilities.ddistroActions: ["restart_service", "configure_model", "change_files",
+"service_control"]` and `capabilities.ddistroTools: ["explore", "exec"]`. The broker removes both
+fields before Codex sees them and refuses any value it does not know. Tools are declared on
+`thread/start` only; `thread/resume` never adds one. A saved thread from a lower revision is
+upgraded once, to a new thread.
+
+**Tools.**
+
+- `ddistro_explore` is read-only. It covers roots, file list, search and read, data-only config,
+  database schema, and structured database queries with fixed operators. It never runs raw SQL.
+  With `change_files`, it also has `checkout`, which copies files into the task's scratch folder
+  and never writes to a live root.
+- `ddistro_exec` runs `ddistro exec` in the no-network sandbox on redacted, read-only snapshots.
+  The output describes those captured copies, not the live WSL host. The model checks live state
+  with `ddistro_read` and `ddistro_explore`.
+
+**Proposals.** The model can only propose. The broker builds every proposal from a root
+`ddistro` preview, and the model never supplies a hash, a receipt id or a command.
+
+- `propose_file_change` stages the task's scratch edits with `ddistro changes stage`. It can cover
+  several roots, but only roots that `access roots` lists with `change: true`. The card shows the
+  manifest hash and the complete diff (at most 4000 lines and 256 KiB). A larger or truncated diff
+  is refused, never shortened.
+- `propose_file_undo` uses `changes rollback-preview`, and approval runs `changes undo` with its
+  preview hash.
+- `propose_service` uses `ddistro operations preview` for one target and verb from the typed matrix
+  (Apache restart, or a server install or update on an allowed branch). The card shows the target,
+  verb, branch and the 8 summary lines. Approval runs `operations apply` once with that receipt and
+  `plan_sha256`. Start, stop, PostgreSQL and the components are unsupported.
+
+**Approval and status.** Approval and cancellation work as for restarts. `ddistro/action/decide`
+`approve` or `cancel` is accepted once per proposal. A cancel, an expiry, a new turn, or the end of
+the session runs nothing. The client gets `ddistro/action/updated` with `state` and `verified`:
+
+| State | Meaning |
+|---|---|
+| `verified` | The change ran and was checked. |
+| `failed` | The change ran or may have run, and the check did not pass. |
+| `unverified` | The change ran, but the check could not confirm it. |
+| `conflict`, `stale` | Something changed since the preview. Nothing was overwritten. |
+| `cancelled`, `expired` | Nothing ran. |
+| `busy` | Another operation held the lock. |
+| `not_executed`, `refused` | Nothing ran. |
+| anything else | The outcome is unknown. |
+
+A receipt left `executing` is reported as unknown and is never run again. Running a used receipt
+again only returns its recorded result.
+
 ### Thread archive and delete
 
 `thread/archive`, `thread/unarchive`, and `thread/delete` (Codex 0.163.0 stable,
@@ -516,10 +589,12 @@ a static fact that adds no command and opens no database.
 - The account-home repair removes the trust entry but does not stop it from being written again (the source of the original file is unverified).
   An account-free `thread/start` with the pinned runtime did not write one (fixture), so what
   wrote it is not known; prevention through the managed config was not tested and is not done.
-- `ddistro_action` holds Codex's dynamic tool call open while the user decides (at most 60 s,
-  then up to about 75 s for the restart and its check). Whether Codex 0.163.0 bounds a dynamic
-  tool call more tightly was not measured; if it does, the turn ends first and the proposal
-  expires with nothing run.
+- `ddistro_action` holds Codex's dynamic tool call open while the user decides (at most 60 s).
+  An approved legacy restart then takes up to about 75 s with its check; an approved
+  `propose_service` waits at most 600 s, the CLI's existing bound for `changes` and the probe,
+  and past it reports an unknown outcome without stopping `ddistro_server` or re-running the
+  receipt. Whether Codex 0.163.0 bounds a dynamic tool call more tightly was not measured; if
+  it does, the turn ends first and a pending proposal expires with nothing run.
 - The task mapping keeps the 256 most recently started threads in start order, so `thread/list`
   orders by start time and cannot list older threads. A thread started between two pages
   shifts nothing, because the cursor is a thread id, not an offset.
