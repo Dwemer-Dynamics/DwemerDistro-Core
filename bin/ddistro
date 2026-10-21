@@ -2947,7 +2947,7 @@ def cmd_health(opts, ctx):
                                         [path for _, path in leaves])["state"]
             if state != "present":
                 add(f"component.{component_id}.port", component_id, "skipped", f"startup marker {state}",
-                    "not installed" if state == "absent" else "marker could not be checked")
+                    "startup not configured" if state == "absent" else "marker could not be checked")
                 continue
             if component_id not in HEALTH_COMPONENT_PORTS:
                 add(f"component.{component_id}.port", component_id, "skipped", "startup marker present",
