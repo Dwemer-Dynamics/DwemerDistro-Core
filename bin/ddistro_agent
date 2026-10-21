@@ -900,11 +900,18 @@ def service_targets_view(payload):
 
 # live_run: general commands on the LIVE distro through the trusted ddistro_run supervisor. Declared only to a client
 # that opts in with initialize capabilities.ddistroActions ["live_run"], and only when ddistro_run is a trusted
-# root-owned file whose digest the attestation binds and whose isolation canary (live_run_isolation) passed. Every run
-# needs the user's approval of the exact request (or an active task grant of this session covering its account and
-# network); the model cannot approve, and the broker sends exactly the approved request bytes to the supervisor.
+# root-owned file whose digest the attestation binds and whose isolation canary (live_run_isolation) passed. Without
+# live_run_auto every run needs the user's approval of the exact request (or an active task grant of this session
+# covering its account and network); with it, a run declared routine and showing no destructive sign starts at once and
+# every other run needs that approval (never a grant). The model cannot approve, and the broker sends exactly the
+# approved or automatic request bytes to the supervisor.
 RUN_TOOL = "ddistro_run"
 RUN_CAPABILITY = "live_run"
+# A client that also negotiates live_run_auto gets the risk-declaring tool: a run the model marks routine starts without a
+# card unless its code shows a destructive sign; a destructive, unclassified or flagged run always needs the user's
+# confirmation of that exact request, and no task grant ever covers it. See ASSISTANT_RUNTIME.md "Automatic routine runs".
+RUN_AUTO_CAPABILITY = "live_run_auto"
+RUN_RISKS = ("routine", "destructive")
 RUN_HELPER = "/usr/local/bin/ddistro_run"
 RUN_OPERATIONS = ("run", "status", "output", "cancel", "list")
 RUN_INTERPRETERS = ("bash", "python3", "php", "psql")
@@ -996,13 +1003,85 @@ RUN_HINTS = {
     "cancelled_proposal": "the user did not approve it; nothing ran. Do not retry unless the user asks",
     "expired": "the approval window passed; nothing ran. Propose again only if the user still wants it",
 }
+# The tool as declared to a live_run_auto session: the same operations plus the required risk of every run.
+RUN_AUTO_SPEC = {
+    "type": "function", "name": RUN_TOOL,
+    "description": "Runs code on the LIVE DwemerDistro (the real WSL Linux: live files, services and databases), not a "
+                   "sandbox or snapshot. Every run declares risk. risk routine starts at once without asking the user: "
+                   "reads and inspection, configuration and database updates the user asked for, installs, updates and "
+                   "service control, as any account (root included) and with network when the work needs it. risk "
+                   "destructive waits for the user to confirm this exact request, every time: deleting data, rows or "
+                   "files, dropping, truncating or resetting a database, table, schema or settings, uninstalling or "
+                   "purging software, removing accounts, and overwriting data that has no backup. When unsure, use "
+                   "destructive. DwemerDistro also asks the user when the code shows a common destructive pattern (for "
+                   "example rm -r, DROP, TRUNCATE, DELETE FROM or package removal) even if you marked it routine; that "
+                   "check is a backstop, not a guarantee, so classifying honestly is your job. Never split, encode or "
+                   "disguise destructive work to avoid the confirmation. There is no general undo: back up a file "
+                   "yourself (for example cp f f.bak) before editing it, and read the result back afterwards to verify. "
+                   "run: interpreter bash, python3, php or psql; the code is passed as a file, never on a command line. "
+                   "account defaults to dwemer; root is full trust over the distro; postgres runs psql with peer login "
+                   "(database names the database). network defaults to false: an empty network, no internet and no TCP "
+                   "to local services (Unix sockets such as PostgreSQL's still work); ask for true only when needed. "
+                   "stdin is empty and nothing is interactive (use apt-get -y). Windows drives (/mnt), Windows interop "
+                   "and the assistant's own state are hidden. The reply gives job_id, state, exit_code and the redacted "
+                   "output tail after waiting up to wait_seconds; a longer job keeps running: call status with job_id "
+                   "and wait_seconds to wait more, output to page older text, cancel to stop it. exit_code 0 only means "
+                   "the process exited 0 (succeeded), not that the change is verified. Never rerun a write whose "
+                   "outcome is unknown or cancelled without checking first. Processes left in the command's process "
+                   "group are stopped when it ends; start services with their init script or setsid and redirect their "
+                   "output.",
+    "inputSchema": {"type": "object", "additionalProperties": False, "required": ["operation"], "properties": dict(
+        RUN_SPEC["inputSchema"]["properties"],
+        risk={"type": "string", "enum": list(RUN_RISKS),
+              "description": "run only (required): routine runs at once; destructive waits for the user's confirmation"},
+        reason={"type": "string", "maxLength": ACTION_REASON_CHARS,
+                "description": "run only (required): one plain sentence shown to the user: what this changes and why; "
+                               "for destructive, exactly what is deleted, reset or overwritten"})},
+}
+# Conservative backstop for automatic runs: code matching any of these never runs without the user's confirmation, even
+# when the model marked it routine. It only ever adds a confirmation. It cannot prove code is harmless (a command can be
+# built at run time, encoded or hidden in a called script), so a miss is possible and the model's declaration stays the
+# primary signal. Plain single-file rm/unlink is deliberately not listed (routine temporary-file cleanup).
+RUN_DESTRUCTIVE_SIGNS = tuple((label, re.compile(pattern, re.IGNORECASE | re.MULTILINE)) for label, pattern in (
+    ("SQL DROP", r"\bdrop\s+(?:table|database|schema|view|materialized\s+view|index|sequence|function|procedure|"
+                 r"trigger|type|extension|role|user|owned|column|constraint)\b"),
+    ("SQL TRUNCATE", r"\btruncate\s+(?:table\s+)?(?:only\s+)?[\"\w]"),
+    ("SQL DELETE", r"\bdelete\s+from\b"),
+    ("database drop or clean restore", r"\b(?:dropdb|dropuser)\b|\bpg_restore\b[^\n]*\s(?:-c|--clean)\b"),
+    ("recursive or wildcard delete", r"(?:^|[\s;&|(`'\"])rm\s+(?:[^\n;&|]*\s)?(?:-[A-Za-z]*r[A-Za-z]*|--recursive)\b"
+                                     r"|(?:^|[\s;&|(`'\"])rm\s+[^\n;&|]*\*"),
+    ("find -delete", r"\bfind\b[^\n]*\s(?:-delete\b|-exec\s+rm\b)"),
+    ("recursive delete", r"\brmtree\s*\("),
+    ("package removal", r"\b(?:apt|apt-get|aptitude)\s+(?:-\S+\s+)*(?:remove|purge|autoremove)\b"
+                        r"|\bdpkg\s+(?:-\S+\s+)*(?:-r|-P|--remove|--purge)\b|\bpip3?\s+uninstall\b|\bsnap\s+remove\b"),
+    ("account removal", r"\b(?:userdel|deluser|groupdel|delgroup)\b"),
+    ("disk wipe or raw write", r"\b(?:mkfs(?:\.\w+)?|wipefs|shred|blkdiscard)\b|\bdd\b[^\n]*\bof="),
+    ("file truncation", r"\btruncate\s+(?:-s|--size)\b"),
+    ("git discard", r"\bgit\s+(?:reset\s+--hard|clean\s+-[A-Za-z]*f)"),
+))
 
 
-def run_request(arguments):
+def run_destructive_signs(code):
+    """The labels of RUN_DESTRUCTIVE_SIGNS the code matches, in table order. An empty list proves nothing."""
+    return [label for label, pattern in RUN_DESTRUCTIVE_SIGNS if pattern.search(code)]
+
+
+def run_risk(arguments, automatic):
+    """The model's declared risk of a run: None when not declared (or not negotiated), else routine or destructive. Any
+    other value is refused, so an unknown risk never runs automatically."""
+    if not automatic or "risk" not in arguments:
+        return None
+    risk = arguments.get("risk")
+    if risk not in RUN_RISKS:
+        raise PolicyError(-32602, "risk must be routine or destructive")
+    return risk
+
+
+def run_request(arguments, automatic=False):
     """(request, wait seconds, reason) for validated run arguments. The request is exactly what ddistro_run receives;
-    nothing is added to or removed from the code."""
+    nothing is added to or removed from the code. risk (live_run_auto only) is read by run_risk and is not part of it."""
     reject_unknown(arguments, ("operation", "interpreter", "code", "account", "cwd", "network", "timeout_seconds",
-                               "database", "reason", "wait_seconds"))
+                               "database", "reason", "wait_seconds") + (("risk",) if automatic else ()))
     interpreter = arguments.get("interpreter")
     if interpreter not in RUN_INTERPRETERS:
         raise PolicyError(-32602, "interpreter must be one of " + ", ".join(RUN_INTERPRETERS))
@@ -2568,6 +2647,8 @@ class Broker:
         # offered), whether the client negotiated it, the session-only task grant, and this session's jobs.
         self.run_digest = live_run
         self.live_run = False
+        # live_run_auto: routine runs start without a card; never set without live_run.
+        self.live_run_auto = False
         self.redact = redact or run_redactor(None)
         self.spawn = spawn
         self.run_lock = run_lock
@@ -2804,7 +2885,7 @@ class Broker:
                 raise PolicyError(-32602, "invalid parameter: capabilities.experimentalApi")
             self.experimental = experimental is True
             actions = capabilities.pop("ddistroActions", None) if isinstance(capabilities, dict) else None
-            known = tuple(ACTION_OPERATIONS) + (RUN_CAPABILITY,)
+            known = tuple(ACTION_OPERATIONS) + (RUN_CAPABILITY, RUN_AUTO_CAPABILITY)
             if actions is not None and (not isinstance(actions, list) or len(actions) > len(known)
                                         or any(not isinstance(name, str) or name not in known for name in actions)
                                         or len(set(actions)) != len(actions)):
@@ -2812,7 +2893,9 @@ class Broker:
             # live_run declares its own tool (ddistro_run), not a ddistro_action operation. Like change_files it is
             # dropped silently where this installation cannot honor it (no attested ddistro_run canary).
             self.live_run = bool(self.experimental and actions and RUN_CAPABILITY in actions and self.run_digest)
-            actions = [name for name in actions or () if name != RUN_CAPABILITY]
+            # Automatic routine runs only on top of live_run; an older client never asks, so it keeps a card per run.
+            self.live_run_auto = self.live_run and RUN_AUTO_CAPABILITY in actions
+            actions = [name for name in actions or () if name not in (RUN_CAPABILITY, RUN_AUTO_CAPABILITY)]
             # Codex never sees this broker-only field; the action needs the dynamic tools experimentalApi enables.
             self.actions = frozenset(actions) if self.experimental else frozenset()
             # File changes need the trusted access policy as the session started; otherwise they are not offered.
@@ -2847,7 +2930,8 @@ class Broker:
                                              if EXPLORE_CAPABILITY in self.tools else [])
                                           + ([EXEC_SPEC] if EXEC_CAPABILITY in self.tools else [])
                                           + ([action_spec(self.actions)] if self.actions else [])
-                                          + ([RUN_SPEC] if self.live_run else []))
+                                          + ([RUN_AUTO_SPEC if self.live_run_auto else RUN_SPEC]
+                                             if self.live_run else []))
             self._cancel_proposals(None, "cancelled")
             return enforce_sandbox(params)
         if method == "thread/resume":
@@ -3276,6 +3360,9 @@ class Broker:
             if proposal["action"] == "live_run":
                 if decision != "cancel" and params.get("digest") != proposal["digest"]:
                     raise PolicyError(-32602, "digest must be the proposal's digest")
+                # A destructive, unclassified-automatic or flagged run is confirmed once; it never becomes a grant.
+                if decision == "approve_session" and not proposal["grantable"]:
+                    raise PolicyError(-32602, "approve_session is not offered for this proposal")
             elif decision == "approve_session" or "digest" in params:
                 raise PolicyError(-32602, "approve_session and digest apply only to live_run proposals")
             if proposal["state"] == "proposed" and (self.stopping or time.monotonic() > proposal["expires"]):
@@ -3834,8 +3921,9 @@ class Broker:
                 if operation == "run":
                     if not isinstance(turn_id, str) or not 0 < len(turn_id) <= 128:
                         raise PolicyError(-32602, "turnId is required")
-                    request, wait, reason = run_request(arguments)
-                    self._run_start(request_id, request, wait, reason, thread_id, turn_id, key)
+                    request, wait, reason = run_request(arguments, self.live_run_auto)
+                    risk = run_risk(arguments, self.live_run_auto)
+                    self._run_start(request_id, request, wait, reason, thread_id, turn_id, key, risk)
                     return
                 if operation == "list":
                     reject_unknown(arguments, ("operation",))
@@ -3877,38 +3965,59 @@ class Broker:
             raise PolicyError(-32602, "no job with that job_id in this chat; call list for this chat's jobs")
         return job
 
-    def _run_start(self, request_id, request, wait, reason, thread_id, turn_id, key):
-        """Runs under the session's task grant when it covers the request; otherwise shows the user the exact request
-        and waits for approve (once), approve_session (Allow for this task) or cancel."""
+    def _run_start(self, request_id, request, wait, reason, thread_id, turn_id, key, risk=None):
+        """In a live_run_auto session a run declared routine whose code shows no destructive sign starts at once; every
+        other run there (destructive, undeclared, or flagged) shows the user the exact request for approve (once) or
+        cancel. Otherwise (an older client) a run starts under the session's task grant when that covers it and shows no
+        destructive sign, and every other run shows the card with approve, approve_session (Allow for this task) or
+        cancel; a flagged run is never grantable."""
         digest = sha256_bytes(run_bytes(request))
+        signs = run_destructive_signs(request["code"])
         with self.state_lock:
-            covered = run_covered(self.run_grant, request)
+            automatic = self.live_run_auto and risk == "routine" and not signs
+            covered = not self.live_run_auto and not signs and run_covered(self.run_grant, request)
             grant = self._grant_view()
             epoch = self.run_stops.get(thread_id, 0)
-        if covered:
-            job, failure = self._run_launch(thread_id, turn_id, request, digest, "task_grant", epoch)
-            self._run_started_reply(request_id, job, failure, wait, "task_grant", False)
+        if risk == "destructive" or signs:
+            shown_risk = "destructive"
+        else:
+            shown_risk = "routine" if automatic else "unclassified"
+        if automatic or covered:
+            approval = "automatic" if automatic else "task_grant"
+            job, failure = self._run_launch(thread_id, turn_id, request, digest, approval, epoch)
+            self._run_started_reply(request_id, job, failure, wait, approval, False, shown_risk, signs)
             return
+        grantable = not self.live_run_auto and not signs
         proposal = {"id": secrets.token_hex(16), "thread": thread_id, "turn": turn_id, "service": None,
                     "operation": "run", "action": "live_run", "state": "proposed", "event": threading.Event(),
                     "expires": time.monotonic() + RUN_APPROVAL_SECONDS, "digest": digest,
-                    "scope": (request["account"], request["network"])}
+                    "scope": (request["account"], request["network"]), "grantable": grantable}
         busy, _ = self._reserve_proposal(proposal)
         if busy:
             self._run_reply(request_id, {"tool": RUN_TOOL, "operation": "run", "state": "busy", "started": False,
                                          "proposed": False, "hint": "another approval is pending; wait for the user",
                                          "error": {"code": "busy", "message": "another proposal is pending"}}, False)
             return
-        widens = grant is not None
+        widens = grant is not None and grantable
         change = dict(request, code_sha256=sha256_bytes(request["code"].encode("utf-8")), digest=digest,
-                      scope=run_scope(request), grant=grant, widens_grant=widens)
+                      scope=run_scope(request), grant=grant if grantable else None, widens_grant=widens,
+                      risk=shown_risk, risk_declared=risk, risk_signs=signs)
         change.pop("schema_version")
         expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + RUN_APPROVAL_SECONDS))
+        label = "Run on the live distro as " + request["account"]
+        impact = run_impact(request)
+        if shown_risk == "destructive":
+            label = "Destructive: r" + label[1:]
+            why = ("The assistant marked it destructive" if risk == "destructive" else "It was not marked destructive")
+            if signs:
+                why += ("; DwemerDistro also found: " if risk == "destructive" else ", but DwemerDistro found: ") + \
+                    ", ".join(signs)
+            impact = why + ". It can delete, reset or overwrite data that may not be recoverable. " + impact
         self._to_client(encode({"method": "ddistro/action/proposed", "params": {
             "proposalId": proposal["id"], "threadId": thread_id, "turnId": turn_id, "action": "live_run",
-            "label": "Run on the live distro as " + request["account"], "impact": run_impact(request),
-            "reason": sanitize(reason), "expiresAt": expires_at,
-            "decisions": ["approve", "approve_session", "cancel"], "change": change}}))
+            "label": label, "impact": impact, "reason": sanitize(reason), "expiresAt": expires_at,
+            "decisions": ["approve", "approve_session", "cancel"] if grantable else ["approve", "cancel"],
+            "change": change}}))
         go, state = self._await_run_decision(proposal)
         job = failure = None
         approval = "user_task_grant" if state == "approved_session" else "user_once"
@@ -3924,12 +4033,12 @@ class Broker:
         if self.stopping:
             return
         if go:
-            self._run_started_reply(request_id, job, failure, wait, approval, True)
+            self._run_started_reply(request_id, job, failure, wait, approval, True, shown_risk, signs)
             return
         hint = RUN_HINTS["expired" if state == "expired" else "cancelled_proposal"]
         self._run_reply(request_id, {"tool": RUN_TOOL, "operation": "run", "state": state, "proposed": True,
                                      "user_approved": False, "started": False, "spec": run_spec_view(request),
-                                     "hint": hint}, False)
+                                     "risk": shown_risk, "risk_signs": signs, "hint": hint}, False)
 
     def _await_run_decision(self, proposal):
         """Like _await_decision, but an approved run is not an action teardown waits for: it becomes a job that
@@ -4003,19 +4112,20 @@ class Broker:
             job.lock.wait_for(lambda: job.state != "starting", RUN_START_SECONDS + 5)
         return job, None
 
-    def _run_started_reply(self, request_id, job, failure, wait, approval, user):
+    def _run_started_reply(self, request_id, job, failure, wait, approval, user, risk, signs):
         if job is None:
             state = failure["state"]
             self._run_reply(request_id, {"tool": RUN_TOOL, "operation": "run", "state": state, "proposed": user,
-                                         "user_approved": user, "approval": approval, "started": False,
+                                         "user_approved": user, "approval": approval, "risk": risk,
+                                         "risk_signs": signs, "started": False,
                                          "error": {"code": failure["code"], "message": failure["message"]},
                                          "hint": RUN_HINTS.get(state)}, False)
             return
         self._run_wait(job, wait)
         view = self._run_view(job, RUN_REPLY_CHARS)
         self._run_reply(request_id, {"tool": RUN_TOOL, "operation": "run", "state": view["state"], "proposed": user,
-                                     "user_approved": user, "approval": approval, "started": view["started"],
-                                     "job": view, "hint": RUN_HINTS.get(view["state"])},
+                                     "user_approved": user, "approval": approval, "risk": risk, "risk_signs": signs,
+                                     "started": view["started"], "job": view, "hint": RUN_HINTS.get(view["state"])},
                         view["state"] == "running" or view["succeeded"])
 
     def _run_wait(self, job, seconds):

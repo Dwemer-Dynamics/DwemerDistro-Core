@@ -106,7 +106,10 @@ digest equal to that file now. `capabilities.live_run` gives `available`, `reaso
 `run_helper_missing`, `run_helper_untrusted`, `attestation_invalid`, `live_run_unverified`, `run_digest_stale`)
 and static facts: interpreters, default account, network modes, masked paths, approval decisions, grant scope
 and limits. Only while it is true does `assistant_tools.tools` list `ddistro_run`. It runs approved commands on
-the LIVE distro, not in a sandbox; root is full trust. See "ddistro_run live commands" in ASSISTANT_RUNTIME.md.
+the LIVE distro, not in a sandbox; root is full trust. `live_run.automatic` describes the optional `live_run_auto`
+client capability: runs the model declares routine start without a prompt, while destructive, undeclared and
+pattern-flagged runs always need the user's confirmation of the exact request and are never covered by a grant. See
+"ddistro_run live commands" and "Automatic routine runs" in ASSISTANT_RUNTIME.md.
 There is no `ddistro` command for it: the broker starts the `ddistro_run` supervisor itself.
 
 ## Status and update
@@ -728,8 +731,10 @@ no root shell, no raw SQL and no general service control: it can use only the ty
 described here, and every change needs approval in the Launcher. A Launcher that negotiates `live_run` adds
 `ddistro_run`: arbitrary commands, SQL through `psql`, and package or service work on the live distro, as
 `dwemer`, `root`, `postgres` or another account, each run approved by the user in the Launcher (or covered by a
-session grant the user approved). That is a general, full-trust path once approved, not a sandbox and not an
-allowlist; its masks only prevent accidental access to Windows and the assistant's own state. Launcher chat may come
+session grant the user approved). A Launcher that also negotiates `live_run_auto` lets runs the model declares
+routine start without a prompt; destructive ones still need the user's confirmation of the exact request, and the
+broker's destructive-pattern check is a backstop, not a guarantee. That is a general, full-trust path, not a sandbox
+and not an allowlist; its masks only prevent accidental access to Windows and the assistant's own state. Launcher chat may come
 later and will appear in `capabilities` only when implemented. The existing CHIM-MCP `/chat` is unchanged.
 
 ## Health

@@ -5,9 +5,10 @@ a dedicated, attested sandbox. The model can change only the task's scratch copy
 Applying scratch changes to a live install is a separate, trusted launcher/manual
 operation and is never done by this tool. A task ID or `--yes` grants nothing.
 The one exception is `ddistro_run` (`live_run`, below): a client that opts in lets the model
-propose commands on the LIVE distro, and each runs only after the user approves it (or a
-session grant they approved covers it). Approved, it is not a sandbox: as root it is full
-trust over the distro.
+run commands on the LIVE distro. Each runs only after the user approves it (or a session grant
+they approved covers it), or, for a client that also opts in to `live_run_auto`, at once when the
+model declares it routine and its code shows no destructive sign; destructive runs always wait for
+the user. It is not a sandbox: as root it is full trust over the distro.
 
 ```bash
 install_assistant_runtime [--archive PATH] [--host-archive PATH] [--install-prerequisites]   # root, explicit
@@ -309,7 +310,7 @@ The broker relays JSONL both ways and forwards only these client methods:
 | `turn/start` | `threadId` (this task), `input` (only `text` items and `image` items with a `data:image/` or `https://` URL), `model`, `effort`, `summary`, `outputSchema`, `personality`, `serviceTier`, `clientUserMessageId` |
 | `turn/interrupt` | `threadId` (this task), `turnId` |
 | `thread/archive`, `thread/unarchive`, `thread/delete` | `threadId` (this task) only; see "Thread archive and delete" |
-| `ddistro/action/decide` | `proposalId`, `threadId`, `decision` (`approve`/`cancel`, and for a `live_run` proposal `approve_session`), `digest` (required to approve a `live_run` proposal, refused on any other); answered by the broker, never forwarded; see "ddistro_action" and "ddistro_run" |
+| `ddistro/action/decide` | `proposalId`, `threadId`, `decision` (`approve`/`cancel`, and for a `live_run` proposal that offers it `approve_session`), `digest` (required to approve a `live_run` proposal, refused on any other); answered by the broker, never forwarded; see "ddistro_action" and "ddistro_run" |
 | `ddistro/run/revoke`, `ddistro/run/cancel` | only after `live_run` was negotiated; see "ddistro_run" |
 
 For thread and turn requests, `approvalPolicy` may only be `never`, and `cwd` only
@@ -581,9 +582,10 @@ again only returns its recorded result.
 not a sandbox and not a snapshot. It exists so the Assistant can do general work (edit a setting in a product
 database, install a package, inspect any path) that the typed tools do not cover. Its safety rests on the user's
 approval of the exact request, not on an allowlist: there is no program, path, SQL or per-mod allowlist, no
-read-only tier and no SQL preview. A command meant only to read can still change things, so a run is never let
-through because the model says it only reads; the typed read tools (`ddistro_read`, `ddistro_explore`) stay the
-automatic way to look.
+read-only tier and no SQL preview. A command meant only to read can still change things, so without
+`live_run_auto` a run is never let through because the model says it only reads; the typed read tools
+(`ddistro_read`, `ddistro_explore`) stay the automatic way to look. With `live_run_auto` (see "Automatic routine
+runs") the user has chosen to trust the model's own risk declaration for routine work.
 
 **Availability.** The client adds `"live_run"` to `initialize` `capabilities.ddistroActions` (with
 `experimentalApi: true`). It is honored only when, as the session starts, the attestation is current, binds the
@@ -599,20 +601,27 @@ tool (`RUN_SPEC`). It is its own tool, not a `ddistro_action` operation. `ddistr
   and optionally `account` (default `dwemer`; any local account but `ddagent`), `cwd` (absolute; default the
   account's home), `network` (default `false`), `timeout_seconds` (1-3600, default 300), `database` (psql only),
   `wait_seconds` (0-60, default 20). Code with control characters other than tab, newline and CR, or with
-  bidirectional or zero-width characters, is refused, so the reviewed text is what runs.
+  bidirectional or zero-width characters, is refused, so the reviewed text is what runs. Only in a `live_run_auto`
+  session, `risk` (`routine` or `destructive`; any other value is refused and nothing runs); it is not part of the
+  request bytes or digest.
 - `status` (`job_id`, `wait_seconds`), `output` (`job_id`, `offset`, `max_chars` up to 48 KiB), `cancel`
   (`job_id`), `list`. A job is visible only to the thread that started it.
 
-**Approval.** With no covering grant, the broker sends `ddistro/action/proposed` with `action: "live_run"`, an
+**Approval.** Without `live_run_auto` and with no covering grant, the broker sends `ddistro/action/proposed` with `action: "live_run"`, an
 impact text (root: full trust), `decisions: ["approve", "approve_session", "cancel"]`, and `change`: the exact
 `code`, `interpreter`, `account`, `cwd`, `network`, `timeout_seconds`, `database`, `code_sha256`, `digest` (the
-sha256 of the exact request bytes the supervisor will read), `scope`, the current `grant` and `widens_grant`. It
+sha256 of the exact request bytes the supervisor will read), `scope`, the current `grant` and `widens_grant`, and
+`risk` (`destructive` or `unclassified`), `risk_declared` (the model's, or null) and `risk_signs` (the destructive
+patterns found, below). It
 expires after 600 s. The client answers `ddistro/action/decide` with that `digest` (required to approve; a
 missing or different digest is `-32602` and changes nothing). `approve` runs it once. `approve_session` (Allow for
 this task) runs it and adds its exact `(account, network)` scope to the session grant, installed under the same
 lock as the decision so a later revoke always wins: later runs that one scope covers (same account, or root, at
 the same or a wider network tier) run without a card. Scopes are never combined. A request no scope covers shows
-a new card with `widens_grant: true`; approving it with `approve_session` adds one more scope. The grant lives only in the broker's memory for
+a new card with `widens_grant: true`; approving it with `approve_session` adds one more scope. A run whose code
+shows a destructive sign is never covered by a grant: it gets a card with `decisions: ["approve", "cancel"]`,
+`grant: null`, `risk: "destructive"`, a `Destructive:` label and the signs in its impact, and `approve_session` for it is
+`-32602`. The grant lives only in the broker's memory for
 this session and its task's threads; it is never stored and ends when the session ends or the client sends
 `ddistro/run/revoke` (`{}` -> `{revoked}`; running jobs continue). `ddistro/run/grant` `{active, scope, reason}`
 reports every change. The model has no path to approve, grant or revoke. Replay, late, unknown and foreign-thread
@@ -620,13 +629,38 @@ decisions are refused as for other proposals, and `turn/start`, `turn/interrupt`
 `thread/resume`, expiry or the end of the session end a pending card with nothing run. One proposal of any kind is
 pending at a time.
 
+**Automatic routine runs (`live_run_auto`).** A client that adds `"live_run_auto"` next to `"live_run"` (ignored
+without it) gets `RUN_AUTO_SPEC` at `thread/start`: the same tool with a required `risk`. The model declares
+`routine` for reads, inspection, requested configuration and database updates, installs, updates and service control
+(any account, root included, network when needed) and `destructive` for deleting data, rows or files, dropping,
+truncating or resetting databases, tables, schemas or settings, uninstalling or purging, removing accounts, and
+overwriting data with no backup; when unsure, `destructive`. Then:
+
+- `routine` with no destructive sign: no card. The run starts at once (`approval: "automatic"`, `user_approved:
+  false`), with the same digest, helper, maintenance lock, Stop, timeout and job limits as an approved run, and
+  `ddistro/run/started` carries the exact code so the client can show it.
+- `destructive`, no `risk` (a thread started with the older `RUN_SPEC`), or a destructive sign: a card for the exact
+  request with `decisions: ["approve", "cancel"]`, every time. No grant exists in such a session: `approve_session`
+  is never offered and is `-32602`.
+
+The destructive signs (`RUN_DESTRUCTIVE_SIGNS`) are case-insensitive patterns over the code: SQL `DROP <object>`,
+`TRUNCATE`, `DELETE FROM`; `dropdb`, `dropuser`, `pg_restore --clean`; `rm` recursive or with a wildcard;
+`find -delete` or `-exec rm`; `rmtree(`; `apt`/`apt-get`/`aptitude` remove, purge or autoremove, `dpkg -r/-P`,
+`pip uninstall`, `snap remove`; `userdel`, `deluser`, `groupdel`, `delgroup`; `mkfs`, `wipefs`, `shred`, `blkdiscard`,
+`dd of=`; `truncate -s`; `git reset --hard`, `git clean -f`. They apply to older clients' grants too, and only ever
+add a confirmation. They are a backstop, not a detector: code can build a command at run time, encode it, or call a
+script that deletes, and a plain single-file `rm` or `unlink` is deliberately not flagged (temporary-file cleanup).
+The trust model is therefore: the model's declaration is the primary signal, steered by the tool description and the
+Launcher's instructions; the patterns catch common mistakes; the user sees every automatic run's code and output in
+the chat and can Stop it. Nothing here is a security boundary against a model that misclassifies on purpose.
+
 **Execution.** For an approved or covered request the broker checks the common maintenance lock
 (`/run/lock/dwemerdistro-maintenance.lock`, used as it is, never replaced) by taking it shared without waiting and
 releasing it at once: a run does not start while an exclusive change holds it (`busy`). The lock is not held for
 the job, so the command's own `ddistro` changes take it as usual. A Stop, archive or delete of the thread after
 the approval but before the job is registered means the run never starts. At most 4 jobs run at once per
 session. The broker then sends `ddistro/run/started` `{threadId, turnId, jobId,
-approval: user_once|user_task_grant|task_grant, digest, state: "starting", spec}` with the exact code, and starts
+approval: user_once|user_task_grant|task_grant|automatic, digest, state: "starting", spec}` with the exact code, and starts
 `/usr/local/bin/ddistro_run supervise` in its own session and process group, writing the request bytes to its
 stdin. The root supervisor:
 
@@ -658,7 +692,7 @@ as success), and `refused` / `not_started` / `busy` (nothing ran). `turn/interru
 `ddistro/run/cancel` `{threadId, jobId}` stops one; a stop is SIGTERM to the group, then SIGKILL after 10 s. Jobs
 otherwise outlive the turn, so a later turn of the same thread can ask for their status.
 
-**Model replies** say `state`, `started`, `approval` and `user_approved`, and for a job `exit_code`, `signal`,
+**Model replies** say `state`, `started`, `approval`, `user_approved`, `risk` and `risk_signs`, and for a job `exit_code`, `signal`,
 `succeeded` (exited 0) and `verified: false` with the note that only the exit status is known, the redacted
 output tail (24 K characters) and a `hint`. The broker never retries; a cancelled, timed-out, killed or unknown
 run may have changed things partway and is not rerun. There is no undo: the tool tells the model to back up a file
@@ -696,7 +730,9 @@ a static fact that adds no command and opens no database.
   its account has. The PID namespace is shared on purpose (services, `ps`, init scripts), so a command can see and
   signal other processes its account may signal. Network off is all or nothing: there is no per-host rule.
 - A `ddistro_run` job's output is redacted line by line with patterns; a secret in an unusual format can pass.
-  Grant-covered runs show no card; the launcher shows them from `ddistro/run/started`.
+  Grant-covered and automatic runs show no card; the launcher shows them from `ddistro/run/started`.
+- Automatic runs trust the model's `risk`. The destructive patterns are a conservative backstop that a disguised,
+  generated or indirect deletion can pass; they do not make an automatic run safe, only common mistakes rarer.
 - A background process a job leaves in its own session keeps running after the job, and if it kept the job's
   stdout or stderr, it gets an error writing to them once the broker stops reading.
 

@@ -439,11 +439,13 @@ def cmd_capabilities(opts, ctx):
                   "approval": "client ddistro/action/decide", "services": list(SERVICE_RESTARTS),
                   "capability_operations": action_operations})
     if live_run:
-        # General commands on the LIVE distro (not a sandbox); every run is approved, or covered by a session grant.
+        # General commands on the LIVE distro (not a sandbox); every run is approved or covered by a session grant, or,
+        # with live_run_auto, starts at once when declared routine and not flagged destructive (see live_run.automatic).
         tools.append({"name": "ddistro_run", "mutates": True, "live": True, "requires": "features.live_run",
                       "declared_when": "initialize capabilities.ddistroActions [\"live_run\"]",
                       "operations": ["run", "status", "output", "cancel", "list"],
-                      "approval": "client ddistro/action/decide approve|approve_session|cancel with digest"})
+                      "approval": "client ddistro/action/decide approve|approve_session|cancel with digest",
+                      "automatic_when": "initialize capabilities.ddistroActions [\"live_run\", \"live_run_auto\"]"})
     data = {
         "commands": [
             {"name": "version", "mutates": False}, {"name": "capabilities", "mutates": False},
@@ -546,6 +548,13 @@ def cmd_capabilities(opts, ctx):
                                   "proposal_seconds": 600, "grant": "session_only",
                                   "grant_scope": "account_network_pairs", "grant_scopes_combine": False,
                                   "revoke": "ddistro/run/revoke"},
+                     # With live_run_auto the model declares risk per run: routine runs start without a card;
+                     # destructive, undeclared and pattern-flagged runs need approve of the exact request (no grant).
+                     "automatic": {"capability": "live_run_auto", "risk": ["routine", "destructive"],
+                                   "routine": "runs_without_prompt", "destructive": "exact_request_confirmation",
+                                   "undeclared": "exact_request_confirmation",
+                                   "flagged": "exact_request_confirmation", "flag_check": "pattern_backstop",
+                                   "unknown_risk": "refused", "grants": False},
                      "limits": {"code_bytes": 128 * 1024, "timeout_seconds": [1, 3600], "default_timeout_seconds": 300,
                                 "wait_seconds": [0, 60], "running_jobs": 4, "kept_jobs": 32, "ring_chars": 512 * 1024,
                                 "turn_calls": 32},
