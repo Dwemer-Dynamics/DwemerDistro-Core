@@ -558,6 +558,17 @@ ensure_pgvector() {
     "$helper" >/dev/null || fail "Portable pgvector setup failed."
 }
 
+# Install, repair and update deploy and migrate PHP code, so they require the fixed shared
+# PHP runtime first. The helper does no APT or network work when PHP is already fixed.
+require_php_security() {
+    local helper="/usr/local/bin/ensure_php_security"
+    if [ ! -x "$helper" ]; then
+        helper="/home/dwemer/dwemerdistro/bin/ensure_php_security"
+    fi
+    [ -x "$helper" ] || fail "PHP security helper is unavailable. Update DwemerDistro first."
+    "$helper" || fail "The PHP security update is incomplete; $PRODUCT was not changed."
+}
+
 ensure_database_role() {
     local role_exists
 
@@ -1467,8 +1478,9 @@ case "$COMMAND" in
         done
         require_root "$COMMAND" "$PRODUCT" --branch "$BRANCH_CHOICE"
         acquire_operation_lock
-        start_postgres
         BRANCH=$(resolve_branch "$BRANCH_CHOICE") || exit $?
+        require_php_security
+        start_postgres
         case "$COMMAND" in
             install) install_product "$BRANCH" ;;
             update) update_product "$BRANCH" ;;
