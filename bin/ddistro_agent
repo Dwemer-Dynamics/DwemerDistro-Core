@@ -180,7 +180,13 @@ TOOL_SPEC = {
                    "allowlisted log), health (bounded local checks), performance (bounded local timings, host load, and "
                    "recent Herika request stage timings; not provider latency or time to first token), model_options "
                    "(CHIM profiles with each role's connector id, and the existing LLM connectors), update_check (local "
-                   "blockers to a server update; the network is not checked). It cannot change, repair, or update anything.",
+                   "blockers to a server update; the network is not checked). It cannot change, repair, or update anything. "
+                   "Before judging whether a server, component or port is up, take what is configured here and where it "
+                   "listens from inventory, status and health (they read ddistro_server's registry, the shared component "
+                   "catalog and /etc/dwemerdistro_services.conf); Apache's own listeners are the Listen lines of "
+                   "/etc/apache2/ports.conf. Never assume a default port: probe the endpoints actually configured there and "
+                   "listening, since ports differ between installs and a failed check of an unconfigured port proves "
+                   "nothing.",
     "inputSchema": {"type": "object", "additionalProperties": False, "required": ["operation"], "properties": {
         "operation": {"type": "string", "enum": list(TOOL_OPERATIONS)},
         "product": {"type": "string", "enum": list(TOOL_PRODUCTS),
@@ -978,17 +984,19 @@ RUN_SPEC = {
                 "description": "run only: absolute working folder, default the account's home"},
         "network": {"type": "boolean", "description": "run only: default false (no network at all)"},
         "timeout_seconds": {"type": "integer", "minimum": RUN_TIMEOUT[0], "maximum": RUN_TIMEOUT[1],
-                            "description": "run only: hard limit, default 300; package installs may need 1800"},
+                            "description": "run only: hard limit, default %d; package installs may need 1800"
+                                           % RUN_DEFAULT_TIMEOUT},
         "database": {"type": "string", "maxLength": 63, "description": "run with psql only: the database to open"},
         "reason": {"type": "string", "maxLength": ACTION_REASON_CHARS,
                    "description": "run only (required): one plain sentence shown to the user: what this does and why"},
         "job_id": {"type": "string", "maxLength": 32, "description": "status/output/cancel (required)"},
         "wait_seconds": {"type": "integer", "minimum": RUN_WAIT[0], "maximum": RUN_WAIT[1],
-                         "description": "run/status: wait up to this long for the job to finish, default 20"},
+                         "description": "run/status: wait up to this long for the job to finish, default %d"
+                                        % RUN_DEFAULT_WAIT},
         "offset": {"type": "integer", "minimum": 0,
                    "description": "output only: first character to return (output.from/to of earlier replies)"},
         "max_chars": {"type": "integer", "minimum": RUN_PAGE_CHARS[0], "maximum": RUN_PAGE_CHARS[1],
-                      "description": "output only: default 24576"}}},
+                      "description": "output only: default %d" % RUN_REPLY_CHARS}}},
 }
 RUN_HINTS = {
     "running": "the job is still running; call status with this job_id and wait_seconds to wait for it",
@@ -1055,14 +1063,44 @@ RUN_RECOVERY_TEXT = (" recovery lists this chat's recorded jobs, including ones 
                      "unverified claim and does not verify, back up or undo anything. Never store secrets in it.")
 
 
+def run_limits():
+    """ddistro_run's operational limits as the model sees them (tool description and list replies), taken from the
+    constants that enforce them, so the two cannot drift."""
+    return {"timeout_seconds": list(RUN_TIMEOUT), "default_timeout_seconds": RUN_DEFAULT_TIMEOUT,
+            "wait_seconds": list(RUN_WAIT), "default_wait_seconds": RUN_DEFAULT_WAIT,
+            "running_jobs": RUN_MAX_RUNNING, "kept_jobs": RUN_MAX_JOBS, "turn_calls": RUN_TURN_CALLS,
+            "session_tool_calls": TOOL_SESSION_CALLS, "ring_chars": RUN_RING_CHARS, "reply_tail_chars": RUN_REPLY_CHARS,
+            "output_page_chars": {"default": RUN_REPLY_CHARS, "max": RUN_PAGE_CHARS[1]}, "code_bytes": RUN_CODE_BYTES,
+            "stdin": "empty", "pty": False, "jobs": "session_bound"}
+
+
+def run_limits_text():
+    """The limits sentence appended to every ddistro_run description."""
+    return (" Limits: timeout_seconds %d-%d (default %d); at most %d jobs running and %d kept per session (the oldest "
+            "finished are forgotten); %d ddistro_run calls per turn and %d assistant tool calls per session; a job keeps "
+            "only its newest %d characters of output; wait_seconds %d-%d (default %d); a reply holds a %d character tail "
+            "and output pages %d characters by default (at most %d). There is no terminal: stdin is empty and nothing "
+            "gets a PTY, so a prompt fails instead of waiting. Jobs belong to this session: its end stops each running "
+            "job and whatever remains in its process group, and a new session cannot reach their job_ids; a service "
+            "deliberately detached with its init script or setsid is outside that group and keeps running. list also "
+            "returns these limits. To check a service, first read where it is configured to listen with ddistro_read "
+            "(inventory, status, health; Apache's Listen lines in /etc/apache2/ports.conf) and probe those actual "
+            "endpoints instead of assuming a default port." % (
+                RUN_TIMEOUT[0], RUN_TIMEOUT[1], RUN_DEFAULT_TIMEOUT, RUN_MAX_RUNNING, RUN_MAX_JOBS, RUN_TURN_CALLS,
+                TOOL_SESSION_CALLS, RUN_RING_CHARS, RUN_WAIT[0], RUN_WAIT[1], RUN_DEFAULT_WAIT, RUN_REPLY_CHARS,
+                RUN_REPLY_CHARS, RUN_PAGE_CHARS[1]))
+
+
 def run_tool_spec(automatic, recovery):
-    """The ddistro_run declaration: exactly RUN_SPEC or RUN_AUTO_SPEC unless task_recovery was negotiated."""
+    """The ddistro_run declaration: RUN_SPEC or RUN_AUTO_SPEC with the limits sentence, plus the recovery operations
+    when task_recovery was negotiated."""
     base = RUN_AUTO_SPEC if automatic else RUN_SPEC
+    description = base["description"] + run_limits_text()
     if not recovery:
-        return base
+        return dict(base, description=description)
     properties = dict(base["inputSchema"]["properties"], **RUN_RECOVERY_PROPERTIES)
     properties["operation"] = {"type": "string", "enum": list(RUN_OPERATIONS + RECOVERY_OPERATIONS)}
-    return dict(base, description=base["description"] + RUN_RECOVERY_TEXT,
+    return dict(base, description=description + RUN_RECOVERY_TEXT,
                 inputSchema=dict(base["inputSchema"], properties=properties))
 
 
@@ -4279,7 +4317,8 @@ class Broker:
                     with self.state_lock:
                         jobs = [job for job in self.jobs.values() if job.thread == thread_id]
                     self._run_reply(request_id, {"tool": RUN_TOOL, "operation": "list",
-                                                 "jobs": [self._run_view(job, 0) for job in jobs[-RUN_MAX_JOBS:]]}, True)
+                                                 "jobs": [self._run_view(job, 0) for job in jobs[-RUN_MAX_JOBS:]],
+                                                 "limits": run_limits()}, True)
                     return
                 allowed = {"status": ("operation", "job_id", "wait_seconds"), "cancel": ("operation", "job_id"),
                            "output": ("operation", "job_id", "offset", "max_chars")}[operation]

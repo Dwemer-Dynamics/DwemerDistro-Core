@@ -541,7 +541,7 @@ def cmd_capabilities(opts, ctx):
                      "interpreters": ["bash", "python3", "php", "psql"], "default_account": "dwemer",
                      "accounts": "any_local_account_except_ddagent", "root": "full_distro_trust",
                      "non_root": "no_new_privs", "network": {"default": False, "off": "empty_network_namespace",
-                                                             "on": "host_network"},
+                                                             "on": "host_network", "dns": "host_resolver"},
                      "masked": ["/mnt", "/run/WSL", "/init", "/var/lib/dwemerdistro/assistant"],
                      "code_transport": "sealed_fd", "stdin": "empty",
                      "approval": {"decisions": ["approve", "approve_session", "cancel"], "binds": "digest",
@@ -555,9 +555,13 @@ def cmd_capabilities(opts, ctx):
                                    "undeclared": "exact_request_confirmation",
                                    "flagged": "exact_request_confirmation", "flag_check": "pattern_backstop",
                                    "unknown_risk": "refused", "grants": False},
+                     # The same values as ddistro_agent run_limits(), which the broker enforces and the model is told.
                      "limits": {"code_bytes": 128 * 1024, "timeout_seconds": [1, 3600], "default_timeout_seconds": 300,
-                                "wait_seconds": [0, 60], "running_jobs": 4, "kept_jobs": 32, "ring_chars": 512 * 1024,
-                                "turn_calls": 32},
+                                "wait_seconds": [0, 60], "default_wait_seconds": 20, "running_jobs": 4,
+                                "kept_jobs": 32, "ring_chars": 512 * 1024, "turn_calls": 32, "session_tool_calls": 256,
+                                "reply_tail_chars": 24 * 1024,
+                                "output_page_chars": {"default": 24 * 1024, "max": 48 * 1024},
+                                "stdin": "empty", "pty": False, "jobs": "session_bound"},
                      # With task_recovery every job is journaled per task before it starts and at each outcome; see
                      # ASSISTANT_RUNTIME.md "Task recovery journal".
                      "recovery": {"capability": "task_recovery", "version": 1, "requires": "live_run",

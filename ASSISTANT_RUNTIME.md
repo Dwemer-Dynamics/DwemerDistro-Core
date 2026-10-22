@@ -605,7 +605,12 @@ tool (`RUN_SPEC`). It is its own tool, not a `ddistro_action` operation. `ddistr
   session, `risk` (`routine` or `destructive`; any other value is refused and nothing runs); it is not part of the
   request bytes or digest.
 - `status` (`job_id`, `wait_seconds`), `output` (`job_id`, `offset`, `max_chars` up to 48 KiB), `cancel`
-  (`job_id`), `list`. A job is visible only to the thread that started it.
+  (`job_id`), `list` (this thread's jobs and `limits`). A job is visible only to the thread that started it.
+
+The declared description ends with a limits sentence built by `run_limits_text()` from the enforcing constants
+(timeout, running and kept jobs, per-turn and per-session calls, output ring, wait, reply tail and page size, empty
+stdin and no PTY, session-bound jobs) and tells the model to read a service's configured port from `ddistro_read`
+(inventory, status, health) rather than assume one; `list` returns the same values as `limits` (`run_limits()`).
 
 **Approval.** Without `live_run_auto` and with no covering grant, the broker sends `ddistro/action/proposed` with `action: "live_run"`, an
 impact text (root: full trust), `decisions: ["approve", "approve_session", "cancel"]`, and `change`: the exact
@@ -669,7 +674,14 @@ stdin. The root supervisor:
 - forks the command, which gets a private mount namespace in which `/mnt` (Windows drives, WSLg), `/run/WSL`
   (interop), `/init` and `/var/lib/dwemerdistro/assistant` (the Codex sign-in, memory, receipts, task and thread
   state) are hidden, and, with `network: false`, an empty network namespace with only its own loopback (no
-  internet, no TCP to local services; Unix sockets such as PostgreSQL's work). These masks prevent accidents only:
+  internet, no TCP to local services; Unix sockets such as PostgreSQL's work). With `network: true`, when
+  `/etc/resolv.conf` is a link into a masked directory (WSL links it to `/mnt/wsl/resolv.conf`), the supervisor
+  first reads that root-owned, not group- or other-writable regular file (at most 32 KiB, no link followed at the
+  last step) and writes only its `nameserver`, `search`, `domain`, `options` and `sortlist` lines to the same path
+  inside the mask, which is then made read-only; nothing else of the masked directory appears, the host file is
+  unchanged, and a regular `/etc/resolv.conf` or a link elsewhere is left as it is. If that file is unusable the
+  mask stays empty and name lookups fail as before; `started` reports the copied path as `resolver` (or null).
+  With `network: false` nothing is copied, so the canary's empty `/mnt` still holds. These masks prevent accidents only:
   a root command can undo them. Product configuration is not hidden, so it can be edited;
 - drops to the account (its groups, uid and gid) with no_new_privs unless it is root, so sudo, su and other setuid
   programs cannot raise a non-root run; root keeps every capability;

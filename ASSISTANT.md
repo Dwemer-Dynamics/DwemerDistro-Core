@@ -105,7 +105,8 @@ root-owned file, and the passing attestation records `live_run_isolation: true` 
 digest equal to that file now. `capabilities.live_run` gives `available`, `reason` (`foundations_unavailable`,
 `run_helper_missing`, `run_helper_untrusted`, `attestation_invalid`, `live_run_unverified`, `run_digest_stale`)
 and static facts: interpreters, default account, network modes, masked paths, approval decisions, grant scope
-and limits. Only while it is true does `assistant_tools.tools` list `ddistro_run`. It runs approved commands on
+and limits. `live_run.limits` holds the same values as the broker's `run_limits()` (the ones it enforces, states in
+the `ddistro_run` description and returns from `list`). Only while it is true does `assistant_tools.tools` list `ddistro_run`. It runs approved commands on
 the LIVE distro, not in a sandbox; root is full trust. `live_run.automatic` describes the optional `live_run_auto`
 client capability: runs the model declares routine start without a prompt, while destructive, undeclared and
 pattern-flagged runs always need the user's confirmation of the exact request and are never covered by a grant. See
