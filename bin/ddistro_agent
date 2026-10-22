@@ -953,6 +953,13 @@ RUN_BACKSTOP_SECONDS = 15
 RUN_DRAIN_SECONDS = 1.0
 RUN_FINAL_STATES = ("exited", "timed_out", "cancelled", "killed", "unknown")
 RUN_UNSTARTED_STATES = ("refused", "not_started", "busy")
+# Why run code must not be used to (re)start services: isolate() gives every run a private, non-propagating mount view
+# (and, without network, an empty network namespace) that whatever it detaches keeps.
+RUN_PRIVATE_VIEW = ("a service started from run code (init script, setsid or nohup) keeps the run's private view (no "
+                    "/mnt, mounts that do not propagate and, with network false, an empty network), so it may run but "
+                    "be unreachable")
+RUN_RESTART_ROUTE = (" Restart Apache with ddistro_action propose_restart (or propose_service) when offered, never from "
+                     "run code.")
 RUN_SPEC = {
     "type": "function", "name": RUN_TOOL,
     "description": "Runs code on the LIVE DwemerDistro (the real WSL Linux: live files, services and databases), not a "
@@ -972,7 +979,7 @@ RUN_SPEC = {
                    "to wait more, output to page older text, cancel to stop it. exit_code 0 only means the process "
                    "exited 0 (succeeded), not that the change is verified. Never rerun a write whose outcome is "
                    "unknown or cancelled without checking first. Processes left in the command's process group are "
-                   "stopped when it ends; start services with their init script or setsid and redirect their output.",
+                   "stopped when it ends; %s.%s" % (RUN_PRIVATE_VIEW, RUN_RESTART_ROUTE),
     "inputSchema": {"type": "object", "additionalProperties": False, "required": ["operation"], "properties": {
         "operation": {"type": "string", "enum": list(RUN_OPERATIONS)},
         "interpreter": {"type": "string", "enum": list(RUN_INTERPRETERS), "description": "run only (required)"},
@@ -1036,8 +1043,7 @@ RUN_AUTO_SPEC = {
                    "and wait_seconds to wait more, output to page older text, cancel to stop it. exit_code 0 only means "
                    "the process exited 0 (succeeded), not that the change is verified. Never rerun a write whose "
                    "outcome is unknown or cancelled without checking first. Processes left in the command's process "
-                   "group are stopped when it ends; start services with their init script or setsid and redirect their "
-                   "output.",
+                   "group are stopped when it ends; %s.%s" % (RUN_PRIVATE_VIEW, RUN_RESTART_ROUTE),
     "inputSchema": {"type": "object", "additionalProperties": False, "required": ["operation"], "properties": dict(
         RUN_SPEC["inputSchema"]["properties"],
         risk={"type": "string", "enum": list(RUN_RISKS),
@@ -1063,6 +1069,47 @@ RUN_RECOVERY_TEXT = (" recovery lists this chat's recorded jobs, including ones 
                      "unverified claim and does not verify, back up or undo anything. Never store secrets in it.")
 
 
+# live_service (with live_run and live_run_auto, and only when ddistro service list answers): operation service restarts
+# or checks the code-owned apache or a root-registered service through the trusted `ddistro service <verb> <id>` in the
+# distro's own namespaces. Nothing from the request becomes a command, path or argument but a checked id and a verb;
+# ddistro resolves and validates the id again. A restart starts at once without a card (service control is routine);
+# stop, start, PostgreSQL and unregistered targets are refused before anything runs. See ASSISTANT_RUNTIME.md
+# "Service operation".
+RUN_SERVICE_CAPABILITY = "live_service"
+RUN_SERVICE_OPERATION = "service"
+RUN_SERVICE_VERBS = ("restart", "status", "list")
+# Mirrors ddistro SERVICE_ID.
+RUN_SERVICE_ID = re.compile(r"^[a-z][a-z0-9-]{1,31}\Z")
+RUN_SERVICE_PROPERTIES = {
+    "target": {"type": "string", "maxLength": 32,
+               "description": "service restart/status (required): apache or a registered id from verb list"},
+    "verb": {"type": "string", "enum": list(RUN_SERVICE_VERBS),
+             "description": "service only (required): restart (runs at once), status or list (read-only)"}}
+RUN_SERVICE_ROUTE = (" Restart or check services with operation service (verb list, status or restart, target, "
+                     "reason), never from run code: it runs the trusted DwemerDistro service control in the distro's "
+                     "own view at once, without asking, and verifies a new process in the distro's own mount and network namespaces and "
+                     "its ports (an HTTP check, if any, proves only that it answers, not that it is healthy). Targets "
+                     "are apache (shared: every server pauses for a few seconds) and the root-registered services verb "
+                     "list returns with their label and impact. stop, start and PostgreSQL are not offered, and "
+                     "a service that is not registered needs root to register a trusted init wrapper first; do not "
+                     "start it yourself from run code.")
+RUN_SERVICE_HINTS = {
+    "verified": "a new process runs in the distro's own view and its ports answer; that is not application health",
+    "failed": "the restart ran but was not verified; report the failed checks and do not retry automatically",
+    "running": "the process is in the distro's own view and its ports answer; that is not application health",
+    "degraded": ("the process is running but a check failed; namespace failed means it is in a private run view and "
+                 "unreachable: restart it with operation service"),
+    "not_running": "no live process behind its pid file",
+    "unchecked": "the process runs and its ports answer, but its namespaces could not be read; not verified",
+    "refused": "nothing ran; fix the request named in the message",
+    "unsupported": ("nothing ran: only apache and root-registered services are supported; an unregistered service needs "
+                    "root to register a trusted init wrapper. Do not start it from run code"),
+    "busy": "nothing ran: another DwemerDistro change holds the maintenance lock; try again later",
+    "not_executed": "nothing ran; report the reason",
+    "unknown": "the restart may have run; check with verb status before doing anything else",
+}
+
+
 def run_limits():
     """ddistro_run's operational limits as the model sees them (tool description and list replies), taken from the
     constants that enforce them, so the two cannot drift."""
@@ -1081,8 +1128,9 @@ def run_limits_text():
             "only its newest %d characters of output; wait_seconds %d-%d (default %d); a reply holds a %d character tail "
             "and output pages %d characters by default (at most %d). There is no terminal: stdin is empty and nothing "
             "gets a PTY, so a prompt fails instead of waiting. Jobs belong to this session: its end stops each running "
-            "job and whatever remains in its process group, and a new session cannot reach their job_ids; a service "
-            "deliberately detached with its init script or setsid is outside that group and keeps running. list also "
+            "job and whatever remains in its process group, and a new session cannot reach their job_ids; a process "
+            "deliberately detached (setsid or an init script) is outside that group and keeps running, but still in "
+            "the run's private view. list also "
             "returns these limits. To check a service, first read where it is configured to listen with ddistro_read "
             "(inventory, status, health; Apache's Listen lines in /etc/apache2/ports.conf) and probe those actual "
             "endpoints instead of assuming a default port." % (
@@ -1091,17 +1139,30 @@ def run_limits_text():
                 RUN_REPLY_CHARS, RUN_PAGE_CHARS[1]))
 
 
-def run_tool_spec(automatic, recovery):
+def run_tool_spec(automatic, recovery, service=False):
     """The ddistro_run declaration: RUN_SPEC or RUN_AUTO_SPEC with the limits sentence, plus the recovery operations
-    when task_recovery was negotiated."""
+    when task_recovery was negotiated and the service operation when live_service was (automatic sessions only).
+    Without live_service the declaration is exactly the earlier one."""
     base = RUN_AUTO_SPEC if automatic else RUN_SPEC
     description = base["description"] + run_limits_text()
-    if not recovery:
+    service = service and automatic
+    if not recovery and not service:
         return dict(base, description=description)
-    properties = dict(base["inputSchema"]["properties"], **RUN_RECOVERY_PROPERTIES)
-    properties["operation"] = {"type": "string", "enum": list(RUN_OPERATIONS + RECOVERY_OPERATIONS)}
-    return dict(base, description=description + RUN_RECOVERY_TEXT,
-                inputSchema=dict(base["inputSchema"], properties=properties))
+    properties = dict(base["inputSchema"]["properties"])
+    operations = RUN_OPERATIONS
+    if recovery:
+        properties.update(RUN_RECOVERY_PROPERTIES)
+        operations += RECOVERY_OPERATIONS
+        description += RUN_RECOVERY_TEXT
+    if service:
+        properties.update(RUN_SERVICE_PROPERTIES)
+        properties["reason"] = dict(properties["reason"], description=(
+            "run and service (required): one plain sentence shown to the user: what this changes and why; for "
+            "destructive, exactly what is deleted, reset or overwritten"))
+        operations += (RUN_SERVICE_OPERATION,)
+        description = description.replace(RUN_RESTART_ROUTE, RUN_SERVICE_ROUTE)
+    properties["operation"] = {"type": "string", "enum": list(operations)}
+    return dict(base, description=description, inputSchema=dict(base["inputSchema"], properties=properties))
 
 
 # Conservative backstop for automatic runs: code matching any of these never runs without the user's confirmation, even
@@ -3009,6 +3070,8 @@ class Broker:
         self.live_run = False
         # live_run_auto: routine runs start without a card; never set without live_run.
         self.live_run_auto = False
+        # live_service: operation service on the automatic ddistro_run; never set without live_run_auto.
+        self.live_service = False
         self.redact = redact or run_redactor(None)
         self.spawn = spawn
         self.run_lock = run_lock
@@ -3264,7 +3327,8 @@ class Broker:
                 raise PolicyError(-32602, "invalid parameter: capabilities.experimentalApi")
             self.experimental = experimental is True
             actions = capabilities.pop("ddistroActions", None) if isinstance(capabilities, dict) else None
-            known = tuple(ACTION_OPERATIONS) + (RUN_CAPABILITY, RUN_AUTO_CAPABILITY, RECOVERY_CAPABILITY)
+            known = tuple(ACTION_OPERATIONS) + (RUN_CAPABILITY, RUN_AUTO_CAPABILITY, RECOVERY_CAPABILITY,
+                                                RUN_SERVICE_CAPABILITY)
             if actions is not None and (not isinstance(actions, list) or len(actions) > len(known)
                                         or any(not isinstance(name, str) or name not in known for name in actions)
                                         or len(set(actions)) != len(actions)):
@@ -3277,8 +3341,12 @@ class Broker:
             # task_recovery adds the recovery and checkpoint operations to ddistro_run and ddistro/task/recovery; it
             # needs live_run and a journal, and an older client never asks, so its declaration is unchanged.
             self.recovery = self.live_run and RECOVERY_CAPABILITY in actions and self.journal is not None
+            # live_service adds operation service to the automatic tool; like change_files it is dropped silently
+            # where this installation cannot honor it (ddistro service list does not answer).
+            self.live_service = (self.live_run_auto and RUN_SERVICE_CAPABILITY in actions
+                                 and self._service_list()[0])
             actions = [name for name in actions or ()
-                       if name not in (RUN_CAPABILITY, RUN_AUTO_CAPABILITY, RECOVERY_CAPABILITY)]
+                       if name not in (RUN_CAPABILITY, RUN_AUTO_CAPABILITY, RECOVERY_CAPABILITY, RUN_SERVICE_CAPABILITY)]
             # Codex never sees this broker-only field; the action needs the dynamic tools experimentalApi enables.
             self.actions = frozenset(actions) if self.experimental else frozenset()
             # File changes need the trusted access policy as the session started; otherwise they are not offered.
@@ -3313,7 +3381,7 @@ class Broker:
                                              if EXPLORE_CAPABILITY in self.tools else [])
                                           + ([EXEC_SPEC] if EXEC_CAPABILITY in self.tools else [])
                                           + ([action_spec(self.actions)] if self.actions else [])
-                                          + ([run_tool_spec(self.live_run_auto, self.recovery)]
+                                          + ([run_tool_spec(self.live_run_auto, self.recovery, self.live_service)]
                                              if self.live_run else []))
             self._cancel_proposals(None, "cancelled")
             return enforce_sandbox(params)
@@ -3370,6 +3438,15 @@ class Broker:
             self._require_thread(params)
             return params
         raise PolicyError(-32601, "method not available in DwemerDistro assistant: " + method[:64])
+
+    def _service_list(self):
+        """(ok, payload) of ddistro service list; ok only for the expected shape."""
+        try:
+            ok, payload = self.run_tool(["service", "list"])
+        except (OSError, ValueError):
+            return False, None
+        ok = ok and isinstance(payload, dict) and isinstance(payload.get("services"), list)
+        return ok, payload if ok else None
 
     def _checkout(self):
         """True when ddistro_explore offers checkout: change_files negotiated with the trusted access policy."""
@@ -4299,11 +4376,18 @@ class Broker:
                     owned = isinstance(thread_id, str) and thread_id in self.threads
                 if not owned:
                     raise PolicyError(-32602, "threadId does not belong to this task")
-                operations = RUN_OPERATIONS + (RECOVERY_OPERATIONS if self.recovery else ())
+                operations = (RUN_OPERATIONS + (RECOVERY_OPERATIONS if self.recovery else ())
+                              + ((RUN_SERVICE_OPERATION,) if self.live_service else ()))
                 if operation not in operations:
                     raise PolicyError(-32602, "operation must be one of " + ", ".join(operations))
                 if operation in RECOVERY_OPERATIONS:
                     self._run_reply(request_id, self._recovery_call(operation, arguments, thread_id, turn_id), True)
+                    return
+                if operation == RUN_SERVICE_OPERATION:
+                    if not isinstance(turn_id, str) or not 0 < len(turn_id) <= 128:
+                        raise PolicyError(-32602, "turnId is required")
+                    document = self._service_call(arguments)
+                    self._run_reply(request_id, document, document["state"] in ("verified", "running", "listed"))
                     return
                 if operation == "run":
                     if not isinstance(turn_id, str) or not 0 < len(turn_id) <= 128:
@@ -4338,12 +4422,75 @@ class Broker:
                                 view["state"] == "running" or view["succeeded"])
             except PolicyError as exc:
                 self._run_reply(request_id, {"tool": RUN_TOOL, "operation": operation if operation in
-                                             RUN_OPERATIONS + RECOVERY_OPERATIONS else None, "state": "refused", "started": False,
+                                             RUN_OPERATIONS + RECOVERY_OPERATIONS + (RUN_SERVICE_OPERATION,) else None,
+                                             "state": "refused", "started": False,
                                              "error": {"code": "invalid_arguments", "message": exc.message}}, False)
         finally:
             with self.state_lock:
                 self.tool_jobs.discard(threading.current_thread())
             self.run_slots.release()
+
+    def _service_call(self, arguments):
+        """operation service: `ddistro service list|status|restart` with fixed argv (host context, never a run's view).
+        The target is a checked id and ddistro resolves it again; stop, start, PostgreSQL and other targets are refused
+        before anything runs. Like propose_restart, a running restart is not adopted into the session's stoppable runs,
+        because stopping it midway could leave the service down."""
+        reject_unknown(arguments, ("operation", "verb", "target", "reason"))
+        verb, target = arguments.get("verb"), arguments.get("target")
+        memory_value(arguments, "reason", ACTION_REASON_CHARS)
+        document = {"tool": RUN_TOOL, "operation": RUN_SERVICE_OPERATION, "verb": verb if verb in RUN_SERVICE_VERBS
+                    else None, "target": target if isinstance(target, str) and RUN_SERVICE_ID.match(target) else None,
+                    "executed": False, "verified": False}
+        if verb in ("stop", "start") or target in ("postgresql", "components"):
+            why = SERVICE_UNSUPPORTED_VERBS.get(verb) or (SERVICE_POSTGRES_REASON if target == "postgresql"
+                                                          else SERVICE_COMPONENT_REASON)
+            return dict(document, state="unsupported", hint=RUN_SERVICE_HINTS["unsupported"],
+                        error={"code": "unsupported", "message": why})
+        if verb not in RUN_SERVICE_VERBS:
+            raise PolicyError(-32602, "verb must be one of " + ", ".join(RUN_SERVICE_VERBS))
+        if verb == "list":
+            if target is not None:
+                raise PolicyError(-32602, "list takes no target")
+            ok, payload = self._service_list()
+            if not ok:
+                return dict(document, state="not_executed", hint=RUN_SERVICE_HINTS["not_executed"],
+                            error={"code": "failed", "message": "the registered services could not be read"})
+            payload = sanitize(payload)
+            services = [{k: entry.get(k) for k in ("id", "label", "impact", "verbs", "ports") if k in entry}
+                        for entry in payload["services"][:24] if isinstance(entry, dict)]
+            return dict(document, state="listed", services=services, refused=payload.get("refused", [])[:16],
+                        unsupported=payload.get("unsupported"), hint="restart or check one of these ids")
+        if document["target"] is None:
+            raise PolicyError(-32602, "target must be apache or a registered id from verb list")
+        memory_value(arguments, "reason", ACTION_REASON_CHARS)  # required; only the model's own sentence
+        try:
+            ok, payload = self.run_tool(["service", verb, target])
+        except (OSError, ValueError):
+            ok, payload = False, {"code": "failed", "message": "ddistro could not be run"}
+        payload = sanitize(payload) if isinstance(payload, dict) else {}
+        if ok:
+            keys = ("label", "state", "executed", "verified", "checks", "before", "after", "namespace", "impact",
+                    "health", "pid", "started", "verified_at", "output_tail", "captured_at")
+            data = {k: payload[k] for k in keys if k in payload}
+            state = data.get("state") if verb == "status" else ("verified" if payload.get("verified") is True
+                                                                 and payload.get("state") == "verified" else "failed")
+            if state not in RUN_SERVICE_HINTS:
+                state = "unknown"
+            document.update(data)
+            return dict(document, state=state, executed=verb == "restart", verified=state == "verified",
+                        hint=RUN_SERVICE_HINTS[state])
+        code = payload.get("code")
+        if code == "unsupported":
+            state = "unsupported"
+        elif code == "busy":
+            state = "busy"
+        elif verb == "status" or code in ACTION_NOT_RUN_CODES:
+            state = "not_executed"
+        else:
+            # Stopped at its time bound or an unreadable result: the init script may have run, so never "not run".
+            state = "unknown"
+        return dict(document, state=state, executed=None if state == "unknown" else False, hint=RUN_SERVICE_HINTS[state],
+                    error={"code": code or "failed", "message": payload.get("message", "")[:400]})
 
     def _run_job(self, job_id, thread_id):
         """Only a job of this session and of the calling thread; any other id is unknown."""

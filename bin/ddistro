@@ -131,7 +131,9 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
   performance [product]         (bounded local timings now: fixed local HTTP health, PostgreSQL SELECT 1, host load/memory, recent Herika [PERF] records)
   agent serve --task TASK      (root; raw Codex App Server JSONL, no --json envelope)
   memory status|list|search|add|update|forget|reset|export|configure   (root; assistant notes, see ASSISTANT.md)
-  service restart apache       (root; restart, then verify a new process and its ports; see ASSISTANT.md)
+  service restart <service>    (root; apache or a root-registered service: restart, then verify a new process in the
+                               distro's own namespaces and its ports; see ASSISTANT.md)
+  service status <service> | service list   (read-only: process, namespaces, ports; registered services)
   access roots                                   (root; read-only access policy: roots, presence, db/config support)
   files list ROOT [--path P] [--depth 1-3] [--limit N]                    (root; read-only, no links followed)
   files search ROOT [--query TEXT] [--name-glob GLOB] [--path P] [--limit N]   (root; literal, redacted, bounded)
@@ -445,7 +447,10 @@ def cmd_capabilities(opts, ctx):
                       "declared_when": "initialize capabilities.ddistroActions [\"live_run\"]",
                       "operations": ["run", "status", "output", "cancel", "list"],
                       "approval": "client ddistro/action/decide approve|approve_session|cancel with digest",
-                      "automatic_when": "initialize capabilities.ddistroActions [\"live_run\", \"live_run_auto\"]"})
+                      "automatic_when": "initialize capabilities.ddistroActions [\"live_run\", \"live_run_auto\"]",
+                      "capability_operations": {"live_service": ["service"]},
+                      "service_when": "initialize capabilities.ddistroActions [\"live_run\", \"live_run_auto\", "
+                                      "\"live_service\"]"})
     data = {
         "commands": [
             {"name": "version", "mutates": False}, {"name": "capabilities", "mutates": False},
@@ -479,6 +484,8 @@ def cmd_capabilities(opts, ctx):
             # Root measures the PostgreSQL SELECT 1; other users get it skipped (requires_root).
             {"name": "performance", "arguments": ["[product]"], "mutates": False},
             {"name": "service restart", "arguments": ["<service>"], "mutates": True, "requires_root": True},
+            {"name": "service status", "arguments": ["<service>"], "mutates": False},
+            {"name": "service list", "mutates": False},
             {"name": "exec", "flags": ["--task", "--request-json"], "mutates": False, "requires_root": True},
             {"name": "operations targets", "mutates": False},
             {"name": "operations preview", "flags": ["--target", "--verb", "--branch", "--task", "--thread"],
@@ -530,7 +537,9 @@ def cmd_capabilities(opts, ctx):
                      "assistant_foundations": foundations,
                      # ddistro_run live commands: foundations plus the attested ddistro_run canary for the bytes
                      # installed now; the reason is in live_run.
-                     "live_run": live_run},
+                     "live_run": live_run,
+                     # ddistro_run operation service (capability live_service, with live_run_auto); see live_run.service.
+                     "live_service": live_run},
         "assistant_foundations": {"available": foundations, "reason": foundations_reason,
                                   "requires": ["ddistro_agent", "ddistro_access", "ddistro_exec", "ddistro_changes",
                                                "agent status installed", "agent status probe_passed"]},
@@ -555,6 +564,17 @@ def cmd_capabilities(opts, ctx):
                                    "undeclared": "exact_request_confirmation",
                                    "flagged": "exact_request_confirmation", "flag_check": "pattern_backstop",
                                    "unknown_risk": "refused", "grants": False},
+                     # With live_run_auto and live_service, operation service restarts or checks the code-owned apache or
+                     # a root-registered service through ddistro service in the distro's own namespaces, at once and
+                     # without a card; nothing from the request becomes a command, path or argument but the id and verb.
+                     "service": {"capability": "live_service", "requires": ["live_run", "live_run_auto"],
+                                 "operation": "service", "verbs": ["restart", "status"], "targets": "service list",
+                                 "restart": "runs_without_prompt", "context": "host_distro_namespaces",
+                                 "verification": ["command", "new_process", "namespace.mnt", "namespace.net", "ports",
+                                                  "http_transport_optional"],
+                                 "health": "not_checked", "refused": ["stop", "start", "postgresql", "components",
+                                                                      "unregistered"],
+                                 "turn_calls": "shared_with_run", "journaled": False},
                      # The same values as ddistro_agent run_limits(), which the broker enforces and the model is told.
                      "limits": {"code_bytes": 128 * 1024, "timeout_seconds": [1, 3600], "default_timeout_seconds": 300,
                                 "wait_seconds": [0, 60], "default_wait_seconds": 20, "running_jobs": 4,
@@ -591,9 +611,17 @@ def cmd_capabilities(opts, ctx):
                            "receipts": {"max": MODEL_RECEIPTS_MAX, "days": MODEL_RECEIPT_DAYS}, "lock": "maintenance"},
         "update_check": {"scope": "local_only", "network": False, "remote_changes_checked": False,
                          "assessments": list(UPDATE_CHECK_ASSESSMENTS), "max_paths": UPDATE_CHECK_PATHS},
+        # services stays the code-owned set; registered ids come from service list (see ASSISTANT.md "Service restart").
         "service_restart": {"services": {name: {"label": spec["label"], "impact": spec["impact"]}
                                          for name, spec in SERVICE_RESTARTS.items()},
-                            "verification": ["command", "new_process", "ports"], "lock": "maintenance"},
+                            "verification": ["command", "new_process", "ports"], "lock": "maintenance",
+                            "commands": ["service restart", "service status", "service list"],
+                            "namespace_checks": ["namespace.mnt", "namespace.net"], "namespace_reference": "pid_1",
+                            "http_check": "transport_only_any_status", "health": "not_checked",
+                            "registry": {"dir": SERVICE_REGISTRY_DIR, "max": SERVICE_REGISTRY_MAX, "file_bytes": 4096,
+                                         "owner": "root", "schema": 1, "reserved": list(SERVICE_RESERVED),
+                                         "code_owned": list(SERVICE_RESTARTS), "postgresql": "unsupported",
+                                         "pidfile": "/run/", "ports": [1024, 65535], "max_ports": 8}},
         "agent": {"provider": "codex", "readiness_command": "agent status", "ready_when": ["installed", "probe_passed"]},
         # Configured profile assignments only; which profile an NPC is using is not reported.
         "models": {"products": ["herika"], "scope": "configured_profiles", "roles": [role for role, _ in MODELS_ROLES],
@@ -4129,6 +4157,23 @@ SERVICE_RESTART_TIMEOUT = 60
 SERVICE_VERIFY_SECONDS = 15
 MAINTENANCE_LOCK = "/run/lock/dwemerdistro-maintenance.lock"
 LISTEN_LINE = re.compile(r"^\s*Listen\s+(?:(?:127\.0\.0\.1|0\.0\.0\.0|\[::\]|\*):)?([0-9]{1,5})\s*$", re.M)
+# Root-registered services: one <id>.json per service in a root-owned folder, read as data (never sourced). Each names
+# a trusted root-owned init script that accepts restart, a pid file under /run, the process name and its explicit
+# ports; ddistro adds nothing else to the host-exec allowlist. Apache stays code-owned and PostgreSQL unsupported.
+SERVICE_REGISTRY_DIR = "/etc/dwemerdistro/services.d"
+SERVICE_REGISTRY_MAX = 16
+SERVICE_ID = re.compile(r"^[a-z][a-z0-9-]{1,31}\Z")
+SERVICE_RESERVED = ("apache", "apache2", "postgresql", "postgres", "components")
+SERVICE_SPEC_KEYS = {"schema", "id", "label", "impact", "init", "pidfile", "comm", "ports"}
+SERVICE_INIT = re.compile(r"^/(?:etc/init\.d|usr/local/sbin|usr/local/lib/dwemerdistro)/[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+SERVICE_PIDFILE = re.compile(r"^/run/[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?\.pid\Z")
+SERVICE_COMM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,14}\Z")
+SERVICE_HTTP_PATH = re.compile(r"^/[A-Za-z0-9._~/-]{0,99}\Z")
+SERVICE_TEXT = re.compile(r"^[^\x00-\x1f\x7f]+\Z")
+SERVICE_REFUSED_COMMS = ("apache2", "postgres", "postmaster", "init", "systemd")
+SERVICE_UNREGISTERED = ("Only root-registered services can be restarted or checked here; ask root to register a trusted "
+                        "init wrapper in " + SERVICE_REGISTRY_DIR + ". A service started from run code stays in that "
+                        "run's private view and may be unreachable.")
 
 
 def maintenance_exclusive_fd():
@@ -4175,16 +4220,236 @@ def process_start(pid):
 
 
 def service_ports(spec):
-    text = health_read_small(spec["ports_conf"], health_owners(False)) or ""
-    return sorted({int(port) for port in LISTEN_LINE.findall(text) if 0 < int(port) < 65536})[:8]
+    if "ports" in spec:
+        return list(spec["ports"])
+    text = health_read_small(spec["ports_conf"], health_owners(False))
+    if text is None:
+        raise CliError("unsupported", "Apache's listener configuration could not be read; no restart was attempted.")
+    modules = None
+    if re.search(r"<\s*IfModule\b", text, re.I):
+        code, out, _ = run_helper(["-M"], 10, 64 * 1024, helper="/usr/sbin/apache2ctl")
+        if code != 0:
+            raise CliError("unsupported", "Apache's active modules could not be checked; no restart was attempted.")
+        modules = set(re.findall(r"^\s*(\w+_module)\s+\((?:static|shared)\)", out.data.decode("utf-8", "replace"), re.M))
+        if "core_module" not in modules:
+            raise CliError("unsupported", "Apache returned no usable module list; no restart was attempted.")
+    return apache_listener_ports(text, modules or set())
+
+
+def apache_listener_ports(text, modules):
+    """Resolve Listen directives and nested IfModule blocks; refuse other configuration rather than guess which ports apply."""
+    active, ports = [True], set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        opening = re.fullmatch(r"<IfModule\s+(!?)([A-Za-z0-9_.-]+)\s*>", line, re.I)
+        if opening:
+            negate, name = opening.groups()
+            if name.startswith("mod_") and name.endswith(".c"):
+                name = name[4:-2] + "_module"
+            elif not name.endswith("_module"):
+                raise CliError("unsupported", "Apache uses an unsupported module condition; no restart was attempted.")
+            enabled = name in modules
+            active.append(active[-1] and (not enabled if negate else enabled))
+            continue
+        if re.fullmatch(r"</IfModule\s*>", line, re.I):
+            if len(active) == 1:
+                raise CliError("unsupported", "Apache's module conditions are unbalanced; no restart was attempted.")
+            active.pop()
+            continue
+        match = LISTEN_LINE.fullmatch(line)
+        if not match:
+            raise CliError("unsupported", "Apache's listener configuration needs manual verification; no restart was attempted.")
+        if active[-1]:
+            port = int(match.group(1))
+            if not 0 < port < 65536:
+                raise CliError("unsupported", "Apache has an invalid listener port; no restart was attempted.")
+            ports.add(port)
+    if len(active) != 1 or not ports or len(ports) > 8:
+        raise CliError("unsupported", "Apache's active listeners could not be resolved; no restart was attempted.")
+    return sorted(ports)
+
+
+def service_spec_problem(name, spec, reserved_ports):
+    """None for a registry entry ddistro may restart, else a short reason code; the entry is never partly used."""
+    if (type(spec) is not dict or set(spec) - {"http_path"} != SERVICE_SPEC_KEYS
+            or type(spec.get("schema")) is not int or spec["schema"] != 1):
+        return "bad_shape"
+    if spec["id"] != name:
+        return "id_mismatch"
+    if any(word in name for word in ("postgres", "apache")):
+        return "reserved_id"
+    for key, limit in (("label", 80), ("impact", 300)):
+        if type(spec[key]) is not str or len(spec[key]) > limit or not SERVICE_TEXT.match(spec[key]):
+            return "bad_" + key
+    if type(spec["init"]) is not str or not SERVICE_INIT.match(spec["init"]) or ".." in spec["init"]:
+        return "bad_init"
+    if os.path.basename(spec["init"]).startswith(("apache", "postgres")):
+        return "unsupported_init"
+    if type(spec["pidfile"]) is not str or not SERVICE_PIDFILE.match(spec["pidfile"]) or ".." in spec["pidfile"] \
+            or spec["pidfile"] == SERVICE_RESTARTS["apache"]["pidfile"]:
+        return "bad_pidfile"
+    if type(spec["comm"]) is not str or not SERVICE_COMM.match(spec["comm"]) or spec["comm"] in SERVICE_REFUSED_COMMS:
+        return "bad_comm"
+    ports = spec["ports"]
+    if (type(ports) is not list or not 1 <= len(ports) <= 8
+            or any(type(port) is not int or not 1024 <= port <= 65535 for port in ports)
+            or len(set(ports)) != len(ports)):
+        return "bad_ports"
+    if set(ports) & reserved_ports:
+        return "shared_port"
+    if "http_path" in spec and (type(spec["http_path"]) is not str or not SERVICE_HTTP_PATH.match(spec["http_path"])
+                                or ".." in spec["http_path"]):
+        return "bad_http_path"
+    return None
+
+
+def service_registry():
+    """({id: spec} of valid root-registered services, [{id, reason}] of refused entries). Each file is read through
+    health_read_small: every folder from / and the file itself root-owned and not group/other writable, no link
+    followed, at most 4 KB. A missing folder is an empty registry."""
+    try:
+        names = sorted(os.listdir(SERVICE_REGISTRY_DIR))
+    except OSError:
+        return {}, []
+    # Apache's and PostgreSQL's ports are never claimed by a registered service, so a port check cannot pass for them.
+    # Reserve even conditional Apache ports, without running module discovery for each registry read.
+    apache_text = health_read_small(SERVICE_RESTARTS["apache"]["ports_conf"], health_owners(False)) or ""
+    reserved_ports = {int(port) for port in LISTEN_LINE.findall(apache_text)} | {5432}
+    port = os.environ.get("DDISTRO_POSTGRES_PORT", "")
+    if re.match(r"^[0-9]{1,5}\Z", port):
+        reserved_ports.add(int(port))
+    valid, refused = {}, []
+    for entry in [name for name in names if name.endswith(".json")]:
+        name = entry[:-5]
+        if not SERVICE_ID.match(name):
+            refused.append({"id": clean_line(name)[:40], "reason": "bad_id"})
+            continue
+        if name in SERVICE_RESERVED:
+            refused.append({"id": name, "reason": "reserved_id"})
+            continue
+        if len(valid) >= SERVICE_REGISTRY_MAX:
+            refused.append({"id": name, "reason": "too_many"})
+            continue
+        text = health_read_small(SERVICE_REGISTRY_DIR + "/" + entry, (0,))
+        if text is None:
+            refused.append({"id": name, "reason": "untrusted_or_unreadable"})
+            continue
+        try:
+            spec = json.loads(text, parse_constant=reject_constant)
+        except ValueError:
+            refused.append({"id": name, "reason": "bad_json"})
+            continue
+        problem = service_spec_problem(name, spec, reserved_ports)
+        if problem:
+            refused.append({"id": name, "reason": problem})
+            continue
+        valid[name] = spec
+    return valid, refused
+
+
+def service_spec(name):
+    """The code-owned apache spec or one valid registered spec; anything else is unsupported, with nothing run."""
+    if name in SERVICE_RESTARTS:
+        return SERVICE_RESTARTS[name]
+    if name in OPERATION_UNSUPPORTED_TARGETS:
+        raise CliError("unsupported", f"{name} is not supported: {OPERATION_UNSUPPORTED_TARGETS[name]}.",
+                       {"reason": "unsupported_target", "target": name})
+    registered, refused = service_registry()
+    if name in registered:
+        return registered[name]
+    reason = next((entry["reason"] for entry in refused if entry["id"] == name), "not_registered")
+    raise CliError("unsupported", f"{name} is not a registered service ({reason}). " + SERVICE_UNREGISTERED,
+                   {"reason": "unsupported_target", "target": name, "registry": reason})
+
+
+def service_namespace(pid):
+    """{mnt, net}: passed when the process shares PID 1's (the distro's own) namespace, failed in another one (such as a
+    ddistro_run private view), unknown when it cannot be read. PID 1 is the reference, never ddistro's own view."""
+    result = {}
+    for kind in ("mnt", "net"):
+        try:
+            own, reference = os.readlink(f"/proc/{pid}/ns/{kind}"), os.readlink(f"/proc/1/ns/{kind}")
+        except (OSError, TypeError):
+            result[kind] = "unknown"
+            continue
+        result[kind] = "passed" if own == reference else "failed"
+    return result
+
+
+def service_http(spec, ports):
+    """HTTP transport only: any HTTP status line on the first port passes, 503 included; never application health."""
+    if "http_path" not in spec or not ports:
+        return None
+    status, _, problem = health_http_get(ports[0], spec["http_path"])
+    if status is None:
+        return {"id": "http", "result": "failed", "detail": problem}
+    return {"id": "http", "result": "passed", "detail": f"HTTP {status} answered (transport only, not health)"}
+
+
+def service_view_checks(pid, ports, spec):
+    namespace = service_namespace(pid) if pid else {"mnt": "unknown", "net": "unknown"}
+    # unknown (not readable, for example without root) never counts as passed, so it can never verify a restart.
+    checks = [{"id": "namespace." + kind, "result": namespace[kind],
+               "detail": "the distro's own view" if namespace[kind] == "passed" else
+               ("another namespace (a private run view)" if namespace[kind] == "failed" else "not readable")}
+              for kind in ("mnt", "net")]
+    open_ports = [port for port in ports if health_connect(port)[0]]
+    checks += [{"id": f"port.{port}", "result": "passed" if port in open_ports else "failed"} for port in ports]
+    http = service_http(spec, ports) if open_ports else None
+    if http:
+        checks.append(http)
+    return checks, namespace
+
+
+def cmd_service_list(opts, ctx):
+    registered, refused = service_registry()
+    services = [{"id": "apache", "label": SERVICE_RESTARTS["apache"]["label"], "impact": SERVICE_RESTARTS["apache"]["impact"],
+                 "verbs": ["restart", "status"], "source": "code_owned"}]
+    services += [{"id": name, "label": spec["label"], "impact": spec["impact"], "verbs": ["restart", "status"],
+                  "source": "registry", "ports": spec["ports"]} for name, spec in registered.items()]
+    data = {"schema": 1, "services": services, "refused": refused, "registry": SERVICE_REGISTRY_DIR,
+            "unsupported": {"targets": OPERATION_UNSUPPORTED_TARGETS, "verbs": {"stop": OPERATION_UNSUPPORTED_VERBS["stop"],
+                                                                                "start": OPERATION_UNSUPPORTED_VERBS["start"]}},
+            "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    return data, "\n".join(f"{s['id']:<24} {s['label']}" for s in services)
+
+
+def cmd_service_status(opts, ctx):
+    """Read-only: the process behind the pid file, whether it is in the distro's own view, and which ports answer."""
+    name = opts["service"]
+    spec = service_spec(name)
+    pid, started = service_pid(spec)
+    ports = service_ports(spec)
+    checks, namespace = service_view_checks(pid, ports, spec)
+    if pid is None:
+        checks.insert(0, {"id": "process", "result": "failed", "detail": "no live " + spec["comm"] + " process behind "
+                          + spec["pidfile"]})
+    results = {check["result"] for check in checks}
+    if pid is None:
+        state = "not_running"
+    elif "failed" in results:
+        state = "degraded"
+    elif "unknown" in results:
+        state = "unchecked"
+    else:
+        state = "running"
+    data = {"service": name, "label": spec["label"], "action": "status", "executed": False, "state": state,
+            "pid": pid, "started": started, "namespace": namespace, "checks": checks, "health": "not_checked",
+            "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    return data, f"{spec['label']}: {data['state']}"
 
 
 def cmd_service_restart(opts, ctx):
     name = opts["service"]
-    spec = SERVICE_RESTARTS[name]
     if os.geteuid() != 0:
         raise CliError("permission_denied", "service restart must run as root. ddistro never elevates by itself.")
+    if any(result != "passed" for result in service_namespace(os.getpid()).values()):
+        raise CliError("unsupported", "Service restarts must run in the distro's own mount and network namespaces; nothing ran.")
+    spec = service_spec(name)
     check_helper(spec["init"])
+    ports = service_ports(spec)  # Resolve configuration before an init script can change anything.
     lock = maintenance_exclusive_fd()
     try:
         before = service_pid(spec)
@@ -4199,7 +4464,6 @@ def cmd_service_restart(opts, ctx):
             output_tail = (error.details.get("stdout_tail", [])[-10:] + error.details.get("stderr_tail", [])[-10:])
         # Fresh evidence only: a new process (pid and start time) behind the pid file and every configured port
         # accepting, polled within a bound. An exit code alone is never reported as verified.
-        ports = service_ports(spec)
         deadline = time.monotonic() + SERVICE_VERIFY_SECONDS
         while True:
             after = service_pid(spec)
@@ -4215,13 +4479,17 @@ def cmd_service_restart(opts, ctx):
     checks = [{"id": "command", "result": "passed" if code == 0 else "failed", "detail": f"exit code {code}" if isinstance(code, int) else code},
               {"id": "new_process", "result": "passed" if replaced else "failed",
                "detail": f"pid {before[0]} -> {after[0]}" + ("" if old_gone else "; the old process is still running")}]
-    checks += [{"id": f"port.{port}", "result": "passed" if port in open_ports else "failed"} for port in ports]
+    # A new process that answers only inside a private view (for example one started from a ddistro_run) is not the
+    # service the distro and Windows reach, so the namespace checks gate verified like the ports do.
+    view_checks, namespace = service_view_checks(after[0], ports, spec)
+    checks += view_checks
     if not ports:
         checks.append({"id": "ports", "result": "failed", "detail": "no Listen port found in " + spec["ports_conf"]})
     verified = all(check["result"] == "passed" for check in checks)
     data = {"service": name, "label": spec["label"], "action": "restart", "executed": True,
             "state": "verified" if verified else "failed", "verified": verified, "checks": checks,
-            "before": {"pid": before[0]}, "after": {"pid": after[0]},
+            "before": {"pid": before[0]}, "after": {"pid": after[0]}, "namespace": namespace, "impact": spec["impact"],
+            "health": "not_checked",
             "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "output_tail": output_tail}
     return data, f"{spec['label']} restart: {data['state']}"
@@ -4824,7 +5092,8 @@ COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products"
             "server update": cmd_server_update, "agent status": cmd_agent_status, "agent probe": cmd_agent_probe,
             "models": cmd_models, "inventory": cmd_inventory, "health": cmd_health, "performance": cmd_performance,
             "agent home-config": cmd_agent_home_config, "agent home-config-repair": cmd_agent_home_config_repair,
-            "service restart": cmd_service_restart, "update-check": cmd_update_check,
+            "service restart": cmd_service_restart, "service status": cmd_service_status,
+            "service list": cmd_service_list, "update-check": cmd_update_check,
             "models options": cmd_models_options, "models preview": cmd_models_preview, "models apply": cmd_models_apply,
             "models rollback-preview": cmd_models_rollback_preview, "models rollback": cmd_models_rollback}
 COMMANDS.update({"changes " + name: cmd_changes for name in CHANGES_SPEC})
@@ -4882,11 +5151,16 @@ def parse_command(rest, ctx):
                            "agent home-config-repair --sha256 HASH, or agent serve --task TASK.")
         name, rest = "agent " + rest[1], rest[1:]
     elif name == "service":
-        if len(rest) != 3 or rest[1] != "restart":
-            raise CliError("invalid_argument", "Expected service restart <service>.")
-        if rest[2] not in SERVICE_RESTARTS:
-            raise CliError("unsupported", "Only these services can be restarted: " + ", ".join(SERVICE_RESTARTS) + ".")
-        ctx["command"] = "service restart"
+        if rest[1:] == ["list"]:
+            ctx["command"] = "service list"
+            return {}
+        if len(rest) != 3 or rest[1] not in ("restart", "status"):
+            raise CliError("invalid_argument", "Expected service list, service status <service> or service restart <service>.")
+        ctx["command"] = "service " + rest[1]
+        # Only the shape here; the command resolves the code-owned apache or a registered id, else unsupported.
+        if not SERVICE_ID.match(rest[2]):
+            raise CliError("unsupported", "That is not a service id. " + SERVICE_UNREGISTERED,
+                           {"reason": "unsupported_target"})
         return {"service": rest[2]}
     if name not in COMMANDS:
         raise CliError("invalid_argument", "Unknown command.\n" + USAGE)

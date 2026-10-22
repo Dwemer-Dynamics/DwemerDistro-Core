@@ -659,6 +659,27 @@ The trust model is therefore: the model's declaration is the primary signal, ste
 Launcher's instructions; the patterns catch common mistakes; the user sees every automatic run's code and output in
 the chat and can Stop it. Nothing here is a security boundary against a model that misclassifies on purpose.
 
+**Service operation (`live_service`).** A client that adds `"live_service"` next to `"live_run"` and
+`"live_run_auto"` (ignored without both, and dropped silently when `ddistro service list --json` does not answer
+at `initialize`) gets one more `ddistro_run` operation, `service`, with `verb` (`list`, `status` or `restart`),
+`target` (for status and restart: `apache` or a registered id from ASSISTANT.md "Registered services") and a
+required `reason`. There is no code, path, command or flag: the broker runs exactly `/usr/local/bin/ddistro
+service <verb> [<target>] --json` as root (90 s, 1 MiB) through `run_ddistro`, the host-context path
+`propose_restart` uses, never through `ddistro_run`'s isolation and never in a run's view. `restart` starts at once
+without a card (service control is routine) and, like `propose_restart`, is not adopted into stoppable runs; ddistro
+holds the maintenance lock and verifies a new process in PID 1's mount and network namespaces and its ports (ASSISTANT.md
+"Service restart"). `stop`, `start`, `postgresql` and `components` are `unsupported` before anything runs; a
+malformed id, a missing `reason`, an unknown key or a `target` on `list` is `refused`; an unregistered id comes back
+`unsupported` from ddistro with the registration hint. The reply is `{tool, operation: "service", verb, target,
+state, executed, verified, hint, captured_at}` plus, from ddistro, `label, checks, before, after, namespace, impact,
+health: "not_checked", pid, started, verified_at, output_tail` (restart and status) or `services, refused,
+unsupported` (list). `state` is `verified`/`failed` (restart), `running`/`degraded`/`unchecked`/`not_running`
+(status), `listed`, or `unsupported`, `refused`, `busy`, `not_executed`, `unknown` (a timeout or unreadable result:
+the restart may have run, `executed: null`). Each call counts against the 32 `ddistro_run` calls per turn and the
+session total; it is not journaled by `task_recovery`. Without `live_service` the `ddistro_run` input schema is
+exactly the earlier one; only the description sentence that recommended init scripts or setsid for services changed
+for every session. `capabilities` advertises the contract as `features.live_service` and `live_run.service`.
+
 **Execution.** For an approved or covered request the broker checks the common maintenance lock
 (`/run/lock/dwemerdistro-maintenance.lock`, used as it is, never replaced) by taking it shared without waiting and
 releasing it at once: a run does not start while an exclusive change holds it (`busy`). The lock is not held for
@@ -690,7 +711,10 @@ stdin. The root supervisor:
   the broker stops the job unless that digest is the approved one;
 - on timeout or cancel sends SIGTERM to the command's process group and SIGKILL after 5 s; when the command
   ends, whatever is left in its group is stopped too. Processes that left the group (a service started through
-  its init script, setsid or start-stop-daemon) keep running by design and should redirect their output.
+  its init script, setsid or start-stop-daemon) keep running by design, but in the run's private view: the masked,
+  non-propagating mount namespace and, with `network: false`, the empty network namespace. Such a service can run
+  yet be unreachable from the distro, other runs and Windows, so the tool descriptions route service control to
+  operation `service` (below) or the approval cards instead of run code.
 
 **Output and lifecycle.** stdout and stderr are read by the broker, redacted (ddistro_access's redaction, applied
 to whole blocks so multi-line keys are caught), control characters replaced, lines clipped at 4096 characters and

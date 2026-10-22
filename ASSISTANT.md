@@ -19,7 +19,8 @@ ddistro agent home-config | agent home-config-repair --sha256 HASH   # root only
 ddistro agent serve --task TASK                                   # root only, raw JSONL
 ddistro models herika                                             # root only, see Model assignments
 ddistro inventory                                                 # any user, see Inventory
-ddistro service restart apache                                    # root only, see Service restart
+ddistro service restart <service>                                 # root only, see Service restart
+ddistro service status <service> | service list                   # read-only, see Service restart
 ```
 
 Products are the five `ddistro_server` products: `herika` (aliases `chim`, `skyrim`),
@@ -455,27 +456,68 @@ gets presence only until code adds a check for it.
 
 ## Service restart
 
-`service restart <service>` (root) restarts one service from a fixed allowlist and then
-verifies it fresh. Today the allowlist is only `apache`: `/etc/init.d/apache2 restart`, the
-same root-owned init script the distro start uses. Apache is shared, so CHIM (HerikaServer),
-STOBE and Dialectic web servers and custom PHP mods stop answering for a few seconds. TTS,
-speech and MCP services start from `dwemer`-owned `start.sh` scripts and a PostgreSQL restart
-drops every database session, so any other name is `unsupported`. Nothing in the request
-becomes a path or an argument.
+`service restart <service>` (root) restarts one service and then verifies it fresh. The
+service is either the code-owned `apache` (`/etc/init.d/apache2 restart`, the same root-owned
+init script the distro start uses) or a root-registered service (below). Apache is shared, so
+CHIM (HerikaServer), STOBE and Dialectic web servers and custom PHP mods stop answering for a
+few seconds. TTS, speech and MCP services start from `dwemer`-owned `start.sh` scripts and a
+PostgreSQL restart drops every database session, so `postgresql`, `components` and any name
+that is not registered are `unsupported`; the message says root must register a trusted init
+wrapper. Nothing in the request becomes a path or an argument: only an id that resolves to
+`apache` or a valid registry entry.
+
+**Registered services.** Root may register a service it controls with one
+`/etc/dwemerdistro/services.d/<id>.json` (at most 16 are read; there is no installer or
+migration that writes them):
+`{"schema": 1, "id", "label", "impact", "init", "pidfile", "comm", "ports": [..], "http_path"?}`.
+The file is read as data through the same trusted read as health (every folder from `/` and the
+file root-owned, not group- or world-writable, no link followed, at most 4 KB). An entry is
+refused as a whole, and listed in `service list` `refused` with a reason, unless: `id` equals the
+file name and matches `^[a-z][a-z0-9-]{1,31}$` and is not reserved (`apache`, `apache2`,
+`postgresql`, `postgres`, `components`, nor any id containing `apache` or `postgres`); `init` is
+a file directly in `/etc/init.d`, `/usr/local/sbin` or `/usr/local/lib/dwemerdistro` that is not
+an Apache or PostgreSQL script (it must also pass the trusted-helper check when used, and must
+accept `restart`); `pidfile` is under `/run/` (not Apache's); `comm` is the 1-15 character
+process name (not `apache2`, `postgres`, `postmaster`, `init` or `systemd`); `ports` lists 1-8
+distinct ports from 1024-65535, none of them Apache's `Listen` ports or PostgreSQL's; and
+`http_path`, when given, is a plain absolute path. Code-owned `apache` cannot be overridden.
+Registering is root trust: the init script runs as root.
+
+The controller refuses a restart before running an init script unless its own mount and
+network namespaces match PID 1's. Apache listener verification resolves `IfModule` blocks
+against `apache2ctl -M`, including disabled conditional HTTPS listeners. Unsupported
+listener directives or unreadable module information require manual verification and
+refuse a restart; the command does not guess or change Apache configuration.
 
 The command takes the maintenance lock exclusively without waiting (`busy` while an update,
 repair, or `changes apply` runs). It then reads the pid in `/run/apache2/apache2.pid` (the
 process must be named `apache2`), runs the init script for at most 60 seconds, and polls for up
 to 15 seconds until a new process (different pid or start time) is behind the pid file, the
 old process is gone, and
-every `Listen` port in `/etc/apache2/ports.conf` accepts a loopback connection. `data` is
+every active `Listen` port in `/etc/apache2/ports.conf` (a registered service: its `ports`) accepts a
+loopback connection. The new process must also be in the distro's own view: `namespace.mnt` and
+`namespace.net` pass only when `/proc/<new pid>/ns/{mnt,net}` equal PID 1's, so a process left in
+a `ddistro_run` private view (see ASSISTANT_RUNTIME.md) fails them; unreadable is `unknown`,
+never passed. With `http_path`, `http` passes on any HTTP status line from the first port, 503
+included: it proves transport, not application health (`health: "not_checked"`). `data` is
 `{service, label, action, executed: true, state: "verified"|"failed", verified, checks:
-[{id: "command"|"new_process"|"port.N"|"ports", result, detail?}], before: {pid}, after:
-{pid}, verified_at, output_tail}`. An exit code of 0 alone is never `verified`. A refusal
+[{id: "command"|"new_process"|"namespace.mnt"|"namespace.net"|"port.N"|"ports"|"http", result,
+detail?}], before: {pid}, after: {pid}, namespace: {mnt, net}, impact, health, verified_at,
+output_tail}`. An exit code of 0 alone is never `verified`. A refusal
 before the restart (`permission_denied`, `helper_unavailable`, `unsafe_path`, `busy`,
-`unsupported`) is an error envelope and runs nothing. `capabilities` lists the allowlist with
-each service's label and impact under `service_restart`, and `features.assistant_actions`
-says the broker offers it to the Assistant (see ASSISTANT_RUNTIME.md, "ddistro_action").
+`unsupported`) is an error envelope and runs nothing. `capabilities` lists the code-owned
+services with label and impact under `service_restart` (with the registry rules), and
+`features.assistant_actions` says the broker offers it to the Assistant (see
+ASSISTANT_RUNTIME.md, "ddistro_action" and "Service operation").
+
+`service status <service>` is read-only and needs no root where `/proc` is readable: `{service,
+label, action: "status", executed: false, state: "running"|"degraded"|"unchecked"|"not_running",
+pid, started, namespace, checks, health: "not_checked", captured_at}` with the same namespace,
+port and `http` checks (`degraded`: a check failed, for example a private view; `unchecked`: a
+namespace could not be read). `service list` returns `{schema: 1, services: [{id, label, impact,
+verbs, source: "code_owned"|"registry", ports?}], refused: [{id, reason}], registry,
+unsupported, captured_at}`. The typed `operations` matrix and the legacy `propose_restart` and
+`propose_service` cards stay `apache`-only.
 
 ## Typed service operations
 
