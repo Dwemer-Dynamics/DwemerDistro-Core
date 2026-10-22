@@ -708,6 +708,29 @@ masked, have no WSL variables and an empty stdin, and reach neither the probe's 
 outer check reached) nor `1.1.1.1:443`. The second must time out after 2 s with its background child gone and
 its output closed without help from the probe.
 
+**Task recovery journal (`task_recovery`, version 1).** Every `serve` session journals its `ddistro_run` jobs in
+`/var/lib/dwemerdistro/assistant/agent/journal/<task>.json` (root 0700 directory, root 0600 single-link file, at most
+256 KiB, replaced atomically under an exclusive `flock` of a persistent empty `<task>.lock` that is never replaced).
+A job is recorded as `launching` before its supervisor starts (if that write fails the run is `not_started` with
+`journal_unavailable`), then `running`, then its final state. An entry holds the request digest, code sha256 and size,
+interpreter, account, network, database, a cwd sha256, risk, approval, timestamps, exit code, signal and stop reason;
+never the code, output or the model's reason. At most 64 jobs (finished ones evicted first; an evicted unfinished
+one is counted in `dropped_incomplete`), 32 checkpoints and 16 session records are kept.
+
+A client that adds `"task_recovery"` next to `"live_run"` gets two more `ddistro_run` operations (an older client's
+declaration is unchanged): `recovery` returns this chat's jobs and checkpoints, and `checkpoint` stores the model's
+`progress` (required), `next_step`, `verification`, up to 5 one-line `backup_refs` and up to 8 `job_ids` (each must be a
+journaled job of the same task and thread, else the call is refused), redacted and bounded, as `source: model, trust: untrusted_claim, verified: false`. Both count toward the `ddistro_run` turn and
+session budgets. The client method `ddistro/task/recovery` `{threadId}` returns the same view for one task-owned
+thread; `ddistro_agent recovery --task UUID` (root) prints it for every thread in the task's registry, reading under
+the shared lock only (it never takes `serve.lock` and never signals a process). Each job view has `recovery`:
+`none` (nothing ran), `verify_before_continuing` (it ran; `process_succeeded` is exit 0 only and `verified` is always
+false), `live_this_session` (the only `controllable` state; use status, output or cancel), `interrupted` (no outcome
+was recorded and its session ended: `state interrupted`, `outcome unknown`, never shown running), or
+`other_session_active` (another live broker, matched by pid and kernel start time, still owns it). `replayable`,
+`replay` and `rollback` are always false: nothing is rerun on reconnect, and a job of an earlier session is not a
+job id `status`/`cancel` accept.
+
 ### Thread archive and delete
 
 `thread/archive`, `thread/unarchive`, and `thread/delete` (Codex 0.163.0 stable,

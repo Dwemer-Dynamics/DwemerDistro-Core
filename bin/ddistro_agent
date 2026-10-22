@@ -1038,6 +1038,34 @@ RUN_AUTO_SPEC = {
                 "description": "run only (required): one plain sentence shown to the user: what this changes and why; "
                                "for destructive, exactly what is deleted, reset or overwritten"})},
 }
+RUN_RECOVERY_PROPERTIES = {
+    "progress": {"type": "string", "maxLength": 300,
+                 "description": "checkpoint only (required): one short sentence on what is done so far"},
+    "next_step": {"type": "string", "maxLength": 300, "description": "checkpoint only: what you plan next"},
+    "verification": {"type": "string", "maxLength": 300,
+                     "description": "checkpoint only: how you checked the result (stored as your claim, not proof)"},
+    "backup_refs": {"type": "array", "maxItems": 5, "items": {"type": "string", "maxLength": 256},
+                    "description": "checkpoint only: paths or names of backups you made (for example f.bak)"},
+    "job_ids": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 32},
+                "description": "checkpoint only: the job_ids this note is about"}}
+RUN_RECOVERY_TEXT = (" recovery lists this chat's recorded jobs, including ones from an earlier session that ended "
+                     "before their outcome was known (interrupted: outcome unknown, cannot be reattached; check the "
+                     "state with a read, never rerun it blindly), and your checkpoints. checkpoint saves a short note "
+                     "of progress, next step, how you verified and any backups you made; it is stored as your own "
+                     "unverified claim and does not verify, back up or undo anything. Never store secrets in it.")
+
+
+def run_tool_spec(automatic, recovery):
+    """The ddistro_run declaration: exactly RUN_SPEC or RUN_AUTO_SPEC unless task_recovery was negotiated."""
+    base = RUN_AUTO_SPEC if automatic else RUN_SPEC
+    if not recovery:
+        return base
+    properties = dict(base["inputSchema"]["properties"], **RUN_RECOVERY_PROPERTIES)
+    properties["operation"] = {"type": "string", "enum": list(RUN_OPERATIONS + RECOVERY_OPERATIONS)}
+    return dict(base, description=base["description"] + RUN_RECOVERY_TEXT,
+                inputSchema=dict(base["inputSchema"], properties=properties))
+
+
 # Conservative backstop for automatic runs: code matching any of these never runs without the user's confirmation, even
 # when the model marked it routine. It only ever adds a confirmation. It cannot prove code is harmless (a command can be
 # built at run time, encoded or hidden in a called script), so a miss is possible and the model's declaration stays the
@@ -1193,6 +1221,9 @@ class RunJob:
         self.stop_at = None
         self.message = None
         self.worker = None
+        # task_recovery: recorded in the task journal before start; a later write failure is reported in the view.
+        self.journaled = False
+        self.journal_error = None
 
     def finished(self):
         return self.state in RUN_FINAL_STATES + RUN_UNSTARTED_STATES
@@ -1818,6 +1849,297 @@ class ThreadStore:
             write_root_file(dir_fd, self.task_id + ".json", json.dumps(document).encode(), 0o600)
         finally:
             os.close(dir_fd)
+
+
+# ---------------------------------------------------------------- task execution journal (task_recovery)
+
+# A root-owned record per task of every ddistro_run job: written before the supervisor starts and again at each
+# outcome, so a later session can show what may have run. It holds digests and bounded labels, never code or output,
+# and nothing in it is ever replayed. Model checkpoints are stored as untrusted claims; nothing here verifies a change
+# or offers rollback. See ASSISTANT_RUNTIME.md "Task recovery journal".
+JOURNAL_DIR = AGENT_STATE + "/journal"
+JOURNAL_SCHEMA = 1
+JOURNAL_LIMIT = 256 * 1024
+JOURNAL_JOBS = 64
+JOURNAL_CHECKPOINTS = 32
+JOURNAL_SESSIONS = 16
+RECOVERY_CAPABILITY = "task_recovery"
+RECOVERY_VERSION = 1
+RECOVERY_OPERATIONS = ("recovery", "checkpoint")
+CHECKPOINT_TEXT = 300
+CHECKPOINT_REFS = 5
+CHECKPOINT_REF_CHARS = 256
+CHECKPOINT_JOBS = 8
+RECOVERY_HINTS = {
+    "none": "nothing to recover",
+    "live_this_session": "still owned by this session; use status, output or cancel with its job_id",
+    "verify_before_continuing": "it ran (exit code 0 is not verification); read the result back before relying on it",
+    "interrupted": ("its session ended before an outcome was recorded; it may have changed things partway and cannot be "
+                    "reattached or cancelled. Do not rerun it; check the state with a read first"),
+    "other_session_active": "another live assistant session owns it; it cannot be controlled here. Do not rerun it",
+}
+
+
+def journal_file_ok(st, limit):
+    """A journal or lock file: one regular root file, 0600 or stricter, a single link and within its size limit."""
+    return (stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o177 and st.st_nlink == 1
+            and st.st_size <= limit)
+
+
+def process_start(pid):
+    """The kernel start time of pid (to tell a live owner from a reused pid), or None."""
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as handle:
+            fields = handle.read(4096).rsplit(b")", 1)[1].split()
+        return fields[19].decode()
+    except (OSError, IndexError, ValueError, UnicodeDecodeError):
+        return None
+
+
+class RootJournalFiles:
+    """<task>.json beside a persistent <task>.lock in the root-only journal directory. The lock file is never
+    replaced or written (its inode is the lock); the record is replaced atomically under the exclusive lock."""
+
+    def __init__(self, task_id):
+        self.name = task_id
+
+    def _dir(self):
+        try:
+            return open_root_dir(JOURNAL_DIR, "journal_untrusted", private=True)
+        except Refusal:
+            parent = open_root_dir(AGENT_STATE, "state_untrusted")
+            try:
+                os.mkdir("journal", 0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise Refusal("journal_untrusted")
+            finally:
+                os.close(parent)
+            return open_root_dir(JOURNAL_DIR, "journal_untrusted", private=True)
+
+    def locked(self, exclusive):
+        return _JournalAccess(self, exclusive)
+
+
+class _JournalAccess:
+    def __init__(self, files, exclusive):
+        self.files, self.exclusive = files, exclusive
+        self.dir_fd = self.lock_fd = None
+
+    def __enter__(self):
+        self.dir_fd = self.files._dir()
+        try:
+            self.lock_fd = os.open(self.files.name + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+                                   | os.O_NONBLOCK, 0o600, dir_fd=self.dir_fd)
+            if not journal_file_ok(os.fstat(self.lock_fd), 0):
+                raise Refusal("journal_untrusted")
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH)
+        except OSError:
+            self.__exit__()
+            raise Refusal("journal_untrusted")
+        except Refusal:
+            self.__exit__()
+            raise
+        return self
+
+    def __exit__(self, *_):
+        for fd in (self.lock_fd, self.dir_fd):
+            if fd is not None:
+                os.close(fd)
+        self.lock_fd = self.dir_fd = None
+
+    def read(self):
+        try:
+            fd = os.open(self.files.name + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                         dir_fd=self.dir_fd)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise Refusal("journal_untrusted")
+        try:
+            if not journal_file_ok(os.fstat(fd), JOURNAL_LIMIT):
+                raise Refusal("journal_untrusted")
+            return read_bounded(fd, JOURNAL_LIMIT)
+        finally:
+            os.close(fd)
+
+    def write(self, data):
+        write_root_file(self.dir_fd, self.files.name + ".json", data, 0o600)
+        # The rename is durable only once the directory is synced (dir_fd is O_PATH, which fsync refuses).
+        fd = os.open(".", O_DIR, dir_fd=self.dir_fd)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def journal_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+class TaskJournal:
+    """The execution journal of one task. Every change is read-modify-replace under the task's exclusive lock, so
+    concurrent sessions or CLI readers never lose or tear a record; a read takes the shared lock and changes nothing."""
+
+    def __init__(self, task_id, files=None, session=None):
+        self.task_id = task_id
+        self.files = files or RootJournalFiles(task_id)
+        pid = os.getpid()
+        self.session = session or {"id": secrets.token_hex(8), "pid": pid, "start": process_start(pid)}
+        self.lock = threading.Lock()
+
+    def _load(self, access):
+        data = access.read()
+        if data is None:
+            return {"schema_version": JOURNAL_SCHEMA, "task_id": self.task_id, "sessions": [], "jobs": [],
+                    "checkpoints": [], "dropped_incomplete": 0}
+        try:
+            document = json.loads(data)
+        except ValueError:
+            raise Refusal("journal_invalid")
+        if not isinstance(document, dict) or document.get("schema_version") != JOURNAL_SCHEMA \
+                or document.get("task_id") != self.task_id \
+                or any(not isinstance(document.get(key), list) for key in ("sessions", "jobs", "checkpoints")):
+            raise Refusal("journal_invalid")
+        for key in ("sessions", "jobs", "checkpoints"):
+            document[key] = [entry for entry in document[key] if isinstance(entry, dict)]
+        if type(document.get("dropped_incomplete")) is not int:
+            document["dropped_incomplete"] = 0
+        return document
+
+    def read(self):
+        with self.files.locked(False) as access:
+            return self._load(access)
+
+    def update(self, change):
+        with self.lock, self.files.locked(True) as access:
+            document = self._load(access)
+            result = change(document)
+            document["sessions"] = document["sessions"][-JOURNAL_SESSIONS:]
+            document["checkpoints"] = document["checkpoints"][-JOURNAL_CHECKPOINTS:]
+            jobs = document["jobs"]
+            while len(jobs) > JOURNAL_JOBS:
+                done = [i for i, job in enumerate(jobs) if job.get("status") in RUN_FINAL_STATES + RUN_UNSTARTED_STATES]
+                if not done:
+                    document["dropped_incomplete"] += 1
+                jobs.pop(done[0] if done else 0)
+            data = json.dumps(document, separators=(",", ":"), sort_keys=True).encode()
+            if len(data) > JOURNAL_LIMIT:
+                raise Refusal("journal_full")
+            access.write(data)
+            return result
+
+    def session_open(self):
+        entry = dict(self.session, opened_at=journal_now(), closed_at=None)
+        self.update(lambda document: document["sessions"].append(entry))
+
+    def session_close(self):
+        def change(document):
+            for entry in document["sessions"]:
+                if entry.get("id") == self.session["id"]:
+                    entry["closed_at"] = journal_now()
+        self.update(change)
+
+    def job_launching(self, job, risk):
+        """Recorded before the supervisor starts; a failure here means the job must not start."""
+        request = job.request
+        code = request["code"].encode("utf-8")
+        entry = {"job_id": job.id, "thread_id": job.thread, "turn_id": job.turn, "session_id": self.session["id"],
+                 "digest": job.digest, "code_sha256": sha256_bytes(code), "code_bytes": len(code),
+                 "interpreter": request["interpreter"], "account": request["account"], "network": request["network"],
+                 "database": request["database"], "timeout_seconds": request["timeout_seconds"],
+                 "cwd_sha256": sha256_bytes(request["cwd"].encode("utf-8")) if request["cwd"] else None,
+                 "risk": risk, "approval": job.approval, "status": "launching", "recorded_at": journal_now(),
+                 "started": False, "started_at": None, "finished_at": None, "exit_code": None, "signal": None,
+                 "reason": None, "process_succeeded": False}
+        self.update(lambda document: document["jobs"].append(entry))
+
+    def job_update(self, job):
+        with job.lock:
+            fields = {"status": job.state, "started": job.started, "started_at": job.started_at,
+                      "finished_at": job.finished_at, "exit_code": job.exit.get("exit_code"),
+                      "signal": job.exit.get("signal"), "reason": str(job.reason)[:64] if job.reason else None,
+                      "process_succeeded": job.state == "exited" and job.exit.get("exit_code") == 0}
+
+        def change(document):
+            for entry in document["jobs"]:
+                if entry.get("job_id") == job.id and entry.get("session_id") == self.session["id"]:
+                    entry.update(fields)
+        self.update(change)
+
+    def checkpoint(self, thread_id, turn_id, claim):
+        entry = dict(claim, id="cp_" + secrets.token_hex(8), thread_id=thread_id, turn_id=turn_id,
+                     session_id=self.session["id"], source="model", trust="untrusted_claim", verified=False,
+                     recorded_at=journal_now())
+
+        def change(document):
+            # A note may only refer to this task's journaled jobs of the same thread, never to another chat's.
+            own = {job.get("job_id") for job in document["jobs"] if job.get("thread_id") == thread_id}
+            if any(job not in own for job in entry.get("job_ids") or ()):
+                raise PolicyError(-32602, "job_ids must be jobs recorded for this chat")
+            document["checkpoints"].append(entry)
+        self.update(change)
+        return entry
+
+
+def journal_text(value, limit):
+    return value[:limit] if isinstance(value, str) else None
+
+
+def recovery_view(document, thread_ids, session_id=None, live_jobs=(), alive=None):
+    """The task-scoped recovery state: jobs and checkpoints of the given task-owned threads only. A job without an
+    outcome is live only while this very session still owns it; otherwise it is interrupted (or owned by another live
+    session) with an unknown outcome, never shown as running, and never reattachable or replayed."""
+    alive = alive or (lambda session: session.get("pid") is not None and session.get("start") is not None
+                      and process_start(session["pid"]) == session["start"])
+    sessions = {entry.get("id"): entry for entry in document["sessions"] if isinstance(entry.get("id"), str)}
+    final = RUN_FINAL_STATES + RUN_UNSTARTED_STATES
+    jobs, counts = [], collections.Counter()
+    for entry in document["jobs"]:
+        if entry.get("thread_id") not in thread_ids:
+            continue
+        status = entry.get("status") if isinstance(entry.get("status"), str) else "unknown"
+        owner = entry.get("session_id")
+        if status in final:
+            state, outcome = status, status
+            recovery = "verify_before_continuing" if entry.get("started") is True else "none"
+        elif owner == session_id and entry.get("job_id") in live_jobs:
+            state, outcome, recovery = status, "pending", "live_this_session"
+        else:
+            other = sessions.get(owner)
+            active = owner != session_id and other is not None and other.get("closed_at") is None and alive(other)
+            state, outcome = "interrupted", "unknown"
+            recovery = "other_session_active" if active else "interrupted"
+        counts[recovery] += 1
+        jobs.append({"job_id": journal_text(entry.get("job_id"), 32),
+                     "thread_id": journal_text(entry.get("thread_id"), 128),
+                     "turn_id": journal_text(entry.get("turn_id"), 128), "state": state, "outcome": outcome,
+                     "recorded_status": status[:16], "recovery": recovery, "hint": RECOVERY_HINTS[recovery],
+                     "controllable": recovery == "live_this_session", "replayable": False,
+                     "started": entry.get("started") is True, "exit_code": entry.get("exit_code"),
+                     "signal": entry.get("signal"), "process_succeeded": entry.get("process_succeeded") is True,
+                     "verified": False, "risk": entry.get("risk"), "approval": entry.get("approval"),
+                     "interpreter": entry.get("interpreter"), "account": entry.get("account"),
+                     "network": entry.get("network"), "digest": entry.get("digest"),
+                     "code_sha256": entry.get("code_sha256"), "code_bytes": entry.get("code_bytes"),
+                     "recorded_at": entry.get("recorded_at"), "started_at": entry.get("started_at"),
+                     "finished_at": entry.get("finished_at"), "reason": entry.get("reason")})
+    checkpoints = [{"id": entry.get("id"), "thread_id": entry.get("thread_id"), "turn_id": entry.get("turn_id"),
+                    "source": "model", "trust": "untrusted_claim", "verified": False,
+                    "recorded_at": entry.get("recorded_at"),
+                    "progress": journal_text(entry.get("progress"), CHECKPOINT_TEXT),
+                    "next_step": journal_text(entry.get("next_step"), CHECKPOINT_TEXT),
+                    "verification_claim": journal_text(entry.get("verification_claim"), CHECKPOINT_TEXT),
+                    "backup_refs": [ref[:CHECKPOINT_REF_CHARS] for ref in entry.get("backup_refs") or ()
+                                    if isinstance(ref, str)][:CHECKPOINT_REFS],
+                    "job_ids": [job for job in entry.get("job_ids") or () if isinstance(job, str)][:CHECKPOINT_JOBS]}
+                   for entry in document["checkpoints"] if entry.get("thread_id") in thread_ids]
+    return {"recovery_version": RECOVERY_VERSION, "task_id": document["task_id"], "jobs": jobs,
+            "checkpoints": checkpoints, "summary": {key: counts[key] for key in RECOVERY_HINTS if key != "none"},
+            "dropped_incomplete": document.get("dropped_incomplete", 0), "replay": False, "rollback": False,
+            "note": ("job states come from the broker; checkpoints are the model's own unverified notes. Nothing here "
+                     "verifies a change, undoes one or reruns a command")}
 
 
 # ---------------------------------------------------------------- sandbox
@@ -2594,7 +2916,7 @@ class Broker:
 
     def __init__(self, proc, client_in, client_out, threads, err_sink=None, run_tool=run_ddistro, memory=False,
                  access=False, change_roots=(), managed_exec=False, live_run=None, redact=None, spawn=spawn_run,
-                 run_lock=maintenance_clear):
+                 run_lock=maintenance_clear, journal=None):
         self.proc = proc
         self.client_in = client_in
         self.client_out = client_out
@@ -2659,8 +2981,26 @@ class Broker:
         self.jobs = collections.OrderedDict()
         self.run_workers = set()
         self.run_slots = threading.Semaphore(RUN_CALL_CONCURRENCY)
+        # task_recovery: the task's execution journal (None: jobs are not journaled, e.g. the probe), whether the
+        # client negotiated reading it, and why the session record failed. A job the journal cannot record never
+        # starts.
+        self.journal = journal
+        self.recovery = False
+        self.journal_error = None
+
+    def _journal_session(self, opening):
+        if self.journal is None:
+            return
+        try:
+            if opening:
+                self.journal.session_open()
+            else:
+                self.journal.session_close()
+        except (Refusal, OSError) as exc:
+            self.journal_error = getattr(exc, "reason", "journal_untrusted")
 
     def run(self):
+        self._journal_session(True)
         reader = threading.Thread(target=self._pump_client, daemon=True)
         reader.start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
@@ -2671,6 +3011,7 @@ class Broker:
         self._stop_diagnostics()
         stop_process_group(self.proc)
         reader.join(CLIENT_POLL * 10)
+        self._journal_session(False)
         return self.proc.returncode
 
     # diagnostic children
@@ -2837,7 +3178,7 @@ class Broker:
                 if method == "ddistro/action/decide":
                     self._decide_action(request_id, message.get("params"))
                     return
-                if method in ("ddistro/run/revoke", "ddistro/run/cancel"):
+                if method in ("ddistro/run/revoke", "ddistro/run/cancel", "ddistro/task/recovery"):
                     self._run_client(request_id, method, message.get("params"))
                     return
                 message["params"] = self._authorize(method, message.get("params"))
@@ -2885,7 +3226,7 @@ class Broker:
                 raise PolicyError(-32602, "invalid parameter: capabilities.experimentalApi")
             self.experimental = experimental is True
             actions = capabilities.pop("ddistroActions", None) if isinstance(capabilities, dict) else None
-            known = tuple(ACTION_OPERATIONS) + (RUN_CAPABILITY, RUN_AUTO_CAPABILITY)
+            known = tuple(ACTION_OPERATIONS) + (RUN_CAPABILITY, RUN_AUTO_CAPABILITY, RECOVERY_CAPABILITY)
             if actions is not None and (not isinstance(actions, list) or len(actions) > len(known)
                                         or any(not isinstance(name, str) or name not in known for name in actions)
                                         or len(set(actions)) != len(actions)):
@@ -2895,7 +3236,11 @@ class Broker:
             self.live_run = bool(self.experimental and actions and RUN_CAPABILITY in actions and self.run_digest)
             # Automatic routine runs only on top of live_run; an older client never asks, so it keeps a card per run.
             self.live_run_auto = self.live_run and RUN_AUTO_CAPABILITY in actions
-            actions = [name for name in actions or () if name not in (RUN_CAPABILITY, RUN_AUTO_CAPABILITY)]
+            # task_recovery adds the recovery and checkpoint operations to ddistro_run and ddistro/task/recovery; it
+            # needs live_run and a journal, and an older client never asks, so its declaration is unchanged.
+            self.recovery = self.live_run and RECOVERY_CAPABILITY in actions and self.journal is not None
+            actions = [name for name in actions or ()
+                       if name not in (RUN_CAPABILITY, RUN_AUTO_CAPABILITY, RECOVERY_CAPABILITY)]
             # Codex never sees this broker-only field; the action needs the dynamic tools experimentalApi enables.
             self.actions = frozenset(actions) if self.experimental else frozenset()
             # File changes need the trusted access policy as the session started; otherwise they are not offered.
@@ -2930,7 +3275,7 @@ class Broker:
                                              if EXPLORE_CAPABILITY in self.tools else [])
                                           + ([EXEC_SPEC] if EXEC_CAPABILITY in self.tools else [])
                                           + ([action_spec(self.actions)] if self.actions else [])
-                                          + ([RUN_AUTO_SPEC if self.live_run_auto else RUN_SPEC]
+                                          + ([run_tool_spec(self.live_run_auto, self.recovery)]
                                              if self.live_run else []))
             self._cancel_proposals(None, "cancelled")
             return enforce_sandbox(params)
@@ -3916,8 +4261,12 @@ class Broker:
                     owned = isinstance(thread_id, str) and thread_id in self.threads
                 if not owned:
                     raise PolicyError(-32602, "threadId does not belong to this task")
-                if operation not in RUN_OPERATIONS:
-                    raise PolicyError(-32602, "operation must be one of " + ", ".join(RUN_OPERATIONS))
+                operations = RUN_OPERATIONS + (RECOVERY_OPERATIONS if self.recovery else ())
+                if operation not in operations:
+                    raise PolicyError(-32602, "operation must be one of " + ", ".join(operations))
+                if operation in RECOVERY_OPERATIONS:
+                    self._run_reply(request_id, self._recovery_call(operation, arguments, thread_id, turn_id), True)
+                    return
                 if operation == "run":
                     if not isinstance(turn_id, str) or not 0 < len(turn_id) <= 128:
                         raise PolicyError(-32602, "turnId is required")
@@ -3949,8 +4298,8 @@ class Broker:
                                              "state": view["state"], "hint": RUN_HINTS.get(view["state"])},
                                 view["state"] == "running" or view["succeeded"])
             except PolicyError as exc:
-                self._run_reply(request_id, {"tool": RUN_TOOL, "operation": operation if operation in RUN_OPERATIONS
-                                             else None, "state": "refused", "started": False,
+                self._run_reply(request_id, {"tool": RUN_TOOL, "operation": operation if operation in
+                                             RUN_OPERATIONS + RECOVERY_OPERATIONS else None, "state": "refused", "started": False,
                                              "error": {"code": "invalid_arguments", "message": exc.message}}, False)
         finally:
             with self.state_lock:
@@ -3984,7 +4333,7 @@ class Broker:
             shown_risk = "routine" if automatic else "unclassified"
         if automatic or covered:
             approval = "automatic" if automatic else "task_grant"
-            job, failure = self._run_launch(thread_id, turn_id, request, digest, approval, epoch)
+            job, failure = self._run_launch(thread_id, turn_id, request, digest, approval, epoch, shown_risk)
             self._run_started_reply(request_id, job, failure, wait, approval, False, shown_risk, signs)
             return
         grantable = not self.live_run_auto and not signs
@@ -4023,7 +4372,7 @@ class Broker:
         approval = "user_task_grant" if state == "approved_session" else "user_once"
         if go:
             # The grant itself was installed by the decision (see _decide_action), so a later revoke always wins.
-            job, failure = self._run_launch(thread_id, turn_id, request, digest, approval, epoch)
+            job, failure = self._run_launch(thread_id, turn_id, request, digest, approval, epoch, shown_risk)
             state = "started" if job is not None else "not_executed"
         with self.state_lock:
             proposal["state"] = state
@@ -4067,7 +4416,7 @@ class Broker:
         self._to_client(encode({"method": "ddistro/run/grant", "params": {
             "active": view is not None, "scope": view, "reason": reason}}))
 
-    def _run_launch(self, thread_id, turn_id, request, digest, approval, epoch):
+    def _run_launch(self, thread_id, turn_id, request, digest, approval, epoch, risk=None):
         """Starts one job for exactly this request. (job, None), or (None, failure) when nothing was started. epoch is
         the thread's stop count when the call began: a Stop of the thread since then means nothing starts."""
         with self.state_lock:
@@ -4103,6 +4452,18 @@ class Broker:
             while len(self.jobs) > RUN_MAX_JOBS and finished:
                 self.jobs.pop(finished.pop(0), None)
             self.run_workers.add(worker)
+        if self.journal is not None:
+            # Recorded before anything starts: a job the journal cannot hold does not run.
+            try:
+                self.journal.job_launching(job, risk)
+                job.journaled = True
+            except (Refusal, OSError) as exc:
+                with self.state_lock:
+                    self.jobs.pop(job.id, None)
+                    self.run_workers.discard(worker)
+                return None, {"state": "not_started", "code": "journal_unavailable", "message": (
+                    "the task's execution journal could not record the run (%s); nothing ran"
+                    % getattr(exc, "reason", "journal_untrusted"))}
         spec = dict(run_spec_view(request), code=request["code"])
         self._to_client(encode({"method": "ddistro/run/started", "params": {
             "threadId": thread_id, "turnId": turn_id, "jobId": job.id, "approval": approval, "digest": digest,
@@ -4156,6 +4517,13 @@ class Broker:
             params = {}
         if not isinstance(params, dict):
             raise PolicyError(-32602, "params must be an object")
+        if method == "ddistro/task/recovery":
+            if not self.recovery:
+                raise PolicyError(-32601, "method not available in DwemerDistro assistant: " + method)
+            reject_unknown(params, ("threadId",))
+            self._require_thread(params)
+            self._to_client(encode({"id": request_id, "result": self._recovery_read(params["threadId"])}))
+            return
         if method == "ddistro/run/revoke":
             reject_unknown(params, ())
             with self.state_lock:
@@ -4172,6 +4540,52 @@ class Broker:
             state = job.state
         self._to_client(encode({"id": request_id, "result": {"jobId": job.id, "state": state,
                                                               "stopping": not job.finished()}}))
+
+    def _recovery_read(self, thread_id):
+        """The recovery view of one task-owned thread from the journal; reading changes nothing."""
+        with self.state_lock:
+            live = frozenset(job_id for job_id, job in self.jobs.items() if not job.finished())
+        try:
+            document = self.journal.read()
+        except (Refusal, OSError) as exc:
+            return {"recovery_version": RECOVERY_VERSION, "available": False,
+                    "reason": getattr(exc, "reason", "journal_untrusted"), "replay": False, "rollback": False}
+        view = recovery_view(document, {thread_id}, self.journal.session["id"], live)
+        view.update(available=True, session_error=self.journal_error)
+        return view
+
+    def _recovery_call(self, operation, arguments, thread_id, turn_id):
+        """ddistro_run recovery reads this chat's journal; checkpoint stores the model's short note as an untrusted
+        claim (redacted, bounded). Neither starts, stops or reruns anything."""
+        if operation == "recovery":
+            reject_unknown(arguments, ("operation",))
+            return dict(self._recovery_read(thread_id), tool=RUN_TOOL, operation="recovery")
+        reject_unknown(arguments, ("operation", "progress", "next_step", "verification", "backup_refs", "job_ids"))
+        claim = {}
+        for key, name in (("progress", "progress"), ("next_step", "next_step"), ("verification", "verification_claim")):
+            value = memory_value(arguments, key, CHECKPOINT_TEXT) if key in arguments else None
+            claim[name] = self.redact(value) if value else None
+        if not claim["progress"]:
+            raise PolicyError(-32602, "progress is required: one short sentence on what is done")
+        refs = arguments.get("backup_refs", [])
+        if not isinstance(refs, list) or len(refs) > CHECKPOINT_REFS or any(
+                not isinstance(ref, str) or not 0 < len(ref) <= CHECKPOINT_REF_CHARS or RUN_HIDDEN_TEXT.search(ref)
+                or "\n" in ref for ref in refs):
+            raise PolicyError(-32602, "backup_refs must be at most %d one-line paths or names" % CHECKPOINT_REFS)
+        jobs = arguments.get("job_ids", [])
+        if not isinstance(jobs, list) or len(jobs) > CHECKPOINT_JOBS or any(
+                not isinstance(job, str) or not RUN_JOB_ID.match(job) for job in jobs):
+            raise PolicyError(-32602, "job_ids must be at most %d job ids" % CHECKPOINT_JOBS)
+        claim.update(backup_refs=[self.redact(ref) for ref in refs], job_ids=list(dict.fromkeys(jobs)))
+        try:
+            entry = self.journal.checkpoint(thread_id, turn_id if isinstance(turn_id, str) else None, claim)
+        except (Refusal, OSError) as exc:
+            return {"tool": RUN_TOOL, "operation": "checkpoint", "recorded": False,
+                    "error": {"code": "journal_unavailable", "reason": getattr(exc, "reason", "journal_untrusted")},
+                    "hint": "the checkpoint was not saved; tell the user your progress in the reply instead"}
+        return {"tool": RUN_TOOL, "operation": "checkpoint", "recorded": True, "checkpoint_id": entry["id"],
+                "trust": "untrusted_claim", "verified": False,
+                "hint": "saved as your own unverified note; it does not verify, back up or undo anything"}
 
     def _run_worker(self, job, payload):
         """Owns one supervisor for its whole life (its parent-death signal is tied to this thread): relays redacted
@@ -4340,6 +4754,12 @@ class Broker:
                 job.duration_ms = int((time.monotonic() - job.clock) * 1000)
                 job.exit = {"exit_code": exit_code, "signal": signal_number, "leftovers_stopped": leftovers}
             job.lock.notify_all()
+        if job.journaled and (state == "running" or job.finished()):
+            try:
+                self.journal.job_update(job)
+            except (Refusal, OSError) as exc:
+                with job.lock:
+                    job.journal_error = getattr(exc, "reason", "journal_untrusted")
         view = self._run_view(job, 0)
         self._to_client(encode({"method": "ddistro/run/updated", "params": {
             "threadId": job.thread, "jobId": job.id, "state": view["state"], "started": view["started"],
@@ -4413,6 +4833,8 @@ class Broker:
                     "message": job.message, "spec": run_spec_view(job.request),
                     "started_at": job.started_at, "finished_at": job.finished_at, "duration_ms": job.duration_ms,
                     "leftovers_stopped": job.exit.get("leftovers_stopped"),
+                    "journal": ("unrecorded: " + job.journal_error) if job.journal_error else
+                    ("recorded" if job.journaled else None),
                     "output": {"text": text, "from": start, "to": end, "total_chars": job.end,
                                "available_from": job.base, "earlier_text": start > 0}}
         if view["finished"] and view["started"]:
@@ -4767,6 +5189,23 @@ def policy_change_roots(module):
                  and roots[root].get("change") is True and not roots[root].get("unsupported"))
 
 
+def cmd_recovery(task_id):
+    """root: the task's recovery view as JSON for the launcher, read under the journal's shared lock only."""
+    try:
+        require_root()
+        if not TASK_ID_PATTERN.match(task_id):
+            raise Refusal("task_id_invalid")
+        threads = ThreadStore(task_id)
+        view = recovery_view(TaskJournal(task_id).read(), set(threads.ids))
+        view["available"] = True
+    except Refusal as exc:
+        view = {"recovery_version": RECOVERY_VERSION, "available": False, "reason": exc.reason}
+    except OSError:
+        view = {"recovery_version": RECOVERY_VERSION, "available": False, "reason": "journal_untrusted"}
+    print(json.dumps(view))
+    return 0 if view["available"] else 3
+
+
 def cmd_serve(task_id):
     try:
         require_root()
@@ -4812,7 +5251,7 @@ def cmd_serve(task_id):
     # ddistro_exec also needs the attested canary for the installed helper bytes; ddistro checks the helper per call.
     broker = Broker(proc, sys.stdin.buffer, sys.stdout.buffer, threads, sys.stderr.buffer, memory=memory,
                     access=access, change_roots=change_roots, managed_exec=access and managed_exec,
-                    live_run=live_run, redact=run_redactor(policy))
+                    live_run=live_run, redact=run_redactor(policy), journal=TaskJournal(task_id))
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, lambda *_: broker.request_stop())
     returncode = broker.run()
@@ -5794,6 +6233,9 @@ def main(argv):
                                help="root: account-home config status, or --repair --sha256 HASH to quarantine it")
     home.add_argument("--repair", action="store_true")
     home.add_argument("--sha256")
+    recovery = commands.add_parser("recovery", allow_abbrev=False,
+                                   help="root: the task's execution journal recovery view as JSON (read only)")
+    recovery.add_argument("--task", required=True, help="task UUID prepared under " + TASKS_ROOT)
     args = parser.parse_args(argv)
     if args.command == "status":
         return cmd_status()
@@ -5803,6 +6245,8 @@ def main(argv):
         if args.sha256 is not None and not args.repair:
             parser.error("--sha256 needs --repair")
         return cmd_home_config(args.repair, args.sha256)
+    if args.command == "recovery":
+        return cmd_recovery(args.task)
     return cmd_serve(args.task)
 
 

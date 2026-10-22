@@ -558,6 +558,18 @@ def cmd_capabilities(opts, ctx):
                      "limits": {"code_bytes": 128 * 1024, "timeout_seconds": [1, 3600], "default_timeout_seconds": 300,
                                 "wait_seconds": [0, 60], "running_jobs": 4, "kept_jobs": 32, "ring_chars": 512 * 1024,
                                 "turn_calls": 32},
+                     # With task_recovery every job is journaled per task before it starts and at each outcome; see
+                     # ASSISTANT_RUNTIME.md "Task recovery journal".
+                     "recovery": {"capability": "task_recovery", "version": 1, "requires": "live_run",
+                                  "operations": ["recovery", "checkpoint"], "client_method": "ddistro/task/recovery",
+                                  "client_params": ["threadId"], "cli": "ddistro_agent recovery --task UUID",
+                                  "journal": "root_private_per_task", "recorded_before_start": True,
+                                  "stores": "digests_and_labels", "code": False, "output": False,
+                                  "interrupted": "outcome_unknown_not_reattachable", "replay": False,
+                                  "rollback": False, "checkpoints": "model_untrusted_claims", "verified": False,
+                                  "journal_failure": "run_not_started",
+                                  "limits": {"jobs": 64, "checkpoints": 32, "sessions": 16, "bytes": 256 * 1024,
+                                             "checkpoint_text": 300, "backup_refs": 5, "job_ids": 8}},
                      "lock": "maintenance_clear_at_start", "undo": None, "verification": "exit_status_only"},
         "service_operations": {"commands": ["operations targets", "operations preview", "operations apply"],
                                "preview_seconds": OPERATION_PREVIEW_SECONDS, "summary_max_lines": 8,
