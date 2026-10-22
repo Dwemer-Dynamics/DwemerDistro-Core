@@ -3187,6 +3187,12 @@ def health_word(document, key):
     return clean_line(value[:64]) if type(value) is str else None
 
 
+def health_server_matches(document, service):
+    """Accept the two published Dialectic health labels, without accepting another product on its port."""
+    accepted = (service, "DIALECTIC Server") if service == "DialecticServer" else (service,)
+    return type(document.get("service")) is str and document["service"] in accepted
+
+
 def cmd_health(opts, ctx):
     product = opts.get("product")
     captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -3216,7 +3222,7 @@ def cmd_health(opts, ctx):
 
     def server_health(service):
         def judge(status, document):
-            if document.get("service") != service:
+            if not health_server_matches(document, service):
                 return "failed", f"answered, but not as {service}"
             facts = "".join(f", {key} {str(document[key]).lower()}" for key in
                             ("database", "schema", "database_schema_ready", "background_processor")
@@ -3601,7 +3607,7 @@ def cmd_performance(opts, ctx):
             add(f"server.{name}.http", name, "failed", elapsed, {"http_status": status}, problem)
             continue
         add(f"server.{name}.http", name, "measured", elapsed,
-            {"http_status": status, "service_matched": document.get("service") == service,
+            {"http_status": status, "service_matched": health_server_matches(document, service),
              "status_ok": status == 200 and health_word(document, "status") == "ok"})
     timeout = left(2)
     if timeout is None:
