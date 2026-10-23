@@ -75,6 +75,7 @@ AGENT_USER = "ddagent"
 NOLOGIN_SHELLS = ("/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "/usr/bin/false")
 STATE_ROOT = "/var/lib/dwemerdistro/assistant"
 TASKS_ROOT = STATE_ROOT + "/tasks"
+GAME_TASKS_ROOT = STATE_ROOT + "/game-tasks"
 AGENT_STATE = STATE_ROOT + "/agent"
 THREADS_DIR = AGENT_STATE + "/threads"
 ACCOUNT_HOME_NAME = "codex-home"
@@ -1643,8 +1644,8 @@ def scratch_ancestor(st, identity):
             and stat.S_IMODE(st.st_mode) == SCRATCH_ANCESTOR_MODE)
 
 
-def open_tasks_root(identity):
-    fd = open_root_dir(TASKS_ROOT, "state_untrusted")
+def open_tasks_root(identity, game=False):
+    fd = open_root_dir(GAME_TASKS_ROOT if game else TASKS_ROOT, "state_untrusted")
     if not scratch_ancestor(os.fstat(fd), identity):
         os.close(fd)
         raise Refusal("tasks_root_untrusted")
@@ -1759,10 +1760,10 @@ def verified_session_identity():
 
 # ---------------------------------------------------------------- task and account state
 
-def load_task(task_id, identity):
+def load_task(task_id, identity, game=False):
     if not TASK_ID_PATTERN.match(task_id):
         raise Refusal("task_id_invalid")
-    tasks_fd = open_tasks_root(identity)
+    tasks_fd = open_tasks_root(identity, game)
     task_fd = meta_fd = None
     try:
         try:
@@ -5418,7 +5419,7 @@ def cmd_serve(task_id, client_kind="launcher", owner_fd=None):
         if not TASK_ID_PATTERN.match(task_id):
             raise Refusal("task_id_invalid")
         # Task errors are reported even when the runtime still needs a probe.
-        context, work_fd = load_task(task_id, agent_identity())
+        context, work_fd = load_task(task_id, agent_identity(), client_kind == "game")
         identity, managed_exec, live_run = verified_session_identity()
         if owner_fd is None:
             lock = SingletonLock()
@@ -5472,7 +5473,7 @@ def cmd_serve(task_id, client_kind="launcher", owner_fd=None):
     broker = Broker(proc, sys.stdin.buffer, sys.stdout.buffer, threads, sys.stderr.buffer, memory=memory,
                     access=access, change_roots=change_roots, managed_exec=access and managed_exec,
                     live_run=live_run if client_kind == "launcher" else None, redact=run_redactor(policy),
-                    journal=TaskJournal(task_id), client_kind=client_kind)
+                    journal=TaskJournal(task_id) if client_kind == "launcher" else None, client_kind=client_kind)
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, lambda *_: broker.request_stop())
     returncode = broker.run()

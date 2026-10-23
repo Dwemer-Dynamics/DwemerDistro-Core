@@ -25,6 +25,14 @@ api, agent = load("ddistro_api"), load("ddistro_agent")
 
 
 class GamePolicy(unittest.TestCase):
+    def test_game_workspace_root_is_separate_from_maintenance_tasks(self):
+        with patch.object(agent, "open_root_dir", return_value=7) as opened, \
+             patch.object(agent.os, "fstat", return_value=object()), \
+             patch.object(agent, "scratch_ancestor", return_value=True):
+            self.assertEqual(agent.open_tasks_root(None, game=True), 7)
+            opened.assert_called_once_with(agent.GAME_TASKS_ROOT, "state_untrusted")
+        self.assertNotEqual(agent.GAME_TASKS_ROOT, agent.TASKS_ROOT)
+
     def broker(self):
         return agent.Broker(None, None, io.BytesIO(), types.SimpleNamespace(task_id="test"),
                             memory=True, access=True, managed_exec=True, live_run="a" * 64, client_kind="game")

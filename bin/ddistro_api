@@ -240,6 +240,11 @@ class App:
     def __init__(self):
         self.agent = load_agent()
         self.owner = self.agent.SingletonLock()
+        account = pwd.getpwnam("ddagent")
+        if not os.path.lexists(self.agent.GAME_TASKS_ROOT):
+            os.mkdir(self.agent.GAME_TASKS_ROOT, 0o710)
+            os.chown(self.agent.GAME_TASKS_ROOT, 0, account.pw_gid)
+        os.close(self.agent.open_tasks_root(account, game=True))
         self.store = Store()
         self.store.write("UPDATE requests SET state='outcome_unknown' WHERE state NOT IN ('completed','failed','cancelled','outcome_unknown')")
         self.lock = threading.Condition(threading.RLock())
@@ -514,9 +519,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cid, task = str(uuid.uuid4()), str(uuid.uuid4())
             # Empty game scratch contains no Launcher diagnostic snapshot, configuration or memory.
             account = pwd.getpwnam("ddagent")
-            tasks_fd = app.agent.open_tasks_root(account)
+            tasks_fd = app.agent.open_tasks_root(account, game=True)
             os.close(tasks_fd)
-            directory = app.agent.TASKS_ROOT + "/" + task
+            directory = app.agent.GAME_TASKS_ROOT + "/" + task
             os.mkdir(directory, 0o710)
             os.chown(directory, 0, account.pw_gid)
             os.mkdir(directory + "/work", 0o700)

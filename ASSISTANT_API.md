@@ -47,7 +47,8 @@ have only `chat`: no host shell, SQL, service control, file changes, Launcher
 memory, account methods, approvals or game actions. Their worker has no distro
 dynamic tools; native execution, apps, browser and agent spawning are disabled
 in its pinned runtime configuration. The existing outer sandbox remains enforced.
-Game scratch starts empty, without the Launcher's diagnostic snapshot.
+Game scratch starts empty, without the Launcher's diagnostic snapshot. Its tasks
+live under a separate `game-tasks/` root and never appear in maintenance task lists.
 
 The same provider account signs in once through the trusted Launcher. Provider
 credentials are not sent to mods. Each client's conversation/task/thread mapping
@@ -96,7 +97,8 @@ actual WSL setup; otherwise call from the mod's WSL server. Do not expose this
 unencrypted bearer-token endpoint over a network. Same Windows-user or WSL-root
 compromise is outside client-token isolation.
 
-`api/` is root 0700, its database and control socket root 0600. Root-local relay
+`api/` is root 0700, its database and control socket root 0600. `game-tasks/` is
+root:ddagent 0710, with private per-conversation scratch. Root-local relay
 access also checks Unix peer credentials. HTTP never accepts a client-supplied
 role, owner, permission list, task path or raw Codex method. It returns generic
 errors and does not log tokens, prompts, replies or request bodies.
