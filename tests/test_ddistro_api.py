@@ -179,5 +179,57 @@ class Scheduling(unittest.TestCase):
         self.assertEqual(released, [session])
 
 
+class Maintenance(unittest.TestCase):
+    def test_busy_shutdown_does_not_run_update(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(api, "prepare_root"), \
+             patch.object(api, "LIFECYCLE", root + "/gate"), \
+             patch.object(api, "local_call", side_effect=api.ApiError(409, "request_running")), \
+             patch.object(api.subprocess, "run") as run:
+            with self.assertRaises(api.ApiError) as error:
+                api.maintenance(["/bin/true"])
+            self.assertEqual(error.exception.status, 409)
+            run.assert_not_called()
+
+    def test_maintenance_blocks_auto_connect_without_replacing_lock(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(api, "prepare_root"), \
+             patch.object(api, "LIFECYCLE", root + "/gate"):
+            with api.lifecycle(exclusive=True):
+                inode = os.stat(api.LIFECYCLE).st_ino
+                with self.assertRaises(api.ApiError) as error:
+                    with api.lifecycle():
+                        self.fail("Auto-connect entered maintenance")
+                self.assertEqual(error.exception.code, "maintenance_running")
+            with api.lifecycle():
+                self.assertEqual(os.stat(api.LIFECYCLE).st_ino, inode)
+
+    def test_background_jobs_prevent_idle_shutdown(self):
+        app = types.SimpleNamespace(lock=threading.RLock(), current=None, queue=[],
+            store=types.SimpleNamespace(rows=lambda *args: []),
+            sessions={"idle": types.SimpleNamespace(jobs={"live-job"}, active=False, queued=False)})
+        handler = api.Handler.__new__(api.Handler)
+        handler.server = types.SimpleNamespace(app=app)
+        with self.assertRaises(api.ApiError) as error:
+            handler.route("POST", "/v1/admin/shutdown", {}, "launcher", "launcher")
+        self.assertEqual(error.exception.code, "request_running")
+
+    def test_accepted_game_request_is_protected_before_worker_reserves(self):
+        app = types.SimpleNamespace(lock=threading.RLock(), current=None, queue=[], sessions={},
+            store=types.SimpleNamespace(rows=lambda *args: [{"id": "accepted-but-not-scheduled"}]))
+        handler = api.Handler.__new__(api.Handler)
+        handler.server = types.SimpleNamespace(app=app)
+        with self.assertRaises(api.ApiError) as error:
+            handler.route("POST", "/v1/admin/shutdown", {}, "launcher", "launcher")
+        self.assertEqual(error.exception.code, "request_running")
+
+    def test_stale_daemon_is_not_treated_as_ready(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(api, "prepare_root"), \
+             patch.object(api, "LIFECYCLE", root + "/gate"), patch.object(api, "SELF", __file__), \
+             patch.object(api, "local_call", return_value=(types.SimpleNamespace(close=lambda: None),
+                 io.BytesIO(b'{"version":1,"generation":"old"}'))):
+            with self.assertRaises(api.ApiError) as error:
+                api.ensure()
+            self.assertEqual(error.exception.code, "api_update_required")
+
+
 if __name__ == "__main__":
     unittest.main()

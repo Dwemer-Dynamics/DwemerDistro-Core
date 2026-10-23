@@ -1,6 +1,13 @@
 #!/bin/bash
 # Enhanced update script with minimal output
 
+# Drain the persistent Assistant before replacing any helper it attests. The root API
+# owns a separate gate for the entire update, so auto-connect cannot restart it midway.
+if [ "${DDISTRO_ASSISTANT_MAINTENANCE:-}" != 1 ] && [ -x /usr/local/bin/ddistro_api ] \
+    && [ -d /var/lib/dwemerdistro/assistant/agent ]; then
+    exec /usr/bin/python3 /home/dwemer/dwemerdistro/bin/ddistro_api maintenance /bin/bash "$0" "$@"
+fi
+
 # Simple color palette
 GREEN='\033[0;32m'
 RED='\033[1;31m'
@@ -112,6 +119,13 @@ fi
 # Repair old image keyrings before any subsequent component installation uses APT.
 /usr/local/bin/repair_github_cli_keyring || exit 1
 
+# Patch the shared PHP runtime before any server, migration, or configuration step runs PHP.
+printf ">> Verifying the PHP security update...\n"
+if ! /usr/local/bin/ensure_php_security; then
+    printf "${RED}[ERROR] The PHP security update is incomplete. Server files were not updated.${NC}\n"
+    exit 1
+fi
+
 printf ">> Checking installed server repository origins...\n"
 /usr/local/bin/ddistro_server migrate-remotes all || exit 1
 
@@ -120,12 +134,40 @@ update-locale LANG=C.UTF-8 LC_ALL=C.UTF-8
 service postgresql start >/dev/null 7<&- || exit 1
 /usr/local/bin/ensure_postgres_utf8 || exit 1
 
+# Replace a shipped configuration file only while it still matches what an update installed.
+# A file the user changed is kept; a missing file gets the shipped default.
+SHIPPED_CONFIG_STATE=/var/lib/dwemerdistro/shipped-config
+install_shipped_config() {
+    local source="$1" target="$2" mode="$3"
+    local baseline="$SHIPPED_CONFIG_STATE/$(basename "$target").sha256"
+    local shipped current recorded=""
+
+    shipped="$(sha256sum < "$source" | cut -d ' ' -f 1)" || return 1
+    if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
+        printf "${RED}[ERROR] $target is not a plain file. It was not changed.${NC}\n"
+        return 1
+    fi
+    if [ -f "$target" ]; then
+        current="$(sha256sum < "$target" | cut -d ' ' -f 1)" || return 1
+        [ ! -f "$baseline" ] || recorded="$(head -n 1 "$baseline")"
+        if [ "$current" != "$shipped" ] && [ "$current" != "$recorded" ]; then
+            printf ">> Keeping customized %s\n" "$target"
+            return 0
+        fi
+    fi
+    install -d -o root -g root -m 755 "$SHIPPED_CONFIG_STATE" \
+        && install -o root -g root -m "$mode" "$source" "$target" \
+        && printf '%s\n' "$shipped" > "$baseline"
+}
+
 printf ">> Copying configuration files to /etc...\n"
-find /home/dwemer/dwemerdistro/etc/ -type f ! -name "php.ini" ! -name "dwemerdistro_services.conf" -exec cp {} /etc/ \; 2>/dev/null
+find /home/dwemer/dwemerdistro/etc/ -type f ! -name "php.ini" ! -name "dwemerdistro_services.conf" \
+    ! -name "dwemerdistro-lmstudio.json" ! -name "cuda_config" -exec cp {} /etc/ \; 2>/dev/null
 if [ $? -eq 0 ]; then
     # The LM Studio helper runs as dwemer and must read the public model catalog.
-    install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/dwemerdistro-lmstudio.json /etc/dwemerdistro-lmstudio.json || exit 1
-    # ddistro inventory refuses a component catalog that is not a plain root-owned file only root can change.
+    install_shipped_config /home/dwemer/dwemerdistro/etc/dwemerdistro-lmstudio.json /etc/dwemerdistro-lmstudio.json 644 || exit 1
+    install_shipped_config /home/dwemer/dwemerdistro/etc/cuda_config /etc/cuda_config 644 || exit 1
+    # The validated shared component catalog is shipped with the Assistant.
     install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/dwemerdistro-components.json /etc/dwemerdistro-components.json || exit 1
     # Keep the existing service ports, including CUSTOM_MODS_PORT; only a missing file gets the defaults.
     # start_env sources it as root, so an existing file must be a plain root-owned file only root can change.
@@ -156,18 +198,30 @@ print_header "UPDATING PHP CONFIGURATION"
 # Only a freshly prepared image has the marker that enables this initialization.
 /usr/local/bin/initialize_fresh_distro || exit 1
 
-printf ">> Updating PHP Apache configuration...\n"
-cp /home/dwemer/dwemerdistro/etc/php.ini /etc/php/8.2/apache2/php.ini 2>/dev/null
-if [ $? -eq 0 ]; then
-    printf "${GREEN}[SUCCESS] PHP configuration updated${NC}\n"
+# Existing PHP settings belong to the user; only a missing Apache php.ini gets the distro default.
+printf ">> Checking PHP Apache configuration...\n"
+PHP_APACHE_INI=/etc/php/8.2/apache2/php.ini
+if [ -e "$PHP_APACHE_INI" ] || [ -L "$PHP_APACHE_INI" ]; then
+    printf "${GREEN}[SUCCESS] Existing PHP configuration kept unchanged${NC}\n"
+elif install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/php.ini "$PHP_APACHE_INI"; then
+    printf "${GREEN}[SUCCESS] Default PHP configuration installed${NC}\n"
 else
-    printf "${RED}[ERROR] Error updating PHP configuration${NC}\n"
+    printf "${RED}[ERROR] Error installing the default PHP configuration${NC}\n"
     exit 1
 fi
 
-# The new helpers make an existing probe stale; rerun it once now that every Core file is in place.
-# Skipped without the runtime; busy or failed only warns, so it never fails this update.
-/usr/local/bin/install_assistant_runtime --reprobe 7<&- || true
+# Existing and fresh users receive the same hash-verified runtime, without account sign-in.
+# An interrupted download can be retried; no user data or provider credentials are replaced.
+/usr/local/bin/install_assistant_runtime --install-prerequisites 7<&- || exit 1
+# Do not report a successful Assistant upgrade with a skipped or failed isolation check.
+if ! /usr/local/bin/ddistro --json agent probe 7<&- | /usr/bin/python3 -c '
+import json, sys
+result = json.load(sys.stdin)
+sys.exit(0 if result.get("ok") is True and result.get("data", {}).get("passed") is True else 1)
+'; then
+    printf "${RED}[ERROR] Assistant isolation did not pass. Check connectivity and retry Update Distro.${NC}\n"
+    exit 1
+fi
 
 printf "\n${BOLD}=======================================================${NC}\n"
 printf "${BOLD}${GREEN}        CORE SYSTEM UPDATED SUCCESSFULLY!          ${NC}\n"
