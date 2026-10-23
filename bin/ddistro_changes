@@ -6,6 +6,10 @@ code and process exit code follow bin/ddistro; stderr carries short progress lin
 state is root-only under STATE_ROOT. The workspace holds copies of explicitly selected text
 files owned by the agent account. Nothing here runs repository code or hooks as root.
 See ASSISTANT.md for the command contract.
+
+Schema 1 tasks edit one product from PRODUCT_ROOTS and keep their original code path. Schema 2
+tasks (checkout, rollback-preview, undo) edit files from several roots, but only roots the
+code-owned access policy (ddistro_access) marks change: True; this file holds no v2 root paths.
 """
 import contextlib
 import difflib
@@ -30,6 +34,7 @@ SCHEMA_VERSION = 1
 STATE_ROOT = "/var/lib/dwemerdistro/assistant/tasks"
 MAINTENANCE_LOCK = "/run/lock/dwemerdistro-maintenance.lock"
 CLI_PATH = "/usr/local/bin/ddistro"  # foundation sanitizer, status, and log reader
+ACCESS_PATH = "/usr/local/bin/ddistro_access"  # code-owned root policy; the only source of v2 change roots
 PHP = "/usr/bin/php"
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Only HerikaServer is editable so far; other products are refused rather than guessed.
@@ -49,6 +54,11 @@ DIFF_LIMIT = 8 * 1024 * 1024  # bytes of the JSON-encoded diff string
 LINT_TIMEOUT = 30
 LIST_LIMIT = 200
 CONTEXT_DIR = ".ddistro-context"
+TASK_V2 = 2
+ROOT_ID = re.compile(r"^[a-z][a-z0-9]{0,31}\Z")
+# v2 edits are limited to source and plain-text types; config-like names are refused even when a root allows changes.
+EDIT_NAME = re.compile(r"(?i)^[^.].*\.(php|py|js|mjs|cjs|ts|css|html?|md|txt|json|xml|csv|sh|lua|sql)\Z")
+CONFIG_NAME = re.compile(r"(?i)^((config|configuration|settings|conf|secrets?)(\..*)?|.*\.(ini|cfg|conf|toml|ya?ml|env|properties))\Z")
 
 ERRORS = {"failed": 1, "internal_error": 1, "partial": 10, "conflict": 11, "rollback": 12,
           "invalid_argument": 64, "not_found": 66, "unsupported": 69, "busy": 75,
@@ -332,7 +342,7 @@ def normalize_path(raw, product):
         reason = "this name is reserved for workspace diagnostics"
     elif any(part.lower() in EXCLUDED_PARTS for part in parts):
         reason = "Git metadata, logs, caches, uploads, and voice files are never edited here"
-    elif SECRET_NAME.match(parts[-1]) or PRODUCT_EXCLUDES[product].match(rel):
+    elif SECRET_NAME.match(parts[-1]) or (product in PRODUCT_EXCLUDES and PRODUCT_EXCLUDES[product].match(rel)):
         reason = "it may hold credentials or user configuration; edit it directly if you must"
     else:
         return rel
@@ -353,9 +363,9 @@ def check_product_dir(info, owner, path):
         raise ChangeError("unsafe_path", f"{path} is not a trusted product folder.", {"path": path})
 
 
-def open_product_root(product):
-    """Open the product root from / without following links; returns (fd, owner uid)."""
-    root = PRODUCT_ROOTS[product]
+def open_product_root(product, root=None):
+    """Open the product root (or a v2 policy root) from / without following links; returns (fd, owner uid)."""
+    root = root or PRODUCT_ROOTS[product]
     fd, infos = os.open("/", DIR_FLAGS), []
     try:
         for part in root.strip("/").split("/"):
@@ -515,10 +525,11 @@ def scratch_account():
     raise ChangeError("unsupported", "Neither the ddagent nor the dwemer account exists for the workspace.")
 
 
-def scratch_write(work_fd, rel, data, uid, gid):
-    parts, fd = rel.split("/"), os.dup(work_fd)
+def scratch_parent(work_fd, rel, uid, gid):
+    """Open, creating as the workspace owner, the workspace folder that holds rel; never follows links."""
+    fd = os.dup(work_fd)
     try:
-        for part in parts[:-1]:
+        for part in rel.split("/")[:-1]:
             created = False
             with contextlib.suppress(FileExistsError):
                 os.mkdir(part, 0o700, dir_fd=fd)
@@ -529,7 +540,16 @@ def scratch_write(work_fd, rel, data, uid, gid):
             if created:
                 os.fchown(fd, uid, gid)
                 os.fchmod(fd, 0o700)
-        out = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600, dir_fd=fd)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def scratch_write(work_fd, rel, data, uid, gid):
+    parts, fd = rel.split("/"), scratch_parent(work_fd, rel, uid, gid)
+    try:
+        out =os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600, dir_fd=fd)
         try:
             write_all(out, data)
             os.fchown(out, uid, gid)
@@ -571,13 +591,13 @@ def open_work(path, task):
     return fd
 
 
-def load_cli():
-    """Load the foundation CLI module (sanitizer, status, logs) after checking it is root-controlled."""
-    info, parent = os.lstat(CLI_PATH), os.stat(os.path.dirname(CLI_PATH))
+def load_trusted(name, path):
+    """Load a root-controlled helper module (the ddistro CLI or the access policy) after checking ownership."""
+    info, parent = os.lstat(path), os.stat(os.path.dirname(path))
     if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 \
             or parent.st_uid != 0 or parent.st_mode & 0o022:
-        raise ChangeError("unsupported", "The ddistro command is not a trusted root-owned file.")
-    spec = spec_from_loader("ddistro_cli", SourceFileLoader("ddistro_cli", CLI_PATH))
+        raise ChangeError("unsupported", f"{os.path.basename(path)} is not a trusted root-owned file.")
+    spec = spec_from_loader(name, SourceFileLoader(name, path))
     module = module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -586,7 +606,7 @@ def load_cli():
 def diagnostics(product):
     """Sanitized status and recent log lines for a task with no selected files."""
     try:
-        cli = load_cli()
+        cli = load_trusted("ddistro_cli", CLI_PATH)
     except (ChangeError, OSError, SyntaxError):
         return {"status.json": canonical({"available": False, "reason": "ddistro unavailable"})}
     files = {}
@@ -730,7 +750,7 @@ def lint(manifest, blobs):
     for entry in manifest["files"]:
         if entry["new_sha256"] is None:
             continue
-        data, rel = blobs[entry["new_sha256"]], entry["path"]
+        data, rel = blobs[entry["new_sha256"]], entry.get("scratch", entry["path"])
         if rel.endswith(".json"):
             try:
                 json.loads(data.decode("utf-8"))
@@ -776,16 +796,52 @@ def load_stage(stage, manifest_sha256, task_id):
     return manifest, blobs
 
 
+def freeze_stage(stages, manifest_sha256, manifest, blobs, task_id):
+    """Store a manifest and its bytes root-only under stages/<sha> and lint the stored copy; returns warnings."""
+    with contextlib.suppress(FileExistsError):
+        make_state_dir(stages)
+    final = os.path.join(stages, manifest_sha256)
+    if os.path.lexists(final):
+        manifest, frozen = load_stage(final, manifest_sha256, task_id)
+        errors, warnings = lint(manifest, frozen)
+        if errors:
+            raise ChangeError("failed", "Validation now fails for this already staged batch; do not apply it.",
+                              {"reason": "validation", "errors": errors})
+        return warnings
+    tmp = os.path.join(stages, ".tmp-" + uuid.uuid4().hex)
+    make_state_dir(tmp)
+    try:
+        make_state_dir(os.path.join(tmp, "blobs"))
+        for sha, data in blobs.items():
+            write_state(os.path.join(tmp, "blobs", sha), data)
+        write_state(os.path.join(tmp, "manifest.json"), canonical(manifest))
+        # Validate the bytes read back from root-only storage, not the editable workspace.
+        manifest, frozen = load_stage(tmp, manifest_sha256, task_id)
+        errors, warnings = lint(manifest, frozen)
+        if errors:
+            raise ChangeError("failed", "Validation failed; nothing was staged.",
+                              {"reason": "validation", "errors": errors})
+        os.rename(tmp, final)
+        fsync_dir(stages)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return warnings
+
+
 def cmd_diff(opts):
     path = task_dir(opts["task_id"])
-    task = load_task(path)
+    task = read_task(path)
+    if task["schema_version"] == TASK_V2:
+        return diff_v2(path, task)
     manifest, _, diff = build_manifest(path, task)
     return dict(change_summary(task["task_id"], manifest, diff), state=derive_state(path)[0])
 
 
 def cmd_stage(opts):
     path = task_dir(opts["task_id"])
-    task = load_task(path)
+    task = read_task(path)
+    if task["schema_version"] == TASK_V2:
+        return stage_v2(path)
     with task_lock(path):
         if os.path.lexists(os.path.join(path, "apply")):
             raise ChangeError("conflict", "This task was already applied; prepare a new task for more changes.")
@@ -795,34 +851,8 @@ def cmd_stage(opts):
             raise ChangeError("invalid_argument", f"The diff exceeds {DIFF_LIMIT} bytes and cannot be reviewed in "
                               "full; nothing was staged. Split the change into smaller tasks.",
                               {"reason": "diff_too_large", "diff_limit": DIFF_LIMIT})
-        stages = os.path.join(path, "stages")
-        with contextlib.suppress(FileExistsError):
-            make_state_dir(stages)
-        final = os.path.join(stages, summary["manifest_sha256"])
-        if not os.path.lexists(final):
-            tmp = os.path.join(stages, ".tmp-" + uuid.uuid4().hex)
-            make_state_dir(tmp)
-            try:
-                make_state_dir(os.path.join(tmp, "blobs"))
-                for sha, data in blobs.items():
-                    write_state(os.path.join(tmp, "blobs", sha), data)
-                write_state(os.path.join(tmp, "manifest.json"), canonical(manifest))
-                # Validate the bytes read back from root-only storage, not the editable workspace.
-                manifest, frozen = load_stage(tmp, summary["manifest_sha256"], task["task_id"])
-                errors, warnings = lint(manifest, frozen)
-                if errors:
-                    raise ChangeError("failed", "Validation failed; nothing was staged.",
-                                      {"reason": "validation", "errors": errors})
-                os.rename(tmp, final)
-                fsync_dir(stages)
-            finally:
-                shutil.rmtree(tmp, ignore_errors=True)
-        else:
-            manifest, frozen = load_stage(final, summary["manifest_sha256"], task["task_id"])
-            errors, warnings = lint(manifest, frozen)
-            if errors:
-                raise ChangeError("failed", "Validation now fails for this already staged batch; do not apply it.",
-                                  {"reason": "validation", "errors": errors})
+        warnings = freeze_stage(os.path.join(path, "stages"), summary["manifest_sha256"], manifest, blobs,
+                                task["task_id"])
     progress(f"Staged {len(summary['files'])} changed files as {summary['manifest_sha256']}.")
     return dict(summary, warnings=warnings, state="staged")
 
@@ -849,10 +879,28 @@ def journal_files(path, kind):
     return [{"path": rel, "state": state} for rel, state in states.items()]
 
 
-def run_writes(path, kind, task, manifest_sha256, plan):
+def open_targets(task, plan):
+    """Open each live root a plan touches once: the v1 product root (key None) or v2 policy roots, rechecked now."""
+    opened = {}
+    try:
+        for step in plan:
+            key = step.get("root")
+            if key not in opened:
+                if key is None:
+                    opened[key] = open_product_root(task["product"])
+                else:
+                    opened[key] = open_product_root(key, change_spec(key, step["root_path"])[1]["path"])
+    except BaseException:
+        for fd, _ in opened.values():
+            os.close(fd)
+        raise
+    return opened
+
+
+def run_writes(path, kind, task, manifest_sha256, plan, directory=None, extra=None):
     """Write each planned file with an fsynced intent/done journal and record one immutable receipt."""
-    directory = os.path.join(path, kind)
-    journal = os.open(os.path.join(directory, "journal.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL
+    directory = directory or os.path.join(path, kind)
+    journal =os.open(os.path.join(directory, "journal.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL
                       | NOFOLLOW, 0o600)
 
     def record(**event):
@@ -860,27 +908,31 @@ def run_writes(path, kind, task, manifest_sha256, plan):
         os.fsync(journal)
 
     started, files, failure = now(), [], None
-    root_fd, owner = open_product_root(task["product"])
+    roots = open_targets(task, plan)
     try:
         record(event="begin", manifest_sha256=manifest_sha256)
         for step in plan:
             entry = {key: step[key] for key in ("path", "action", "base_sha256", "new_sha256")}
+            entry.update((key, step[key]) for key in ("root", "scratch", "new_size") if key in step)
+            root_fd, owner = roots[step.get("root")]
             if failure:
                 files.append(dict(entry, state="pending"))
                 continue
-            record(event="intent", path=step["path"], action=step["action"])
+            label = step.get("scratch", step["path"])  # v2 journals name root/path
+            record(event="intent", path=label, action=step["action"])
             try:
                 meta = replace_file(root_fd, owner, step["path"], step["expect"], step["data"], step["meta"])
             except (ChangeError, OSError) as error:
                 failure = error
                 reason = error.message if isinstance(error, ChangeError) else errno.errorcode.get(error.errno, "error")
-                record(event="failed", path=step["path"], reason=reason)
+                record(event="failed", path=label, reason=reason)
                 files.append(dict(entry, state="failed", reason=reason))
                 continue
-            record(event="done", path=step["path"], meta=meta)
+            record(event="done", path=label, meta=meta)
             files.append(dict(entry, state="written", meta=meta))
     finally:
-        os.close(root_fd)
+        for fd, _ in roots.values():
+            os.close(fd)
         os.close(journal)
     written = sum(1 for item in files if item["state"] == "written")
     if failure is None:
@@ -889,8 +941,8 @@ def run_writes(path, kind, task, manifest_sha256, plan):
         state = "partial" if kind == "apply" else "rollback_partial"
     else:
         state = "failed" if kind == "apply" else "rollback_failed"
-    receipt = {"schema_version": SCHEMA_VERSION, "task_id": task["task_id"], "kind": kind, "state": state,
-               "manifest_sha256": manifest_sha256, "started": started, "finished": now(), "files": files}
+    receipt = dict(extra or {}, schema_version=task["schema_version"], task_id=task["task_id"], kind=kind,
+                   state=state, manifest_sha256=manifest_sha256, started=started, finished=now(), files=files)
     write_state(os.path.join(directory, "receipt.json"), canonical(receipt), exclusive=True)
     result = apply_result(task["task_id"], receipt)
     if state in ("partial", "rollback_partial"):
@@ -901,17 +953,18 @@ def run_writes(path, kind, task, manifest_sha256, plan):
 
 
 def stale_files(task, plan):
-    root_fd, owner = open_product_root(task["product"])
-    stale = []
+    roots, stale = open_targets(task, plan), []
     try:
         for step in plan:
-            data, info = live_file(root_fd, owner, step["path"])
+            data, info = live_file(*roots[step.get("root")], step["path"])
             reason = mismatch(data, info, step["expect"])
             if reason:
-                stale.append({"path": step["path"], "reason": reason})
+                stale.append(dict({"path": step["path"], "reason": reason},
+                                  **({"root": step["root"]} if "root" in step else {})))
             step["live"] = data
     finally:
-        os.close(root_fd)
+        for fd, _ in roots.values():
+            os.close(fd)
     return stale
 
 
@@ -920,7 +973,9 @@ def cmd_apply(opts):
     if not SHA256.match(manifest_sha256):
         raise ChangeError("invalid_argument", "--manifest-sha256 must be 64 lowercase hex characters.")
     path = task_dir(opts["task_id"])
-    task = load_task(path)
+    task = read_task(path)
+    if task["schema_version"] == TASK_V2:
+        return apply_v2(path, manifest_sha256)
     with maintenance_exclusive(), task_lock(path):
         receipt = optional_json(os.path.join(path, "apply", "receipt.json"))
         if receipt is not None:
@@ -957,7 +1012,10 @@ INVERSE = {"create": "delete", "delete": "create", "modify": "modify"}
 
 def cmd_rollback(opts):
     path = task_dir(opts["task_id"])
-    task = load_task(path)
+    task = read_task(path)
+    if task["schema_version"] == TASK_V2:
+        raise ChangeError("invalid_argument", "Multi-root changes are undone only through rollback-preview and an "
+                          "approved undo --preview-sha256.", {"reason": "preview_required"})
     with maintenance_exclusive(), task_lock(path):
         done = optional_json(os.path.join(path, "rollback", "receipt.json"))
         if done is not None:
@@ -1001,9 +1059,9 @@ def cmd_rollback(opts):
         return run_writes(path, "rollback", task, receipt["manifest_sha256"], plan)
 
 
-def derive_state(path):
-    """(state, receipt, files) from the task's immutable records; never repairs anything."""
-    busy = task_busy(path)
+def derive_state(path, busy=None):
+    """(state, receipt, files) from the task's (or a v2 round's) immutable records; never repairs anything."""
+    busy = task_busy(path) if busy is None else busy
     for kind, interrupted in (("rollback", "rollback_interrupted"), ("apply", "interrupted")):
         receipt = optional_json(os.path.join(path, kind, "receipt.json"))
         if receipt is not None:
@@ -1017,7 +1075,9 @@ def derive_state(path):
 
 def cmd_status(opts):
     path = task_dir(opts["task_id"])
-    task = load_task(path)
+    task = read_task(path)
+    if task["schema_version"] == TASK_V2:
+        return status_v2(path, task)
     state, receipt, files = derive_state(path)
     stages = os.path.join(path, "stages")
     staged = sorted(name for name in os.listdir(stages) if SHA256.match(name)) if os.path.isdir(stages) else []
@@ -1038,29 +1098,651 @@ def cmd_list(opts):
     for name in names:
         try:
             path = task_dir(name)
-            task = load_task(path)
+            task = read_task(path)
+            if task["schema_version"] == TASK_V2:
+                with contextlib.suppress(ChangeError):
+                    settle(path, task)
+                state, count = state_v2(path, task)[0], len(records(task))
+            else:
+                state, count = derive_state(path)[0], len(task["paths"])
             tasks.append({"task_id": name, "product": task["product"], "created": task["created"],
-                          "state": derive_state(path)[0], "files": len(task["paths"])})
+                          "state": state, "files": count})
         except ChangeError:
             tasks.append({"task_id": name, "product": None, "created": None, "state": "incomplete", "files": 0})
     tasks.sort(key=lambda item: item["created"] or "", reverse=True)
     return {"tasks": tasks[:LIST_LIMIT], "total": len(tasks)}
 
 
+# --- Schema 2: multi-root tasks ------------------------------------------------------
+# Policy seam: ddistro_access.ACCESS_ROOTS[id] must carry change: True and an absolute "path", and
+# ddistro_access.deny_reason(spec, parts, is_dir) must return None for the file. Nothing else grants a root.
+
+_ACCESS = []
+
+
+def load_access():
+    """The code-owned access policy module, loaded once per process after the root-ownership check."""
+    if not _ACCESS:
+        try:
+            _ACCESS.append(load_trusted("ddistro_access", ACCESS_PATH))
+        except (OSError, SyntaxError):
+            raise ChangeError("unsupported", "The assistant access policy is not installed; no root can be changed.",
+                              {"reason": "policy_unavailable"})
+    return _ACCESS[0]
+
+
+def change_spec(root_id, recorded_path=None):
+    """(access module, policy row) for a root the policy explicitly allows changing; recorded_path must still match."""
+    access = load_access()
+    roots = getattr(access, "ACCESS_ROOTS", None)
+    valid_id = isinstance(root_id, str) and ROOT_ID.match(root_id) is not None
+    spec = roots.get(root_id) if valid_id and isinstance(roots, dict) else None
+    path = spec.get("path") if isinstance(spec, dict) else None
+    if not isinstance(path, str) or spec.get("change") is not True or spec.get("unsupported") \
+            or not path.startswith("/") or path == "/" or os.path.normpath(path) != path \
+            or not callable(getattr(access, "deny_reason", None)):
+        raise ChangeError("unsupported", f"{CONTROL.sub('?', str(root_id))[:40]} is not a root the assistant may "
+                          "change.", {"root": root_id if valid_id else None, "reason": "not_changeable"})
+    if recorded_path is not None and path != recorded_path:
+        raise ChangeError("conflict", f"The approved {root_id} folder changed since checkout; nothing was written.",
+                          {"root": root_id, "reason": "root_moved"})
+    return access, spec
+
+
+def change_path(access, root_id, spec, raw):
+    """A relative file path in a change root that passes the legacy rules, the shared policy, and the v2 type rules."""
+    rel = normalize_path(raw, root_id)
+    parts = rel.split("/")
+    reason = access.deny_reason(spec, parts, False)
+    if reason is None and CONFIG_NAME.match(parts[-1]):
+        reason = "config"
+    elif reason is None and not EDIT_NAME.match(parts[-1]):
+        reason = "unsupported_type"
+    if reason:
+        raise ChangeError("invalid_argument", f"{root_id}/{rel} cannot be changed by the assistant ({reason}).",
+                          {"root": root_id, "path": rel, "reason": "excluded", "policy": str(reason)[:40]})
+    return rel
+
+
+def refuse_inline_secret(data, root_id, rel):
+    """Refuse bytes the shared policy redactor would rewrite (or cannot decode); None means absent. Bytes are never
+    sanitized here: a file holding a credential is refused whole, and no content goes into the error."""
+    if data is None:
+        return
+    access = load_access()
+    decode, redact = getattr(access, "decode_text", None), getattr(access, "redact_text", None)
+    if not callable(decode) or not callable(redact):
+        raise ChangeError("unsupported", "The assistant access policy has no redactor; no file can be changed.",
+                          {"reason": "policy_unavailable"})
+    text = decode(data)
+    if text is None or redact(text)[1]:
+        raise ChangeError("invalid_argument", f"{root_id}/{rel} contains what looks like an inline credential; the "
+                          "assistant cannot read or write it. Move the value into protected configuration.",
+                          {"root": root_id, "path": rel, "reason": "inline_secret"})
+
+
+def check_v2(path, task):
+    """Validate a schema 2 task.json; scratch paths are always <root>/<path>, so roots never collide."""
+    good = type(task) is dict and task.get("schema_version") == TASK_V2 \
+        and task.get("task_id") == os.path.basename(path) and type(task.get("targets")) is list \
+        and type(task.get("round")) is int and task["round"] >= 1 and type(task.get("undone")) is list \
+        and type(task.get("scratch_uid")) is int and type(task.get("scratch_gid")) is int \
+        and isinstance(task.get("workspace"), str)
+    for target in task["targets"] if good else []:
+        good = good and type(target) is dict and ROOT_ID.match(str(target.get("root"))) is not None \
+            and isinstance(target.get("root_path"), str) and type(target.get("files")) is list \
+            and all(type(record) is dict and isinstance(record.get("path"), str)
+                    and record.get("scratch") == f"{target['root']}/{record['path']}" for record in target["files"])
+    if not good:
+        raise ChangeError("failed", "task.json is not a valid schema 2 task.", {"reason": "state_integrity"})
+    return task
+
+
+def read_task(path):
+    """v1 tasks through the unchanged load_task; v2 tasks through check_v2."""
+    try:
+        raw = read_json_state(os.path.join(path, "task.json"))
+    except FileNotFoundError:
+        return load_task(path)
+    if type(raw) is dict and raw.get("schema_version") == TASK_V2:
+        return check_v2(path, raw)
+    return load_task(path)
+
+
+def save_task(path, task):
+    write_state(os.path.join(path, "task.json"), json.dumps(task, indent=1, sort_keys=True).encode())
+
+
+def upgrade_task(path):
+    """The v2 task for checkout. Only a fresh, empty diagnostic v1 task is upgraded, in place: the same work/
+    folder and its context files stay. A v1 task with selected files or stage/apply history is left untouched."""
+    task = read_task(path)
+    if task["schema_version"] == TASK_V2:
+        return task, False
+    fresh = task.get("diagnostic_only") is True and not task["paths"] \
+        and not any(os.path.lexists(os.path.join(path, name)) for name in ("stages", "apply", "rollback", "rounds"))
+    if not fresh:
+        raise ChangeError("unsupported", "This chat's change task uses the older single-server format and already has "
+                          "selected files or changes, so it was left unchanged. Start a fresh chat to change files "
+                          "across servers.", {"task_id": task["task_id"], "reason": "legacy_task",
+                                              "hint": "fresh_chat"})
+    task = dict(task, schema_version=TASK_V2, upgraded_from=1, targets=[], round=1, undone=[])
+    task.pop("paths")
+    save_task(path, task)
+    return task, True
+
+
+def round_dir(path, number):
+    return os.path.join(path, "rounds", str(number))
+
+
+def records(task):
+    return {(target["root"], record["path"]): record for target in task["targets"] for record in target["files"]}
+
+
+def fold(task, receipt):
+    """Point each written file's baseline at what the receipt says is now live."""
+    index = records(task)
+    for entry in receipt["files"]:
+        if entry.get("state") != "written":
+            continue
+        record = index.get((entry.get("root"), entry["path"]))
+        if record is None:
+            raise ChangeError("failed", "A receipt names a file outside this task.", {"reason": "state_integrity"})
+        record.update(exists=entry["new_sha256"] is not None, sha256=entry["new_sha256"], meta=entry.get("meta"),
+                      size=entry.get("new_size", 0))
+
+
+def settle(path, task):
+    """Fold finished undo and apply receipts into the task's baselines, in order; True when task changed.
+
+    Interrupted rounds (a journal without a receipt) are reported, never guessed or repaired."""
+    changed = False
+    for number in range(1, task["round"]):
+        rollback = os.path.join(round_dir(path, number), "rollback")
+        if number in task["undone"] or not os.path.lexists(rollback):
+            continue
+        receipt = optional_json(os.path.join(rollback, "receipt.json"))
+        if receipt is None:
+            raise ChangeError("rollback", "An earlier undo was interrupted; nothing was repeated.",
+                              {"task_id": task["task_id"], "state": "rollback_interrupted", "round": number,
+                               "files": journal_files(round_dir(path, number), "rollback")})
+        fold(task, receipt)
+        task["undone"].append(number)
+        changed = True
+    while True:
+        apply = os.path.join(round_dir(path, task["round"]), "apply")
+        receipt = optional_json(os.path.join(apply, "receipt.json"))
+        if receipt is None:
+            if os.path.lexists(apply):
+                raise ChangeError("partial", "An earlier apply was interrupted; its outcome is unknown and nothing was "
+                                  "repeated. Inspect the listed files.",
+                                  {"task_id": task["task_id"], "state": "interrupted", "round": task["round"],
+                                   "files": journal_files(round_dir(path, task["round"]), "apply")})
+            return changed
+        fold(task, receipt)
+        task["round"] += 1
+        changed = True
+
+
+@contextlib.contextmanager
+def locked_v2(path, maintenance=False):
+    """Hold the task lock (and the maintenance lock for live writes), then yield the settled v2 task."""
+    with (maintenance_exclusive() if maintenance else contextlib.nullcontext()), task_lock(path):
+        task = read_task(path)
+        if task["schema_version"] != TASK_V2:
+            raise ChangeError("invalid_argument", "This command needs a multi-root task; run checkout first.")
+        if settle(path, task):
+            save_task(path, task)
+        yield task
+
+
+def split_lines(data):
+    if data is None:
+        return []
+    lines = data.decode("utf-8").split("\n")
+    return [line + "\n" for line in lines[:-1]] + ([lines[-1]] if lines[-1] else [])
+
+
+def unified(base, new, label):
+    """Complete unified diff lines for one file; every line lacking a final newline is marked, as git does."""
+    old_name = "a/" + label if base is not None else "/dev/null"
+    new_name = "b/" + label if new is not None else "/dev/null"
+    out = [line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
+           for line in difflib.unified_diff(split_lines(base), split_lines(new), old_name, new_name)]
+    return out or [f"--- {old_name}\n", f"+++ {new_name}\n"]  # an empty file created or deleted
+
+
+def build_manifest_v2(path, task):
+    """Every changed checked-out file against its current baseline; returns (manifest, blobs, diff). No truncation."""
+    work_fd = open_work(path, task)
+    files, blobs, chunks, total = [], {}, [], 0
+    try:
+        for target in task["targets"]:
+            for record in target["files"]:
+                new = scratch_read(work_fd, record["scratch"], task["scratch_uid"])
+                if (new is None and not record["exists"]) or (new is not None and digest(new) == record["sha256"]):
+                    continue
+                refuse_inline_secret(new, target["root"], record["path"])  # before any diff text is built
+                base = read_state(os.path.join(path, "base", record["sha256"]), MAX_FILE_BYTES) \
+                    if record["exists"] else None
+                if base is not None and digest(base) != record["sha256"]:
+                    raise ChangeError("failed", "A baseline copy was altered.", {"reason": "state_integrity"})
+                if new is not None:
+                    total += len(new)
+                    blobs[digest(new)] = new
+                files.append({"root": target["root"], "root_path": target["root_path"], "path": record["path"],
+                              "scratch": record["scratch"],
+                              "action": "delete" if new is None else "modify" if record["exists"] else "create",
+                              "base_sha256": record["sha256"], "base_meta": record["meta"],
+                              "new_sha256": digest(new) if new is not None else None,
+                              "new_size": len(new) if new is not None else 0})
+                chunks.extend(unified(base, new, record["scratch"]))
+    finally:
+        os.close(work_fd)
+    if total > MAX_BATCH_BYTES:
+        raise ChangeError("invalid_argument", f"The edited files exceed {MAX_BATCH_BYTES} bytes together.")
+    manifest = {"schema_version": TASK_V2, "task_id": task["task_id"], "round": task["round"], "files": files}
+    return manifest, blobs, "".join(chunks)
+
+
+def summary_v2(task, manifest, diff):
+    summary = change_summary(task["task_id"], manifest, diff)
+    summary.update(round=manifest["round"], diff_lines=diff.count("\n"),
+                   files=[{key: entry[key] for key in ("root", "path", "scratch", "action", "base_sha256",
+                                                       "new_sha256")} for entry in manifest["files"]])
+    return summary
+
+
+def scratch_replace(work_fd, rel, expect_sha, data, uid, gid):
+    """Replace (or delete, when data is None) one workspace file only while it still holds expect_sha
+    (None = absent); returns False, touching nothing, when the agent edited it meanwhile."""
+    name, fd = rel.rsplit("/", 1)[-1], scratch_parent(work_fd, rel, uid, gid)
+    try:
+        current = read_file(fd, name, rel, owner_uid=uid)[0]
+        if (digest(current) if current is not None else None) != expect_sha:
+            return False
+        if data is None:
+            if current is not None:
+                os.unlink(name, dir_fd=fd)
+            return True
+        tmp = f".ddistro-{uuid.uuid4().hex[:16]}.tmp"
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600, dir_fd=fd)
+        try:
+            write_all(out, data)
+            os.fchown(out, uid, gid)
+            os.fchmod(out, 0o600)
+            os.rename(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+        finally:
+            os.close(out)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp, dir_fd=fd)
+        return True
+    finally:
+        os.close(fd)
+
+
+def cmd_checkout(opts):
+    """Copy live files from approved change roots into the task workspace as <root>/<path> (workspace only).
+
+    A new file is copied; an already checked-out file whose workspace copy is unedited is refreshed from live;
+    an edited workspace copy is kept when live is unchanged and is a conflict otherwise. Nothing is written
+    unless every requested file passes validation (policy, links, size, inline credentials, conflicts). This is not
+    write-atomic: a failure mid-copy can leave earlier workspace copies written but unrecorded in task.json."""
+    path = task_dir(opts["task_id"])
+    requests = []
+    for root_id, raws in opts["targets"]:
+        access, spec = change_spec(root_id)
+        requests.extend((root_id, spec["path"], change_path(access, root_id, spec, raw)) for raw in raws)
+    requests, live = list(dict.fromkeys(requests)), {}
+    for root_id, root_path, rel in requests:  # refuse links and oversize files before touching the task
+        root_fd, owner = open_product_root(root_id, root_path)
+        try:
+            live[(root_id, rel)] = live_file(root_fd, owner, rel)
+        finally:
+            os.close(root_fd)
+        refuse_inline_secret(live[(root_id, rel)][0], root_id, rel)
+    with task_lock(path):
+        task, upgraded = upgrade_task(path)
+        if settle(path, task):
+            save_task(path, task)
+        index = records(task)
+        if len(index) + sum(1 for root_id, _, rel in requests if (root_id, rel) not in index) > MAX_FILES:
+            raise ChangeError("invalid_argument", f"A task can hold at most {MAX_FILES} files.")
+        uid, gid = task["scratch_uid"], task["scratch_gid"]
+        work_fd = open_work(path, task)
+        try:
+            plan, conflicts = [], []
+            for root_id, root_path, rel in requests:
+                data, info = live[(root_id, rel)]
+                scratch, record = f"{root_id}/{rel}", index.get((root_id, rel))
+                current = scratch_read(work_fd, scratch, uid)
+                have = digest(current) if current is not None else None
+                want = {"sha256": digest(data) if data is not None else None,
+                        "meta": file_meta(info) if data is not None else None}
+                if record is None:
+                    state = "checked_out" if current is None or have == want["sha256"] else "conflict"
+                elif have != record["sha256"]:
+                    state = "kept_modified" if mismatch(data, info, record) is None else "conflict"
+                else:
+                    state = "unchanged" if mismatch(data, info, record) is None else "refreshed"
+                if state == "conflict":
+                    conflicts.append({"root": root_id, "path": rel, "scratch": scratch,
+                                      "reason": "workspace_edited" if record else "workspace_file_exists"})
+                plan.append((root_id, root_path, rel, scratch, record, data, want, have, state))
+            if conflicts:
+                raise ChangeError("conflict", "Workspace copies have edits that a fresh checkout would overwrite; "
+                                  "nothing was changed. Stage or revert those edits first.",
+                                  {"task_id": task["task_id"], "conflicts": conflicts})
+            sizes = {key: record.get("size", 0) for key, record in index.items()}
+            sizes.update(((step[0], step[2]), len(step[5] or b"")) for step in plan
+                         if step[8] in ("checked_out", "refreshed"))
+            if sum(sizes.values()) > MAX_BATCH_BYTES:
+                raise ChangeError("invalid_argument", f"The task's files would exceed {MAX_BATCH_BYTES} bytes together.")
+            results = []
+            for root_id, root_path, rel, scratch, record, data, want, have, state in plan:
+                if state in ("checked_out", "refreshed"):
+                    if data is not None:
+                        with contextlib.suppress(FileExistsError):
+                            write_state(os.path.join(path, "base", want["sha256"]), data, exclusive=True)
+                    if have != want["sha256"] and not scratch_replace(work_fd, scratch, have, data, uid, gid):
+                        raise ChangeError("conflict", f"{scratch} was edited during checkout; it was kept. Try again.",
+                                          {"task_id": task["task_id"], "scratch": scratch})
+                    fresh = {"path": rel, "scratch": scratch, "exists": data is not None, "sha256": want["sha256"],
+                             "meta": want["meta"], "size": len(data or b""), "checked_out": now()}
+                    if record is None:
+                        target = next((item for item in task["targets"] if item["root"] == root_id), None)
+                        if target is None:
+                            target = {"root": root_id, "root_path": root_path, "files": []}
+                            task["targets"].append(target)
+                        target["files"].append(fresh)
+                        index[(root_id, rel)] = record = fresh
+                    else:
+                        record.update(fresh)
+                results.append({"root": root_id, "path": rel, "scratch": scratch, "exists": record["exists"]
+                                if record else data is not None, "state": state,
+                                "base_sha256": record["sha256"] if record else want["sha256"]})
+        finally:
+            os.close(work_fd)
+        task["diagnostic_only"] = not index
+        save_task(path, task)
+    progress(f"Checked out {len(results)} files into task {task['task_id']}.")
+    return {"task_id": task["task_id"], "schema_version": TASK_V2, "upgraded": upgraded,
+            "workspace": task["workspace"], "round": task["round"], "files": results}
+
+
+def diff_v2(path, task):
+    settle(path, task)  # in memory only; diff never writes task state
+    manifest, _, diff = build_manifest_v2(path, task)
+    return dict(summary_v2(task, manifest, diff), state=state_v2(path, task)[0])
+
+
+def stage_v2(path):
+    with locked_v2(path) as task:
+        manifest, blobs, diff = build_manifest_v2(path, task)
+        summary = summary_v2(task, manifest, diff)
+        if summary["diff_truncated"]:
+            raise ChangeError("invalid_argument", f"The diff exceeds {DIFF_LIMIT} bytes and cannot be reviewed in "
+                              "full; nothing was staged. Split the change into smaller rounds.",
+                              {"reason": "diff_too_large", "diff_limit": DIFF_LIMIT})
+        for folder in (os.path.join(path, "rounds"), round_dir(path, task["round"])):
+            with contextlib.suppress(FileExistsError):
+                make_state_dir(folder)
+        warnings = freeze_stage(os.path.join(round_dir(path, task["round"]), "stages"), summary["manifest_sha256"],
+                                manifest, blobs, task["task_id"])
+    progress(f"Staged {len(summary['files'])} changed files as {summary['manifest_sha256']}.")
+    return dict(summary, warnings=warnings, state="staged")
+
+
+def recheck_policy(entries):
+    """Every target root and path must still pass the current policy before any live write."""
+    for entry in entries:
+        access, spec = change_spec(entry["root"], entry["root_path"])
+        if change_path(access, entry["root"], spec, entry["path"]) != entry["path"]:
+            raise ChangeError("failed", "A staged path no longer normalizes the same way.", {"reason": "state_integrity"})
+
+
+def apply_v2(path, manifest_sha256):
+    """Apply the staged round only while the workspace and baselines still produce exactly manifest_sha256."""
+    with locked_v2(path, maintenance=True) as task:
+        if task["round"] > 1:
+            last = optional_json(os.path.join(round_dir(path, task["round"] - 1), "apply", "receipt.json"))
+            if last is not None and last.get("manifest_sha256") == manifest_sha256:
+                return dict(apply_result(task["task_id"], last, replayed=True), round=task["round"] - 1)
+        manifest, _, _ = build_manifest_v2(path, task)
+        current = digest(canonical(manifest))
+        if current != manifest_sha256:
+            raise ChangeError("conflict", "The workspace or live baseline changed since this change was staged; "
+                              "nothing was written. Stage again and review the new diff.",
+                              {"task_id": task["task_id"], "reason": "stale_stage", "current_manifest_sha256": current})
+        if not manifest["files"]:
+            return {"task_id": task["task_id"], "state": "no_changes", "receipt": None, "files": [],
+                    "replayed": False, "round": task["round"]}
+        here = round_dir(path, task["round"])
+        manifest, blobs = load_stage(os.path.join(here, "stages", manifest_sha256), manifest_sha256, task["task_id"])
+        recheck_policy(manifest["files"])
+        plan = [dict({key: entry[key] for key in ("root", "root_path", "path", "scratch", "action", "base_sha256",
+                                                  "new_sha256", "new_size")},
+                     data=blobs.get(entry["new_sha256"]), meta=entry["base_meta"],
+                     expect={"sha256": entry["base_sha256"], "meta": entry["base_meta"]}) for entry in manifest["files"]]
+        stale = stale_files(task, plan)
+        if stale:
+            raise ChangeError("conflict", "Live files changed since checkout; nothing was written. Check the files out "
+                              "again.", {"task_id": task["task_id"], "stale": stale})
+        for step in plan:  # current redactor over both the live bytes about to be replaced and the staged bytes
+            refuse_inline_secret(step["live"], step["root"], step["path"])
+            refuse_inline_secret(step["data"], step["root"], step["path"])
+        apply = os.path.join(here, "apply")
+        make_state_dir(apply)
+        make_state_dir(os.path.join(apply, "backups"))
+        for step in plan:
+            if step["live"] is not None:
+                with contextlib.suppress(FileExistsError):
+                    write_state(os.path.join(apply, "backups", step["base_sha256"]), step["live"], exclusive=True)
+            if step["data"] is not None:  # the next round's baseline
+                with contextlib.suppress(FileExistsError):
+                    write_state(os.path.join(path, "base", step["new_sha256"]), step["data"], exclusive=True)
+        progress(f"Applying {len(plan)} files in round {task['round']}.")
+        number = task["round"]
+        try:
+            return dict(run_writes(path, "apply", task, manifest_sha256, plan, apply, {"round": number}), round=number)
+        finally:
+            with contextlib.suppress(ChangeError):
+                if settle(path, task):
+                    save_task(path, task)
+
+
+def latest_written(path, task):
+    """(round, raw receipt bytes) of the newest apply that wrote anything, or (None, None)."""
+    for number in range(task["round"] - 1, 0, -1):
+        raw = read_state(os.path.join(round_dir(path, number), "apply", "receipt.json"))
+        if any(entry.get("state") == "written" for entry in json.loads(raw.decode("utf-8"))["files"]):
+            return number, raw
+    return None, None
+
+
+def plan_step(plan, scratch):
+    return next(step for step in plan if step["scratch"] == scratch)
+
+
+def undo_plan(path, task):
+    """The exact reverse of the newest applied round, checked against live files and the workspace.
+
+    Returns (round, receipt, plan, preview, diff), or None when nothing can be undone. preview is the record
+    hashed into preview_sha256: the receipt, every live, target and workspace hash, and the full diff."""
+    number, raw = latest_written(path, task)
+    if number is None or number in task["undone"]:
+        return None
+    receipt, here = json.loads(raw.decode("utf-8")), round_dir(path, number)
+    base_meta = {(entry["root"], entry["path"]): entry["base_meta"] for entry in
+                 load_stage(os.path.join(here, "stages", receipt["manifest_sha256"]), receipt["manifest_sha256"],
+                            task["task_id"])[0]["files"]}
+    roots = {target["root"]: target["root_path"] for target in task["targets"]}
+    plan = []
+    for entry in reversed([item for item in receipt["files"] if item["state"] == "written"]):
+        backup = None
+        if entry["action"] != "create":
+            backup = read_state(os.path.join(here, "apply", "backups", entry["base_sha256"]), MAX_FILE_BYTES)
+            if digest(backup) != entry["base_sha256"]:
+                raise ChangeError("failed", "A backup was altered; nothing can be undone.",
+                                  {"reason": "state_integrity", "path": entry["scratch"]})
+        plan.append({"root": entry["root"], "root_path": roots[entry["root"]], "path": entry["path"],
+                     "scratch": entry["scratch"], "action": INVERSE[entry["action"]],
+                     "base_sha256": entry["new_sha256"], "new_sha256": entry["base_sha256"],
+                     "new_size": len(backup or b""), "data": backup, "meta": base_meta[(entry["root"], entry["path"])],
+                     "expect": {"sha256": entry["new_sha256"], "meta": entry["meta"]}})
+    recheck_policy(plan)
+    stale = stale_files(task, plan)
+    if stale:
+        raise ChangeError("conflict", "Files changed after the change was applied; undo was refused and nothing was "
+                          "written.", {"task_id": task["task_id"], "round": number, "stale": stale})
+    work_fd = open_work(path, task)
+    try:
+        pending = []
+        for step in plan:
+            data = scratch_read(work_fd, step["scratch"], task["scratch_uid"])
+            if (digest(data) if data is not None else None) != step["base_sha256"]:
+                pending.append(step["scratch"])
+    finally:
+        os.close(work_fd)
+    if pending:
+        raise ChangeError("conflict", "The workspace has newer edits to files this undo would restore; nothing was "
+                          "written. Apply or revert those edits first.",
+                          {"task_id": task["task_id"], "round": number, "pending": pending})
+    diff = "".join(line for step in plan for line in unified(step["live"], step["data"], step["scratch"]))
+    preview = {"kind": "file_undo", "task_id": task["task_id"], "round": number, "apply_receipt_sha256": digest(raw),
+               "diff_sha256": digest(diff.encode("utf-8")),
+               "files": [{"root": step["root"], "path": step["path"], "action": step["action"],
+                          "live_sha256": step["base_sha256"], "target_sha256": step["new_sha256"],
+                          "scratch_sha256": step["base_sha256"]} for step in plan]}
+    return number, receipt, plan, preview, diff
+
+
+def cmd_rollback_preview(opts):
+    """Read-only: the full reverse diff of the newest applied round and the preview_sha256 that undo must quote."""
+    path = task_dir(opts["task_id"])
+    task = read_task(path)
+    if task["schema_version"] != TASK_V2:
+        raise ChangeError("invalid_argument", "This task uses the older format; use ddistro changes rollback.")
+    settle(path, task)  # in memory only
+    found = undo_plan(path, task)
+    if found is None:
+        return {"task_id": task["task_id"], "state": "nothing_to_undo", "preview_sha256": None, "diff": "",
+                "diff_lines": 0, "files": []}
+    number, receipt, _, preview, diff = found
+    if len(json.dumps(diff)) > DIFF_LIMIT:
+        raise ChangeError("invalid_argument", f"The undo diff exceeds {DIFF_LIMIT} bytes and cannot be reviewed in "
+                          "full.", {"reason": "diff_too_large", "diff_limit": DIFF_LIMIT})
+    return {"task_id": task["task_id"], "state": "undo_available", "round": number,
+            "preview_sha256": digest(canonical(preview)), "applied_manifest_sha256": receipt["manifest_sha256"],
+            "diff": diff, "diff_lines": diff.count("\n"), "files": preview["files"]}
+
+
+def cmd_undo(opts):
+    """Undo the newest applied round only while it still matches the reviewed rollback-preview hash exactly."""
+    preview_sha256 = opts["preview_sha256"]
+    if not SHA256.match(preview_sha256):
+        raise ChangeError("invalid_argument", "--preview-sha256 must be 64 lowercase hex characters.")
+    path = task_dir(opts["task_id"])
+    with locked_v2(path, maintenance=True) as task:
+        if task["undone"]:
+            number = max(task["undone"])
+            done = optional_json(os.path.join(round_dir(path, number), "rollback", "receipt.json"))
+            if done is not None and done.get("preview_sha256") == preview_sha256:
+                return dict(apply_result(task["task_id"], done, replayed=True), round=number)
+        found = undo_plan(path, task)
+        if found is None:
+            raise ChangeError("conflict", "There is no applied change left to undo.",
+                              {"task_id": task["task_id"], "reason": "nothing_to_undo"})
+        number, receipt, plan, preview, _ = found
+        if digest(canonical(preview)) != preview_sha256:
+            raise ChangeError("conflict", "Live files, the workspace, or the applied change differ from the reviewed "
+                              "undo preview; nothing was written. Preview the undo again.",
+                              {"task_id": task["task_id"], "reason": "stale_preview"})
+        rollback = os.path.join(round_dir(path, number), "rollback")
+        make_state_dir(rollback)
+        progress(f"Undoing {len(plan)} files from round {number}.")
+        failure, result = None, None
+        try:
+            result = run_writes(path, "rollback", task, receipt["manifest_sha256"], plan, rollback,
+                                {"round": number, "preview_sha256": preview_sha256})
+        except ChangeError as error:
+            failure = error
+        written = optional_json(os.path.join(rollback, "receipt.json")) or {"files": []}
+        # Return each restored workspace copy to the restored bytes, unless the agent edited it meanwhile.
+        scratch, work_fd = [], open_work(path, task)
+        try:
+            for entry in written["files"]:
+                if entry["state"] == "written":
+                    step = plan_step(plan, entry["scratch"])
+                    same = scratch_replace(work_fd, step["scratch"], step["base_sha256"], step["data"],
+                                           task["scratch_uid"], task["scratch_gid"])
+                    scratch.append({"scratch": step["scratch"], "state": "restored" if same else "kept_edited"})
+        finally:
+            os.close(work_fd)
+            with contextlib.suppress(ChangeError):
+                if settle(path, task):
+                    save_task(path, task)
+        if failure is not None:
+            if isinstance(failure.details, dict):
+                failure.details.update(round=number, scratch=scratch)
+            raise failure
+        return dict(result, round=number, scratch=scratch)
+
+
+def state_v2(path, task):
+    """(state, receipt, files) for the open round, or the newest finished round when nothing is staged."""
+    busy = task_busy(path)
+    state, receipt, files = derive_state(round_dir(path, task["round"]), busy)
+    if state == "prepared" and task["round"] > 1:
+        state, receipt, files = derive_state(round_dir(path, task["round"] - 1), busy)
+    return state, receipt, files
+
+
+def status_v2(path, task):
+    with contextlib.suppress(ChangeError):
+        settle(path, task)  # in memory; an interrupted round is then reported by state_v2
+    state, receipt, files = state_v2(path, task)
+    stages = os.path.join(round_dir(path, task["round"]), "stages")
+    staged = sorted(name for name in os.listdir(stages) if SHA256.match(name)) if os.path.isdir(stages) else []
+    return {"task_id": task["task_id"], "schema_version": TASK_V2, "state": state, "product": task["product"],
+            "workspace": task["workspace"], "created": task["created"], "diagnostic_only": not records(task),
+            "round": task["round"], "staged_manifests": staged,
+            "selected": [record["scratch"] for record in records(task).values()],
+            "targets": [{"root": target["root"],
+                         "files": [{key: record[key] for key in ("path", "scratch", "exists", "sha256")}
+                                   for record in target["files"]]} for target in task["targets"]],
+            "receipt": receipt, "files": files}
+
+
 COMMANDS = {"prepare": cmd_prepare, "diff": cmd_diff, "stage": cmd_stage, "apply": cmd_apply,
-            "status": cmd_status, "rollback": cmd_rollback, "list": cmd_list}
+            "status": cmd_status, "rollback": cmd_rollback, "list": cmd_list, "checkout": cmd_checkout,
+            "rollback-preview": cmd_rollback_preview, "undo": cmd_undo}
+TASK_OPTION = ("checkout", "rollback-preview", "undo")  # newer verbs name the task with --task
 
 
 def parse(argv):
     if not argv or argv[0] not in COMMANDS:
         raise ChangeError("invalid_argument", "Expected one of: " + ", ".join(COMMANDS) + ".")
-    command, args, opts = argv[0], argv[1:], {"paths": []}
-    valued = {"prepare": ("--product", "--path"), "apply": ("--manifest-sha256",)}.get(command, ())
+    command, args, opts = argv[0], argv[1:], {"paths": [], "targets": []}
+    valued = {"prepare": ("--product", "--path"), "apply": ("--manifest-sha256",),
+              "checkout": ("--task", "--root", "--path"), "rollback-preview": ("--task",),
+              "undo": ("--task", "--preview-sha256")}.get(command, ())
     positional, index = [], 0
     while index < len(args):
         token = args[index]
         if token in valued and index + 1 < len(args):
-            if token == "--path":
+            if token == "--root":
+                if not ROOT_ID.match(args[index + 1]):
+                    raise ChangeError("invalid_argument", "--root must be a root ID from ddistro access roots.")
+                opts["targets"].append((args[index + 1], []))
+            elif token == "--path" and command == "checkout":
+                if not opts["targets"]:
+                    raise ChangeError("invalid_argument", "Each --path must follow the --root it belongs to.")
+                opts["targets"][-1][1].append(args[index + 1])
+                if sum(len(paths) for _, paths in opts["targets"]) > MAX_FILES:
+                    raise ChangeError("invalid_argument", f"At most {MAX_FILES} files can be selected.")
+            elif token == "--path":
                 opts["paths"].append(args[index + 1])
                 if len(opts["paths"]) > MAX_FILES:
                     raise ChangeError("invalid_argument", f"At most {MAX_FILES} files can be selected.")
@@ -1074,11 +1756,19 @@ def parse(argv):
             raise ChangeError("invalid_argument", f"Unsupported option or missing value for {command}: {token[:40]}")
         positional.append(token)
         index += 1
-    needs_task = command not in ("prepare", "list")
+    needs_task = command not in ("prepare", "list") + TASK_OPTION
     if len(positional) != int(needs_task):
         raise ChangeError("invalid_argument", f"Wrong number of arguments for {command}.")
     if needs_task:
         opts["task_id"] = positional[0]
+    if command in TASK_OPTION:
+        if "task" not in opts:
+            raise ChangeError("invalid_argument", f"{command} requires --task with the task ID.")
+        opts["task_id"] = opts.pop("task")
+    if command == "checkout" and (not opts["targets"] or any(not paths for _, paths in opts["targets"])):
+        raise ChangeError("invalid_argument", "checkout requires --root ROOT followed by at least one --path.")
+    if command == "undo" and "preview_sha256" not in opts:
+        raise ChangeError("invalid_argument", "undo requires --preview-sha256 from rollback-preview.")
     if command == "prepare":
         opts["product"] = ALIASES.get(opts.get("product"), opts.get("product"))
         if opts["product"] not in KNOWN_PRODUCTS:

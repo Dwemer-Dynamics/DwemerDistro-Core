@@ -92,6 +92,12 @@ if [ $? -eq 0 ]; then
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro /usr/local/bin/ddistro || exit 1
     # Root-only file changes helper; ddistro checks it is root-owned before running it.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_changes /usr/local/bin/ddistro_changes || exit 1
+    # Read-only access policy library; ddistro loads it only when it is root-owned and root-writable only.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_access /usr/local/bin/ddistro_access || exit 1
+    # Sandboxed command helper for read-only file snapshots; ddistro runs it only when it is root-owned.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_exec /usr/local/bin/ddistro_exec || exit 1
+    # Live command supervisor for the Assistant's approved runs; the broker starts it only while the probe attests it.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_run /usr/local/bin/ddistro_run || exit 1
     # Assistant runtime helpers. Only the scripts are installed here: the pinned Codex runtime,
     # bubblewrap, and the ddagent account come from an explicit install_assistant_runtime run.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_agent /usr/local/bin/ddistro_agent || exit 1
@@ -118,6 +124,8 @@ find /home/dwemer/dwemerdistro/etc/ -type f ! -name "php.ini" ! -name "dwemerdis
 if [ $? -eq 0 ]; then
     # The LM Studio helper runs as dwemer and must read the public model catalog.
     install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/dwemerdistro-lmstudio.json /etc/dwemerdistro-lmstudio.json || exit 1
+    # ddistro inventory refuses a component catalog that is not a plain root-owned file only root can change.
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/dwemerdistro-components.json /etc/dwemerdistro-components.json || exit 1
     # Keep the existing service ports, including CUSTOM_MODS_PORT; only a missing file gets the defaults.
     # start_env sources it as root, so an existing file must be a plain root-owned file only root can change.
     SERVICES_CONF=/etc/dwemerdistro_services.conf
@@ -130,6 +138,10 @@ if [ $? -eq 0 ]; then
     fi
     if ! runuser -u dwemer -- python3 -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1]))["models"], list))' /etc/dwemerdistro-lmstudio.json; then
         printf "${RED}[ERROR] LM Studio model catalog is not readable by dwemer${NC}\n"
+        exit 1
+    fi
+    if ! runuser -u dwemer -- python3 -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1]))["components"], list))' /etc/dwemerdistro-components.json; then
+        printf "${RED}[ERROR] Component catalog is not readable by dwemer${NC}\n"
         exit 1
     fi
     printf "${GREEN}[SUCCESS] Configuration files successfully copied to /etc/${NC}\n"
@@ -151,6 +163,10 @@ else
     printf "${RED}[ERROR] Error updating PHP configuration${NC}\n"
     exit 1
 fi
+
+# The new helpers make an existing probe stale; rerun it once now that every Core file is in place.
+# Skipped without the runtime; busy or failed only warns, so it never fails this update.
+/usr/local/bin/install_assistant_runtime --reprobe 7<&- || true
 
 printf "\n${BOLD}=======================================================${NC}\n"
 printf "${BOLD}${GREEN}        CORE SYSTEM UPDATED SUCCESSFULLY!          ${NC}\n"

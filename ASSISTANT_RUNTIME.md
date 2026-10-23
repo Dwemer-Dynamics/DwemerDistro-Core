@@ -4,6 +4,11 @@
 a dedicated, attested sandbox. The model can change only the task's scratch copy.
 Applying scratch changes to a live install is a separate, trusted launcher/manual
 operation and is never done by this tool. A task ID or `--yes` grants nothing.
+The one exception is `ddistro_run` (`live_run`, below): a client that opts in lets the model
+run commands on the LIVE distro. Each runs only after the user approves it (or a session grant
+they approved covers it), or, for a client that also opts in to `live_run_auto`, at once when the
+model declares it routine and its code shows no destructive sign; destructive runs always wait for
+the user. It is not a sandbox: as root it is full trust over the distro.
 
 ```bash
 install_assistant_runtime [--archive PATH] [--host-archive PATH] [--install-prerequisites]   # root, explicit
@@ -48,8 +53,23 @@ features, not its version: distro builds backport `--bind-fd` (Ubuntu 24.04's 0.
 Debian 12's `0.8.0-2+deb12u1` both list it). Without them the installer stops and `status`
 reports `bwrap_unsupported`. Only a passing probe on the target distro shows the sandbox
 works there. `/usr/bin/python3` (root-owned, under `/usr`) runs the in-sandbox guard. `update.sh` installs
-`ddistro_agent` and `install_assistant_runtime` as root-owned `0755` scripts but never runs
-the installer, downloads the runtime, or installs packages.
+`ddistro_agent` and `install_assistant_runtime` as root-owned `0755` scripts but never
+downloads the runtime or installs packages.
+
+Replacing the runtime or any helper the attestation is bound to (the `ddistro` CLI included)
+makes the probe `probe_stale`. So a regular installer run (last, after the database reader and
+every runtime file are final) and `update.sh` (after every Core file is copied) each run
+`install_assistant_runtime --reprobe` once. It does nothing without the installed runtime and
+`ddagent`, and runs only the fixed root-owned `/usr/local/bin/ddistro agent probe`, under that
+command's existing 600 s bound and process-group handling. It never downloads, signs in, or
+touches provider credentials. The probe takes `serve.lock` without waiting, so a running session
+is never stopped or replaced: the probe reports `busy` (exit `75`) and is not retried. A busy,
+failed, or skipped probe only prints a warning and never fails the install or update. The
+Assistant and its new tools stay off until the user ends the session and presses **Run
+isolation check** (or runs `ddistro agent probe` as root). A passing probe re-enables the
+legacy session, but `managed_exec_isolation` is optional, so `ddistro capabilities` is still what
+shows whether the Assistant foundations tools are on. `--db-reader` exits before this step and
+never probes.
 
 ## Identity and state
 
@@ -122,6 +142,16 @@ folder, then remove the guard. Nothing is deleted, and sign-in
 and history in the account home are not touched. The file is moved, not edited, so the workspace is
 simply no longer marked trusted for Codex. The model has no path to this command; the launcher runs
 it only after the user confirms its inline proposal.
+
+The App Server writes that same trust entry during normal use, so serve also repairs it on its own:
+once per start, while holding `serve.lock` and before the strict managed open, it inspects the home
+exactly as `home-config` status does and, only if the state is `repairable` and no `ddagent`
+process remains (waiting at most 5 seconds), runs the same quarantine (pending guard, byte-identical
+move, receipt). It does not retry. Any other state, including an unknown, symlinked, or wrongly owned config,
+other unmanaged files, a pending guard, or a failed or partial repair, changes nothing more, and
+the strict open refuses as before (`account_home_unmanaged_config` or
+`home_config_repair_pending`), so the launcher's manual path still applies. No setting is ever
+allowed through, and sign-in and thread state are not touched.
 
 ## Sandbox
 
@@ -246,7 +276,10 @@ world-readable host secret, world-writable fake live directory, and loopback lis
 The attestation is bound to the runtime and code-mode host hashes and file identities, the policy hash, the
 `ddistro_agent` hash, the bubblewrap hash, the kernel release and version, and the
 `ddagent` UID and GID. A change to any of them makes `status` report `probe_stale` and
-makes serve refuse. A root-owned attestation that is group- or other-writable is ignored.
+makes serve refuse. When they are installed, it also binds the sha256 of `ddistro_run`, `ddistro_access`,
+`ddistro_changes`, `ddistro_exec` and `ddistro` files, and it records, when its optional canary passed,
+`managed_exec_isolation: true` and, when the `ddistro_run` canary passed, `live_run_isolation: true`;
+`ddistro capabilities` uses those (see ASSISTANT.md). A root-owned attestation that is group- or other-writable is ignored.
 
 ## serve
 
@@ -277,6 +310,8 @@ The broker relays JSONL both ways and forwards only these client methods:
 | `turn/start` | `threadId` (this task), `input` (only `text` items and `image` items with a `data:image/` or `https://` URL), `model`, `effort`, `summary`, `outputSchema`, `personality`, `serviceTier`, `clientUserMessageId` |
 | `turn/interrupt` | `threadId` (this task), `turnId` |
 | `thread/archive`, `thread/unarchive`, `thread/delete` | `threadId` (this task) only; see "Thread archive and delete" |
+| `ddistro/action/decide` | `proposalId`, `threadId`, `decision` (`approve`/`cancel`, and for a `live_run` proposal that offers it `approve_session`), `digest` (required to approve a `live_run` proposal, refused on any other); answered by the broker, never forwarded; see "ddistro_action" and "ddistro_run" |
+| `ddistro/run/revoke`, `ddistro/run/cancel` | only after `live_run` was negotiated; see "ddistro_run" |
 
 For thread and turn requests, `approvalPolicy` may only be `never`, and `cwd` only
 `/work`; the broker sets both. `permissions` may only be `dwemer-scratch`.
@@ -339,14 +374,22 @@ else is refused), every `thread/start` gets the broker's own declaration
 `dynamicTools: [ddistro_read]`. Clients cannot send `dynamicTools`; older clients that do not
 opt in get no tool and are otherwise unchanged. Codex 0.163.0 refuses `dynamicTools` without
 that capability. The declaration (`TOOL_SPEC` in `bin/ddistro_agent`) is one function with
-strict input `{"operation": "inventory"|"status"|"models"|"logs"|"health", "product"?, "log"?,
-"lines"?: 1-400, "query"?: <= 200 chars, "since"?: "YYYY-MM-DDTHH:MM:SSZ"}` and `additionalProperties: false`.
+strict input `{"operation": "inventory"|"status"|"models"|"logs"|"health"|"performance"|"model_options"|"update_check", "product"?,
+"log_source"?: "apache"|"postgres", "log"?, "lines"?: 1-400, "query"?: <= 200 chars,
+"since"?: "YYYY-MM-DDTHH:MM:SSZ"}` and `additionalProperties: false`. `product` lists servers only
+(`herika`, `lorkhan`, `stobe`, `dialectic`, `reign`); the shared Apache and PostgreSQL logs are
+`log_source`. The schema is flat (no `oneOf` or conditionals, which the native tool API does not
+accept), so pairing rules are checked at run time. Threads started before `log_source` were declared
+`product` `apache`/`postgres`; the broker still accepts that for `logs` only.
 
 The broker answers `item/tool/call` itself and never forwards it, so a client cannot see or
 answer the request. It checks that the call is for `ddistro_read` with no namespace, from one
 of this task's threads, and that the arguments match exactly: `inventory` takes nothing;
-`status`/`health` take an optional server product; `models` takes only `herika`; `logs`
-needs a server product, `apache`, or `postgres`, an optional log name from that target's
+`status`/`health`/`performance`/`update_check` take an optional server product (`apache` or
+`postgres` there is refused with a message pointing to `logs` with `log_source`); `models` and
+`model_options` (`ddistro models options herika`) take only `herika`; `logs`
+needs a server product or a `log_source` (not both; the older `product` `apache`/`postgres` form
+is still accepted), an optional log name from that target's
 `ddistro logs` allowlist, `lines` (default 50), and the optional `query` (one line of plain text,
 not `--json` or `--request-id`) and `since` (a valid UTC time in exactly that form), passed as
 `--query` and `--since`. Then it runs, as root and outside the
@@ -376,14 +419,18 @@ queries, and secret-shaped values are redacted in every string, and the text is 
 lines first and says so in `data.budget_trimmed_lines` and `truncated: true`.
 
 Every reply also has `coverage`, computed by the broker from its own counters, never by the model:
-`{result, turn_calls, turn_calls_left, turn_output_kib_left, session_calls_left, health?}`. `result` is
-`checked`, `truncated` (clipped, budget-trimmed, a log filter whose `complete` is false, `models`
-with `truncated` not false, or `inventory` with `complete` not true or a truncated section),
+`{result, turn_calls, turn_calls_left, turn_output_kib_left, session_calls_left, health?, performance?}`.
+`result` is `checked`, `truncated` (clipped, budget-trimmed, a log filter whose `complete` is false, `models`
+with `truncated` not false, `inventory` with `complete` not true or a truncated section, or
+`performance` with `complete` not true),
 `failed` also for `models` with `available` not true, `skipped` also for a log not written yet,
 `refused` (`invalid_arguments`), `budget_hit` (`turn_tool_limit`, `session_tool_limit`), `skipped`
-(`busy`, `cancelled`), or `failed`; a health reply adds its `passed`/`failed`/`skipped` counts. The
-client sees the same text in the `dynamicToolCall` item, so the launcher can show a partial-check
-notice from it. A refused call returns `success: false` with error code
+(`busy`, `cancelled`), or `failed`; a health reply adds its `passed`/`failed`/`skipped` counts and
+`checks` (at most 64 `{id, result}` pairs in ddistro's id shape, results only `passed`, `failed`, or
+`skipped`) with `checks_complete` (false when an entry was left out), so overlapping reads such
+as `health herika` then `health` can be counted as unique checks rather than added summaries; a
+performance reply adds its `measured`/`failed`/`skipped` counts. The client sees the same text in
+the `dynamicToolCall` item, so the launcher can show a partial-check notice from it. A refused call returns `success: false` with error code
 `invalid_arguments` and runs nothing. No write, repair, update, approval, or escalation is
 reachable through the tool. Codex reports the call to the client as its usual
 `dynamicToolCall` item notifications.
@@ -422,6 +469,304 @@ per-turn and per-session budgets (the two tools count together). Recalled notes 
 as tool data marked `non_authoritative`; a note cannot change the policy, the sandbox, the
 declarations, or what a tool may do, and it never replaces fresh `ddistro_read` evidence.
 
+### ddistro_action live action
+
+The live actions. A client opts in with `initialize` `capabilities.ddistroActions`, a list of
+distinct names from `"restart_service"` and `"configure_model"` (with `experimentalApi: true`);
+the broker removes the field before Codex sees it, and any other value is refused. Only then
+does `thread/start` also declare `ddistro_action`. A client that sends only
+`["restart_service"]` gets exactly `ACTION_SPEC`: strict `{"operation": "propose_restart",
+"service": "apache", "reason": <= 300 chars}`, and can never be sent a model proposal.
+`configure_model` adds `propose_model_change` (`profile_id`, `role`, `connector_id`, `reason`) and
+`propose_model_rollback` (`reason` only) to a flat schema whose per-operation fields are checked
+at run time. Threads started without the opt-in never get the tool, and older clients are
+unchanged.
+
+A model proposal assigns one fixed CHIM profile role to an existing connector and nothing else.
+The broker, not the model, runs the root `ddistro models preview herika ... --task T --thread TH`
+(or `rollback-preview --task T --thread TH`, the undo of this thread's own latest change; the
+model never supplies or sees a receipt id or `plan_sha256`) and sends the client the validated
+diff in `ddistro/action/proposed` `change`. After `approve`, it runs exactly `ddistro models
+apply|rollback herika --receipt ID --plan-sha256 HASH` once; the preview's 120 s expiry and its
+compare-and-swap still apply, so an approval after a concurrent edit is a `conflict` and writes
+nothing. Approval, expiry, cancellation, and one-per-turn rules are as below. The model gets
+`verified`, `unverified`, `conflict`, `not_executed`, `unknown`, or a refusal; a reply whose
+receipt id does not match the proposal is `unknown`. `verified` means a fresh database read
+shows the assignment: the provider, the model, and in-game replies are not tested.
+
+The model can only propose. On a valid call from one of this task's threads, with a `turnId`,
+at most one `propose_restart` per turn, one of each permitted model operation per turn, and
+one pending per session, the broker records an in-memory proposal
+with a random id and a 60 second expiry, and sends the client `ddistro/action/proposed`
+`{proposalId, threadId, turnId, action: "restart", service, label, impact, reason, expiresAt}`.
+The tool call waits; the model never sees the id. Only the client's `ddistro/action/decide`
+for that id and thread, while it is still pending and unexpired, changes it, once, under the
+broker lock: a replay, a late or second decision, or an unknown id is refused with `-32001`
+and runs nothing. `turn/start` or `turn/interrupt` of that thread, any `thread/start` or
+`thread/resume`, client EOF, a signal, or the expiry ends a pending proposal with nothing run.
+
+After `approve`, if the session is not closing, the broker runs exactly `/usr/local/bin/ddistro
+service restart <service> --json` as root, under the same trusted-helper rules as
+`ddistro_read` (90 s, 1 MiB). It is not adopted into the session's stoppable runs: once
+started, a restart is allowed to finish, because stopping it midway could leave the service
+down. Session teardown waits for it (bounded by the 90 s run limit) so its result is still sent;
+the root CLI runs in its own session and holds the maintenance lock until it finishes either way.
+The client then gets `ddistro/action/updated` `{proposalId, threadId, state, executed,
+verified, checks}`, and the model gets `{tool, operation, service, captured_at, state,
+proposed, user_approved, executed, verified, data|error}`. `state` is `refused` (invalid or a
+second proposal this turn), `busy`, `cancelled`, `expired`, `not_executed` (approved but
+refused before running), `failed` (ran, or may have run when stopped at the 90 s limit or its
+result was unreadable; the fresh check did not pass), or `verified` (ran; a
+new process and every configured port answered). `success` is true only for `verified`. The
+model has no path to approve, choose a command, a unit, or a path, or reach any other service.
+
+### Assistant foundations (tool revisions 11/12)
+
+The Launcher uses tool revision 11 (12 with memory) only when `ddistro capabilities` reports
+`features.assistant_foundations: true` and lists `ddistro_explore` and `ddistro_exec`. The flag
+needs every helper trusted and a passing probe (see ASSISTANT.md). Otherwise the Launcher stays on
+revision 9/10 or lower, and those revisions behave exactly as described above.
+
+**Negotiation.** With `experimentalApi: true`, a revision 11/12 client sends
+`capabilities.ddistroActions: ["restart_service", "configure_model", "change_files",
+"service_control"]` and `capabilities.ddistroTools: ["explore", "exec"]`. The broker removes both
+fields before Codex sees them and refuses any value it does not know. Tools are declared on
+`thread/start` only; `thread/resume` never adds one. A saved thread from a lower revision is
+upgraded once, to a new thread.
+
+**Tools.**
+
+- `ddistro_explore` is read-only. It covers roots, file list, search and read, data-only config,
+  database schema, and structured database queries with fixed operators. It never runs raw SQL.
+  With `change_files`, it also has `checkout`, which copies files into the task's scratch folder
+  and never writes to a live root.
+- `ddistro_exec` runs `ddistro exec` in the no-network sandbox on redacted, read-only snapshots.
+  The output describes those captured copies, not the live WSL host. The model checks live state
+  with `ddistro_read` and `ddistro_explore`.
+
+**Proposals.** The model can only propose. The broker builds every proposal from a root
+`ddistro` preview, and the model never supplies a hash, a receipt id or a command.
+
+- `propose_file_change` stages the task's scratch edits with `ddistro changes stage`. It can cover
+  several roots, but only roots that `access roots` lists with `change: true`. The card shows the
+  manifest hash and the complete diff (at most 4000 lines and 256 KiB). A larger or truncated diff
+  is refused, never shortened.
+- `propose_file_undo` uses `changes rollback-preview`, and approval runs `changes undo` with its
+  preview hash.
+- `propose_service` uses `ddistro operations preview` for one target and verb from the typed matrix
+  (Apache restart, or a server install or update on an allowed branch). The card shows the target,
+  verb, branch and the 8 summary lines. Approval runs `operations apply` once with that receipt and
+  `plan_sha256`. Start, stop, PostgreSQL and the components are unsupported.
+
+**Approval and status.** Approval and cancellation work as for restarts. `ddistro/action/decide`
+`approve` or `cancel` is accepted once per proposal. A cancel, an expiry, a new turn, or the end of
+the session runs nothing. The client gets `ddistro/action/updated` with `state` and `verified`:
+
+| State | Meaning |
+|---|---|
+| `verified` | The change ran and was checked. |
+| `failed` | The change ran or may have run, and the check did not pass. |
+| `unverified` | The change ran, but the check could not confirm it. |
+| `conflict`, `stale` | Something changed since the preview. Nothing was overwritten. |
+| `cancelled`, `expired` | Nothing ran. |
+| `busy` | Another operation held the lock. |
+| `not_executed`, `refused` | Nothing ran. |
+| anything else | The outcome is unknown. |
+
+A receipt left `executing` is reported as unknown and is never run again. Running a used receipt
+again only returns its recorded result.
+
+### ddistro_run live commands (live_run)
+
+`ddistro_run` runs code the model wrote on the LIVE distro: the real WSL filesystem, services and databases. It is
+not a sandbox and not a snapshot. It exists so the Assistant can do general work (edit a setting in a product
+database, install a package, inspect any path) that the typed tools do not cover. Its safety rests on the user's
+approval of the exact request, not on an allowlist: there is no program, path, SQL or per-mod allowlist, no
+read-only tier and no SQL preview. A command meant only to read can still change things, so without
+`live_run_auto` a run is never let through because the model says it only reads; the typed read tools
+(`ddistro_read`, `ddistro_explore`) stay the automatic way to look. With `live_run_auto` (see "Automatic routine
+runs") the user has chosen to trust the model's own risk declaration for routine work.
+
+**Availability.** The client adds `"live_run"` to `initialize` `capabilities.ddistroActions` (with
+`experimentalApi: true`). It is honored only when, as the session starts, the attestation is current, binds the
+sha256 of `/usr/local/bin/ddistro_run`, and records its canary as `optional_checks.live_run_isolation: true`
+(see the probe below), and the file still has that digest; it is checked again before every run. Otherwise
+`live_run` is dropped silently, like `change_files`. Only then does `thread/start` declare the `ddistro_run`
+tool (`RUN_SPEC`). It is its own tool, not a `ddistro_action` operation. `ddistro capabilities` reports
+`features.live_run` and `live_run.reason`.
+
+**Tool.** `operation` `run`, `status`, `output`, `cancel` or `list`.
+
+- `run`: `interpreter` (`bash`, `python3`, `php`, `psql`), `code` (at most 128 KiB), `reason` (shown to the user),
+  and optionally `account` (default `dwemer`; any local account but `ddagent`), `cwd` (absolute; default the
+  account's home), `network` (default `false`), `timeout_seconds` (1-3600, default 300), `database` (psql only),
+  `wait_seconds` (0-60, default 20). Code with control characters other than tab, newline and CR, or with
+  bidirectional or zero-width characters, is refused, so the reviewed text is what runs. Only in a `live_run_auto`
+  session, `risk` (`routine` or `destructive`; any other value is refused and nothing runs); it is not part of the
+  request bytes or digest.
+- `status` (`job_id`, `wait_seconds`), `output` (`job_id`, `offset`, `max_chars` up to 48 KiB), `cancel`
+  (`job_id`), `list` (this thread's jobs and `limits`). A job is visible only to the thread that started it.
+
+The declared description ends with a limits sentence built by `run_limits_text()` from the enforcing constants
+(timeout, running and kept jobs, per-turn and per-session calls, output ring, wait, reply tail and page size, empty
+stdin and no PTY, session-bound jobs) and tells the model to read a service's configured port from `ddistro_read`
+(inventory, status, health) rather than assume one; `list` returns the same values as `limits` (`run_limits()`).
+
+**Approval.** Without `live_run_auto` and with no covering grant, the broker sends `ddistro/action/proposed` with `action: "live_run"`, an
+impact text (root: full trust), `decisions: ["approve", "approve_session", "cancel"]`, and `change`: the exact
+`code`, `interpreter`, `account`, `cwd`, `network`, `timeout_seconds`, `database`, `code_sha256`, `digest` (the
+sha256 of the exact request bytes the supervisor will read), `scope`, the current `grant` and `widens_grant`, and
+`risk` (`destructive` or `unclassified`), `risk_declared` (the model's, or null) and `risk_signs` (the destructive
+patterns found, below). It
+expires after 600 s. The client answers `ddistro/action/decide` with that `digest` (required to approve; a
+missing or different digest is `-32602` and changes nothing). `approve` runs it once. `approve_session` (Allow for
+this task) runs it and adds its exact `(account, network)` scope to the session grant, installed under the same
+lock as the decision so a later revoke always wins: later runs that one scope covers (same account, or root, at
+the same or a wider network tier) run without a card. Scopes are never combined. A request no scope covers shows
+a new card with `widens_grant: true`; approving it with `approve_session` adds one more scope. A run whose code
+shows a destructive sign is never covered by a grant: it gets a card with `decisions: ["approve", "cancel"]`,
+`grant: null`, `risk: "destructive"`, a `Destructive:` label and the signs in its impact, and `approve_session` for it is
+`-32602`. The grant lives only in the broker's memory for
+this session and its task's threads; it is never stored and ends when the session ends or the client sends
+`ddistro/run/revoke` (`{}` -> `{revoked}`; running jobs continue). `ddistro/run/grant` `{active, scope, reason}`
+reports every change. The model has no path to approve, grant or revoke. Replay, late, unknown and foreign-thread
+decisions are refused as for other proposals, and `turn/start`, `turn/interrupt`, `thread/start`,
+`thread/resume`, expiry or the end of the session end a pending card with nothing run. One proposal of any kind is
+pending at a time.
+
+**Automatic routine runs (`live_run_auto`).** A client that adds `"live_run_auto"` next to `"live_run"` (ignored
+without it) gets `RUN_AUTO_SPEC` at `thread/start`: the same tool with a required `risk`. The model declares
+`routine` for reads, inspection, requested configuration and database updates, installs, updates and service control
+(any account, root included, network when needed) and `destructive` for deleting data, rows or files, dropping,
+truncating or resetting databases, tables, schemas or settings, uninstalling or purging, removing accounts, and
+overwriting data with no backup; when unsure, `destructive`. Then:
+
+- `routine` with no destructive sign: no card. The run starts at once (`approval: "automatic"`, `user_approved:
+  false`), with the same digest, helper, maintenance lock, Stop, timeout and job limits as an approved run, and
+  `ddistro/run/started` carries the exact code so the client can show it.
+- `destructive`, no `risk` (a thread started with the older `RUN_SPEC`), or a destructive sign: a card for the exact
+  request with `decisions: ["approve", "cancel"]`, every time. No grant exists in such a session: `approve_session`
+  is never offered and is `-32602`.
+
+The destructive signs (`RUN_DESTRUCTIVE_SIGNS`) are case-insensitive patterns over the code: SQL `DROP <object>`,
+`TRUNCATE`, `DELETE FROM`; `dropdb`, `dropuser`, `pg_restore --clean`; `rm` recursive or with a wildcard;
+`find -delete` or `-exec rm`; `rmtree(`; `apt`/`apt-get`/`aptitude` remove, purge or autoremove, `dpkg -r/-P`,
+`pip uninstall`, `snap remove`; `userdel`, `deluser`, `groupdel`, `delgroup`; `mkfs`, `wipefs`, `shred`, `blkdiscard`,
+`dd of=`; `truncate -s`; `git reset --hard`, `git clean -f`. They apply to older clients' grants too, and only ever
+add a confirmation. They are a backstop, not a detector: code can build a command at run time, encode it, or call a
+script that deletes, and a plain single-file `rm` or `unlink` is deliberately not flagged (temporary-file cleanup).
+The trust model is therefore: the model's declaration is the primary signal, steered by the tool description and the
+Launcher's instructions; the patterns catch common mistakes; the user sees every automatic run's code and output in
+the chat and can Stop it. Nothing here is a security boundary against a model that misclassifies on purpose.
+
+**Service operation (`live_service`).** A client that adds `"live_service"` next to `"live_run"` and
+`"live_run_auto"` (ignored without both, and dropped silently when `ddistro service list --json` does not answer
+at `initialize`) gets one more `ddistro_run` operation, `service`, with `verb` (`list`, `status` or `restart`),
+`target` (for status and restart: `apache` or a registered id from ASSISTANT.md "Registered services") and a
+required `reason`. There is no code, path, command or flag: the broker runs exactly `/usr/local/bin/ddistro
+service <verb> [<target>] --json` as root (90 s, 1 MiB) through `run_ddistro`, the host-context path
+`propose_restart` uses, never through `ddistro_run`'s isolation and never in a run's view. `restart` starts at once
+without a card (service control is routine) and, like `propose_restart`, is not adopted into stoppable runs; ddistro
+holds the maintenance lock and verifies a new process in PID 1's mount and network namespaces and its ports (ASSISTANT.md
+"Service restart"). `stop`, `start`, `postgresql` and `components` are `unsupported` before anything runs; a
+malformed id, a missing `reason`, an unknown key or a `target` on `list` is `refused`; an unregistered id comes back
+`unsupported` from ddistro with the registration hint. The reply is `{tool, operation: "service", verb, target,
+state, executed, verified, hint, captured_at}` plus, from ddistro, `label, checks, before, after, namespace, impact,
+health: "not_checked", pid, started, verified_at, output_tail` (restart and status) or `services, refused,
+unsupported` (list). `state` is `verified`/`failed` (restart), `running`/`degraded`/`unchecked`/`not_running`
+(status), `listed`, or `unsupported`, `refused`, `busy`, `not_executed`, `unknown` (a timeout or unreadable result:
+the restart may have run, `executed: null`). Each call counts against the 32 `ddistro_run` calls per turn and the
+session total; it is not journaled by `task_recovery`. Without `live_service` the `ddistro_run` input schema is
+exactly the earlier one; only the description sentence that recommended init scripts or setsid for services changed
+for every session. `capabilities` advertises the contract as `features.live_service` and `live_run.service`.
+
+**Execution.** For an approved or covered request the broker checks the common maintenance lock
+(`/run/lock/dwemerdistro-maintenance.lock`, used as it is, never replaced) by taking it shared without waiting and
+releasing it at once: a run does not start while an exclusive change holds it (`busy`). The lock is not held for
+the job, so the command's own `ddistro` changes take it as usual. A Stop, archive or delete of the thread after
+the approval but before the job is registered means the run never starts. At most 4 jobs run at once per
+session. The broker then sends `ddistro/run/started` `{threadId, turnId, jobId,
+approval: user_once|user_task_grant|task_grant|automatic, digest, state: "starting", spec}` with the exact code, and starts
+`/usr/local/bin/ddistro_run supervise` in its own session and process group, writing the request bytes to its
+stdin. The root supervisor:
+
+- checks the request again, sets its parent-death signal (the broker's death, even SIGKILL, stops the job) and
+  puts the code in a sealed memfd, so it reaches the interpreter as `/dev/fd/9`, never on a command line;
+- forks the command, which gets a private mount namespace in which `/mnt` (Windows drives, WSLg), `/run/WSL`
+  (interop), `/init` and `/var/lib/dwemerdistro/assistant` (the Codex sign-in, memory, receipts, task and thread
+  state) are hidden, and, with `network: false`, an empty network namespace with only its own loopback (no
+  internet, no TCP to local services; Unix sockets such as PostgreSQL's work). With `network: true`, when
+  `/etc/resolv.conf` is a link into a masked directory (WSL links it to `/mnt/wsl/resolv.conf`), the supervisor
+  first reads that root-owned, not group- or other-writable regular file (at most 32 KiB, no link followed at the
+  last step) and writes only its `nameserver`, `search`, `domain`, `options` and `sortlist` lines to the same path
+  inside the mask, which is then made read-only; nothing else of the masked directory appears, the host file is
+  unchanged, and a regular `/etc/resolv.conf` or a link elsewhere is left as it is. If that file is unusable the
+  mask stays empty and name lookups fail as before; `started` reports the copied path as `resolver` (or null).
+  With `network: false` nothing is copied, so the canary's empty `/mnt` still holds. These masks prevent accidents only:
+  a root command can undo them. Product configuration is not hidden, so it can be edited;
+- drops to the account (its groups, uid and gid) with no_new_privs unless it is root, so sudo, su and other setuid
+  programs cannot raise a non-root run; root keeps every capability;
+- runs it with stdin `/dev/null` and a fixed environment (`DEBIAN_FRONTEND=noninteractive`, `PAGER=cat`,
+  `GIT_TERMINAL_PROMPT=0`, no WSL or Windows variables), and reports `started` with the digest of what it read;
+  the broker stops the job unless that digest is the approved one;
+- on timeout or cancel sends SIGTERM to the command's process group and SIGKILL after 5 s; when the command
+  ends, whatever is left in its group is stopped too. Processes that left the group (a service started through
+  its init script, setsid or start-stop-daemon) keep running by design, but in the run's private view: the masked,
+  non-propagating mount namespace and, with `network: false`, the empty network namespace. Such a service can run
+  yet be unreachable from the distro, other runs and Windows, so the tool descriptions route service control to
+  operation `service` (below) or the approval cards instead of run code.
+
+**Output and lifecycle.** stdout and stderr are read by the broker, redacted (ddistro_access's redaction, applied
+to whole blocks so multi-line keys are caught), control characters replaced, lines clipped at 4096 characters and
+stderr lines prefixed `[stderr] `. A job keeps the newest 512 KiB of characters; offsets are absolute. The client
+gets `ddistro/run/output` `{threadId, jobId, offset, text, notStreamed}` at most 10 times a second, 16 K
+characters each and 64 K per second (the rest stays in the ring), and `ddistro/run/updated` `{threadId, jobId,
+state, started, exitCode, signal, succeeded, verified: false, reason, durationMs, outputChars}`. States:
+`running`, `exited`, `timed_out`, `cancelled`, `killed`, `unknown` (no report from the supervisor; never treated
+as success), and `refused` / `not_started` / `busy` (nothing ran). `turn/interrupt` (Stop), `thread/archive`,
+`thread/unarchive` and `thread/delete` stop that thread's jobs, the end of the session stops all of them,
+`ddistro/run/cancel` `{threadId, jobId}` stops one; a stop is SIGTERM to the group, then SIGKILL after 10 s. Jobs
+otherwise outlive the turn, so a later turn of the same thread can ask for their status.
+
+**Model replies** say `state`, `started`, `approval`, `user_approved`, `risk` and `risk_signs`, and for a job `exit_code`, `signal`,
+`succeeded` (exited 0) and `verified: false` with the note that only the exit status is known, the redacted
+output tail (24 K characters) and a `hint`. The broker never retries; a cancelled, timed-out, killed or unknown
+run may have changed things partway and is not rerun. There is no undo: the tool tells the model to back up a file
+before editing it and to read the result back. ddistro_run calls have their own budget of 32 per turn (polling a
+long job is expected), count toward the 256 per session, and run outside the diagnostic slots (at most 4 calls at
+once).
+
+**Probe canary** (`live_run_isolation`, optional like `managed_exec_isolation`, so a failure only turns
+`live_run` off): it runs the installed, bound `ddistro_run` twice as `nobody` without network, changing nothing.
+The first run must start with the expected digest, read its code from `/dev/fd/`, keep the code out of its
+command line, run as `nobody` with no_new_privs, see `/mnt`, `/run/WSL` and the assistant state empty and `/init`
+masked, have no WSL variables and an empty stdin, and reach neither the probe's host loopback listener (which the
+outer check reached) nor `1.1.1.1:443`. The second must time out after 2 s with its background child gone and
+its output closed without help from the probe.
+
+**Task recovery journal (`task_recovery`, version 1).** Every `serve` session journals its `ddistro_run` jobs in
+`/var/lib/dwemerdistro/assistant/agent/journal/<task>.json` (root 0700 directory, root 0600 single-link file, at most
+256 KiB, replaced atomically under an exclusive `flock` of a persistent empty `<task>.lock` that is never replaced).
+A job is recorded as `launching` before its supervisor starts (if that write fails the run is `not_started` with
+`journal_unavailable`), then `running`, then its final state. An entry holds the request digest, code sha256 and size,
+interpreter, account, network, database, a cwd sha256, risk, approval, timestamps, exit code, signal and stop reason;
+never the code, output or the model's reason. At most 64 jobs (finished ones evicted first; an evicted unfinished
+one is counted in `dropped_incomplete`), 32 checkpoints and 16 session records are kept.
+
+A client that adds `"task_recovery"` next to `"live_run"` gets two more `ddistro_run` operations (an older client's
+declaration is unchanged): `recovery` returns this chat's jobs and checkpoints, and `checkpoint` stores the model's
+`progress` (required), `next_step`, `verification`, up to 5 one-line `backup_refs` and up to 8 `job_ids` (each must be a
+journaled job of the same task and thread, else the call is refused), redacted and bounded, as `source: model, trust: untrusted_claim, verified: false`. Both count toward the `ddistro_run` turn and
+session budgets. The client method `ddistro/task/recovery` `{threadId}` returns the same view for one task-owned
+thread; `ddistro_agent recovery --task UUID` (root) prints it for every thread in the task's registry, reading under
+the shared lock only (it never takes `serve.lock` and never signals a process). Each job view has `recovery`:
+`none` (nothing ran), `verify_before_continuing` (it ran; `process_succeeded` is exit 0 only and `verified` is always
+false), `live_this_session` (the only `controllable` state; use status, output or cancel), `interrupted` (no outcome
+was recorded and its session ended: `state interrupted`, `outcome unknown`, never shown running), or
+`other_session_active` (another live broker, matched by pid and kernel start time, still owns it). `replayable`,
+`replay` and `rollback` are always false: nothing is rerun on reconnect, and a job of an earlier session is not a
+job id `status`/`cancel` accept.
+
 ### Thread archive and delete
 
 `thread/archive`, `thread/unarchive`, and `thread/delete` (Codex 0.163.0 stable,
@@ -439,6 +784,17 @@ a static fact that adds no command and opens no database.
 
 ## Known limitations
 
+- `ddistro_run` is not isolation. An approved root run can read or change anything in the distro, including
+  undoing its own masks (for example through `/proc/1/root` or by unmounting), and a non-root run has everything
+  its account has. The PID namespace is shared on purpose (services, `ps`, init scripts), so a command can see and
+  signal other processes its account may signal. Network off is all or nothing: there is no per-host rule.
+- A `ddistro_run` job's output is redacted line by line with patterns; a secret in an unusual format can pass.
+  Grant-covered and automatic runs show no card; the launcher shows them from `ddistro/run/started`.
+- Automatic runs trust the model's `risk`. The destructive patterns are a conservative backstop that a disguised,
+  generated or indirect deletion can pass; they do not make an automatic run safe, only common mistakes rarer.
+- A background process a job leaves in its own session keeps running after the job, and if it kept the job's
+  stdout or stderr, it gets an error writing to them once the broker stops reading.
+
 - Codex 0.163 permission profiles are beta. The probe, not the configuration, is the
   evidence. Until a passing probe exists on the target distro, serve refuses.
 - The App Server process itself shares the WSL network namespace, so it can reach
@@ -452,6 +808,12 @@ a static fact that adds no command and opens no database.
 - The account-home repair removes the trust entry but does not stop it from being written again (the source of the original file is unverified).
   An account-free `thread/start` with the pinned runtime did not write one (fixture), so what
   wrote it is not known; prevention through the managed config was not tested and is not done.
+- `ddistro_action` holds Codex's dynamic tool call open while the user decides (at most 60 s).
+  An approved legacy restart then takes up to about 75 s with its check; an approved
+  `propose_service` waits at most 600 s, the CLI's existing bound for `changes` and the probe,
+  and past it reports an unknown outcome without stopping `ddistro_server` or re-running the
+  receipt. Whether Codex 0.163.0 bounds a dynamic tool call more tightly was not measured; if
+  it does, the turn ends first and a pending proposal expires with nothing run.
 - The task mapping keeps the 256 most recently started threads in start order, so `thread/list`
   orders by start time and cannot list older threads. A thread started between two pages
   shifts nothing, because the cursor is a thread id, not an offset.
