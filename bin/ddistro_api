@@ -497,7 +497,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if kind != "launcher":
                 raise ApiError(403, "permission_denied")
             with app.lock:
-                if app.current is not None or app.queue or any(s.jobs or s.active or s.queued for s in app.sessions.values()):
+                if (app.current is not None or app.queue
+                        or any(s.jobs or s.active or s.queued for s in app.sessions.values())
+                        or app.store.rows("SELECT id FROM requests WHERE state IN ('queued','running') LIMIT 1")):
                     raise ApiError(409, "request_running")
                 app.stopping = True
             def stop():
@@ -701,9 +703,12 @@ def local_call(method, path, body=None, headers=None):
     conn.request(method, path, payload, {"Content-Type": "application/json", **(headers or {})})
     reply = conn.getresponse()
     if reply.status != 200:
-        reply.read()
+        try:
+            code = json.loads(reply.read()).get("error", "api_refused")
+        except (ValueError, AttributeError):
+            code = "api_refused"
         conn.close()
-        raise ApiError(reply.status, "api_refused")
+        raise ApiError(reply.status, code)
     return conn, reply
 
 
@@ -785,7 +790,7 @@ def maintenance(command):
         result = subprocess.run(command, env={**os.environ, "DDISTRO_ASSISTANT_MAINTENANCE": "1"}, close_fds=True)
     if restart:
         # Use the installed helper after replacement. A failed probe keeps the runtime closed.
-        subprocess.run([SELF, "ensure"], check=False)
+        subprocess.run([SELF, "ensure"], check=False, stdout=subprocess.DEVNULL)
     return result.returncode
 
 
@@ -922,4 +927,4 @@ if __name__ == "__main__":
         sys.exit(main() or 0)
     except ApiError as exc:
         sys.stderr.write(json.dumps({"error": exc.code}) + "\n")
-        sys.exit(1)
+        sys.exit(75 if exc.code in ("request_running", "assistant_busy_retry", "maintenance_running") else 1)

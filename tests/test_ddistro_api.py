@@ -204,7 +204,17 @@ class Maintenance(unittest.TestCase):
 
     def test_background_jobs_prevent_idle_shutdown(self):
         app = types.SimpleNamespace(lock=threading.RLock(), current=None, queue=[],
+            store=types.SimpleNamespace(rows=lambda *args: []),
             sessions={"idle": types.SimpleNamespace(jobs={"live-job"}, active=False, queued=False)})
+        handler = api.Handler.__new__(api.Handler)
+        handler.server = types.SimpleNamespace(app=app)
+        with self.assertRaises(api.ApiError) as error:
+            handler.route("POST", "/v1/admin/shutdown", {}, "launcher", "launcher")
+        self.assertEqual(error.exception.code, "request_running")
+
+    def test_accepted_game_request_is_protected_before_worker_reserves(self):
+        app = types.SimpleNamespace(lock=threading.RLock(), current=None, queue=[], sessions={},
+            store=types.SimpleNamespace(rows=lambda *args: [{"id": "accepted-but-not-scheduled"}]))
         handler = api.Handler.__new__(api.Handler)
         handler.server = types.SimpleNamespace(app=app)
         with self.assertRaises(api.ApiError) as error:

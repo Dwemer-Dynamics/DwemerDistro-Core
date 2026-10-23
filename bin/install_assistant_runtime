@@ -18,6 +18,18 @@ set -euo pipefail
 umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
+# Replacing a pinned runtime is maintenance too. Protect existing jobs and prevent
+# auto-connect from starting between installation and the final isolation probe.
+case "${1:-}" in
+    --db-reader|--reprobe|-h|--help) ;;
+    *)
+        if [ "${DDISTRO_ASSISTANT_MAINTENANCE:-}" != 1 ] && [ -x /usr/local/bin/ddistro_api ] \
+            && [ -d /var/lib/dwemerdistro/assistant/agent ]; then
+            exec /usr/local/bin/ddistro_api maintenance /bin/bash "$0" "$@"
+        fi
+        ;;
+esac
+
 CODEX_URL="https://github.com/openai/codex/releases/download/rust-v0.163.0/codex-x86_64-unknown-linux-musl.tar.gz"
 ARCHIVE_SHA256="beb339e8ecd9ba057a6bb2dc81ad8ca474812edfbf0fc5056ca818797648dde4"
 BINARY_NAME="codex-x86_64-unknown-linux-musl"

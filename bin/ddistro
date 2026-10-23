@@ -1313,14 +1313,20 @@ def cmd_agent_probe(opts, ctx):
     if os.geteuid() != 0:
         raise CliError("permission_denied", "agent probe must run as root. ddistro never elevates by itself.")
     ctx["operation_id"] = str(uuid.uuid4())
-    code, out, _ = run_helper(["probe"], AGENT_PROBE_TIMEOUT, AGENT_STDOUT_LIMIT + 1, helper=AGENT_HELPER)
+    # The persistent API owns serve.lock even when idle; drain it before probing.
+    api = "/usr/local/bin/ddistro_api"
+    if os.environ.get("DDISTRO_ASSISTANT_MAINTENANCE") != "1" and os.path.isfile(api):
+        code, out, _ = run_helper(["maintenance", AGENT_HELPER, "probe"], AGENT_PROBE_TIMEOUT,
+                                  AGENT_STDOUT_LIMIT + 1, helper=api)
+    else:
+        code, out, _ = run_helper(["probe"], AGENT_PROBE_TIMEOUT, AGENT_STDOUT_LIMIT + 1, helper=AGENT_HELPER)
+    if code == 75:
+        raise CliError("busy", "Assistant work is running. Wait for it to finish, then try the isolation check again.")
     doc = agent_document(out, {"passed", "checks", "diagnostics"})
     checks = doc["checks"]
     if type(checks) is not dict or len(checks) > 64 or not all(
             type(name) is str and AGENT_TOKEN.match(name) and type(value) is bool for name, value in checks.items()):
         raise CliError("helper_protocol", "ddistro_agent returned malformed probe checks.", {"helper_exit": code})
-    if code == 75:
-        raise CliError("busy", "An assistant session is running. Stop it before running the isolation check.")
     if type(doc["passed"]) is not bool or code != (0 if doc["passed"] else 1) or doc["passed"] != (
             bool(checks) and all(checks.values())):
         raise CliError("helper_protocol", "ddistro_agent returned an inconsistent probe result.", {"helper_exit": code})
@@ -1407,9 +1413,10 @@ def agent_serve(args):
     if os.geteuid() != 0:
         return serve_refusal("assistant_unavailable", "requires_root", 3)
     try:
-        check_helper(AGENT_HELPER)
+        api = "/usr/local/bin/ddistro_api"
+        check_helper(api)
         os.chdir("/")
-        os.execve(AGENT_HELPER, [AGENT_HELPER, "serve", "--task", args[1]],
+        os.execve(api, [api, "bridge", "--task", args[1]],
                   {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
     except CliError:
         return serve_refusal("assistant_unavailable", "helper_unavailable", 3)
