@@ -452,7 +452,8 @@ def cmd_capabilities(opts, ctx):
                       "service_when": "initialize capabilities.ddistroActions [\"live_run\", \"live_run_auto\", "
                                       "\"live_service\"]"})
     data = {
-        "assistant_api": {"version": 1, "transport": "root_unix_relay", "game_permissions": ["chat"]},
+        "assistant_api": {"version": 1, "transport": "root_unix_relay", "game_permissions": ["chat"],
+                          "automatic_probe": True},
         "commands": [
             {"name": "version", "mutates": False}, {"name": "capabilities", "mutates": False},
             {"name": "products", "mutates": False},
