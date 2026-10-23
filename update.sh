@@ -1,6 +1,13 @@
 #!/bin/bash
 # Enhanced update script with minimal output
 
+# Drain the persistent Assistant before replacing any helper it attests. The root API
+# owns a separate gate for the entire update, so auto-connect cannot restart it midway.
+if [ "${DDISTRO_ASSISTANT_MAINTENANCE:-}" != 1 ] && [ -x /usr/local/bin/ddistro_api ] \
+    && [ -d /var/lib/dwemerdistro/assistant/agent ]; then
+    exec /usr/bin/python3 /home/dwemer/dwemerdistro/bin/ddistro_api maintenance /bin/bash "$0" "$@"
+fi
+
 # Simple color palette
 GREEN='\033[0;32m'
 RED='\033[1;31m'
@@ -203,9 +210,11 @@ else
     exit 1
 fi
 
-# The new helpers make an existing probe stale; rerun it once now that every Core file is in place.
-# Skipped without the runtime; busy or failed only warns, so it never fails this update.
-/usr/local/bin/install_assistant_runtime --reprobe 7<&- || true
+# Existing and fresh users receive the same hash-verified runtime, without account sign-in.
+# An interrupted download can be retried; no user data or provider credentials are replaced.
+/usr/local/bin/install_assistant_runtime --install-prerequisites 7<&- || exit 1
+# Do not report a successful Assistant upgrade with a skipped or failed isolation check.
+/usr/local/bin/ddistro --json agent probe 7<&- || exit 1
 
 printf "\n${BOLD}=======================================================${NC}\n"
 printf "${BOLD}${GREEN}        CORE SYSTEM UPDATED SUCCESSFULLY!          ${NC}\n"

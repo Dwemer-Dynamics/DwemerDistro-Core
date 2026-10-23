@@ -4,6 +4,7 @@ import argparse
 import collections
 import contextlib
 import hashlib
+import fcntl
 import http.client
 import http.server
 import importlib.machinery
@@ -11,6 +12,7 @@ import importlib.util
 import json
 import os
 import pwd
+from pathlib import Path
 import re
 import secrets
 import select
@@ -30,6 +32,8 @@ ROOT = "/var/lib/dwemerdistro/assistant/api"
 SOCKET = ROOT + "/control.sock"
 HELPER = "/usr/local/bin/ddistro_agent"
 SELF = "/usr/local/bin/ddistro_api"
+LIFECYCLE = ROOT + "/lifecycle.lock"
+API_VERSION = 1
 PORT = 18423
 MAX_BODY = 16 * 1024 * 1024  # Enclosing JSON may double escaping; the broker still enforces its own line limit.
 MAX_EVENTS = 512
@@ -238,6 +242,7 @@ class Session:
 
 class App:
     def __init__(self):
+        self.generation = hashlib.sha256(Path(SELF).read_bytes()).hexdigest()
         self.agent = load_agent()
         self.owner = self.agent.SingletonLock()
         account = pwd.getpwnam("ddagent")
@@ -492,7 +497,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if kind != "launcher":
                 raise ApiError(403, "permission_denied")
             with app.lock:
-                if app.current is not None or app.queue:
+                if app.current is not None or app.queue or any(s.jobs or s.active or s.queued for s in app.sessions.values()):
                     raise ApiError(409, "request_running")
                 app.stopping = True
             def stop():
@@ -503,11 +508,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             threading.Timer(0.2, stop).start()
             return {"stopping": True}
         if path == "/v1/capabilities" and method == "GET":
-            result = {"version": 1, "client": client, "kind": kind, "permissions":
+            result = {"version": API_VERSION, "client": client, "kind": kind, "permissions":
                 ["chat", "maintenance", "approvals", "launcher_memory"] if kind == "launcher" else ["chat"],
                 "game_actions": False, "max_sessions": MAX_SESSIONS, "max_queue": MAX_QUEUE}
             if kind == "launcher":
-                result.update(owner_pid=os.getpid(), runtime_active=app.current is not None,
+                result.update(generation=app.generation, owner_pid=os.getpid(), runtime_active=app.current is not None,
                               queued=len(app.queue), workers=len(app.sessions))
             return result
         if path == "/v1/conversations":
@@ -702,30 +707,86 @@ def local_call(method, path, body=None, headers=None):
     return conn, reply
 
 
-def ensure():
+# Serialize startup against maintenance without replacing any lifetime lock inode.
+@contextlib.contextmanager
+def lifecycle(exclusive=False):
     prepare_root()
+    fd = os.open(LIFECYCLE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
-        conn, reply = local_call("GET", "/v1/capabilities")
-        reply.read()
-        conn.close()
-        return
-    except (OSError, http.client.HTTPException):
-        pass
-    log = os.open(ROOT + "/service.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(log, "ab") as output:
-        child = subprocess.Popen([SELF, "serve"], stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-            start_new_session=True, close_fds=True, env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
-    for _ in range(60):
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_mode & 0o077:
+            raise ApiError(503, "state_untrusted")
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ApiError(409, "maintenance_running")
+        yield
+    finally:
+        os.close(fd)
+
+
+def ensure():
+    with lifecycle():
+        expected = hashlib.sha256(Path(SELF).read_bytes()).hexdigest()
         try:
             conn, reply = local_call("GET", "/v1/capabilities")
-            reply.read()
+            document = json.load(reply)
             conn.close()
+            if document.get("version") != API_VERSION or document.get("generation") != expected:
+                raise ApiError(409, "api_update_required")
             return
         except (OSError, http.client.HTTPException):
-            if child.poll() is not None:
+            pass
+        log = os.open(ROOT + "/service.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(log, "ab") as output:
+            child = subprocess.Popen([SELF, "serve"], stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                start_new_session=True, close_fds=True, env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
+        for _ in range(60):
+            try:
+                conn, reply = local_call("GET", "/v1/capabilities")
+                document = json.load(reply)
+                conn.close()
+                if document.get("version") != API_VERSION or document.get("generation") != expected:
+                    raise ApiError(409, "api_update_required")
+                return
+            except (OSError, http.client.HTTPException):
+                if child.poll() is not None:
+                    break
+                time.sleep(0.1)
+        raise ApiError(503, "api_start_failed_or_legacy_session_busy")
+
+
+# Own the maintenance gate across shutdown, helper replacement and isolation probing.
+# Busy requests are refused before running the supplied root maintenance command.
+def maintenance(command):
+    if not command:
+        raise ApiError(400, "maintenance_command_required")
+    restart = False
+    with lifecycle(exclusive=True):
+        try:
+            conn, reply = local_call("POST", "/v1/admin/shutdown", {})
+            reply.read()
+            conn.close()
+            restart = True
+        except (FileNotFoundError, ConnectionRefusedError):
+            pass
+        # Workers inherit the singleton descriptor. Wait for graceful closure, never kill them.
+        agent = load_agent()
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                owner = agent.SingletonLock()
+                os.close(owner.fd)
                 break
-            time.sleep(0.1)
-    raise ApiError(503, "api_start_failed_or_legacy_session_busy")
+            except Exception as exc:
+                if time.monotonic() >= deadline:
+                    raise ApiError(409, "assistant_busy_retry") from exc
+                time.sleep(0.1)
+        result = subprocess.run(command, env={**os.environ, "DDISTRO_ASSISTANT_MAINTENANCE": "1"}, close_fds=True)
+    if restart:
+        # Use the installed helper after replacement. A failed probe keeps the runtime closed.
+        subprocess.run([SELF, "ensure"], check=False)
+    return result.returncode
 
 
 def bridge(task):
@@ -784,7 +845,8 @@ def bridge(task):
 
 def serve():
     prepare_root()
-    app = App()  # Takes the existing singleton; legacy direct sessions cannot compete.
+    with lifecycle():
+        app = App()  # Startup cannot race the maintenance gate.
     # Acquire singleton before removing an obsolete socket, preserving another owner's endpoint.
     if os.path.lexists(SOCKET):
         info = os.lstat(SOCKET)
@@ -809,6 +871,9 @@ def main():
     subs.add_parser("serve")
     subs.add_parser("ensure")
     subs.add_parser("status")
+    update = subs.add_parser("maintenance", help="root: safely drain, update, probe and reconnect")
+    update.add_argument("argv", nargs=argparse.REMAINDER)
+    subs.add_parser("protocol")
     register = subs.add_parser("register", help="root: provision a chat-only game client, token printed once")
     register.add_argument("client")
     revoke = subs.add_parser("revoke")
@@ -817,6 +882,11 @@ def main():
     relay.add_argument("--task", required=True)
     args = parser.parse_args()
     prepare_root()
+    if args.command == "protocol":
+        print(json.dumps({"version": API_VERSION}))
+        return
+    if args.command == "maintenance":
+        return maintenance(args.argv)
     if args.command == "serve":
         return serve()
     if args.command == "bridge":
