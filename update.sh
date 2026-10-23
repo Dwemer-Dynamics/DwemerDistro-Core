@@ -214,7 +214,14 @@ fi
 # An interrupted download can be retried; no user data or provider credentials are replaced.
 /usr/local/bin/install_assistant_runtime --install-prerequisites 7<&- || exit 1
 # Do not report a successful Assistant upgrade with a skipped or failed isolation check.
-/usr/local/bin/ddistro --json agent probe 7<&- || exit 1
+if ! /usr/local/bin/ddistro --json agent probe 7<&- | /usr/bin/python3 -c '
+import json, sys
+result = json.load(sys.stdin)
+sys.exit(0 if result.get("ok") is True and result.get("data", {}).get("passed") is True else 1)
+'; then
+    printf "${RED}[ERROR] Assistant isolation did not pass. Check connectivity and retry Update Distro.${NC}\n"
+    exit 1
+fi
 
 printf "\n${BOLD}=======================================================${NC}\n"
 printf "${BOLD}${GREEN}        CORE SYSTEM UPDATED SUCCESSFULLY!          ${NC}\n"
