@@ -2,6 +2,7 @@
 import importlib.machinery
 import importlib.util
 import io
+import collections
 import json
 import os
 from pathlib import Path
@@ -114,6 +115,32 @@ class Ownership(unittest.TestCase):
         result = self.route("GET", "/v1/capabilities")
         self.assertEqual(result["permissions"], ["chat"])
         self.assertFalse(result["game_actions"])
+
+
+class Scheduling(unittest.TestCase):
+    def test_cancelled_queue_entry_never_takes_reservation(self):
+        app = api.App.__new__(api.App)
+        app.lock = threading.Condition(threading.RLock())
+        app.queue, app.current, app.stopping = collections.deque(), object(), False
+        session = types.SimpleNamespace(active=False, closed=False, queue_cancel=True)
+        owner = app.current
+        with self.assertRaises(api.ApiError) as error:
+            app.reserve(session, cancellable=True)
+        self.assertEqual(error.exception.code, "cancelled_before_execution")
+        self.assertIs(app.current, owner)
+        self.assertFalse(app.queue)
+
+    def test_detached_job_keeps_model_reservation(self):
+        session = api.Session.__new__(api.Session)
+        released = []
+        session.app = types.SimpleNamespace(release=lambda value: released.append(value))
+        session.active, session.turn_done, session.request_id = True, True, None
+        session.jobs = {"job"}
+        session.finish_if_safe()
+        self.assertFalse(released)
+        session.jobs.clear()
+        session.finish_if_safe()
+        self.assertEqual(released, [session])
 
 
 if __name__ == "__main__":

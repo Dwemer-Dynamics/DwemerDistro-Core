@@ -486,9 +486,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             threading.Timer(0.2, stop).start()
             return {"stopping": True}
         if path == "/v1/capabilities" and method == "GET":
-            return {"version": 1, "client": client, "kind": kind, "permissions":
+            result = {"version": 1, "client": client, "kind": kind, "permissions":
                 ["chat", "maintenance", "approvals", "launcher_memory"] if kind == "launcher" else ["chat"],
                 "game_actions": False, "max_sessions": MAX_SESSIONS, "max_queue": MAX_QUEUE}
+            if kind == "launcher":
+                result.update(owner_pid=os.getpid(), runtime_active=app.current is not None,
+                              queued=len(app.queue), workers=len(app.sessions))
+            return result
         if path == "/v1/conversations":
             if method == "GET":
                 return {"conversations": app.store.rows("SELECT id,created FROM conversations WHERE client=? ORDER BY created DESC LIMIT 100", (client,))}
