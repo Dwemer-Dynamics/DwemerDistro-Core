@@ -254,7 +254,8 @@ class App:
             time.sleep(10)
             with self.lock:
                 idle = [session for session in self.sessions.values()
-                        if not session.active and not session.jobs and time.monotonic() - session.last > 900]
+                        if not session.active and not session.jobs and not session.queued and not session.attached
+                        and time.monotonic() - session.last > 900]
             for session in idle:
                 with contextlib.suppress(ApiError, OSError):
                     session.close()
@@ -277,7 +278,8 @@ class App:
                 for old_key, old in list(self.sessions.items()):
                     if old.closed:
                         del self.sessions[old_key]
-                idle = sorted((old for old in self.sessions.values() if not old.active and not old.jobs), key=lambda old: old.last)
+                idle = sorted((old for old in self.sessions.values()
+                    if not old.active and not old.jobs and not old.queued and not old.attached), key=lambda old: old.last)
                 evict = idle[0] if len(self.sessions) >= MAX_SESSIONS and idle else None
             if evict:
                 evict.close()
@@ -344,6 +346,7 @@ class App:
         submitted = False
         try:
             session = self.session(conversation)
+            session.queued = True
             self.reserve(session, request_id)
             rows = self.store.rows("SELECT state FROM requests WHERE id=?", (request_id,))
             if rows[0]["state"] == "cancelled":
@@ -374,6 +377,9 @@ class App:
                 if not submitted:
                     session.turn_done, session.final_state = True, "failed"
                     session.finish_if_safe()
+        finally:
+            if session:
+                session.queued = False
 
 
 class LocalServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -570,7 +576,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return {"id": rid, "state": "queued"}
             if kind != "launcher":
                 raise ApiError(403, "permission_denied")
-            session = app.session(conversation)
+            session = app.sessions.get(conversation["id"])
+            if not session or session.closed:
+                raise ApiError(410, "session_closed")
             if len(parts) == 4 and parts[3] == "events" and method == "GET":
                 session.last = time.monotonic()
                 self.stream(session, raw=True)

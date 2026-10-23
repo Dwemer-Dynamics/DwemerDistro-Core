@@ -118,6 +118,24 @@ class Ownership(unittest.TestCase):
 
 
 class Scheduling(unittest.TestCase):
+    def test_worker_eviction_preserves_attached_and_queued_sessions(self):
+        app = api.App.__new__(api.App)
+        app.lock = threading.Condition(threading.RLock())
+        app.session_gate, app.stopping = threading.Lock(), False
+        closed = []
+        def worker(name, attached=False, queued=False):
+            result = types.SimpleNamespace(conversation={"id": name}, closed=False, active=False,
+                jobs=set(), attached=attached, queued=queued, last=0)
+            result.close = lambda: (closed.append(name), setattr(result, "closed", True))
+            return result
+        app.sessions = {name: worker(name, attached=name == "launcher", queued=name == "queued")
+                        for name in ("launcher", "queued", "idle-a", "idle-b")}
+        with patch.object(api, "Session", side_effect=lambda owner, conversation: worker(conversation["id"])):
+            app.session({"id": "new"})
+        self.assertEqual(closed, ["idle-a"])
+        self.assertIn("launcher", app.sessions)
+        self.assertIn("queued", app.sessions)
+
     def test_cancelled_queue_entry_never_takes_reservation(self):
         app = api.App.__new__(api.App)
         app.lock = threading.Condition(threading.RLock())
