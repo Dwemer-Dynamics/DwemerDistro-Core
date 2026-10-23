@@ -635,7 +635,9 @@ def cmd_prepare(opts):
     if len(rels) > MAX_FILES:
         raise ChangeError("invalid_argument", f"At most {MAX_FILES} files can be selected.")
     account, uid, gid = scratch_account()
-    root_fd, owner = open_product_root(product)
+    # A chat-only workspace works before any game server is installed. Live file
+    # selection still requires the same trusted product root and ownership checks.
+    root_fd, owner = open_product_root(product) if rels else (None, None)
     records, contents, total = [], {}, 0
     try:
         for rel in rels:
@@ -647,7 +649,8 @@ def cmd_prepare(opts):
                 contents[rel] = data
             records.append(record)
     finally:
-        os.close(root_fd)
+        if root_fd is not None:
+            os.close(root_fd)
     if total > MAX_BATCH_BYTES:
         raise ChangeError("invalid_argument", f"The selected files exceed {MAX_BATCH_BYTES} bytes together.")
     ensure_state_root(create=True)
