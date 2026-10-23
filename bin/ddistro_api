@@ -344,10 +344,12 @@ class App:
     def game_turn(self, conversation, request_id, text, context):
         session = None
         submitted = False
+        reserved = False
         try:
             session = self.session(conversation)
             session.queued = True
             self.reserve(session, request_id)
+            reserved = True
             rows = self.store.rows("SELECT state FROM requests WHERE id=?", (request_id,))
             if rows[0]["state"] == "cancelled":
                 session.active = False
@@ -372,11 +374,14 @@ class App:
         except Exception as exc:
             state = "outcome_unknown" if submitted and not (isinstance(exc, ApiError) and exc.code == "runtime_refused") else "failed"
             self.store.write("UPDATE requests SET state=? WHERE id=? AND state NOT IN ('cancelled','completed')", (state, request_id))
-            if session:
+            if session and reserved:
                 # A timeout after submission is ambiguous. Keep the reservation until broker completion/EOF.
                 if not submitted:
                     session.turn_done, session.final_state = True, "failed"
                     session.finish_if_safe()
+                    session.queued = False
+                    with contextlib.suppress(ApiError, OSError):
+                        session.close()
         finally:
             if session:
                 session.queued = False

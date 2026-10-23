@@ -118,6 +118,16 @@ class Ownership(unittest.TestCase):
 
 
 class Scheduling(unittest.TestCase):
+    def test_refused_reservation_does_not_release_an_older_unknown_turn(self):
+        app = api.App.__new__(api.App)
+        session = types.SimpleNamespace(active=True, turn_done=False, queued=False)
+        app.session = lambda conversation: session
+        app.reserve = lambda *args: (_ for _ in ()).throw(api.ApiError(409, "request_running"))
+        app.store = types.SimpleNamespace(write=lambda *args: None)
+        app.game_turn({}, "new", "hello", "")
+        self.assertTrue(session.active)
+        self.assertFalse(session.turn_done)
+
     def test_worker_eviction_preserves_attached_and_queued_sessions(self):
         app = api.App.__new__(api.App)
         app.lock = threading.Condition(threading.RLock())
