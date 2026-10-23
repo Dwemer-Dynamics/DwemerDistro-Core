@@ -244,6 +244,7 @@ class App:
         if not os.path.lexists(self.agent.GAME_TASKS_ROOT):
             os.mkdir(self.agent.GAME_TASKS_ROOT, 0o710)
             os.chown(self.agent.GAME_TASKS_ROOT, 0, account.pw_gid)
+            os.chmod(self.agent.GAME_TASKS_ROOT, 0o710)
         os.close(self.agent.open_tasks_root(account, game=True))
         self.store = Store()
         self.store.write("UPDATE requests SET state='outcome_unknown' WHERE state NOT IN ('completed','failed','cancelled','outcome_unknown')")
