@@ -175,8 +175,8 @@ def sync(directory, data, targets):
     warnings = []
     for target in targets:
         if not target['available']:
-            if target['id'] in SUPPORTED and target.get('reason') != 'Not installed' and data['shared']:
-                warnings.append(target['label'] + ': database unavailable; shared keys are saved for retry')
+            if target['id'] in SUPPORTED and target.get('reason') != 'Not installed' and (data['shared'] or data['bindings'].get(target['id'])):
+                warnings.append(target['label'] + ': database unavailable; shared key changes are saved for retry')
             continue
         bindings = data['bindings'].setdefault(target['id'], {})
         for pid in sorted(set(data['shared']) | set(bindings)):
