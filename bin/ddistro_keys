@@ -79,11 +79,14 @@ def locked_state():
 
 
 def save(directory, data):
+    encoded = json.dumps(data).encode()
+    if len(encoded) > 1048576:
+        raise Refusal('Shared key storage limit reached; remove an unused shared key first')
     temporary = 'keys-' + secrets.token_hex(16)
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
     try:
-        with os.fdopen(fd, 'w') as output:
-            json.dump(data, output)
+        with os.fdopen(fd, 'wb') as output:
+            output.write(encoded)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, 'keys.json', src_dir_fd=directory, dst_dir_fd=directory)
