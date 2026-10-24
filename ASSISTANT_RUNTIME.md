@@ -817,3 +817,18 @@ a static fact that adds no command and opens no database.
 - The task mapping keeps the 256 most recently started threads in start order, so `thread/list`
   orders by start time and cannot list older threads. A thread started between two pages
   shifts nothing, because the cursor is a thread id, not an offset.
+
+### Existing local Codex sign-in
+
+The Windows launcher attempts to reuse the current user's file-based ChatGPT cache
+from `CODEX_HOME/auth.json` or their default `.codex/auth.json` before opening an
+Assistant session. Missing, unreadable, malformed, expired or keyring-only caches
+keep normal sign-in available. Desktop configuration and history are not imported.
+
+The root-only `ddistro_agent auth-import` accepts at most 64 KiB on stdin. It holds
+the existing serve singleton, refuses beside a running agent, validates the managed
+account home and atomically creates `auth.json` as `ddagent` mode `0600` only when
+absent. It never replaces an existing distro account (including an expired account),
+follows a destination symlink or returns credentials. Older Core versions simply
+leave normal sign-in in place. This seeds a separate cache; it does not attach to a
+running desktop conversation or continuously synchronize desktop credentials.

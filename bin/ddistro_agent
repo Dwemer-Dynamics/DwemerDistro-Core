@@ -22,6 +22,7 @@ Privilege split:
   * applying scratch changes to a live install is never done here.
 """
 import argparse
+import base64
 import bisect
 import calendar
 import collections
@@ -5648,6 +5649,80 @@ def repair_runtime_trust_config(identity):
     return None
 
 
+def cmd_auth_import():
+    """Seed an empty account home from launcher stdin; never replace a distro account or run beside it."""
+    report = {"state": "skipped"}
+    lock = home_fd = fd = None
+    temporary = None
+    try:
+        require_root()
+        identity = agent_identity()
+        state_layout(identity)
+        lock = SingletonLock()
+        home_fd = open_account_home(identity)
+        try:
+            os.stat("auth.json", dir_fd=home_fd, follow_symlinks=False)
+            report["state"] = "existing"
+        except FileNotFoundError:
+            if not no_agent_processes(identity, timeout=0):
+                raise Refusal("agent_running")
+            raw = sys.stdin.buffer.read(65537)
+            if len(raw) > 65536:
+                raise Refusal("invalid_auth_cache")
+            document = json.loads(raw)
+            tokens = document.get("tokens") if isinstance(document, dict) else None
+            if (not isinstance(tokens, dict) or document.get("OPENAI_API_KEY")
+                    or document.get("auth_mode") not in (None, "chatgpt")
+                    or not all(isinstance(tokens.get(k), str) and 0 < len(tokens[k]) <= 32768
+                               for k in ("access_token", "refresh_token", "id_token", "account_id"))):
+                raise Refusal("invalid_auth_cache")
+            parts = tokens["access_token"].split(".")
+            if len(parts) != 3:
+                raise Refusal("invalid_auth_cache")
+            claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+            if (not isinstance(claims, dict) or type(claims.get("exp")) is not int
+                    or claims["exp"] <= time.time() + 60):
+                raise Refusal("invalid_auth_cache")
+            # Keep only Codex's account fields; desktop configuration and history never cross this boundary.
+            clean = {"tokens": {k: tokens[k] for k in ("access_token", "refresh_token", "id_token", "account_id")}}
+            if document.get("auth_mode") == "chatgpt":
+                clean["auth_mode"] = "chatgpt"
+            if isinstance(document.get("last_refresh"), str):
+                clean["last_refresh"] = document["last_refresh"]
+            temporary = ".auth-import-" + secrets.token_hex(16)
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=home_fd)
+            data = json.dumps(clean).encode()
+            with os.fdopen(fd, "wb") as output:
+                fd = None
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+                os.fchown(output.fileno(), identity.pw_uid, identity.pw_gid)
+            try:
+                os.link(temporary, "auth.json", src_dir_fd=home_fd, dst_dir_fd=home_fd, follow_symlinks=False)
+                report["state"] = "imported"
+            except FileExistsError:
+                report["state"] = "existing"
+    except (Refusal, OSError, ValueError, TypeError):
+        # Only stable states escape; malformed credential content must never appear in diagnostics.
+        report["state"] = "skipped"
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temporary is not None and home_fd is not None:
+            try:
+                os.unlink(temporary, dir_fd=home_fd)
+            except FileNotFoundError:
+                pass
+        if home_fd is not None:
+            os.close(home_fd)
+        if lock is not None:
+            os.close(lock.fd)
+    print(json.dumps(report))
+    return 0
+
+
 def cmd_home_config(repair=False, expected=None):
     """Status of the account home's unmanaged config (the dry run, with the proposal's sha256), or its repair.
 
@@ -6457,6 +6532,7 @@ def main(argv):
                                help="root: account-home config status, or --repair --sha256 HASH to quarantine it")
     home.add_argument("--repair", action="store_true")
     home.add_argument("--sha256")
+    commands.add_parser("auth-import", allow_abbrev=False, help="root: seed an empty Codex account from stdin")
     recovery = commands.add_parser("recovery", allow_abbrev=False,
                                    help="root: the task's execution journal recovery view as JSON (read only)")
     recovery.add_argument("--task", required=True, help="task UUID prepared under " + TASKS_ROOT)
@@ -6465,6 +6541,8 @@ def main(argv):
         return cmd_status()
     if args.command == "probe":
         return cmd_probe()
+    if args.command == "auth-import":
+        return cmd_auth_import()
     if args.command == "home-config":
         if args.sha256 is not None and not args.repair:
             parser.error("--sha256 needs --repair")

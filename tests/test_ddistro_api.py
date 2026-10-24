@@ -231,5 +231,53 @@ class Maintenance(unittest.TestCase):
             self.assertEqual(error.exception.code, "api_update_required")
 
 
+class AuthImport(unittest.TestCase):
+    def run_import(self, home, raw, busy=False):
+        identity = types.SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+        def lock():
+            if busy:
+                raise agent.Refusal("busy")
+            return types.SimpleNamespace(fd=os.open(home + "/lock", os.O_RDWR | os.O_CREAT, 0o600))
+        output = io.StringIO()
+        with patch.object(agent, "require_root"), patch.object(agent, "agent_identity", return_value=identity), \
+             patch.object(agent, "state_layout"), patch.object(agent, "SingletonLock", side_effect=lock), \
+             patch.object(agent, "open_account_home", side_effect=lambda _: os.open(home, os.O_RDONLY)), \
+             patch.object(agent, "no_agent_processes", return_value=True), \
+             patch.object(agent.sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(raw))), \
+             patch.object(agent.sys, "stdout", output):
+            self.assertEqual(agent.cmd_auth_import(), 0)
+        self.assertNotIn("refresh-secret", output.getvalue())
+        return json.loads(output.getvalue())["state"]
+
+    def test_atomic_private_import_and_no_clobber(self):
+        raw = json.dumps({"tokens": {"access_token": "h.eyJleHAiOjQxMDI0NDQ4MDB9.s",
+            "refresh_token": "refresh-secret", "id_token": "id", "account_id": "account"},
+            "unexpected": "never-import"}).encode()
+        with tempfile.TemporaryDirectory() as home:
+            self.assertEqual(self.run_import(home, raw), "imported")
+            auth = Path(home, "auth.json")
+            self.assertEqual(auth.stat().st_mode & 0o777, 0o600)
+            saved = auth.read_bytes()
+            self.assertNotIn(b"never-import", saved)
+            self.assertEqual(self.run_import(home, b"{}"), "existing")
+            self.assertEqual(auth.read_bytes(), saved)
+            self.assertFalse(any(p.name.startswith(".auth-import-") for p in Path(home).iterdir()))
+
+    def test_destination_symlink_preserved(self):
+        with tempfile.TemporaryDirectory() as home:
+            target = Path(home, "other"); target.write_bytes(b"preserve")
+            Path(home, "auth.json").symlink_to(target)
+            self.assertEqual(self.run_import(home, b"{}"), "existing")
+            self.assertEqual(target.read_bytes(), b"preserve")
+
+    def test_invalid_oversized_and_busy_leave_empty_account(self):
+        with tempfile.TemporaryDirectory() as home:
+            for raw in (b"{}", b"invalid", b"x" * 65537):
+                self.assertEqual(self.run_import(home, raw), "skipped")
+                self.assertFalse(Path(home, "auth.json").exists())
+            self.assertEqual(self.run_import(home, b"{}", busy=True), "skipped")
+            self.assertFalse(Path(home, "auth.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
