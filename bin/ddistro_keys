@@ -128,8 +128,8 @@ def discover():
             row['reason'] = 'This server uses a separate credential format'
             if target in SUPPORTED:
                 try:
-                    exists = sql(database, "SELECT to_regclass('public.core_api_badge') IS NOT NULL;")
-                    if exists != 't':
+                    generation = sql(database, "SELECT COALESCE(to_regclass('public.core_api_badge')::oid::text,'');")
+                    if not generation:
                         raise Refusal('API key table is not available')
                     values = json.loads(sql(database, "SELECT COALESCE(json_agg(r),'[]') FROM (SELECT id,label,"
                         "CASE WHEN octet_length(api_key)<=4096 THEN COALESCE(api_key,'') ELSE NULL END AS key,"
@@ -142,7 +142,7 @@ def discover():
                         except Refusal:
                             continue
                         row['rows'].setdefault(pid, item)
-                    row.update(available=True, reason='')
+                    row.update(available=True, reason='', generation=generation)
                 except (Refusal, ValueError, subprocess.TimeoutExpired):
                     row['reason'] = 'Service database or API key table unavailable'
         targets.append(row)
@@ -166,12 +166,27 @@ def write_key(target, pid, label, old, key):
 
 def source(data, target, pid):
     row = target['rows'].get(pid)
+    prior = data.get('generations', {}).get(target['id'])
+    if target.get('generation') and prior and prior != target['generation']:
+        return 'existing' if row and row['configured'] else 'none'
     if pid in data['overrides'].get(target['id'], []):
         return 'override'
     binding = data['bindings'].get(target['id'], {}).get(pid)
     if row and row['key'] is not None and binding and digest(row['key']) in (binding.get('last'), binding.get('pending')):
         return 'shared'
     return 'existing' if row and row['configured'] else 'none'
+
+
+def align_generation(data, target):
+    """A recreated badge table is a fresh install, not an external edit to an old managed row."""
+    generation = target.get('generation')
+    if not generation:
+        return
+    known = data.setdefault('generations', {})
+    if known.get(target['id']) and known[target['id']] != generation:
+        data['bindings'].pop(target['id'], None)
+        data['overrides'].pop(target['id'], None)
+    known[target['id']] = generation
 
 
 def sync(directory, data, targets):
@@ -181,12 +196,20 @@ def sync(directory, data, targets):
             if target['id'] in SUPPORTED and target.get('reason') != 'Not installed' and (data['shared'] or data['bindings'].get(target['id'])):
                 warnings.append(target['label'] + ': database unavailable; shared key changes are saved for retry')
             continue
+        align_generation(data, target)
         bindings = data['bindings'].setdefault(target['id'], {})
         for pid in sorted(set(data['shared']) | set(bindings)):
             if pid in data['overrides'].get(target['id'], []):
                 continue
             old = target['rows'].get(pid)
             binding = bindings.get(pid)
+            if binding and source(data, target, pid) != 'shared':
+                # External clearing/deletion is an override too; never silently restore a removed secret.
+                overrides = data['overrides'].setdefault(target['id'], [])
+                if pid not in overrides:
+                    overrides.append(pid)
+                bindings.pop(pid, None)
+                continue
             if old and old['configured'] and source(data, target, pid) != 'shared':
                 # An existing or externally changed value stays mod-specific until the user opts in.
                 bindings.pop(pid, None)
@@ -247,6 +270,7 @@ def execute(verb, payload, directory, data, targets):
     target = next((t for t in targets if t['id'] == payload.get('target') and t['available']), None)
     if target is None:
         raise Refusal('This mod cannot be configured here')
+    align_generation(data, target)
     overrides = data['overrides'].setdefault(target['id'], [])
     old = target['rows'].get(pid)
     if verb == 'set-override':

@@ -330,6 +330,14 @@ class SharedProviderKeys(unittest.TestCase):
         self.data["bindings"]["dialectic"]["openrouter"] = {"last": "old", "pending": self.keys.digest("next-secret")}
         self.call("set-shared", provider="openrouter", key="final-secret")
         self.assertEqual(self.targets[2]["rows"]["openrouter"]["key"], "final-secret")
+        self.targets[2]["rows"]["openrouter"].update(key="", configured=False)
+        self.call("set-shared", provider="openrouter", key="another-secret")
+        self.call("sync")
+        self.assertEqual(self.targets[2]["rows"]["openrouter"]["key"], "")
+        self.targets[2]["generation"] = "fresh-table"
+        self.data["generations"] = {"dialectic": "old-table"}
+        self.call("sync")
+        self.assertEqual(self.targets[2]["rows"]["openrouter"]["key"], "another-secret")
         with self.assertRaises(self.keys.Refusal):
             self.call("set-shared", provider="openrouter", key="invalid space")
 
