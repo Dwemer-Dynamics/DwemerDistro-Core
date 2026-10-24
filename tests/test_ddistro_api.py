@@ -289,57 +289,27 @@ class AuthImport(unittest.TestCase):
 class SharedProviderKeys(unittest.TestCase):
     def setUp(self):
         self.keys = load("ddistro_keys")
-        self.data = {"version": 1, "shared": {}, "bindings": {}, "overrides": {}}
-        self.targets = [{"id": t, "label": t, "available": True, "reason": "", "rows": {}}
-                        for t in ("herika", "stobe", "dialectic")]
-        self.targets[0]["rows"]["openrouter"] = {"id": 1, "label": "OpenRouter", "key": "existing-secret", "configured": True}
 
-    def write(self, target, pid, label, old, key):
-        target["rows"][pid] = {"id": 1, "label": label, "key": key, "configured": bool(key)}
+    def test_old_sync_hook_never_copies_credentials(self):
+        with patch.object(self.keys, "trusted_file", side_effect=AssertionError("no service access")):
+            self.assertEqual(self.keys.run("sync", {}), {"ok": True, "outcome": "references_only", "warnings": []})
 
-    def call(self, verb, **payload):
-        with patch.object(self.keys, "save"), patch.object(self.keys, "write_key", side_effect=self.write):
-            return self.keys.execute(verb, payload, 0, self.data, self.targets)
+    def test_retired_copy_operations_are_refused(self):
+        for operation in ("set-shared", "set-override", "use-shared", "remove-shared"):
+            with self.assertRaises(self.keys.Refusal):
+                self.keys.run(operation, {"key": "private-fixture"})
 
-    def test_shared_rotation_preserves_existing_and_overrides(self):
-        self.call("set-shared", provider="openrouter", key="shared-secret-1")
-        self.assertEqual(self.targets[0]["rows"]["openrouter"]["key"], "existing-secret")
-        self.assertEqual(self.targets[1]["rows"]["openrouter"]["key"], "shared-secret-1")
-        self.call("set-override", provider="openrouter", target="stobe", key="override-secret")
-        self.call("set-shared", provider="openrouter", key="shared-secret-2")
-        self.assertEqual(self.targets[1]["rows"]["openrouter"]["key"], "override-secret")
-        self.assertEqual(self.targets[2]["rows"]["openrouter"]["key"], "shared-secret-2")
-        self.call("use-shared", provider="openrouter", target="stobe")
-        self.assertEqual(self.targets[1]["rows"]["openrouter"]["key"], "shared-secret-2")
-        self.call("remove-shared", provider="openrouter")
-        self.assertEqual(self.targets[0]["rows"]["openrouter"]["key"], "existing-secret")
-        self.assertFalse(self.targets[1]["rows"]["openrouter"]["key"])
+    def test_environment_is_literal_and_does_not_inherit(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "env"
+            path.write_text("CHIM_DB_NAME=fixture\nexport CHIM_DB_PASSWORD='$(not-executed)'\nPATH=/untrusted\n")
+            with patch.object(self.keys, "ENV_FILES", (str(path),)), patch.object(self.keys, "trusted_file"):
+                result = self.keys.environment()
+            self.assertEqual(result["CHIM_DB_PASSWORD"], "$(not-executed)")
+            self.assertEqual(result["CHIM_DB_NAME"], "fixture")
+            self.assertNotEqual(result["PATH"], "/untrusted")
 
-    def test_status_never_returns_keys_or_fingerprints(self):
-        self.call("set-shared", provider="openrouter", key="shared-secret")
-        output = json.dumps(self.call("status"))
-        for secret in ("existing-secret", "shared-secret", self.keys.digest("shared-secret")):
-            self.assertNotIn(secret, output)
-        self.assertIn('"source": "shared"', output)
-
-    def test_external_change_and_pending_recovery_are_preserved(self):
-        self.call("set-shared", provider="openrouter", key="first-secret")
-        self.targets[1]["rows"]["openrouter"]["key"] = "external-secret"
-        self.call("set-shared", provider="openrouter", key="next-secret")
-        self.assertEqual(self.targets[1]["rows"]["openrouter"]["key"], "external-secret")
-        self.data["bindings"]["dialectic"]["openrouter"] = {"last": "old", "pending": self.keys.digest("next-secret")}
-        self.call("set-shared", provider="openrouter", key="final-secret")
-        self.assertEqual(self.targets[2]["rows"]["openrouter"]["key"], "final-secret")
-        self.targets[2]["rows"]["openrouter"].update(key="", configured=False)
-        self.call("set-shared", provider="openrouter", key="another-secret")
-        self.call("sync")
-        self.assertEqual(self.targets[2]["rows"]["openrouter"]["key"], "")
-        self.targets[2]["generation"] = "fresh-table"
-        self.data["generations"] = {"dialectic": "old-table"}
-        self.call("sync")
-        self.assertEqual(self.targets[2]["rows"]["openrouter"]["key"], "another-secret")
-        with self.assertRaises(self.keys.Refusal):
-            self.call("set-shared", provider="openrouter", key="invalid space")
 
 
 if __name__ == "__main__":

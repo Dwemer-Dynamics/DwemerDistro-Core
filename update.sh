@@ -110,6 +110,8 @@ if [ $? -eq 0 ]; then
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_agent /usr/local/bin/ddistro_agent || exit 1
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_api /usr/local/bin/ddistro_api || exit 1
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_keys /usr/local/bin/ddistro_keys || exit 1
+    install -d -o root -g root -m 755 /usr/local/lib/dwemerdistro || exit 1
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_keys.php /usr/local/lib/dwemerdistro/keys.php || exit 1
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/install_assistant_runtime /usr/local/bin/install_assistant_runtime || exit 1
     printf "${GREEN}[SUCCESS] Scripts successfully copied to /usr/local/bin/${NC}\n"
 else
@@ -214,7 +216,7 @@ fi
 # Existing and fresh users receive the same hash-verified runtime, without account sign-in.
 # An interrupted download can be retried; no user data or provider credentials are replaced.
 /usr/local/bin/install_assistant_runtime --install-prerequisites 7<&- || exit 1
-/usr/local/bin/ddistro_keys sync 7<&- >/dev/null || printf '[WARNING] Shared API keys could not be synchronized. Open API Keys to retry.\n' >&2
+# Shared key references resolve at request time; do not synchronize legacy copies.
 # Do not report a successful Assistant upgrade with a skipped or failed isolation check.
 if ! /usr/local/bin/ddistro --json agent probe 7<&- | /usr/bin/python3 -c '
 import json, sys
