@@ -232,7 +232,7 @@ class Maintenance(unittest.TestCase):
 
 
 class AuthImport(unittest.TestCase):
-    def run_import(self, home, raw, busy=False):
+    def run_import(self, home, raw, busy=False, check=False):
         identity = types.SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
         def lock():
             if busy:
@@ -245,9 +245,16 @@ class AuthImport(unittest.TestCase):
              patch.object(agent, "no_agent_processes", return_value=True), \
              patch.object(agent.sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(raw))), \
              patch.object(agent.sys, "stdout", output):
-            self.assertEqual(agent.cmd_auth_import(), 0)
+            self.assertEqual(agent.cmd_auth_import(check=check), 0)
         self.assertNotIn("refresh-secret", output.getvalue())
         return json.loads(output.getvalue())["state"]
+
+    def test_read_only_check_does_not_need_idle_server(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.assertEqual(self.run_import(home, b"", busy=True, check=True), "empty")
+            self.assertFalse(Path(home, "auth.json").exists())
+            Path(home, "auth.json").write_bytes(b"preserve")
+            self.assertEqual(self.run_import(home, b"", busy=True, check=True), "existing")
 
     def test_atomic_private_import_and_no_clobber(self):
         raw = json.dumps({"tokens": {"access_token": "h.eyJleHAiOjQxMDI0NDQ4MDB9.s",

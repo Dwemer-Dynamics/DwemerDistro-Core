@@ -832,3 +832,9 @@ absent. It never replaces an existing distro account (including an expired accou
 follows a destination symlink or returns credentials. Older Core versions simply
 leave normal sign-in in place. This seeds a separate cache; it does not attach to a
 running desktop conversation or continuously synchronize desktop credentials.
+
+Before import the launcher uses root-only `auth-import --check`, which returns only
+empty/existing/skipped and neither reads credentials nor takes the serve lock.
+Only an empty account goes through `ddistro_api maintenance` for import. This
+drains an already-running idle API but refuses queued requests and running jobs.
+An existing distro sign-in never restarts the API for credential reuse.
