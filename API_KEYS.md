@@ -1,0 +1,13 @@
+# Shared provider keys
+
+Open **Settings → API Keys** in the launcher. Choose a provider and either **Shared default** or a mod. Saved values are never returned to the launcher. New values are entered in a masked field and sent over stdin to the root-local helper; they do not appear in process arguments or command logs.
+
+Saving a shared key fills empty compatible keys and updates keys already managed as shared. Existing mod keys stay separate. Saving with a mod selected creates an explicit override. **Use shared key** replaces that override; **Remove shared key** clears only managed values that still match the shared binding. Both actions ask for confirmation. Changes made through a mod's own settings are preserved as mod-specific values.
+
+CHIM, STOBE and Dialectic have independently reviewed `core_api_badge` adapters. The helper discovers installed product roots and database names through Core's shared access registry, checks that each table is available, and preserves row IDs. Other formats, including LORKHAN and Reign, are shown as separate credential formats and are not modified by this adapter. No provider accounts or keys are supplied by DwemerDistro. Assistant ChatGPT sign-in is separate.
+
+Core installs `/usr/local/bin/ddistro_keys`. Its fixed operations are `status`, `sync`, `set-shared`, `set-override`, `use-shared` and `remove-shared`. Mutations take a bounded JSON document on stdin with `provider`, optional `target`, and `key` only for set operations. Root is required. Status contains configured flags and source labels, never stored secrets, key prefixes or fingerprints.
+
+The shared store is `/var/lib/dwemerdistro/provider-keys/keys.json`, root-owned mode0600 in a private directory. A durable flock prevents overlapping operations; atomic writes preserve the store, and database updates use compare-and-swap conditions. Pending binding hashes allow interrupted database writes to be recognized without overwriting an external change. Per-database failures leave the shared key saved and return a warning for retry. Cross-database updates are not a distributed transaction. No runtime tables or columns are created.
+
+Compatible installs, repairs, server updates and Core upgrades call `sync` after their existing work. Unsupported formats and absent products are skipped. No game service is restarted by key management. Keep the private credential directory when upgrading or rebuilding a user's installation; remove it from redistributable clean images just like other user credentials. It must never be included in diagnostics, fixtures, source control or release assets.

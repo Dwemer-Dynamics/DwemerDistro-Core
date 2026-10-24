@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Root-local shared provider keys and explicit per-product overrides; secrets only enter through stdin."""
+import contextlib
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
+import subprocess
+import sys
+
+STATE = Path('/var/lib/dwemerdistro/provider-keys')
+ACCESS = '/usr/local/bin/ddistro_access'
+DEFAULTS = ('OpenRouter', 'OpenAI', 'Deepgram', 'Google', 'Azure', 'ElevenLabs',
+            'Replicate', 'Cartesia', 'Nano-GPT', 'DeepL', 'Inworld', 'Groq')
+LABELS = {'herika': 'CHIM', 'stobe': 'STOBE', 'dialectic': 'Dialectic', 'lorkhan': 'LORKHAN', 'reign': 'Reign'}
+SUPPORTED = frozenset(('herika', 'stobe', 'dialectic'))
+
+
+class Refusal(Exception):
+    pass
+
+
+def provider_id(label):
+    if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}', label):
+        raise Refusal('Invalid provider label')
+    return re.sub('[^a-z0-9]', '', label.lower())
+
+
+def digest(key):
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+@contextlib.contextmanager
+def locked_state():
+    # Root-only directory traversal and no-follow opens keep the durable lock inode and credentials trusted.
+    for parent in reversed(STATE.parents):
+        st = parent.lstat()
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise Refusal('Untrusted credential directory')
+    try:
+        STATE.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    st = STATE.lstat()
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o077:
+        raise Refusal('Untrusted credential directory')
+    directory = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    lock = os.open('lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=directory)
+    try:
+        st = os.fstat(lock)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o077:
+            raise Refusal('Untrusted credential lock')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refusal('Another API key operation is running')
+        try:
+            fd = os.open('keys.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+        except FileNotFoundError:
+            data = {'version': 1, 'shared': {}, 'bindings': {}, 'overrides': {}}
+        else:
+            with os.fdopen(fd, 'rb') as source:
+                st = os.fstat(source.fileno())
+                if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o077 or st.st_size > 1048576:
+                    raise Refusal('Untrusted credential store')
+                data = json.loads(source.read(1048577))
+            if data.get('version') != 1 or not all(isinstance(data.get(k), dict) for k in ('shared', 'bindings', 'overrides')):
+                raise Refusal('Unsupported credential store')
+        yield directory, data
+    finally:
+        os.close(lock)
+        os.close(directory)
+
+
+def save(directory, data):
+    temporary = 'keys-' + secrets.token_hex(16)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+    try:
+        with os.fdopen(fd, 'w') as output:
+            json.dump(data, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, 'keys.json', src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=directory)
+
+
+def sql_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def sql(database, query):
+    # SQL and credentials stay on stdin, never in process arguments, environment, or returned errors.
+    result = subprocess.run(['/usr/sbin/runuser', '-u', 'postgres', '--', '/usr/bin/psql', '-X', '-qAt',
+                             '--no-password', '-v', 'ON_ERROR_STOP=1', '-h', '/var/run/postgresql', '-d', database],
+                            input='SET standard_conforming_strings=on;\n' + query, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+                            env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'PGCONNECT_TIMEOUT': '3'})
+    if result.returncode or len(result.stdout) > 1048576:
+        raise Refusal('Service database unavailable')
+    return result.stdout.strip()
+
+
+def discover():
+    st = os.lstat(ACCESS)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+        raise Refusal('Core access policy unavailable')
+    spec = importlib.util.spec_from_loader('keys_access', importlib.machinery.SourceFileLoader('keys_access', ACCESS))
+    policy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy)
+    targets = []
+    for target, database in policy.DB_PRODUCTS.items():
+        row = {'id': target, 'label': LABELS.get(target, target), 'database': database, 'rows': {}, 'available': False}
+        root = policy.ACCESS_ROOTS.get(target, {}).get('path')
+        row['reason'] = 'Not installed'
+        if root and Path(root).is_dir():
+            row['reason'] = 'This server uses a separate credential format'
+            if target in SUPPORTED:
+                try:
+                    exists = sql(database, "SELECT to_regclass('public.core_api_badge') IS NOT NULL;")
+                    if exists != 't':
+                        raise Refusal('API key table is not available')
+                    values = json.loads(sql(database, "SELECT COALESCE(json_agg(r),'[]') FROM (SELECT id,label,"
+                        "CASE WHEN octet_length(api_key)<=4096 THEN COALESCE(api_key,'') ELSE NULL END AS key,"
+                        "COALESCE(octet_length(api_key),0)>0 AS configured FROM public.core_api_badge ORDER BY id LIMIT 129) r;"))
+                    if len(values) > 128:
+                        raise Refusal('Too many provider entries')
+                    for item in values:
+                        try:
+                            pid = provider_id(item['label'])
+                        except Refusal:
+                            continue
+                        row['rows'].setdefault(pid, item)
+                    row.update(available=True, reason='')
+                except (Refusal, ValueError, subprocess.TimeoutExpired):
+                    row['reason'] = 'Service database or API key table unavailable'
+        targets.append(row)
+    return targets
+
+
+def write_key(target, pid, label, old, key):
+    if old is not None and old['key'] is None:
+        raise Refusal('Existing key cannot be managed safely')
+    if old is None:
+        query = ("INSERT INTO public.core_api_badge(label,api_key) SELECT " + sql_literal(label) + ',' + sql_literal(key)
+                 + " WHERE NOT EXISTS(SELECT 1 FROM public.core_api_badge WHERE regexp_replace(lower(label),'[^a-z0-9]','','g')="
+                 + sql_literal(pid) + ') RETURNING id;')
+    else:
+        query = ('UPDATE public.core_api_badge SET api_key=' + sql_literal(key) + ' WHERE id=' + str(int(old['id']))
+                 + ' AND COALESCE(api_key,\'\')=' + sql_literal(old['key']) + ' RETURNING id;')
+    answer = sql(target['database'], 'BEGIN; LOCK TABLE public.core_api_badge IN SHARE ROW EXCLUSIVE MODE; ' + query + ' COMMIT;')
+    if not re.fullmatch(r'\d+', answer):
+        raise Refusal('The mod key changed; refresh and try again')
+
+
+def source(data, target, pid):
+    row = target['rows'].get(pid)
+    if pid in data['overrides'].get(target['id'], []):
+        return 'override'
+    binding = data['bindings'].get(target['id'], {}).get(pid)
+    if row and row['key'] is not None and binding and digest(row['key']) in (binding.get('last'), binding.get('pending')):
+        return 'shared'
+    return 'existing' if row and row['configured'] else 'none'
+
+
+def sync(directory, data, targets):
+    warnings = []
+    for target in targets:
+        if not target['available']:
+            if target['id'] in SUPPORTED and target.get('reason') != 'Not installed' and data['shared']:
+                warnings.append(target['label'] + ': database unavailable; shared keys are saved for retry')
+            continue
+        bindings = data['bindings'].setdefault(target['id'], {})
+        for pid in sorted(set(data['shared']) | set(bindings)):
+            if pid in data['overrides'].get(target['id'], []):
+                continue
+            old = target['rows'].get(pid)
+            binding = bindings.get(pid)
+            if old and old['configured'] and source(data, target, pid) != 'shared':
+                # An existing or externally changed value stays mod-specific until the user opts in.
+                bindings.pop(pid, None)
+                continue
+            entry = data['shared'].get(pid)
+            wanted = entry['key'] if entry else ''
+            if old and old['key'] == wanted:
+                if binding:
+                    binding.update(last=digest(wanted), pending=None)
+                continue
+            if not old and not wanted:
+                bindings.pop(pid, None)
+                continue
+            bindings[pid] = {'last': digest(old['key']) if old and old['key'] is not None else digest(''),
+                             'pending': digest(wanted)}
+            save(directory, data)
+            try:
+                write_key(target, pid, entry['label'] if entry else old['label'], old, wanted)
+                bindings[pid] = {'last': digest(wanted)}
+                save(directory, data)
+            except (Refusal, subprocess.TimeoutExpired):
+                warnings.append(target['label'] + ': key was not updated; refresh and retry')
+    save(directory, data)
+    return warnings
+
+
+def execute(verb, payload, directory, data, targets):
+    providers = {provider_id(label): label for label in DEFAULTS}
+    providers.update({pid: entry['label'] for pid, entry in data['shared'].items()})
+    for target in targets:
+        for pid, row in target['rows'].items():
+            providers.setdefault(pid, row['label'])
+    if verb == 'status':
+        return {'ok': True, 'providers': [{'id': pid, 'label': label, 'configured': pid in data['shared']}
+                    for pid, label in sorted(providers.items())],
+                'targets': [{'id': t['id'], 'label': t['label'], 'available': t['available'], 'reason': t['reason'],
+                    'providers': [{'id': pid, 'label': label, 'configured': bool(t['rows'].get(pid, {}).get('configured')),
+                                   'source': source(data, t, pid)} for pid, label in sorted(providers.items())]}
+                    for t in targets]}
+    if verb == 'sync':
+        return {'ok': True, 'warnings': sync(directory, data, targets)}
+    if not isinstance(payload, dict) or set(payload) - {'provider', 'target', 'key'}:
+        raise Refusal('Invalid request')
+    pid = payload.get('provider')
+    if not isinstance(pid, str) or pid not in providers:
+        raise Refusal('Unknown provider')
+    if verb in ('set-shared', 'set-override'):
+        key = payload.get('key')
+        if not isinstance(key, str) or not 1 <= len(key.encode()) <= 4096 or any(ord(c) < 33 or ord(c) == 127 for c in key):
+            raise Refusal('Enter a valid key without spaces or control characters')
+    if verb in ('set-shared', 'remove-shared'):
+        if verb == 'set-shared':
+            data['shared'][pid] = {'label': providers[pid], 'key': key}
+        else:
+            data['shared'].pop(pid, None)
+        save(directory, data)
+        return {'ok': True, 'warnings': sync(directory, data, targets)}
+    target = next((t for t in targets if t['id'] == payload.get('target') and t['available']), None)
+    if target is None:
+        raise Refusal('This mod cannot be configured here')
+    overrides = data['overrides'].setdefault(target['id'], [])
+    old = target['rows'].get(pid)
+    if verb == 'set-override':
+        write_key(target, pid, providers[pid], old, key)
+        if pid not in overrides:
+            overrides.append(pid)
+        data['bindings'].get(target['id'], {}).pop(pid, None)
+    elif verb == 'use-shared':
+        entry = data['shared'].get(pid)
+        wanted = entry['key'] if entry else ''
+        write_key(target, pid, providers[pid], old, wanted)
+        if pid in overrides:
+            overrides.remove(pid)
+        data['bindings'].setdefault(target['id'], {})[pid] = {'last': digest(wanted)}
+    else:
+        raise Refusal('Unknown operation')
+    save(directory, data)
+    return {'ok': True}
+
+
+def main(argv):
+    try:
+        if os.geteuid() != 0:
+            raise Refusal('Run this operation through the launcher')
+        if len(argv) != 1 or argv[0] not in ('status', 'sync', 'set-shared', 'remove-shared', 'set-override', 'use-shared'):
+            raise Refusal('Unknown operation')
+        verb = argv[0]
+        payload = None
+        if verb not in ('status', 'sync'):
+            raw = sys.stdin.buffer.read(8193)
+            if len(raw) > 8192:
+                raise Refusal('Request is too large')
+            payload = json.loads(raw)
+        with locked_state() as (directory, data):
+            result = execute(verb, payload, directory, data, discover())
+        print(json.dumps(result))
+        return 0
+    except Refusal as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)}))
+    except Exception:
+        # SQL, parser and filesystem diagnostics can contain keys: never return their raw messages.
+        print(json.dumps({'ok': False, 'error': 'API key operation failed. Check Core setup and try again.'}))
+    return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

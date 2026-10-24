@@ -1523,6 +1523,10 @@ case "$COMMAND" in
             update) update_product "$BRANCH" ;;
             repair) repair_product "$BRANCH" ;;
         esac
+        # New compatible mods inherit shared defaults; existing mod-specific keys are preserved.
+        if [ -x /usr/local/bin/ddistro_keys ]; then
+            /usr/local/bin/ddistro_keys sync >/dev/null 2>&1 || printf '[WARNING] Shared API keys could not be synchronized. Open API Keys to retry.\n' >&2
+        fi
         ;;
     uninstall)
         [ "$#" -gt 0 ] || fail "uninstall requires a product." 64
