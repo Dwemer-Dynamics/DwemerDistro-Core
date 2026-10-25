@@ -1,6 +1,13 @@
 #!/bin/bash
 # Enhanced update script with minimal output
 
+# Drain the persistent Assistant before replacing any helper it attests. The root API
+# owns a separate gate for the entire update, so auto-connect cannot restart it midway.
+if [ "${DDISTRO_ASSISTANT_MAINTENANCE:-}" != 1 ] && [ -x /usr/local/bin/ddistro_api ] \
+    && [ -d /var/lib/dwemerdistro/assistant/agent ]; then
+    exec /usr/bin/python3 /home/dwemer/dwemerdistro/bin/ddistro_api maintenance /bin/bash "$0" "$@"
+fi
+
 # Simple color palette
 GREEN='\033[0;32m'
 RED='\033[1;31m'
@@ -44,6 +51,39 @@ if [ -f "$DWEMER_GIT_CONFIG" ] && ! command -v git-credential-manager >/dev/null
     fi
 fi
 
+MAINTENANCE_LOCK="/run/lock/dwemerdistro-maintenance.lock"
+
+# Hold the common maintenance lock shared on fd 7. ddistro changes apply/rollback take it
+# exclusively, so they never interleave with maintenance; shared holders (including nested
+# helpers) still serialize through their own locks. Root creates the fixed root-owned file
+# once; it is never replaced. Release with flock -u, which also covers services that
+# inherited fd 7.
+acquire_maintenance_lock() {
+    local info=""
+    if [ "$(id -u)" -eq 0 ] && [ ! -e "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ]; then
+        (umask 022; set -C; : > "$MAINTENANCE_LOCK") 2>/dev/null || true
+    fi
+    if [ -f "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ] && exec 7<"$MAINTENANCE_LOCK"; then
+        info="$(stat -L -c '%u %h %a' /proc/self/fd/7 2>/dev/null)"
+    fi
+    case "$info" in
+        "0 1 644") ;;
+        "0 1 "*) [ "$(id -u)" -eq 0 ] && chmod 0644 /proc/self/fd/7 || info="" ;;
+        *) info="" ;;
+    esac
+    if [ -z "$info" ]; then
+        exec 7<&-
+        printf "${RED}[ERROR] $MAINTENANCE_LOCK is not a root-owned plain file; it was not replaced.${NC}\n"; exit 1
+    fi
+    if ! flock -s -w 30 7; then
+        exec 7<&-
+        printf "${RED}[ERROR] Another DwemerDistro maintenance or ddistro changes operation is running.${NC}\n"; exit 75
+    fi
+}
+
+acquire_maintenance_lock
+trap 'flock -u 7 2>/dev/null || true' EXIT
+
 print_header "UPDATING SYSTEM FILES"
 
 printf ">> Copying scripts to /usr/local/bin...\n"
@@ -55,6 +95,29 @@ if [ $? -eq 0 ]; then
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_lmstudio /usr/local/bin/ddistro_lmstudio || exit 1
     # The launcher reads custom mod status as dwemer, so the manager must stay world-readable.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_custom_mod /usr/local/bin/ddistro_custom_mod || exit 1
+    # Every user runs the ddistro CLI for status and logs; only root may change it.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro /usr/local/bin/ddistro || exit 1
+    # Root-only file changes helper; ddistro checks it is root-owned before running it.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_changes /usr/local/bin/ddistro_changes || exit 1
+    # Read-only access policy library; ddistro loads it only when it is root-owned and root-writable only.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_access /usr/local/bin/ddistro_access || exit 1
+    # Sandboxed command helper for read-only file snapshots; ddistro runs it only when it is root-owned.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_exec /usr/local/bin/ddistro_exec || exit 1
+    # Live command supervisor for the Assistant's approved runs; the broker starts it only while the probe attests it.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_run /usr/local/bin/ddistro_run || exit 1
+    # Assistant runtime helpers. Only the scripts are installed here: the pinned Codex runtime,
+    # bubblewrap, and the ddagent account come from an explicit install_assistant_runtime run.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_agent /usr/local/bin/ddistro_agent || exit 1
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_api /usr/local/bin/ddistro_api || exit 1
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/install_shared_keys /usr/local/bin/install_shared_keys || exit 1
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_keys /usr/local/bin/ddistro_keys || exit 1
+    install -d -o root -g root -m 755 /usr/local/lib/dwemerdistro || exit 1
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_keys.php /usr/local/lib/dwemerdistro/keys.php || exit 1
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_native_keys.php /usr/local/lib/dwemerdistro/native_keys.php || exit 1
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_shared_keys.php /usr/local/lib/dwemerdistro/shared_keys.php || exit 1
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_legacy_keys.php /usr/local/lib/dwemerdistro/legacy_keys.php || exit 1
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_legacy_keys.sql /usr/local/lib/dwemerdistro/legacy_keys.sql || exit 1
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/install_assistant_runtime /usr/local/bin/install_assistant_runtime || exit 1
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_mod_release.py /usr/local/bin/ddistro_mod_release.py || exit 1
     printf "${GREEN}[SUCCESS] Scripts successfully copied to /usr/local/bin/${NC}\n"
 else
@@ -77,7 +140,7 @@ printf ">> Checking installed server repository origins...\n"
 
 printf ">> Ensuring UTF-8 is the PostgreSQL default...\n"
 update-locale LANG=C.UTF-8 LC_ALL=C.UTF-8
-service postgresql start >/dev/null || exit 1
+service postgresql start >/dev/null 7<&- || exit 1
 /usr/local/bin/ensure_postgres_utf8 || exit 1
 
 # Replace a shipped configuration file only while it still matches what an update installed.
@@ -113,6 +176,10 @@ if [ $? -eq 0 ]; then
     # The LM Studio helper runs as dwemer and must read the public model catalog.
     install_shipped_config /home/dwemer/dwemerdistro/etc/dwemerdistro-lmstudio.json /etc/dwemerdistro-lmstudio.json 644 || exit 1
     install_shipped_config /home/dwemer/dwemerdistro/etc/cuda_config /etc/cuda_config 644 || exit 1
+    install -d -o root -g root -m 755 /etc/dwemer || exit 1
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/shared-key-runtime.json /etc/dwemer/shared-key-runtime.json || exit 1
+    # The validated shared component catalog is shipped with the Assistant.
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/dwemerdistro-components.json /etc/dwemerdistro-components.json || exit 1
     # Keep the existing service ports, including CUSTOM_MODS_PORT; only a missing file gets the defaults.
     # start_env sources it as root, so an existing file must be a plain root-owned file only root can change.
     SERVICES_CONF=/etc/dwemerdistro_services.conf
@@ -125,6 +192,10 @@ if [ $? -eq 0 ]; then
     fi
     if ! runuser -u dwemer -- python3 -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1]))["models"], list))' /etc/dwemerdistro-lmstudio.json; then
         printf "${RED}[ERROR] LM Studio model catalog is not readable by dwemer${NC}\n"
+        exit 1
+    fi
+    if ! runuser -u dwemer -- python3 -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1]))["components"], list))' /etc/dwemerdistro-components.json; then
+        printf "${RED}[ERROR] Component catalog is not readable by dwemer${NC}\n"
         exit 1
     fi
     printf "${GREEN}[SUCCESS] Configuration files successfully copied to /etc/${NC}\n"
@@ -147,6 +218,26 @@ elif install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/php.ini "$PHP_
     printf "${GREEN}[SUCCESS] Default PHP configuration installed${NC}\n"
 else
     printf "${RED}[ERROR] Error installing the default PHP configuration${NC}\n"
+    exit 1
+fi
+
+# Existing and fresh users receive the same hash-verified runtime, without account sign-in.
+# An interrupted download can be retried; no user data or provider credentials are replaced.
+/usr/local/bin/install_assistant_runtime --install-prerequisites 7<&- || exit 1
+# Install the immutable credential library without provisioning operator keys into redistributable images.
+/usr/local/bin/install_shared_keys --install-runtime 7<&- || exit 1
+# Enable installed shared-key adapters only after their central deletion guard is ready; never import user keys here.
+if [ "${DDISTRO_KEYS_IMAGE_BUILD:-}" != 1 ] && ! /usr/local/bin/ddistro_keys prepare-legacy >/dev/null; then
+    printf "${YELLOW}[WARNING] Shared API Keys setup is not ready. Existing keys are preserved; update CHIM 4 and the server adapters, then retry Update Distro.${NC}\n"
+fi
+# Shared key references resolve at request time; do not synchronize legacy copies.
+# Do not report a successful Assistant upgrade with a skipped or failed isolation check.
+if ! /usr/local/bin/ddistro --json agent probe 7<&- | /usr/bin/python3 -c '
+import json, sys
+result = json.load(sys.stdin)
+sys.exit(0 if result.get("ok") is True and result.get("data", {}).get("passed") is True else 1)
+'; then
+    printf "${RED}[ERROR] Assistant isolation did not pass. Check connectivity and retry Update Distro.${NC}\n"
     exit 1
 fi
 

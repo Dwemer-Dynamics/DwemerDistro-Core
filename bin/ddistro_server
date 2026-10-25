@@ -5,6 +5,7 @@ set -u
 WEB_ROOT="/var/www/html"
 STATE_ROOT="/var/lib/dwemerdistro/servers"
 LOCK_PATH="/run/lock/dwemerdistro-server-manager.d"
+MAINTENANCE_HELD=0
 APP_USER="dwemer"
 WEB_GROUP="www-data"
 DATABASE_ROLE="dwemer"
@@ -337,9 +338,41 @@ resolve_branch() {
     esac
 }
 
+MAINTENANCE_LOCK="/run/lock/dwemerdistro-maintenance.lock"
+
+# Hold the common maintenance lock shared on fd 7. ddistro changes apply/rollback take it
+# exclusively, so they never interleave with maintenance; shared holders (including nested
+# helpers) still serialize through their own locks. Root creates the fixed root-owned file
+# once; it is never replaced. Release with flock -u, which also covers services that
+# inherited fd 7.
+acquire_maintenance_lock() {
+    local info=""
+    if [ "$(id -u)" -eq 0 ] && [ ! -e "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ]; then
+        (umask 022; set -C; : > "$MAINTENANCE_LOCK") 2>/dev/null || true
+    fi
+    if [ -f "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ] && exec 7<"$MAINTENANCE_LOCK"; then
+        info="$(stat -L -c '%u %h %a' /proc/self/fd/7 2>/dev/null)"
+    fi
+    case "$info" in
+        "0 1 644") ;;
+        "0 1 "*) [ "$(id -u)" -eq 0 ] && chmod 0644 /proc/self/fd/7 || info="" ;;
+        *) info="" ;;
+    esac
+    if [ -z "$info" ]; then
+        exec 7<&-
+        fail "$MAINTENANCE_LOCK is missing or not a root-owned plain file; it was not replaced."
+    fi
+    if ! flock -s -w 30 7; then
+        exec 7<&-
+        fail "Another DwemerDistro maintenance or ddistro changes operation is running." 75
+    fi
+}
+
 acquire_operation_lock() {
     local owner_pid=""
 
+    acquire_maintenance_lock
+    MAINTENANCE_HELD=1
     mkdir -p "$(dirname "$LOCK_PATH")"
     if ! mkdir "$LOCK_PATH" 2>/dev/null; then
         if [ -f "$LOCK_PATH/pid" ]; then
@@ -380,9 +413,9 @@ start_postgres() {
     fi
 
     if [ -x /etc/init.d/postgresql ]; then
-        /etc/init.d/postgresql start >/dev/null 2>&1 || true
+        /etc/init.d/postgresql start >/dev/null 2>&1 7<&- || true
     elif command -v service >/dev/null 2>&1; then
-        service postgresql start >/dev/null 2>&1 || true
+        service postgresql start >/dev/null 2>&1 7<&- || true
     fi
 
     for attempt in $(seq 1 20); do
@@ -1152,6 +1185,10 @@ on_exit() {
         rmdir "$LOCK_PATH" 2>/dev/null || true
         LOCK_HELD=0
     fi
+    if [ "$MAINTENANCE_HELD" -eq 1 ]; then
+        flock -u 7 2>/dev/null || true
+        MAINTENANCE_HELD=0
+    fi
 
     trap - EXIT INT TERM
     exit "$status"
@@ -1366,7 +1403,7 @@ startup_product() {
     select_product "$key"
     if [ "$PRODUCT" = lorkhan ]; then
         if [ -f "$WEB_ROOT/LorkhanServer/index.php" ] && [ -e /etc/apache2/sites-enabled/lorkhanserver.conf ] && [ -x /etc/init.d/lorkhanserver-worker ]; then
-            service lorkhanserver-worker start || fail 'LORKHAN worker failed to start.'
+            service lorkhanserver-worker start 7<&- || fail 'LORKHAN worker failed to start.'
             # The init script backgrounds the worker; verify it survives startup.
             sleep 1
             service lorkhanserver-worker status >/dev/null 2>&1 || fail 'LORKHAN worker exited during startup.'
@@ -1486,6 +1523,7 @@ case "$COMMAND" in
             update) update_product "$BRANCH" ;;
             repair) repair_product "$BRANCH" ;;
         esac
+        # Shared references resolve at request time; legacy credentials remain untouched.
         ;;
     uninstall)
         [ "$#" -gt 0 ] || fail "uninstall requires a product." 64

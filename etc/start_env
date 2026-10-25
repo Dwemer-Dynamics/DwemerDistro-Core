@@ -5,6 +5,11 @@
 
 /usr/local/bin/print_logo
 
+# Optional Assistant API stays available to paired mods when the Launcher is closed.
+if [ -x /usr/local/bin/ddistro_api ] && [ -f /var/lib/dwemerdistro/assistant/agent/attestation.json ]; then
+    /usr/local/bin/ddistro_api ensure >/dev/null || echo "Assistant API unavailable; other services will continue."
+fi
+
 # Load CUDA configuration if it exists (will not be overwritten by updates)
 if [ -f "/home/dwemer/.cuda_config" ]; then
     source /home/dwemer/.cuda_config

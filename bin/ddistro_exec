@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+"""Root-only managed execution helper: one bounded text-investigation command in a dedicated sandbox.
+
+  ddistro_exec --task UUID --request-json JSON --json
+
+Request: {"argv": [program, args...], "files": [{"root": id, "path": relative}], "timeout": seconds}.
+The program is a bare name from EXEC_PROGRAMS; it runs as ddagent inside a bubblewrap sandbox with no
+network, no capabilities, no_new_privs, its own PID namespace and /proc, read-only /usr (with
+/usr/local hidden), a generated minimal /etc, an empty /home and a read-only root; only the task's /work
+and an ephemeral /tmp are writable.
+Selected files are captured once through ddistro_access, redacted, and exposed read-only at
+/inspect/<root>/<path> as sealed snapshots; they are not the live files and nothing live is mounted.
+
+This never runs a command on the host, never uses the Codex App Server sandbox (which shares the network
+and the account home), never takes the serve lock, and never installs, updates or restarts anything.
+Trust comes only from the installed root-owned ddistro_agent and ddistro_access; there is no environment
+or path override. Tests load a source copy and call execute() with their own modules.
+"""
+import ctypes
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import re
+import resource
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+
+TOOL = {"name": "ddistro_exec", "version": "1.0.0", "source": "DwemerDistro-Core"}
+SCHEMA_VERSION = 1
+AGENT_MODULE = "/usr/local/bin/ddistro_agent"  # identity, task layout and bwrap trust
+ACCESS_MODULE = "/usr/local/bin/ddistro_access"  # roots, deny rules, no-follow reads, redaction
+TASK_SCHEMAS = (1, 2)
+REQUEST_BYTES = 64 * 1024
+ARGV_ITEMS = 32
+ARGV_BYTES = 16 * 1024
+MAX_FILES = 20
+TIMEOUT = (1, 30, 10)  # low, high, default seconds
+SNAPSHOT_FILE_BYTES = 1024 * 1024
+SNAPSHOT_TOTAL_BYTES = 2 * 1024 * 1024
+STDOUT_LIMIT = 64 * 1024
+STDERR_LIMIT = 16 * 1024
+KILL_GRACE = 2.0
+# Child resource limits, set before bwrap starts and inherited by everything in the sandbox.
+RLIMITS = {"RLIMIT_CORE": 0, "RLIMIT_FSIZE": 16 * 1024 * 1024, "RLIMIT_NOFILE": 256, "RLIMIT_NPROC": 512,
+           "RLIMIT_AS": 2 * 1024 * 1024 * 1024}
+TMP_SIZE = str(64 * 1024 * 1024)
+INSPECT = "/inspect"
+SANDBOX_WORK = "/work"
+SANDBOX_PATH = "/usr/bin:/bin"
+# Reviewed read/text tools only; each must be a root-owned file under /usr/bin on the host.
+EXEC_PROGRAMS = ("awk", "cat", "cmp", "comm", "cut", "diff", "find", "grep", "head", "ls", "nl", "od", "python3",
+                 "sed", "sh", "sha256sum", "sort", "stat", "tail", "tr", "uniq", "wc", "xargs")
+ETC_FILES = ("ld.so.cache", "ld.so.conf", "ld.so.conf.d", "alternatives", "nsswitch.conf")
+REQUIRED_BWRAP = (b"--cap-drop", b"--remount-ro", b"--ro-bind-data", b"--bind-fd", b"--die-with-parent",
+                  b"--unshare-all", b"--new-session", b"--clearenv")
+UNSUPPORTED_REASONS = ("unsupported_platform", "agent_identity_missing", "agent_identity_unsafe", "bwrap_missing",
+                       "bwrap_unsupported", "python_untrusted", "state_untrusted", "tasks_root_untrusted",
+                       "policy_helper_unavailable", "policy_helper_untrusted", "helper_untrusted",
+                       "task_not_runtime_ready", "memfd_unsupported", "program_missing")
+ERRORS = {"failed": 1, "cancelled": 130, "invalid_argument": 64, "limit_reached": 64, "not_found": 66,
+          "unsupported": 69, "permission_denied": 77, "unsafe_path": 77, "refused": 77}
+GUARD_EXIT = 97
+PR_SET_NO_NEW_PRIVS = 38
+# Loaded before any fork so the child only calls prctl.
+LIBC = ctypes.CDLL(None, use_errno=True)
+
+# Runs first inside the sandbox, as ddagent, from the host's read-only /usr python: refuses unless the
+# identity, no_new_privs, capabilities, /work identity, read-only mounts and network isolation are what
+# root set up, closes every inherited descriptor above stderr, and only then execs the reviewed program.
+GUARD = r"""
+import os, socket, sys
+READ_ONLY = ("/", "/etc", "/usr", "/usr/local", "/home", "/inspect")
+uid, gid, work, prog = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+status = open("/proc/self/status").read()
+try:
+    st = os.lstat("/work")
+    work_ok = "%d:%d" % (st.st_dev, st.st_ino) == work
+except OSError:
+    work_ok = False
+if (os.getresuid() != (uid, uid, uid) or os.getresgid() != (gid, gid, gid) or os.getgroups() not in ([], [gid])
+        or "NoNewPrivs:\t1" not in status or "CapEff:\t0000000000000000" not in status
+        or "CapPrm:\t0000000000000000" not in status or not work_ok
+        or not all(os.statvfs(path).f_flag & os.ST_RDONLY for path in READ_ONLY)
+        or [name for _, name in socket.if_nameindex() if name != "lo"]):
+    sys.stderr.write("ddistro_exec guard: sandbox identity mismatch\n")
+    sys.exit(97)
+os.closerange(3, 65536)
+os.execv(prog, [os.path.basename(prog)] + sys.argv[5:])
+"""
+
+
+class ExecError(Exception):
+    def __init__(self, code, message, details=None):
+        super().__init__(message)
+        self.code, self.message, self.details = code, message, details or {}
+
+
+class Cancelled(Exception):
+    pass
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def unsupported(reason, message=None):
+    return ExecError("unsupported", message or "Managed execution is not available here (%s)." % reason,
+                     {"reason": reason})
+
+
+# ---------------------------------------------------------------- trusted modules
+
+def trusted_path(path):
+    """Every component a real, root-owned, root-only-writable entry; the last a regular file."""
+    current, st = "/", None
+    try:
+        st = os.lstat(current)
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            return False
+        for part in [p for p in path.split("/") if p]:
+            current = os.path.join(current, part)
+            st = os.lstat(current)
+            if stat.S_ISLNK(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+                return False
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode)
+
+
+def load_module(name, path):
+    """A trusted root-owned library loaded by path. Both modules only run commands under __main__."""
+    if not os.path.lexists(path):
+        raise unsupported("policy_helper_unavailable", "%s is not installed." % os.path.basename(path))
+    if not trusted_path(path):
+        raise unsupported("policy_helper_untrusted", "%s is not a trusted root-owned file." % os.path.basename(path))
+    try:
+        spec = spec_from_loader(name, SourceFileLoader(name, path))
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception:
+        raise unsupported("policy_helper_unavailable", "%s could not be loaded." % os.path.basename(path))
+    return module
+
+
+# ---------------------------------------------------------------- request
+
+def parse_request(raw):
+    if not isinstance(raw, str) or len(raw.encode("utf-8", "surrogatepass")) > REQUEST_BYTES:
+        raise ExecError("invalid_argument", "--request-json must be a JSON object of at most 64 KiB.")
+    try:
+        request = json.loads(raw)
+    except ValueError:
+        raise ExecError("invalid_argument", "--request-json is not valid JSON.")
+    if type(request) is not dict or not set(request) <= {"argv", "files", "timeout"} or "argv" not in request:
+        raise ExecError("invalid_argument", "The request takes argv, and optionally files and timeout.",
+                        {"allowed": ["argv", "files", "timeout"]})
+    argv = request["argv"]
+    if type(argv) is not list or not 1 <= len(argv) <= ARGV_ITEMS \
+            or any(type(item) is not str or "\0" in item for item in argv):
+        raise ExecError("invalid_argument", "argv must be 1 to %d strings without NUL." % ARGV_ITEMS)
+    try:
+        size = sum(len(item.encode("utf-8")) + 1 for item in argv)
+    except UnicodeEncodeError:
+        raise ExecError("invalid_argument", "argv must be valid UTF-8.")
+    if size > ARGV_BYTES:
+        raise ExecError("invalid_argument", "argv is larger than 16 KiB.", {"bytes": size, "limit": ARGV_BYTES})
+    if argv[0] not in EXEC_PROGRAMS:
+        raise ExecError("refused", "That program is not available to managed execution.",
+                        {"reason": "program_not_allowed", "programs": list(EXEC_PROGRAMS)})
+    timeout = request.get("timeout", TIMEOUT[2])
+    if type(timeout) is not int or not TIMEOUT[0] <= timeout <= TIMEOUT[1]:
+        raise ExecError("invalid_argument", "timeout must be a whole number of seconds from 1 to 30.")
+    files = request.get("files", [])
+    if type(files) is not list or len(files) > MAX_FILES:
+        raise ExecError("invalid_argument", "files must be a list of at most %d entries." % MAX_FILES)
+    for entry in files:
+        if type(entry) is not dict or set(entry) != {"root", "path"} \
+                or type(entry["root"]) is not str or type(entry["path"]) is not str:
+            raise ExecError("invalid_argument", "Each file is {\"root\": id, \"path\": relative path}.")
+    return argv, files, timeout
+
+
+# ---------------------------------------------------------------- task (read-only, schema 1 and 2)
+
+def load_task(agent, task_id, identity):
+    """The task context and an O_PATH descriptor for its work folder, checked like ddistro_agent load_task
+    but without changing anything: a pre-runtime root-only task is reported, never converted."""
+    if type(task_id) is not str or not agent.TASK_ID_PATTERN.match(task_id):
+        raise agent.Refusal("task_id_invalid")
+    tasks_fd = agent.open_tasks_root(identity)
+    task_fd = meta_fd = None
+    try:
+        try:
+            task_fd = os.open(task_id, agent.O_DIR, dir_fd=tasks_fd)
+        except FileNotFoundError:
+            raise agent.Refusal("task_missing")
+        except OSError:
+            raise agent.Refusal("task_untrusted")
+        st = os.fstat(task_fd)
+        if st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o700:
+            raise agent.Refusal("task_not_runtime_ready")
+        if not agent.scratch_ancestor(st, identity):
+            raise agent.Refusal("task_untrusted")
+        try:
+            meta_fd = os.open("task.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=task_fd)
+        except OSError:
+            raise agent.Refusal("task_metadata_missing")
+        st = os.fstat(meta_fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o177:
+            raise agent.Refusal("task_untrusted")
+        try:
+            document = json.loads(agent.read_bounded(meta_fd, agent.TASK_METADATA_LIMIT))
+        except ValueError:
+            raise agent.Refusal("task_metadata_invalid")
+        if type(document) is not dict or type(document.get("schema_version")) is not int \
+                or document["schema_version"] not in TASK_SCHEMAS or document.get("task_id") != task_id:
+            raise agent.Refusal("task_metadata_invalid")
+        product = document.get("product")
+        if not isinstance(product, str) or not agent.PRODUCT_PATTERN.match(product):
+            raise agent.Refusal("task_metadata_invalid")
+        try:
+            work_fd = os.open("work", agent.O_PATH_DIR, dir_fd=task_fd)
+        except OSError:
+            raise agent.Refusal("task_work_missing")
+        st = os.fstat(work_fd)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != identity.pw_uid or st.st_mode & 0o002:
+            os.close(work_fd)
+            raise agent.Refusal("work_owner_mismatch")
+        return {"task_id": task_id, "task_schema": document["schema_version"], "product": product}, work_fd
+    finally:
+        for fd in (meta_fd, task_fd, tasks_fd):
+            if fd is not None:
+                os.close(fd)
+
+
+def refusal_error(reason):
+    if reason in UNSUPPORTED_REASONS:
+        return unsupported(reason)
+    if reason == "task_id_invalid":
+        return ExecError("invalid_argument", "--task must be a task UUID.", {"reason": reason})
+    if reason == "task_missing":
+        return ExecError("not_found", "No assistant task has that ID.", {"reason": reason})
+    if reason in ("task_metadata_missing", "task_metadata_invalid", "task_work_missing"):
+        return ExecError("failed", "The task is incomplete or invalid (%s)." % reason, {"reason": reason})
+    return ExecError("unsafe_path", "The task folder failed its ownership checks (%s)." % reason, {"reason": reason})
+
+
+# ---------------------------------------------------------------- snapshots
+
+def sealed_memfd(data):
+    """An immutable in-memory copy: no write, grow, shrink or further seals; rewound for bwrap."""
+    try:
+        fd = os.memfd_create("ddistro-exec-snapshot", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    except (AttributeError, OSError):
+        raise unsupported("memfd_unsupported")
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
+                    fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL)
+        os.lseek(fd, 0, os.SEEK_SET)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def capture_snapshots(access, files):
+    """(receipts, [(memfd, sandbox path)], parent folders). Every file goes through the access policy."""
+    receipts, mounts, wanted, total = [], [], set(), 0
+    try:
+        for entry in files:
+            spec = access.get_root(entry["root"])
+            parts = access.normalize_rel(entry["path"])
+            if not parts:
+                raise ExecError("invalid_argument", "Each file path must name a file inside the root.")
+            access.require_allowed(spec, parts, False)
+            dest = "/".join([INSPECT, entry["root"]] + parts)
+            if dest in wanted:
+                raise ExecError("invalid_argument", "The same file is listed twice.", {"path": dest})
+            wanted.add(dest)
+            root_fd = access.open_root(entry["root"])
+            try:
+                captured_at = now_iso()
+                data, info = access.read_regular(root_fd, parts, SNAPSHOT_FILE_BYTES)
+            finally:
+                os.close(root_fd)
+            text = access.decode_text(data)
+            if text is None:
+                raise ExecError("refused", "Only UTF-8 text files can be snapshotted.",
+                                {"path": "/".join(parts), "reason": "binary"})
+            redacted, count = access.redact_text(text)
+            snapshot = redacted.encode("utf-8")
+            if len(snapshot) > SNAPSHOT_FILE_BYTES:
+                raise ExecError("limit_reached", "A snapshot is larger than 1 MiB.", {"path": "/".join(parts)})
+            total += len(snapshot)
+            if total > SNAPSHOT_TOTAL_BYTES:
+                raise ExecError("limit_reached", "The snapshots together are larger than 2 MiB.",
+                                {"limit": SNAPSHOT_TOTAL_BYTES})
+            mounts.append((sealed_memfd(snapshot), dest))
+            receipts.append({
+                "root": entry["root"], "path": "/".join(parts), "sandbox_path": dest, "captured_at": captured_at,
+                "source_mtime": access.iso_mtime(info.st_mtime), "source_bytes": len(data),
+                "snapshot_bytes": len(snapshot), "snapshot_sha256": hashlib.sha256(snapshot).hexdigest(),
+                # The source hash is only reported when it is the hash of exactly what the sandbox saw.
+                "source_sha256": hashlib.sha256(data).hexdigest() if count == 0 else None,
+                "redactions": count, "live": False})
+    except BaseException:
+        for fd, _ in mounts:
+            os.close(fd)
+        raise
+    folders = set()
+    for dest in wanted:
+        parent = os.path.dirname(dest)
+        while parent != INSPECT:
+            folders.add(parent)
+            parent = os.path.dirname(parent)
+    clash = sorted(wanted & folders)
+    if clash:
+        for fd, _ in mounts:
+            os.close(fd)
+        raise ExecError("invalid_argument", "A listed file is also a folder of another listed file.",
+                        {"path": clash[0]})
+    return receipts, mounts, sorted(folders, key=lambda p: (p.count("/"), p))
+
+
+# ---------------------------------------------------------------- sandbox
+
+def bwrap_features(agent):
+    """Trusted bwrap from ddistro_agent plus the flags this sandbox needs; whether /tmp can be size-capped."""
+    agent.bwrap_state()
+    try:
+        done = subprocess.run([agent.BWRAP, "--help"], stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
+                              env={"PATH": agent.SAFE_PATH})
+    except (OSError, subprocess.TimeoutExpired):
+        raise agent.Refusal("bwrap_unsupported")
+    usage = done.stdout + done.stderr
+    if any(flag not in usage for flag in REQUIRED_BWRAP):
+        raise agent.Refusal("bwrap_unsupported")
+    return b"--size" in usage
+
+
+def etc_files(identity):
+    passwd = "root:x:0:0::/nonexistent:/usr/sbin/nologin\nddagent:x:%d:%d::/tmp:/usr/sbin/nologin\n" % (
+        identity.pw_uid, identity.pw_gid)
+    return {"/etc/passwd": passwd.encode(), "/etc/group": ("root:x:0:\nddagent:x:%d:\n" % identity.pw_gid).encode()}
+
+
+def sandbox_argv(agent, identity, work_fd, mounts, folders, program, args, tmp_sized):
+    """bwrap argv and the descriptors it reads. No --share-net: --unshare-all leaves only loopback."""
+    data_fds = []
+    argv = [agent.BWRAP, "--unshare-all", "--die-with-parent", "--new-session", "--clearenv", "--cap-drop", "ALL"]
+    for key, value in (("PATH", SANDBOX_PATH), ("HOME", "/tmp"), ("TMPDIR", "/tmp"), ("LANG", "C.UTF-8"),
+                       ("PYTHONDONTWRITEBYTECODE", "1")):
+        argv += ["--setenv", key, value]
+    argv += ["--ro-bind", "/usr", "/usr", "--tmpfs", "/usr/local", "--remount-ro", "/usr/local"]
+    for name in agent.ROOT_LINKS:
+        path = "/" + name
+        if os.path.islink(path):
+            argv += ["--symlink", os.readlink(path), path]
+        elif os.path.isdir(path):
+            argv += ["--ro-bind", path, path]
+    argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/home", "--remount-ro", "/home"]
+    if tmp_sized:
+        argv += ["--size", TMP_SIZE]
+    argv += ["--tmpfs", "/tmp", "--tmpfs", "/etc"]
+    for name in ETC_FILES:
+        path = "/etc/" + name
+        if os.path.exists(path) and os.path.realpath(path).startswith(("/etc/", "/usr/")):
+            argv += ["--ro-bind", path, path]
+    try:
+        for dest, data in etc_files(identity).items():
+            fd = sealed_memfd(data)
+            data_fds.append(fd)
+            argv += ["--ro-bind-data", str(fd), dest]
+        argv += ["--tmpfs", INSPECT]
+        for folder in folders:
+            argv += ["--dir", folder]
+        for fd, dest in mounts:
+            argv += ["--ro-bind-data", str(fd), dest]
+        argv += ["--remount-ro", INSPECT, "--remount-ro", "/etc"]
+    except BaseException:
+        for fd in data_fds:
+            os.close(fd)
+        raise
+    st = os.fstat(work_fd)
+    guard = [agent.GUARD_PYTHON, "-I", "-S", "-c", GUARD, str(identity.pw_uid), str(identity.pw_gid),
+             "%d:%d" % (st.st_dev, st.st_ino), "/usr/bin/" + program]
+    # bwrap's remount is not recursive: / and its plain folders become read-only after the last mount
+    # point is created, while the /work, /tmp, /proc and /dev mounts keep their own flags.
+    argv += ["--bind-fd", str(work_fd), SANDBOX_WORK, "--remount-ro", "/", "--chdir", SANDBOX_WORK, "--"]
+    argv += guard + list(args)
+    return argv, data_fds + [fd for fd, _ in mounts] + [work_fd]
+
+
+def child_limits(timeout):
+    def apply():
+        for name, value in RLIMITS.items():
+            if hasattr(resource, name):
+                resource.setrlimit(getattr(resource, name), (value, value))
+        resource.setrlimit(resource.RLIMIT_CPU, (timeout + 1, timeout + 2))
+        os.umask(0o077)
+        if LIBC.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "no_new_privs")
+    return apply
+
+
+def kill_group(proc):
+    """bwrap leads its own process group; with --die-with-parent and a private PID namespace, killing it
+    tears down everything the command started."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(KILL_GRACE)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def run_sandboxed(argv, fds, identity, timeout):
+    """(exit code, stdout, stderr, stream totals, timed_out). Output past the caps is read and discarded."""
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            pass_fds=fds, close_fds=True, user=identity.pw_uid, group=identity.pw_gid,
+                            extra_groups=[], process_group=0, preexec_fn=child_limits(timeout),
+                            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}, cwd="/")
+    streams = {"stdout": (proc.stdout, bytearray(), STDOUT_LIMIT, [0]),
+               "stderr": (proc.stderr, bytearray(), STDERR_LIMIT, [0])}
+
+    def drain(stream, buf, cap, seen):
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                return
+            seen[0] += len(chunk)
+            if len(buf) < cap:
+                buf += chunk[:cap - len(buf)]
+
+    threads = [threading.Thread(target=drain, args=value, daemon=True) for value in streams.values()]
+    for thread in threads:
+        thread.start()
+    timed_out = False
+    try:
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            kill_group(proc)
+    except BaseException:
+        kill_group(proc)
+        raise
+    finally:
+        kill_group(proc)
+        for thread in threads:
+            thread.join(KILL_GRACE)
+    return (proc.returncode, bytes(streams["stdout"][1]), bytes(streams["stderr"][1]),
+            {key: value[3][0] for key, value in streams.items()}, timed_out)
+
+
+def clean_output(access, data, total, cap):
+    text, count = access.redact_text(data.decode("utf-8", "replace"))
+    return {"text": text, "bytes": total, "truncated": total > cap, "limit": cap, "redactions": count}
+
+
+# ---------------------------------------------------------------- command
+
+def execute(agent, access, task_id, raw_request):
+    """The receipt for one sandboxed run. agent and access are the trusted modules (or a test's copies)."""
+    argv, files, timeout = parse_request(raw_request)
+    if platform.system() != "Linux":
+        raise unsupported("unsupported_platform")
+    try:
+        identity = agent.agent_identity()
+        tmp_sized = bwrap_features(agent)
+        context, work_fd = load_task(agent, task_id, identity)
+    except agent.Refusal as refusal:
+        raise refusal_error(refusal.reason)
+    program = os.path.realpath("/usr/bin/" + argv[0])
+    if not program.startswith("/usr/") or program.startswith("/usr/local/") or not trusted_path(program) \
+            or not os.access(program, os.X_OK):
+        os.close(work_fd)
+        raise unsupported("program_missing", "%s is not installed as a trusted /usr program." % argv[0])
+    mounts, fds = [], []
+    try:
+        try:
+            receipts, mounts, folders = capture_snapshots(access, files)
+        except access.AccessError as error:
+            raise ExecError(error.code if error.code in ERRORS else "failed", error.message, error.details)
+        command, fds = sandbox_argv(agent, identity, work_fd, mounts, folders, argv[0], argv[1:], tmp_sized)
+        started, clock = now_iso(), time.monotonic()
+        try:
+            code, out, err, totals, timed_out = run_sandboxed(command, fds, identity, timeout)
+        except OSError:
+            raise ExecError("failed", "The sandbox could not be started.", {"reason": "sandbox_setup_failed"})
+        finished, elapsed = now_iso(), int((time.monotonic() - clock) * 1000)
+    finally:
+        for fd in set(fds) | {fd for fd, _ in mounts} | {work_fd}:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    if code == GUARD_EXIT and b"ddistro_exec guard:" in err:
+        raise ExecError("unsafe_path", "The sandbox did not match its expected identity; nothing ran.",
+                        {"reason": "sandbox_identity_mismatch"})
+    if timed_out:
+        status = "timed_out"
+    elif code is not None and code < 0:
+        status = "signaled"
+    else:
+        status = "exited"
+    shown = [access.redact_text(item)[0] for item in argv]
+    return {
+        "task": context, "status": status, "exit_code": code if code is not None and code >= 0 else None,
+        "signal": -code if code is not None and code < 0 else None, "timed_out": timed_out,
+        "argv": shown, "timeout": timeout, "started_at": started, "finished_at": finished, "duration_ms": elapsed,
+        "stdout": clean_output(access, out, totals["stdout"], STDOUT_LIMIT),
+        "stderr": clean_output(access, err, totals["stderr"], STDERR_LIMIT),
+        "snapshots": receipts,
+        "snapshot_note": "Files under /inspect are redacted copies captured at captured_at, not the live files.",
+        "sandbox": {"network": "none", "user": "ddagent", "capabilities": "none", "no_new_privs": True,
+                    "pid_namespace": True, "writable": [SANDBOX_WORK, "/tmp"],
+                    "read_only": ["/", "/etc", "/usr", "/usr/local", "/home", INSPECT],
+                    "hidden": ["/root", "/run", "/mnt", "account home"],
+                    "tmp_size_limit": int(TMP_SIZE) if tmp_sized else None,
+                    "rlimits": dict(RLIMITS, RLIMIT_CPU=timeout + 1)},
+    }
+
+
+def emit(command, request_id, data=None, error=None):
+    document = {"schema_version": SCHEMA_VERSION, "ok": error is None, "command": command, "request_id": request_id,
+                "tool": TOOL, "data": data, "error": error, "warnings": []}
+    sys.stdout.write(json.dumps(document, ensure_ascii=True) + "\n")
+    sys.stdout.flush()
+
+
+def raise_cancelled(signum, frame):
+    raise Cancelled()
+
+
+def main(argv):
+    request_id = str(uuid.uuid4())
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, raise_cancelled)
+    try:
+        if len(argv) != 5 or argv[0] != "--task" or argv[2] != "--request-json" or argv[4] != "--json":
+            raise ExecError("invalid_argument", "Usage: ddistro_exec --task UUID --request-json JSON --json")
+        if os.geteuid() != 0:
+            raise ExecError("permission_denied", "ddistro_exec must run as root.")
+        if not trusted_path(os.path.realpath(__file__)):
+            raise unsupported("helper_untrusted")
+        agent = load_module("ddistro_agent", AGENT_MODULE)
+        access = load_module("ddistro_access", ACCESS_MODULE)
+        data = execute(agent, access, argv[1], argv[3])
+    except ExecError as error:
+        emit("exec", request_id, error={"code": error.code, "message": error.message, "details": error.details})
+        return ERRORS.get(error.code, 1)
+    except Cancelled:
+        emit("exec", request_id, error={"code": "cancelled", "message": "The run was cancelled.", "details": {}})
+        return ERRORS["cancelled"]
+    except Exception:
+        emit("exec", request_id, error={"code": "failed", "message": "ddistro_exec failed unexpectedly.",
+                                        "details": {"reason": "internal_error"}})
+        return 1
+    emit("exec", request_id, data=data)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
