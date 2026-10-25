@@ -220,14 +220,14 @@ def parse_manifest(raw):
     if not isinstance(manifest, dict):
         raise ModError(f"{MANIFEST_NAME} must be a JSON object.")
     version = manifest.get("schema_version")
-    if type(version) is not int or version not in (1, 2):
+    if isinstance(version, bool) or version not in (1, 2) or (version == 2 and type(version) is not int):
         raise ModError("Unsupported manifest schema_version. This distro supports versions 1 and 2.")
     unknown = set(manifest) - (MANIFEST_KEYS | ({"game", "distribution", "features", "testing"} if version == 2 else set()))
     if unknown:
         raise ModError("Manifest has unsupported fields: " + ", ".join(sorted(unknown)[:5]))
 
     result = {
-        "schema_version": version,
+        "schema_version": int(version),
         "id": validate_mod_id(manifest.get("id")),
         "name": text_field(manifest, "name", 60),
         "description": text_field(manifest, "description", 300, required=False),

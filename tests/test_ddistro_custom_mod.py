@@ -1353,6 +1353,10 @@ class RegistryLifecycleTests(unittest.TestCase):
 
 
 class ReleasePackageTests(unittest.TestCase):
+    def test_legacy_numeric_version_keeps_its_original_normalization(self):
+        data = dict(MANIFEST, schema_version=1.0)
+        self.assertEqual(1, mod.parse_manifest(json.dumps(data))["schema_version"])
+
     def test_cross_platform_package_paths_and_collisions(self):
         release = mod.release_support()
         for path in ("../file", "/file", "lib/.env", "con.txt", "mod/file.", "a\\b"):
