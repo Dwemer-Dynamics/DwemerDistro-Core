@@ -189,8 +189,17 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise RuntimeError('Root-local setup required')
+    if STATE.is_symlink():
+        raise RuntimeError('Shared-key state directory is not trusted')
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with (STATE / 'setup.lock').open('a') as lock:
+    info = STATE.stat()
+    if info.st_uid != 0 or not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o022:
+        raise RuntimeError('Shared-key state directory is not trusted')
+    lock_path = STATE / 'setup.lock'
+    if lock_path.exists() or lock_path.is_symlink():
+        trusted(lock_path)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         install_runtime(args.bundle or os.environ.get('DDISTRO_KEYS_RUNTIME_BUNDLE'))
         if not args.install_runtime:
@@ -203,6 +212,8 @@ def main():
             if ready.returncode:
                 subprocess.run(['/usr/sbin/service', 'postgresql', 'start'], check=True, capture_output=True, timeout=30)
             marker = STATE / 'initialized.json'
+            if marker.exists() or marker.is_symlink():
+                trusted(marker)
             digest = (RUNTIME / '.bundle-sha256').read_text().strip()
             configuration = b''.join(Path(p).read_bytes() for p in ('/etc/chim4-s5.env','/etc/chim4-dialogue.env','/etc/chim4-tts.env',str(CONFIG)) if Path(p).is_file())
             fingerprint = hashlib.sha256(configuration + digest.encode()).hexdigest()
