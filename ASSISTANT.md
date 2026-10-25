@@ -264,3 +264,38 @@ The CLI is a convenience and contract layer, not a sandbox or authorization boun
 anything it can do, the same user can do directly. Root-only work stays in
 `ddistro_server` and `ddistro_changes`, which own their locking. Launcher chat may come
 later and will appear in `capabilities` only when implemented. The existing CHIM-MCP `/chat` is unchanged.
+
+## Health
+
+`health [product]` runs bounded local checks now and reports each one; it repairs nothing (it
+never calls `ddistro_doctor --repair`) and tests no external provider, model, or in-game path.
+There is no overall verdict: each check is `passed`, `failed`, or `skipped` with a `reason`.
+
+```json
+{"captured_at": "...", "scope": "local_bounded", "product": null, "read_as": "root",
+ "summary": {"passed": 9, "failed": 1, "skipped": 16},
+ "checks": [{"id": "server.herika.port", "component": "herika", "result": "passed",
+             "evidence": "tcp 127.0.0.1:8081 accepted in 1 ms (port from ddistro_server status)",
+             "reason": null, "captured_at": "..."}],
+ "scope_limits": ["..."]}
+```
+
+- `server.<product>.installed|port|database`: from the validated `ddistro_server status`
+  (30 seconds). `installed` passes only for state `installed`; a `not-installed` product is
+  one skipped check. `port` connects to the product's reported port on `127.0.0.1` (1.5 s).
+  `database` is the helper's presence check (`skipped` when PostgreSQL was not ready). A
+  helper failure is one failed `servers.status` check.
+- `postgres.port`: TCP to `DDISTRO_POSTGRES_PORT` (the existing override) or 5432.
+- `component.<id>.port` (whole-distro only): an absent or unreadable startup marker is
+  skipped. A present component is port-checked only when it has a known port: `xtts` 8020,
+  `omnivoice` 8021, `parakeet` 8022, `pockettts_audiocpp` 8086 (overridable by plain
+  `NAME=port` lines of a root-owned `/etc/dwemerdistro_services.conf`, which is parsed, never
+  sourced), and `chatterbox`/`pocket_tts` from their `.dwemerdistro-port` file (legacy 8020).
+  Every other component is skipped with `no known local port contract`. Both files are read
+  only when they are regular files of at most 4 KiB, reached from `/` without following any
+  link, with the file and every folder above it owned by root (or, for the port files, the
+  `dwemer` account) and not group- or other-writable; they are opened non-blocking, so a FIFO
+  or device never stalls the check. Anything else is ignored and the default port is used.
+- `disk./`, `disk./var/lib/postgresql`, `disk./home/dwemer`: fails below 2 GiB or 5% free.
+
+A passing port check proves only that something accepts TCP there, not which service.

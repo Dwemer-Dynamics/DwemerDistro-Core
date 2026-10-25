@@ -21,6 +21,7 @@ Privilege split:
   * applying scratch changes to a live install is never done here.
 """
 import argparse
+import collections
 import ctypes
 import errno
 import fcntl
@@ -107,6 +108,72 @@ TASK_METADATA_LIMIT = 4 * 1024 * 1024
 TEXT_LIMIT = 256 * 1024
 MAX_THREADS_PER_TASK = 256
 MAX_TRACKED_REQUESTS = 1024
+# History reads (Codex 0.163 stable App Server schema): (default, maximum) page sizes. The broker always
+# sends a limit so a page stays far below SERVER_LINE_LIMIT; full-item turn pages get a smaller cap.
+TURN_PAGE = (20, 50)
+FULL_TURN_PAGE = (5, 10)
+ITEM_PAGE = (100, 200)
+THREAD_PAGE = (25, 50)
+CURSOR_LIMIT = 4096
+INTERNAL_ID_PREFIX = "ddistro-broker:"
+# Page counts do not bound bytes (one tool item or full turn can be huge), and the launcher refuses lines over
+# 4 MiB. Larger server lines are re-encoded with long strings clipped (marked in place and in ddistroTruncation);
+# a response that still does not fit is replaced by a JSON-RPC error. Ids, cursors, and types are never clipped.
+CLIENT_BYTE_BUDGET = 3 * 1024 * 1024
+CLIP_STEPS = (65536, 16384, 4096, 1024, 256)
+CLIP_KEYS = ("id", "type", "status", "role", "method", "cursor", "nextCursor", "backwardsCursor")
+CLIP_MARK = "...[clipped by DwemerDistro: %d of %d characters omitted]"
+RESPONSE_HEAD = re.compile(rb'^\{"id":(-?[0-9]{1,18}|"[^"\\]{1,128}"),"(?:result|error)":')
+HISTORY_METHODS = ("thread/read", "thread/turns/list", "thread/items/list")
+
+# The one dynamic tool. The broker declares it on thread/start for clients that opt into experimentalApi and
+# answers item/tool/call itself by running fixed read-only ddistro argv as root, outside the model sandbox.
+DDISTRO = "/usr/local/bin/ddistro"
+TOOL_NAME = "ddistro_read"
+TOOL_PRODUCTS = ("herika", "lorkhan", "stobe", "dialectic", "reign")
+# Mirrors ddistro LOG_SOURCES; ddistro validates the name again.
+TOOL_LOGS = {
+    "herika": ("chim.log", "output_from_llm.log", "output_to_plugin.log", "context_sent_to_llm.log", "debugStream.log",
+               "minai.log", "vision.log"),
+    "lorkhan": ("lorkhan.log", "output_from_llm.log", "output_from_llm_fast.log", "output_to_plugin.log",
+                "context_sent_to_llm.log", "context_sent_to_llm_fast.log", "stt.log"),
+    "stobe": ("stobe.log", "stobeserver.log", "stobe_import.log", "output_from_llm.log", "context_sent_to_llm.log"),
+    "dialectic": ("dialectic.log", "service.log", "manager.log", "monitor.log", "output_from_llm.log",
+                  "output_from_llm_fast.log", "output_to_plugin.log", "context_sent_to_llm.log",
+                  "context_sent_to_llm_fast.log", "debugStream.log"),
+    "reign": ("server.log", "server-log.jsonl", "llm-log.jsonl", "otel-traces.ndjson"),
+    "apache": ("error.log", "other_vhosts_access.log", "stobe_error.log", "dialectic_error.log"),
+    "postgres": ("main",),
+}
+TOOL_OPERATIONS = ("inventory", "status", "models", "logs", "health")
+TOOL_SPEC = {
+    "type": "function", "name": TOOL_NAME,
+    "description": "Read-only DwemerDistro diagnostics captured now on this machine: inventory (installed presence), "
+                   "status (managed servers), models (configured CHIM model assignments), logs (redacted tail of an "
+                   "allowlisted log), health (bounded local checks). It cannot change, repair, or update anything.",
+    "inputSchema": {"type": "object", "additionalProperties": False, "required": ["operation"], "properties": {
+        "operation": {"type": "string", "enum": list(TOOL_OPERATIONS)},
+        "product": {"type": "string", "enum": list(TOOL_LOGS),
+                    "description": "status/health: a server; models: herika; logs (required): a server, apache, or postgres"},
+        "log": {"type": "string", "enum": sorted({name for names in TOOL_LOGS.values() for name in names}),
+                "description": "logs only; must belong to product"},
+        "lines": {"type": "integer", "minimum": 1, "maximum": 100, "description": "logs only; default 50"}}},
+}
+TOOL_TIMEOUT = 90
+TOOL_STDOUT_LIMIT = 1024 * 1024
+TOOL_TEXT_BUDGET = 64 * 1024
+TOOL_CONCURRENCY = 2
+# A runaway read loop is bounded per turn (calls and returned text) and per session. A full distro check is
+# about 4-10 calls. Past the turn limits calls are answered with an actionable refusal; once refusals reach
+# TOOL_TURN_CALLS again the broker interrupts that turn itself. The client can always send turn/interrupt.
+TOOL_TURN_CALLS = 16
+TOOL_TURN_TEXT = 512 * 1024
+TOOL_SESSION_CALLS = 256
+TOOL_TRACKED_TURNS = 64
+# On session end diagnostic children get SIGTERM, then SIGKILL after this grace; their threads are joined.
+TOOL_STOP_GRACE = 2.0
+# An oversized response is discarded unread up to this many bytes in total; beyond that the session closes.
+SERVER_DISCARD_LIMIT = 256 * 1024 * 1024
 SHUTDOWN_GRACE = 10.0
 # The client reader polls so it can leave before interpreter shutdown instead of blocking in stdin.
 CLIENT_POLL = 0.2
@@ -825,6 +892,217 @@ def enforce_sandbox(params):
     return params
 
 
+def bounded_id(params, key, required=False):
+    value = params.get(key)
+    if value is None and not required:
+        return
+    if not isinstance(value, str) or not 0 < len(value) <= 128:
+        raise PolicyError(-32602, "invalid parameter: " + key)
+
+
+def page_limit(params, bounds):
+    """Fill in the default page size; refuse anything outside 1..maximum."""
+    value = params.get("limit")
+    if value is None:
+        params["limit"] = bounds[0]
+    elif isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= bounds[1]:
+        raise PolicyError(-32602, "limit must be 1-%d" % bounds[1])
+
+
+def check_choice(params, key, choices):
+    if params.get(key) not in (None,) + choices:
+        raise PolicyError(-32602, "invalid parameter: " + key)
+
+
+def check_cursor(params, anchor=False):
+    cursor = params.get("cursor")
+    if cursor is None or isinstance(cursor, str) and 0 < len(cursor) <= CURSOR_LIMIT:
+        return
+    # thread/items/list also takes an exclusive item anchor inside the requested turn.
+    if anchor and isinstance(cursor, dict) and cursor.get("type") == "item":
+        reject_unknown(cursor, ("type", "itemId"))
+        bounded_id(cursor, "itemId", required=True)
+        if params.get("turnId") is not None:
+            return
+    raise PolicyError(-32602, "invalid parameter: cursor")
+
+
+def clip_strings(value, cap, counter, key=None):
+    if isinstance(value, str):
+        if len(value) <= cap or key in CLIP_KEYS or (key or "").endswith("Id"):
+            return value
+        counter[0] += 1
+        return value[:cap] + CLIP_MARK % (len(value) - cap, len(value))
+    if isinstance(value, list):
+        return [clip_strings(item, cap, counter) for item in value]
+    if isinstance(value, dict):
+        return {k: clip_strings(v, cap, counter, k) for k, v in value.items()}
+    return value
+
+
+def encode(message):
+    return json.dumps(message, separators=(",", ":")).encode() + b"\n"
+
+
+def bounded_line(message, budget):
+    """The message re-encoded under budget, clipping ever shorter strings; None when that is not enough."""
+    line = encode(message)
+    if len(line) <= budget:
+        return line
+    body = "result" if isinstance(message.get("result"), dict) else "params"
+    for cap in CLIP_STEPS:
+        counter = [0]
+        projected = clip_strings(message, cap, counter)
+        if isinstance(projected.get(body), dict):
+            projected[body]["ddistroTruncation"] = {"clippedStrings": counter[0], "maxStringChars": cap,
+                                                    "budgetBytes": budget}
+        line = encode(projected)
+        if len(line) <= budget:
+            return line
+    return None
+
+
+def sanitize(value, key=None):
+    """Tool output strings: no control characters, URL queries, or secret-shaped values."""
+    if isinstance(value, str):
+        value = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "?", value)
+        # Ids and inventory's validated 40-hex commits would otherwise match the hex-token shape.
+        return value if key in CLIP_KEYS + ("commit",) else DIAG_SECRETS.sub("[redacted]", DIAG_URL_QUERY.sub(r"\1?[redacted]", value))
+    if isinstance(value, list):
+        return [sanitize(item) for item in value]
+    if isinstance(value, dict):
+        return {str(k)[:128]: sanitize(v, k) for k, v in value.items()}
+    return value
+
+
+def tool_argv(arguments):
+    """Exact ddistro argv and envelope command for validated ddistro_read arguments."""
+    if not isinstance(arguments, dict):
+        raise PolicyError(-32602, "arguments must be an object")
+    reject_unknown(arguments, ("operation", "product", "log", "lines"))
+    operation, product = arguments.get("operation"), arguments.get("product")
+    if operation not in TOOL_OPERATIONS:
+        raise PolicyError(-32602, "operation must be one of " + ", ".join(TOOL_OPERATIONS))
+    if operation != "logs" and ("log" in arguments or "lines" in arguments):
+        raise PolicyError(-32602, "log and lines apply only to logs")
+    if operation == "inventory":
+        if "product" in arguments:
+            raise PolicyError(-32602, "inventory takes no product")
+        return ["inventory"]
+    if operation in ("status", "health"):
+        if product is None and "product" not in arguments:
+            return [operation]
+        if product not in TOOL_PRODUCTS:
+            raise PolicyError(-32602, "product must be one of " + ", ".join(TOOL_PRODUCTS))
+        return [operation, product]
+    if operation == "models":
+        if arguments.get("product", "herika") != "herika":
+            raise PolicyError(-32602, "models supports only herika")
+        return ["models", "herika"]
+    if product not in TOOL_LOGS:
+        raise PolicyError(-32602, "logs needs product: one of " + ", ".join(TOOL_LOGS))
+    lines = arguments.get("lines", 50)
+    if isinstance(lines, bool) or not isinstance(lines, int) or not 1 <= lines <= 100:
+        raise PolicyError(-32602, "lines must be 1-100")
+    argv = ["logs", product, "--lines", str(lines)]
+    if "log" in arguments:
+        if arguments["log"] not in TOOL_LOGS[product]:
+            raise PolicyError(-32602, "log must be one of " + ", ".join(TOOL_LOGS[product]))
+        argv += ["--log", arguments["log"]]
+    return argv
+
+
+class DiagnosticChild:
+    """One ddistro run in its own process group. The group is signalled only while its leader is unreaped,
+    so a recycled pid is never signalled."""
+
+    def __init__(self, proc):
+        self.proc = proc
+        self.lock = threading.Lock()
+        self.reaped = False
+
+    def signal(self, sig):
+        with self.lock:
+            if not self.reaped:
+                try:
+                    os.killpg(self.proc.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+
+    def reap(self):
+        # Wait for exit without reaping, then reap under the lock that signal() holds.
+        try:
+            os.waitid(os.P_PID, self.proc.pid, os.WEXITED | os.WNOWAIT)
+        except ChildProcessError:
+            pass
+        with self.lock:
+            self.proc.wait()
+            self.reaped = True
+
+
+def run_ddistro(argv, registry=None):
+    """Runs root-owned ddistro --json with fixed argv, a minimal environment, and bounded time and output.
+
+    registry (the broker) adopts the child so session shutdown can stop it; adopt() refuses once the session
+    is stopping. Returns (ok, data_or_error) after checking the envelope shape; never raises for helper failures."""
+    try:
+        st = trusted_chain(DDISTRO, "helper_untrusted")
+        if not stat.S_ISREG(st.st_mode):
+            raise Refusal("helper_untrusted")
+    except Refusal:
+        return False, {"code": "helper_untrusted", "message": DDISTRO + " is missing or not root-owned"}
+    env = {"PATH": SAFE_PATH, "LANG": "C.UTF-8"}
+    port = os.environ.get("DDISTRO_POSTGRES_PORT", "")
+    if re.match(r"^[0-9]{1,5}\Z", port):
+        env["DDISTRO_POSTGRES_PORT"] = port
+    proc = subprocess.Popen([DDISTRO] + argv + ["--json"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, env=env, cwd="/", close_fds=True, start_new_session=True)
+    child = DiagnosticChild(proc)
+    if registry is not None and not registry.adopt(child):
+        child.signal(signal.SIGKILL)
+        proc.stdout.close()
+        child.reap()
+        return False, {"code": "cancelled", "message": "the assistant session is closing"}
+    expired = []
+
+    def kill():
+        expired.append(True)
+        child.signal(signal.SIGKILL)
+    timer = threading.Timer(TOOL_TIMEOUT, kill)
+    timer.daemon = True
+    timer.start()
+    out = b""
+    try:
+        out = proc.stdout.read(TOOL_STDOUT_LIMIT + 1)
+        if len(out) > TOOL_STDOUT_LIMIT:
+            kill()
+    finally:
+        timer.cancel()
+        proc.stdout.close()
+        child.reap()
+        if registry is not None:
+            registry.release(child)
+    if registry is not None and registry.stopping:
+        return False, {"code": "cancelled", "message": "the assistant session is closing"}
+    if expired:
+        reason = "output_too_large" if len(out) > TOOL_STDOUT_LIMIT else "timeout"
+        return False, {"code": reason, "message": "ddistro %s did not finish within bounds" % argv[0]}
+    try:
+        document = json.loads(out.decode("utf-8"))
+    except ValueError:
+        document = None
+    expected = argv[0]
+    if (not isinstance(document, dict) or document.get("schema_version") != 1 or document.get("command") != expected
+            or document.get("ok") not in (True, False)):
+        return False, {"code": "helper_protocol", "message": "ddistro returned an unexpected document"}
+    if document["ok"]:
+        if not isinstance(document.get("data"), dict):
+            return False, {"code": "helper_protocol", "message": "ddistro returned no data"}
+        return True, document["data"]
+    error = document.get("error") if isinstance(document.get("error"), dict) else {}
+    return False, {"code": str(error.get("code", "failed"))[:64], "message": str(error.get("message", ""))[:1024]}
+
+
 THREAD_START_KEYS = ("model", "approvalPolicy", "approvalsReviewer", "cwd", "sandbox", "permissions",
                      "developerInstructions", "ephemeral", "serviceName", "personality", "serviceTier")
 THREAD_RESUME_KEYS = ("threadId", "model", "approvalPolicy", "approvalsReviewer", "cwd", "sandbox", "permissions",
@@ -834,19 +1112,19 @@ TURN_START_KEYS = ("threadId", "input", "model", "effort", "summary", "approvalP
 LOGIN_KEYS = {"chatgpt": ("type", "appBrand", "codexStreamlinedLogin", "useHostedLoginSuccessPage"),
               "chatgptDeviceCode": ("type",)}
 # Read-only or account methods whose parameters do not affect the sandbox.
-PASSTHROUGH_METHODS = ("initialize", "model/list", "configRequirements/read", "permissionProfile/list",
+PASSTHROUGH_METHODS = ("model/list", "configRequirements/read", "permissionProfile/list",
                        "account/rateLimits/read")
 SIMPLE_METHODS = {"account/read": ("refreshToken",), "account/login/cancel": ("loginId",), "account/logout": ()}
 # Server requests whose client answers could widen access; the broker always denies them.
 DENIED_SERVER_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
                           "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval",
-                          "item/tool/call", "mcpServer/elicitation/request", "account/chatgptAuthTokens/refresh")
+                          "mcpServer/elicitation/request", "account/chatgptAuthTokens/refresh")
 
 
 class Broker:
     """Bidirectional JSONL relay that only forwards the launcher's allowed method surface."""
 
-    def __init__(self, proc, client_in, client_out, threads, err_sink=None):
+    def __init__(self, proc, client_in, client_out, threads, err_sink=None, run_tool=run_ddistro):
         self.proc = proc
         self.client_in = client_in
         self.client_out = client_out
@@ -857,6 +1135,20 @@ class Broker:
         self.state_lock = threading.Lock()
         self.pending = {}
         self.server_requests = {}
+        # thread/list is answered from the task's own index: one internal thread/read per listed id.
+        self.internal = {}
+        self.internal_seq = 0
+        # ddistro_read is declared only after the client opts into experimentalApi; calls are answered here.
+        self.experimental = False
+        self.run_tool = run_tool
+        self.tool_slots = threading.Semaphore(TOOL_CONCURRENCY)
+        # Diagnostic runs owned by this session: their threads and process groups (see _stop_diagnostics).
+        self.tool_jobs = set()
+        self.children = set()
+        self.stopping = False
+        # (threadId, turnId) -> [calls, text bytes, interrupted], oldest evicted; plus a session call count.
+        self.turn_budgets = collections.OrderedDict()
+        self.session_calls = 0
         self.failure = None
         self.stop_timer = None
         self.closed = False
@@ -869,12 +1161,46 @@ class Broker:
         self.closed = True
         if self.stop_timer:
             self.stop_timer.cancel()
+        self._stop_diagnostics()
         stop_process_group(self.proc)
         reader.join(CLIENT_POLL * 10)
         return self.proc.returncode
 
+    # diagnostic children
+    def adopt(self, child):
+        with self.state_lock:
+            if self.stopping:
+                return False
+            self.children.add(child)
+            return True
+
+    def release(self, child):
+        with self.state_lock:
+            self.children.discard(child)
+
+    def _stop_diagnostics(self):
+        """No new runs; SIGTERM then SIGKILL exactly the adopted groups; join every tool thread."""
+        with self.state_lock:
+            self.stopping = True
+            children, jobs = list(self.children), list(self.tool_jobs)
+        for child in children:
+            child.signal(signal.SIGTERM)
+        deadline = time.monotonic() + TOOL_STOP_GRACE
+        for job in jobs:
+            job.join(max(0.0, deadline - time.monotonic()))
+        with self.state_lock:
+            children, jobs = list(self.children), list(self.tool_jobs)
+        for child in children:
+            child.signal(signal.SIGKILL)
+        for job in jobs:
+            # Bounded: each remaining run was just SIGKILLed and only has to be reaped.
+            job.join(TOOL_STOP_GRACE + 3)
+
     def request_stop(self):
-        """Signal-safe: terminate only this session's process group."""
+        """Signal-safe (takes no locks): no new diagnostics, then terminate only this session's process group.
+
+        Running diagnostics are stopped by run() once the App Server has gone."""
+        self.stopping = True
         if self.proc.poll() is None:
             try:
                 os.killpg(self.proc.pid, signal.SIGTERM)
@@ -966,13 +1292,22 @@ class Broker:
             if not valid_request_id(request_id) or not isinstance(method, str):
                 self._reply_error(None, -32600, "invalid request")
                 return
+            if isinstance(request_id, str) and request_id.startswith(INTERNAL_ID_PREFIX):
+                self._reply_error(request_id, -32600, "request id prefix is reserved")
+                return
             try:
                 message["params"] = self._authorize(method, message.get("params"))
+                if method == "thread/list":
+                    self._list_threads(request_id, message["params"])
+                    return
             except PolicyError as exc:
                 self._reply_error(request_id, exc.code, exc.message)
                 return
-            if method in ("thread/start", "thread/resume"):
+            if method in ("thread/start", "thread/resume") + HISTORY_METHODS:
                 with self.state_lock:
+                    if len(self.pending) >= MAX_TRACKED_REQUESTS:
+                        self._reply_error(request_id, -32001, "too many requests in progress")
+                        return
                     self.pending[request_key(request_id)] = method
             self._to_server(message)
             return
@@ -992,6 +1327,13 @@ class Broker:
             raise PolicyError(-32602, "params must be an object")
         if method in PASSTHROUGH_METHODS:
             return params
+        if method == "initialize":
+            capabilities = params.get("capabilities")
+            experimental = capabilities.get("experimentalApi") if isinstance(capabilities, dict) else None
+            if experimental not in (None, True, False):
+                raise PolicyError(-32602, "invalid parameter: capabilities.experimentalApi")
+            self.experimental = experimental is True
+            return params
         if method in SIMPLE_METHODS:
             reject_unknown(params, SIMPLE_METHODS[method])
             return params
@@ -1003,11 +1345,47 @@ class Broker:
             return params
         if method == "thread/start":
             reject_unknown(params, THREAD_START_KEYS)
+            # Client tool declarations are never accepted; the broker owns the exact declaration.
+            if self.experimental:
+                params["dynamicTools"] = [TOOL_SPEC]
             return enforce_sandbox(params)
         if method == "thread/resume":
             reject_unknown(params, THREAD_RESUME_KEYS)
             self._require_thread(params)
+            # Full-history hydration is unbounded; history is paged with thread/turns/list and thread/items/list.
+            if params.get("excludeTurns") not in (None, True):
+                raise PolicyError(-32602, "excludeTurns must be true; page history with thread/turns/list")
+            params["excludeTurns"] = True
             return enforce_sandbox(params)
+        if method == "thread/read":
+            reject_unknown(params, ("threadId", "includeTurns"))
+            self._require_thread(params)
+            if params.get("includeTurns") not in (None, False):
+                raise PolicyError(-32602, "includeTurns must be false; page history with thread/turns/list")
+            params["includeTurns"] = False
+            return params
+        if method == "thread/turns/list":
+            reject_unknown(params, ("threadId", "cursor", "limit", "sortDirection", "itemsView"))
+            self._require_thread(params)
+            check_cursor(params)
+            check_choice(params, "sortDirection", ("asc", "desc"))
+            check_choice(params, "itemsView", ("notLoaded", "summary", "full"))
+            page_limit(params, FULL_TURN_PAGE if params.get("itemsView") == "full" else TURN_PAGE)
+            return params
+        if method == "thread/items/list":
+            reject_unknown(params, ("threadId", "turnId", "cursor", "limit", "sortDirection"))
+            self._require_thread(params)
+            bounded_id(params, "turnId")
+            check_cursor(params, anchor=True)
+            check_choice(params, "sortDirection", ("asc", "desc"))
+            page_limit(params, ITEM_PAGE)
+            return params
+        if method == "thread/list":
+            reject_unknown(params, ("cursor", "limit", "sortDirection"))
+            check_cursor(params)
+            check_choice(params, "sortDirection", ("asc", "desc"))
+            page_limit(params, THREAD_PAGE)
+            return params
         if method == "turn/start":
             reject_unknown(params, TURN_START_KEYS)
             self._require_thread(params)
@@ -1024,6 +1402,58 @@ class Broker:
             known = params.get("threadId") in self.threads
         if not known:
             raise PolicyError(-32602, "threadId does not belong to this task")
+
+    def _list_threads(self, request_id, params):
+        """thread/list from this task's own index, never Codex's account-wide list; newest first by default.
+
+        The cursor is the last listed thread id. Each listed id is read with an internal metadata-only
+        thread/read; ids Codex can no longer read (for example ephemeral threads) are left out.
+        """
+        with self.state_lock:
+            ids = list(self.threads.ids)
+        if params.get("sortDirection") != "asc":
+            ids.reverse()
+        start = 0
+        if params.get("cursor") is not None:
+            if params["cursor"] not in ids:
+                raise PolicyError(-32602, "invalid parameter: cursor")
+            start = ids.index(params["cursor"]) + 1
+        page = ids[start:start + params["limit"]]
+        listing = {"id": request_id, "threads": [None] * len(page), "waiting": len(page),
+                   "next": page[-1] if start + len(page) < len(ids) else None}
+        if not page:
+            self._finish_listing(listing)
+            return
+        requests = []
+        with self.state_lock:
+            if len(self.internal) + len(page) > MAX_TRACKED_REQUESTS:
+                raise PolicyError(-32001, "too many history reads in progress")
+            for index, thread_id in enumerate(page):
+                self.internal_seq += 1
+                internal_id = INTERNAL_ID_PREFIX + str(self.internal_seq)
+                self.internal[request_key(internal_id)] = (listing, index, thread_id)
+                requests.append({"id": internal_id, "method": "thread/read",
+                                 "params": {"threadId": thread_id, "includeTurns": False}})
+        for request in requests:
+            self._to_server(request)
+
+    def _collect_listing(self, slot, result):
+        if not isinstance(slot, tuple):
+            return  # the answer to a broker-internal request such as turn/interrupt
+        listing, index, thread_id = slot
+        thread = result.get("thread") if isinstance(result, dict) else None
+        with self.state_lock:
+            if isinstance(thread, dict) and thread.get("id") == thread_id:
+                listing["threads"][index] = clip_strings(dict(thread, turns=[]), 4096, [0])
+            listing["waiting"] -= 1
+            done = listing["waiting"] == 0
+        if done:
+            self._finish_listing(listing)
+
+    def _finish_listing(self, listing):
+        result = {"data": [thread for thread in listing["threads"] if thread is not None],
+                  "nextCursor": listing["next"], "backwardsCursor": None}
+        self._to_client(self._fit({"id": listing["id"], "result": result}))
 
     @staticmethod
     def _check_input(items):
@@ -1057,17 +1487,91 @@ class Broker:
         while True:
             try:
                 line = self.proc.stdout.readline(SERVER_LINE_LIMIT + 1)
+                if len(line) > SERVER_LINE_LIMIT:
+                    if not self._drop_oversized(line):
+                        return
+                    continue
             except (OSError, ValueError):
                 return
             if not line:
                 return
-            if len(line) > SERVER_LINE_LIMIT:
-                self._fail("server_message_too_large")
-                return
             line = self._inspect_server(line)
+            if line is not None and len(line) > CLIENT_BYTE_BUDGET:
+                line = self._fit_line(line)
             if line is not None and not self._to_client(line):
                 self._fail("client_closed")
                 return
+
+    def _too_large(self, request_id):
+        return encode({"id": request_id, "error": {"code": -32003, "message": (
+            "response exceeds the DwemerDistro assistant byte budget; request a smaller limit or itemsView summary"),
+            "data": {"reason": "response_too_large", "budgetBytes": CLIENT_BYTE_BUDGET}}})
+
+    def _fit(self, message):
+        return bounded_line(message, CLIENT_BYTE_BUDGET) or self._too_large(message["id"])
+
+    def _fit_line(self, line):
+        """An over-budget line clipped to fit; otherwise an error for a response, nothing for anything else."""
+        try:
+            message = json.loads(line)
+        except ValueError:
+            message = None
+        if not isinstance(message, dict):
+            return None
+        fitted = bounded_line(message, CLIENT_BYTE_BUDGET)
+        if fitted is not None or "id" not in message:
+            return fitted
+        if "method" not in message:
+            return self._too_large(message["id"])
+        if valid_request_id(message["id"]):
+            with self.state_lock:
+                self.server_requests.pop(request_key(message["id"]), None)
+        self._to_server({"id": message["id"], "error": {"code": -32003, "message": "request too large for the client"}})
+        return None
+
+    def _drop_oversized(self, line):
+        """A line over SERVER_LINE_LIMIT is never parsed. A response identified by its leading id is discarded
+        (bounded by SERVER_DISCARD_LIMIT) and its request answered with an error; anything else (a notification
+        or request that cannot be dropped without leaving client state stale) closes the session. False: stop."""
+        match = RESPONSE_HEAD.match(line[:512])
+        if match is None:
+            self._close_oversized("a message over %d MiB that is not an identifiable response"
+                                  % (SERVER_LINE_LIMIT >> 20))
+            return False
+        discarded = len(line)
+        while not line.endswith(b"\n"):
+            line = self.proc.stdout.readline(4 * 1024 * 1024)
+            discarded += len(line)
+            if not line:
+                return False
+            if discarded > SERVER_DISCARD_LIMIT:
+                self._close_oversized("a response over %d MiB" % (SERVER_DISCARD_LIMIT >> 20))
+                return False
+        request_id = json.loads(match.group(1))
+        key = request_key(request_id)
+        with self.state_lock:
+            slot = self.internal.pop(key, None)
+            self.pending.pop(key, None)
+        if slot is not None:
+            self._collect_listing(slot, None)
+        else:
+            self._to_client(self._too_large(request_id))
+        return True
+
+    def _close_oversized(self, what):
+        """Answers every request the broker tracks with an actionable error, then closes the session."""
+        message = ("Codex App Server sent %s; the assistant session is closing. Start a new session; if this "
+                   "repeats, page history with a smaller limit or itemsView summary." % what)
+        with self.state_lock:
+            ids = [key[1] for key in self.pending]
+            listings = {id(slot[0]): slot[0]["id"] for slot in self.internal.values() if isinstance(slot, tuple)}
+            ids += listings.values()
+            self.pending.clear()
+            self.internal.clear()
+        for request_id in ids:
+            self._to_client(encode({"id": request_id, "error": {"code": -32003, "message": message,
+                                                                 "data": {"reason": "server_message_too_large"}}}))
+        self._fail("server_message_too_large")
 
     def _inspect_server(self, line):
         try:
@@ -1079,6 +1583,16 @@ class Broker:
         key = request_key(message["id"]) if valid_request_id(message["id"]) else None
         if key is None:
             return line
+        if "method" not in message:
+            with self.state_lock:
+                slot = self.internal.pop(key, None)
+            if slot is not None:
+                self._collect_listing(slot, message.get("result"))
+                return None
+        if message.get("method") == "item/tool/call":
+            # Answered here and never shown to the client, so a client cannot answer or spoof it.
+            self._start_tool(message)
+            return None
         if "method" in message:
             with self.state_lock:
                 if len(self.server_requests) < MAX_TRACKED_REQUESTS:
@@ -1087,7 +1601,10 @@ class Broker:
         with self.state_lock:
             method = self.pending.pop(key, None)
         result = message.get("result")
-        if method is None or not isinstance(result, dict):
+        if method == "thread/read" and isinstance(result, dict) and isinstance(result.get("thread"), dict):
+            result["thread"]["turns"] = []
+            return encode(message)
+        if method not in ("thread/start", "thread/resume") or not isinstance(result, dict):
             return line
         thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
         profile = result.get("activePermissionProfile") if isinstance(result.get("activePermissionProfile"), dict) else {}
@@ -1102,6 +1619,114 @@ class Broker:
             except (OSError, Refusal):
                 self.failure = self.failure or "state_untrusted"
         return line
+
+    def _charge_tool(self, params):
+        """Counts one call against the session and its turn; returns (turn budget key, refusal or None)."""
+        thread_id, turn_id = params.get("threadId"), params.get("turnId")
+        key = (thread_id, turn_id) if isinstance(thread_id, str) and isinstance(turn_id, str) \
+            and 0 < len(turn_id) <= 128 else None
+        interrupt = False
+        with self.state_lock:
+            self.session_calls += 1
+            if self.session_calls > TOOL_SESSION_CALLS:
+                return key, {"code": "session_tool_limit", "message": (
+                    "ddistro_read is limited to %d calls per assistant session; answer from the evidence already "
+                    "gathered and start a new session for more checks" % TOOL_SESSION_CALLS)}
+            if key is None or thread_id not in self.threads:
+                return None, None  # refused as invalid by _run_tool_call
+            budget = self.turn_budgets.get(key)
+            if budget is None:
+                budget = self.turn_budgets[key] = [0, 0, False]
+                while len(self.turn_budgets) > TOOL_TRACKED_TURNS:
+                    self.turn_budgets.popitem(last=False)
+            budget[0] += 1
+            if budget[0] <= TOOL_TURN_CALLS and budget[1] < TOOL_TURN_TEXT:
+                return key, None
+            if budget[0] >= 2 * TOOL_TURN_CALLS and not budget[2]:
+                budget[2] = interrupt = True
+        if interrupt:
+            # The model ignored TOOL_TURN_CALLS refusals; end the turn as the client's turn/interrupt would.
+            self._internal_request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+        return None, {"code": "turn_tool_limit", "message": (
+            "ddistro_read is limited to %d calls and %d KiB of output per turn; stop calling it, answer from "
+            "the evidence already gathered, and let the user ask again in a new turn"
+            % (TOOL_TURN_CALLS, TOOL_TURN_TEXT // 1024))}
+
+    def _internal_request(self, method, params):
+        with self.state_lock:
+            if len(self.internal) >= MAX_TRACKED_REQUESTS:
+                return
+            self.internal_seq += 1
+            internal_id = INTERNAL_ID_PREFIX + str(self.internal_seq)
+            self.internal[request_key(internal_id)] = method
+        self._to_server({"id": internal_id, "method": method, "params": params})
+
+    def _start_tool(self, message):
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        if self.stopping:
+            self._tool_reply(message["id"], params, False, {"code": "cancelled", "message": "the session is closing"})
+            return
+        key, refusal = self._charge_tool(params)
+        if refusal is not None:
+            self._tool_reply(message["id"], params, False, refusal)
+            return
+        if not self.tool_slots.acquire(blocking=False):
+            self._tool_reply(message["id"], params, False, {"code": "busy", "message": "another diagnostic is running"})
+            return
+        job = threading.Thread(target=self._run_tool_call, args=(message["id"], params, key), daemon=True)
+        with self.state_lock:
+            started = not self.stopping
+            if started:
+                self.tool_jobs.add(job)
+                job.start()
+        if not started:
+            self.tool_slots.release()
+
+    def _run_tool_call(self, request_id, params, key=None):
+        try:
+            try:
+                if params.get("tool") != TOOL_NAME or params.get("namespace") is not None:
+                    raise PolicyError(-32602, "unknown tool")
+                thread_id = params.get("threadId")
+                with self.state_lock:
+                    owned = isinstance(thread_id, str) and thread_id in self.threads
+                if not owned:
+                    raise PolicyError(-32602, "threadId does not belong to this task")
+                argv = tool_argv(params.get("arguments"))
+            except PolicyError as exc:
+                ok, payload = False, {"code": "invalid_arguments", "message": exc.message}
+            else:
+                try:
+                    # The real runner is handed this broker so shutdown can stop the run's process group.
+                    ok, payload = self.run_tool(argv, self) if self.run_tool is run_ddistro else self.run_tool(argv)
+                except (OSError, ValueError):
+                    ok, payload = False, {"code": "failed", "message": "ddistro could not be run"}
+            if not self.stopping:
+                self._tool_reply(request_id, params, ok, payload, key)
+        finally:
+            with self.state_lock:
+                self.tool_jobs.discard(threading.current_thread())
+            self.tool_slots.release()
+
+    def _tool_reply(self, request_id, params, ok, payload, key=None):
+        arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+        operation = arguments.get("operation") if arguments.get("operation") in TOOL_OPERATIONS else None
+        document = {"tool": TOOL_NAME, "operation": operation,
+                    "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "ok": ok,
+                    "data" if ok else "error": sanitize(payload)}
+        line = bounded_line({"result": document}, TOOL_TEXT_BUDGET)
+        if line is None:
+            ok, text = False, json.dumps({"tool": TOOL_NAME, "operation": operation, "ok": False, "error": {
+                "code": "output_too_large", "message": "narrow the request"}})
+        else:
+            text = json.dumps(json.loads(line)["result"], separators=(",", ":"))
+        if key is not None:
+            with self.state_lock:
+                budget = self.turn_budgets.get(key)
+                if budget is not None:
+                    budget[1] += len(text)
+        self._to_server({"id": request_id, "result": {"success": ok,
+                                                      "contentItems": [{"type": "inputText", "text": text}]}})
 
     def _to_client(self, data):
         try:
@@ -1475,7 +2100,9 @@ def probe_app_server(identity, context, work_path, home_path, checks, diagnostic
                                              and [k for k, v in profiles.items() if v] == [PROFILE])
     bypasses = [("command/exec", {"command": ["true"]}), ("fs/readFile", {"path": SANDBOX_HOME + "/auth.json"}),
                 ("thread/start", {"sandbox": "danger-full-access"}), ("thread/start", {"config": {"approval_policy": "on-request"}}),
-                ("thread/start", {"approvalPolicy": "on-request"}), ("thread/resume", {"threadId": "not-this-task"})]
+                ("thread/start", {"approvalPolicy": "on-request"}), ("thread/resume", {"threadId": "not-this-task"}),
+                ("thread/read", {"threadId": "not-this-task"}), ("thread/turns/list", {"threadId": "not-this-task"}),
+                ("thread/items/list", {"threadId": "not-this-task"}), ("thread/list", {"cwd": SANDBOX_WORK})]
     rejected = True
     for offset, (method, params) in enumerate(bypasses):
         client.send({"id": 10 + offset, "method": method, "params": params})
