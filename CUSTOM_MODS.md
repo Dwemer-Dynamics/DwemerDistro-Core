@@ -16,6 +16,9 @@ ddistro_custom_mod backup <id>                            # root
 ddistro_custom_mod unregister <id>                        # root; keeps files and database
 ddistro_custom_mod setup-web                              # root; shared loopback listener
 ddistro_custom_mod setup-web --protect-project <id>       # root; opt a project folder into source denials
+ddistro_custom_mod setup-web --protect-root <Name>Server  # root; the same for /var/www/html/<Name>Server
+ddistro_custom_mod migrate-root <id> --server-folder <Name>Server   # root; move an install there
+ddistro_custom_mod migrate-root <id> --drop-legacy-url    # root; retire the old URL alias
 ```
 
 ## Shared web port
@@ -107,6 +110,100 @@ regex-escaped, never passed to a shell. The option may be given once.
   version has no command to remove an id.
 - Without any opted-in id the site file has only the fixed rules above.
 
+### Direct server folders
+
+A manifest with `"server_folder": "CommonGroundServer"` installs to
+`/var/www/html/CommonGroundServer` instead of `/var/www/html/custom-mods/<id>`; its URL is
+`http://127.0.0.1:<CUSTOM_MODS_PORT>/CommonGroundServer/`. The id, the database
+`custom_<id>`, the registry entry, backups and every lifecycle command stay as above. Without
+the field nothing changes.
+
+- The name is 7-47 ASCII letters or digits, starts with a capital letter and ends in
+  `Server`. Official and KAGRENAC product names (`HerikaServer`, `StobeServer`,
+  `ExampleServer`, `KagrenacServer` and the rest of the reserved ids plus `Server`) are refused.
+  Install refuses an existing entry of that name in any letter case and a name another
+  registry entry (removed ones included) already uses; nothing is adopted.
+- `/var/www/html` itself must be owned by root or `dwemer` (DwemerDistro ships it as
+  `dwemer:www-data`, mode `2755`), with no group or other write, reached without links; it is
+  checked and never changed. Because `dwemer` may add names there, install refuses a folder of
+  that name that appears meanwhile, and root sets the new folder's owner and mode only through a
+  handle that does not follow links.
+- Before the folder is created, the name is saved in the root-only list
+  `/var/lib/dwemerdistro-custom-mods/protected-roots` (same rules as `protected-projects`, at most
+  64 names, never removed) and `setup-web` applies, on every listener, the denials the known
+  KAGRENAC paths get (`.git` at any depth, `client/`, `ports/`, `docs/`, `config/`, `lib/`,
+  `sql/`, `scripts/`, and `config.json` and `.env` at any depth). So `dashboard_path`,
+  `health_path` and `assets` may not be in those folders. The custom listener then grants that
+  exact name only; `/var/www/html` is never granted as a whole. Every root named in the list or
+  in any registry entry, removed ones included, keeps these rules.
+- Status, check, update, switch, backup, restore and the health check always use the
+  registered folder. An update whose manifest names another `server_folder` (or adds or drops
+  it) keeps the installed folder and says so; only `migrate-root` moves an install. An update
+  or switch of a mod registered with a `server_folder` (a migrated one too, whose manifest may
+  still have none) is refused before the fast-forward if the incoming `dashboard_path`,
+  `health_path` or `assets` are in a denied folder or file.
+- `setup-web --protect-root <Name>Server` saves and applies the same protection and grant
+  without installing anything, for a manual install there: run it before placing the source.
+
+### Moving an installed mod (`migrate-root`)
+
+```bash
+sudo ddistro_custom_mod migrate-root dead-drop --server-folder DeadDropServer
+```
+
+Moves a **ready** `custom-mods/<id>` install, under the shared lock, in one rename on the same
+filesystem. Nothing is copied: owners, modes, the private config and its lock keep their
+inodes; the database, token, history and settings are untouched. It refuses, changing
+nothing, when the entry is not `ready` or already moved, the folder is not the plain
+registered `custom-mods/<id>` checkout, tracked files changed or the checkout is not at its
+registered branch and commit, the destination exists in any letter case or is claimed by
+another entry, `/var/www/html` fails the owner and mode check above, the two folders are on
+different filesystems, or the app's config lock (`<setup.config_path>.lock`) is held by a
+running save (the lock is then held until the move finishes). A missing lock is not created; a
+save that starts during the move uses the old absolute paths and saves nothing once the folder
+has moved. Repository code and Git never run as root.
+
+Steps: backup (config, database dump, the registry entry and this manager's Apache site, in
+the backups folder below) → save and apply the destination's protection → wait (up to 20
+seconds) until the custom listener answers with it: a graceful reload returns before Apache
+serves the new config and the port was already open, so only answers count — an unknown path
+under the still-missing `/<Name>Server` must be `404` (the old config answers `403`) while
+`.git/HEAD`, `config/config.php`, `lib/` and `config.json` stay `403`, on several fresh
+connections in a row; otherwise it refuses and nothing is moved → move record saved in the
+registry entry (`migration`: exact source, destination, backup folder and the folder's device
+and inode) → rename → registry switch (still with the record) → `setup-web` with an `Alias` from
+the old `/custom-mods/<id>` URL to the same folder (no copy, no link) → health `200` and `403`
+for `.git/HEAD` and the private config on both URLs, retried until that reload answers (same
+20-second limit) → record removed. Registry writes are synced. If anything after the rename
+fails, the folder, registry entry and listener are put back and the message says so (or names
+exactly what could not be undone, with the backup).
+
+**Interrupted move.** If the process dies part way (WSL shutdown, kill), the registry entry
+keeps the move record: `status` shows the mod as failed with the command to run, and every
+other command (update, switch, backup, branches, unregister, restore, `--drop-legacy-url`)
+refuses. Run the same command again:
+
+```bash
+sudo ddistro_custom_mod migrate-root dead-drop --server-folder DeadDropServer
+```
+
+It checks that the record names exactly this mod, `custom-mods/<id>`, `/var/www/html/<Name>Server`
+and a backup folder of this mod, and that the entry still matches the recorded one. Then exactly
+one of the two paths must exist and be the recorded folder (same device and inode, no link) with
+its checkout clean at the registered branch and commit. If it is still at `custom-mods/<id>`,
+the move starts again from the beginning (new backup); if it is already at `/<Name>Server`, the
+move is finished (registry, alias, route checks), or undone if those checks fail. If both paths
+exist, neither does, the folder is a different one, the checkout changed, or the record is
+damaged, it refuses and changes nothing; nothing is adopted. Resolve that by hand with the
+backup the message names.
+
+The new URL is canonical: `status` reports it as `dashboard_url`/`health_url` and the old one
+as `legacy_url`. Game clients that hardcode the old URL keep working through the alias until
+they are rebuilt and paired with the new URL; changing a config alone does not update a
+compiled client. Then retire the alias with `migrate-root <id> --drop-legacy-url`. Stop the
+game and other clients during the move: a request that is running while the folder moves can
+fail.
+
 To change the port: edit `CUSTOM_MODS_PORT` as root, run
 `sudo ddistro_custom_mod setup-web` (the old custom listener is replaced; official ports
 are not touched), then update every client pairing URL (for example `server_url`) to the
@@ -156,11 +253,13 @@ fields are rejected.
 | `setup.config_path` | Untracked private `.php` file. A repository that tracks it is rejected. |
 | `setup.migrate_script` | Tracked `.php` script, safe to run repeatedly. It reads `config_path` and exits non-zero on failure. |
 | `branches` | Optional `{"default": "main", "allowed": ["main", "dev", "unstable"]}`. At most 10 branch names; `default` must be in `allowed`. See below. |
+| `server_folder` | Optional `"<Name>Server"`: install directly in `/var/www/html/<Name>Server`. See [Direct server folders](#direct-server-folders). |
 | `assets` | Optional `{"icon": "...", "banner": "..."}`; either key may be left out. Each is a relative path (same rules as above) to a tracked `.png`, `.jpg`, or `.jpeg` file. URLs are not accepted. |
 
 Assets are recorded from the installed commit on install and on each successful update,
 so a change shows only after **Update**. `status` reports `icon_url` and `banner_url` on
-the fixed route `http://127.0.0.1:<CUSTOM_MODS_PORT>/custom-mods/<id>/<path>`, or an empty string when
+the mod's fixed route (`http://127.0.0.1:<CUSTOM_MODS_PORT>/custom-mods/<id>/<path>`, or
+`/<server_folder>/<path>`), or an empty string when
 an asset is not declared or its file is missing or a link. Manifests without `assets`
 work as before.
 
@@ -205,7 +304,7 @@ columns or tables you do not know.
    system config, credential helpers, prompts, or hooks, and only over `https`.
 2. `install` repeats the check under the shared server-manager lock and refuses if the
    commit differs from the previewed one.
-3. It refuses if the id is registered, `/var/www/html/custom-mods/<id>` exists, or the
+3. It refuses if the id is registered, `/var/www/html/custom-mods/<id>` (or its `server_folder`) exists, or the
    database `custom_<id with _>` exists. Existing folders and databases are never adopted.
 4. root creates the scoped folder (`dwemer:www-data`, no world access) and the scoped
    database owned by the existing `dwemer` role. The role is never created or changed.
@@ -213,7 +312,7 @@ columns or tables you do not know.
    (only if missing) with a random token and the scoped database name, lint it, and run
    `migrate_script`.
 6. root runs `setup-web` (below), then the health URL
-   `http://127.0.0.1:<CUSTOM_MODS_PORT>/custom-mods/<id>/<health_path>` must answer 200.
+   `http://127.0.0.1:<CUSTOM_MODS_PORT>/custom-mods/<id>/<health_path>` (or `/<server_folder>/...`) must answer 200.
    Only then is the registry entry marked `ready`. A failure is recorded as `failed` with a
    safe message; files and database are kept, and **Update** retries setup.
 
@@ -261,5 +360,5 @@ Install, Update, and branch switching first require the shared PHP security upda
   `dwemer` status reads. It holds no tokens or passwords.
 - The manager is installed with mode `0755` by `update.sh` for the same reason.
 - Operations share `/run/lock/dwemerdistro-server-manager.d` with `ddistro_server`.
-- Dashboard and health links are always built from the fixed route above on
+- Dashboard and health links are always built from the registered route above on
   `CUSTOM_MODS_PORT`, never from a URL in the manifest.

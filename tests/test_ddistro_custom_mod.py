@@ -14,8 +14,8 @@ import unittest
 
 import types
 
-# grp/pwd exist only on Unix; the validation code under test never calls them.
-for _name in ("grp", "pwd"):
+# grp/pwd/fcntl exist only on Unix; the validation code under test never calls them.
+for _name in ("grp", "pwd", "fcntl"):
     sys.modules.setdefault(_name, types.ModuleType(_name)) if os.name == "nt" else None
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -192,6 +192,61 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaises(mod.ModError, msg=bad):
                 mod.web_site_text(19042, bad)
 
+    def test_server_folder_is_optional_validated_and_keeps_served_paths_public(self):
+        self.assertEqual(mod.parse_manifest(manifest())["server_folder"], "")
+        parsed = mod.parse_manifest(manifest(server_folder="CommonGroundServer", assets={"icon": "ui/icon.png"}))
+        self.assertEqual(parsed["server_folder"], "CommonGroundServer")
+        self.assertEqual(mod.mod_urls("common-ground", parsed)[1], "http://127.0.0.1:19000/CommonGroundServer/health.php")
+        self.assertEqual(mod.entry_folder({"id": "common-ground", "server_folder": "CommonGroundServer"}),
+                         mod.WEB_ROOT + "/CommonGroundServer")
+        self.assertEqual(mod.entry_folder({"id": "common-ground"}), mod.MOD_ROOT + "/common-ground")
+        for bad in ("commonGroundServer", "CommonGround", "Server", "Common-GroundServer", "Common.Server", "../XServer",
+                    "X/Server", "HerikaServer", "herikaServer", "KagrenacServer", "ExampleServer", "ChimServer",
+                    "CustomModsServer", "A" * 42 + "Server", "CommonGroundServer\n", "", 7, []):
+            with self.assertRaises(mod.ModError, msg=bad):
+                mod.parse_manifest(manifest(server_folder=bad))
+        for change in ({"health_path": "lib/health.php"}, {"dashboard_path": "client/"},
+                       {"assets": {"icon": "docs/icon.png"}}):
+            with self.assertRaises(mod.ModError, msg=change):
+                mod.parse_manifest(manifest(server_folder="CommonGroundServer", **change))
+        self.assertFalse(mod.is_scoped_folder(mod.WEB_ROOT + "/HerikaServer"))
+        self.assertFalse(mod.is_scoped_folder(mod.WEB_ROOT + "/custom-mods"))
+        self.assertTrue(mod.is_scoped_folder(mod.WEB_ROOT + "/CommonGroundServer"))
+        self.assertFalse(mod.is_scoped_folder(mod.WEB_ROOT + "/x/CommonGroundServer"))
+
+    def test_direct_roots_are_denied_everywhere_and_granted_by_exact_name(self):
+        import re
+        self.assertEqual(mod.web_site_text(19042, [], [], []), mod.web_site_text(19042))
+        text = mod.web_site_text(19042, ["dead-drop"], ["CommonGroundServer", "DeadDropServer"],
+                                 [("dead-drop", "DeadDropServer")])
+        source_dir, project_dir, url, git_dir, git_url = mod.root_deny_rules(
+            ["CommonGroundServer", "DeadDropServer"], ["dead-drop"])
+        self.assert_rules_rendered(text, (source_dir, project_dir, url))
+        vhost, base_grant = text.index("<VirtualHost"), text.index("\t\tRequire all granted")
+        self.assertLess(text.index(f'<DirectoryMatch "{git_dir}">'), vhost)
+        root_grant = text.index('<LocationMatch "^/(CommonGroundServer|DeadDropServer)(/|$)">\n\t\tRequire all granted')
+        self.assertLess(base_grant, root_grant)
+        self.assertLess(root_grant, text.index(f'<LocationMatch "{git_url}">'))
+        self.assertLess(root_grant, text.index(f'<LocationMatch "{url}">'))
+        self.assertIn('\tAlias "/custom-mods/dead-drop" "/var/www/html/DeadDropServer"\n', text)
+        rules = (source_dir, project_dir, url)
+        for root in ("/CommonGroundServer", "/DeadDropServer", "/custom-mods/dead-drop"):
+            for path in ("config/config.php", "lib/app.php", "client/x", "scripts/migrate.php", "config.json",
+                         "ui/.env", "docs"):
+                self.assertTrue(rules_deny(rules, f"{root}/{path}")[0], root + path)
+                if not root.startswith("/custom-mods"):
+                    self.assertEqual(rules_deny(rules, f"{root}/{path}"), (True, True), root + path)
+            self.assertTrue(re.search(git_url, f"{root}/.git/HEAD"), root)
+            self.assertEqual(rules_deny(rules, f"{root}/health.php"), (False, False), root)
+        self.assertTrue(re.search(git_dir, "/var/www/html/DeadDropServer/.git/config"))
+        for url_ in ("/CommonGroundServerX/lib/x", "/XCommonGroundServer/lib/x", "/HerikaServer/lib/x",
+                     "/custom-mods/dead-drops/lib/x"):
+            self.assertEqual(rules_deny(rules, url_), (False, False), url_)
+        self.assertIsNone(re.search(r"^/(CommonGroundServer|DeadDropServer)(/|$)", "/HerikaServer/"))
+        for bad in (["HerikaServer"], ["a|.*Server"], ["X)|(.*Server"]):
+            with self.assertRaises(mod.ModError, msg=bad):
+                mod.web_site_text(19042, [], bad, [])
+
     def test_rejects_bad_ids(self):
         for bad in ("ab", "Example", "-abc", "abc-", "a--b", "a_b", "../x", "herika", "stobe", "custom-mods",
                     "a" * 33, "example-test\n", 7, None):
@@ -366,6 +421,19 @@ class CliTests(unittest.TestCase):
                          "a" * 40)
         self.assertEqual(mod.parse_args(["setup-web", "--protect-project", "kag-proj"])["protect_project"], "kag-proj")
         self.assertNotIn("protect_project", mod.parse_args(["setup-web"]))
+        self.assertEqual(mod.parse_args(["setup-web", "--protect-root", "DeadDropServer"])["protect_root"], "DeadDropServer")
+        move = mod.parse_args(["migrate-root", "dead-drop", "--server-folder", "DeadDropServer"])
+        self.assertEqual((move["id"], move["server_folder"]), ("dead-drop", "DeadDropServer"))
+        self.assertTrue(mod.parse_args(["migrate-root", "dead-drop", "--drop-legacy-url"])["drop_legacy_url"])
+        for argv in (["migrate-root", "dead-drop"], ["migrate-root", "dead-drop", "--server-folder", "../x"],
+                     ["migrate-root", "dead-drop", "--server-folder", "HerikaServer"],
+                     ["migrate-root", "--server-folder", "DeadDropServer"],
+                     ["migrate-root", "dead-drop", "--server-folder", "DeadDropServer", "--drop-legacy-url"],
+                     ["setup-web", "--protect-root", "dead-drop"],
+                     ["setup-web", "--protect-root", "DeadDropServer", "--protect-project", "dead-drop"],
+                     ["update", "dead-drop", "--server-folder", "DeadDropServer"]):
+            with self.assertRaises(mod.ModError, msg=argv):
+                mod.parse_args(argv)
         for argv in (["setup-web", "--protect-project"], ["setup-web", "--protect-project", "KagrenacServer"],
                      ["setup-web", "--protect-project", "herika"], ["setup-web", "--protect-project", "../x"],
                      ["setup-web", "--protect-project", "a$(id)b"], ["setup-web", "--protect-project", ""],
@@ -402,13 +470,17 @@ class RegistryLifecycleTests(unittest.TestCase):
         root = self.temp.name.replace("\\", "/")
         self.saved = {name: getattr(mod, name) for name in
                       ("STATE_ROOT", "REGISTRY_ROOT", "BACKUP_ROOT", "MOD_ROOT", "LOCK_PATH", "PROTECTED_PROJECTS",
-                       "APACHE_DIR")}
+                       "APACHE_DIR", "WEB_ROOT", "PROTECTED_ROOTS", "read_protected_roots")}
+        # Temp folders are not root-owned; tests of the roots list itself call read_protected_list.
+        mod.read_protected_roots = lambda: []
         mod.STATE_ROOT = root + "/state"
         mod.REGISTRY_ROOT = mod.STATE_ROOT + "/registry"
         mod.BACKUP_ROOT = mod.STATE_ROOT + "/backups"
         mod.PROTECTED_PROJECTS = mod.STATE_ROOT + "/protected-projects"
+        mod.PROTECTED_ROOTS = mod.STATE_ROOT + "/protected-roots"
         mod.APACHE_DIR = root + "/apache2"
-        mod.MOD_ROOT = root + "/custom-mods"
+        mod.WEB_ROOT = root + "/html"
+        mod.MOD_ROOT = mod.WEB_ROOT + "/custom-mods"
         mod.LOCK_PATH = root + "/lock.d"
         self.chown = getattr(os, "chown", None)
         os.chown = lambda *args, **kwargs: None
@@ -588,7 +660,7 @@ class RegistryLifecycleTests(unittest.TestCase):
         self.assertEqual(entry["state"], "failed")
 
     def checkout_with(self, head="a" * 40, current="main", dest_exists=False, dest_ancestor=True,
-                      checkout_fails=False, switching=True, pin="d" * 40, setup_fails=False):
+                      checkout_fails=False, switching=True, pin="d" * 40, setup_fails=False, root="", incoming=None):
         """Run update_checkout (a switch to dev, or an update of main) with git answering from the given state.
 
         The fetched commit is always d*40; the fourth result is the full git argument lists.
@@ -620,14 +692,15 @@ class RegistryLifecycleTests(unittest.TestCase):
         mod.backup = mod.apply_permissions = mod.write_config_if_missing = mod.run_setup_checks = lambda *a: None
         if setup_fails:
             mod.run_setup_checks = lambda *a: (_ for _ in ()).throw(mod.ModError("The mod's database migration failed."))
-        mod.read_commit_manifest = lambda folder, ref: (mod.parse_manifest(manifest()), set(), "", "d" * 40)
+        mod.read_commit_manifest = lambda folder, ref: (mod.parse_manifest(manifest(**(incoming or {}))), set(), "",
+                                                        "d" * 40)
         mod.database_exists = lambda name: True
         mod.database_owner = lambda name: mod.DATABASE_ROLE
         mod.check_health = lambda mod_id, manifest_: (True, "")
         mod.setup_web = lambda: None
         progress = {"changed": False}
         error = None
-        self.checked_entry = self.entry()
+        self.checked_entry = dict(self.entry(), server_folder=root) if root else self.entry()
         try:
             mod.update_checkout(self.checked_entry, mod.MOD_ROOT + "/example-server", self.SOURCE, False,
                                 "dev" if switching else "main", progress, expect_commit=pin, switching=switching)
@@ -679,6 +752,24 @@ class RegistryLifecycleTests(unittest.TestCase):
         error, progress, calls = self.checkout_with(pin=None)
         self.assertIn("needs the reviewed commit", str(error))
         self.assertEqual(calls, [])
+
+    def test_update_of_a_direct_root_checks_served_paths_even_with_a_legacy_manifest(self):
+        # Migrated installs keep a manifest without server_folder; the registered root still gets the denials.
+        for change in ({"health_path": "lib/health.php"}, {"dashboard_path": "client/"},
+                       {"assets": {"icon": "docs/icon.png"}}, {"health_path": "ui/config.json"}):
+            for switching in (False, True):
+                error, progress, calls = self.checkout_with(switching=switching, root="DeadDropServer", incoming=change)
+                self.assertIn("never serves. Nothing was updated.", str(error), change)
+                self.assertNotIn("merge", calls)
+                self.assertNotIn("checkout", calls)
+                self.assertFalse(progress["changed"])
+        error, progress, calls = self.checkout_with(switching=False, root="DeadDropServer")
+        self.assertIsNone(error)
+        self.assertIn("merge", calls)
+        # A custom-mods install is unchanged: those paths stay allowed there.
+        error, _, calls = self.checkout_with(switching=False, incoming={"health_path": "lib/health.php"})
+        self.assertIsNone(error)
+        self.assertIn("merge", calls)
 
     def test_update_passes_pin_and_refusal_keeps_mod_ready(self):
         mod.write_entry(self.entry())
@@ -911,6 +1002,310 @@ class RegistryLifecycleTests(unittest.TestCase):
         finally:
             for name, value in saved.items():
                 setattr(mod, name, value)
+
+    def legacy_install(self):
+        """A ready custom-mods/example-server install with a config, as Core left it."""
+        folder = mod.MOD_ROOT + "/example-server"
+        os.makedirs(folder + "/config")
+        with open(folder + "/config/config.php", "w") as handle:
+            handle.write("<?php return [];")
+        mod.write_entry(self.entry())
+        return folder
+
+    def migrate_with(self, name="DeadDropServer", dirty=b"", head=None, problem=None, reload_lag=5, leak=None,
+                     timeout=5):
+        """Run migrate-root with git, backup and a fake Apache; returns (error, calls).
+
+        Each setup-web is a graceful reload: the next reload_lag requests are still answered by the previous
+        config. The first config denies /<name> (403); later ones grant it (404 while missing) and deny
+        ROOT_PROBES (403, except leak); the old /custom-mods/<id> alias answers only from a config written
+        while the registry entry had its legacy_route.
+        """
+        calls = []
+        old = {"grant": False, "alias": False}
+        apache = {"loaded": old, "pending": old, "lag": 0}
+        dest = mod.WEB_ROOT + "/" + name
+
+        class Result:
+            def __init__(self, out=b""):
+                self.returncode, self.stdout = 0, out
+
+        def git(args, **kwargs):
+            if args[0] == "status":
+                return Result(dirty)
+            if args[0] == "rev-parse":
+                return Result((head or "a" * 40).encode())
+            return Result(b"main")
+
+        def backup_for_move(entry):
+            target = f"{mod.BACKUP_ROOT}/{entry['id']}/20261021000000-1"
+            os.makedirs(target, exist_ok=True)
+            return target
+
+        def setup_web():
+            calls.append(("setup-web", sorted(os.listdir(mod.WEB_ROOT))))
+            alias = bool(mod.read_entry("example-server").get("legacy_route"))
+            apache.update(pending={"grant": True, "alias": alias}, lag=reload_lag)
+
+        def answering():
+            if apache["lag"]:
+                apache["lag"] -= 1
+            else:
+                apache["loaded"] = apache["pending"]
+            return apache["loaded"]
+
+        def http_status(url):
+            loaded, path = answering(), url.split(f"/{name}/", 1)[1]
+            if path.startswith("ddistro-reload-"):
+                calls.append(("answer", os.path.lexists(dest), 404 if loaded["grant"] else 403))
+            if not loaded["grant"]:
+                return 403
+            if path in mod.ROOT_PROBES:
+                return 404 if path == leak else 403
+            return 200 if os.path.lexists(dest + "/" + path) else 404
+
+        def route_problem(entry, folder):
+            if folder == "" and (problem or not answering()["alias"]):
+                return problem or "http://127.0.0.1:19000/custom-mods/example-server/health.php: HTTP 404"
+            return None
+
+        names = ("require_root", "acquire_lock", "read_protection_lists", "require_safe_web_root", "git",
+                 "backup_for_move", "protect_root", "setup_web", "http_status", "route_problem", "RELOAD_TIMEOUT")
+        saved = {n: getattr(mod, n) for n in names}
+        mod.require_root = mod.acquire_lock = mod.read_protection_lists = mod.require_safe_web_root = lambda: None
+        mod.git, mod.backup_for_move, mod.setup_web = git, backup_for_move, setup_web
+        mod.protect_root = lambda folder: calls.append(("protect", folder))
+        mod.http_status, mod.route_problem, mod.RELOAD_TIMEOUT = http_status, route_problem, timeout
+        if os.name == "nt":  # Windows realpath rewrites temp paths, so the link check runs on POSIX only
+            real = os.path.realpath
+            os.path.realpath = lambda path: path
+            self.addCleanup(setattr, os.path, "realpath", real)
+        try:
+            mod.command_migrate_root({"id": "example-server", "server_folder": name})
+        except mod.ModError as error:
+            return error, calls
+        finally:
+            for n, value in saved.items():
+                setattr(mod, n, value)
+        return None, calls
+
+    def test_migrate_root_renames_in_place_and_keeps_old_url_as_alias(self):
+        folder = self.legacy_install()
+        inode = os.stat(folder + "/config/config.php").st_ino
+        error, calls = self.migrate_with()
+        self.assertIsNone(error)
+        dest = mod.WEB_ROOT + "/DeadDropServer"
+        self.assertFalse(os.path.lexists(folder))
+        self.assertEqual(os.stat(dest + "/config/config.php").st_ino, inode)
+        # Protection saved and applied, and Apache seen answering with it (the open port proves nothing), before
+        # the folder appeared; then the alias was applied and its route retried until that reload answered.
+        self.assertEqual(calls, [("protect", "DeadDropServer"), ("setup-web", ["custom-mods"]),
+                                 ("answer", False, 403), ("answer", False, 404), ("answer", False, 404),
+                                 ("answer", False, 404), ("setup-web", ["DeadDropServer", "custom-mods"])])
+        entry = mod.read_entry("example-server")
+        self.assertNotIn("migration", entry)
+        self.assertEqual((entry["folder"], entry["server_folder"], entry["legacy_route"], entry["database"]),
+                         (dest, "DeadDropServer", "/custom-mods/example-server", "custom_example_server"))
+        self.assertEqual(mod.checked_folder(entry), dest)
+        self.assertEqual(mod.web_locations(), (["DeadDropServer"], [("example-server", "DeadDropServer")]))
+        status = mod.status_entry(entry, False)
+        self.assertEqual((status["dashboard_url"], status["legacy_url"]),
+                         ("http://127.0.0.1:19000/DeadDropServer/ui/", "http://127.0.0.1:19000/custom-mods/example-server/"))
+        self.assertIsNone(mod.tombstone_problem(mod.unregistered_entry(entry), "example-server"))
+        self.assertEqual(mod.web_locations()[0], ["DeadDropServer"])  # a tombstone keeps its root protected
+        error, _ = self.migrate_with()
+        self.assertIn("already in", str(error))
+
+    def test_migrate_root_never_renames_before_apache_answers_with_the_protection(self):
+        folder = self.legacy_install()
+        # The reload never takes effect, or takes effect without a denial: refused, nothing moved or recorded.
+        for kwargs, text in (({"reload_lag": 10 ** 6}, "did not answer with the protection"),
+                             ({"leak": "lib/"}, "did not answer with the protection")):
+            error, calls = self.migrate_with(timeout=0.3, **kwargs)
+            self.assertIn(text, str(error), kwargs)
+            self.assertIn("Nothing was moved", str(error))
+            self.assertEqual([c for c in calls if c[0] == "setup-web"], [("setup-web", ["custom-mods"])])
+            self.assertTrue(all(not c[1] for c in calls if c[0] == "answer"))
+            self.assertTrue(os.path.isdir(folder + "/config"))
+            self.assertFalse(os.path.lexists(mod.WEB_ROOT + "/DeadDropServer"))
+            self.assertEqual(mod.read_entry("example-server"), self.entry())
+
+    def test_migrate_root_refusals_change_nothing(self):
+        folder = self.legacy_install()
+        os.makedirs(mod.WEB_ROOT + "/takenserver")
+        other = dict(self.entry(), id="other-mod", folder=mod.WEB_ROOT + "/OtherServer", server_folder="OtherServer")
+        mod.write_entry(other)
+        moving = dict(self.entry(), id="third-mod", folder=mod.MOD_ROOT + "/third-mod",
+                      migration={"server_folder": "ThirdServer"})
+        mod.write_entry(moving)
+        for kwargs, text in (({"name": "TakenServer"}, "already exists"), ({"name": "OTHERServer"}, "registered to"),
+                             ({"name": "ThirdServer"}, "registered to"),
+                             ({"dirty": b" M lib/app.php"}, "changed locally"), ({"head": "b" * 40}, "registered branch")):
+            error, calls = self.migrate_with(**kwargs)
+            self.assertIn(text, str(error), kwargs)
+            self.assertEqual(calls, [], kwargs)
+            self.assertTrue(os.path.isdir(folder + "/config"))
+            self.assertEqual(mod.read_entry("example-server"), self.entry())
+        mod.write_entry(self.entry("failed"))
+        self.assertIn("Only a ready mod", str(self.migrate_with()[0]))
+
+    def test_failed_migration_check_moves_everything_back(self):
+        folder = self.legacy_install()
+        error, calls = self.migrate_with(problem="http://127.0.0.1:19000/custom-mods/example-server: HTTP 404",
+                                         timeout=1)
+        self.assertIn("It was undone", str(error))
+        self.assertTrue(os.path.isdir(folder + "/config"))
+        self.assertFalse(os.path.lexists(mod.WEB_ROOT + "/DeadDropServer"))
+        self.assertEqual(mod.read_entry("example-server"), self.entry())
+        self.assertEqual(calls[-1][0], "setup-web")
+
+    def interrupted(self, where):
+        """migrate-root killed just before (\"rename\") or just after (\"after-rename\") the rename."""
+        real_rename, real_finish = os.rename, mod.finish_move
+
+        def die(*args):
+            raise KeyboardInterrupt  # stands in for the process dying: nothing after this runs
+        if where == "rename":
+            os.rename = die
+        else:
+            mod.finish_move = die
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.migrate_with()
+        finally:
+            os.rename, mod.finish_move = real_rename, real_finish
+        entry = mod.read_entry("example-server")
+        self.assertEqual(entry["migration"]["server_folder"], "DeadDropServer")
+        self.assertEqual(entry["migration"]["entry"], self.entry())
+        return entry
+
+    def test_interrupted_migration_is_resumed_by_a_rerun(self):
+        dest = mod.WEB_ROOT + "/DeadDropServer"
+        folder = self.legacy_install()
+        for name in ("require_root", "acquire_lock"):
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, lambda: None)
+        for where in ("rename", "after-rename"):
+            inode = os.stat(folder + "/config/config.php").st_ino
+            entry = self.interrupted(where)
+            self.assertEqual(os.path.isdir(dest), where == "after-rename")
+            # Until it is resumed, every other command refuses and status says what to run.
+            for call in (lambda: mod.checked_folder(entry), lambda: mod.backup(entry),
+                         lambda: mod.command_unregister({"id": "example-server"}),
+                         lambda: mod.drop_legacy_url(entry)):
+                with self.assertRaises(mod.ModError, msg=where) as caught:
+                    call()
+                self.assertIn("--server-folder DeadDropServer to finish or undo it", str(caught.exception))
+            status = mod.status_entry(entry, False)
+            self.assertEqual(status["state"], "failed")
+            self.assertIn("was interrupted", status["message"])
+            error, calls = self.migrate_with()
+            self.assertIsNone(error, where)
+            entry = mod.read_entry("example-server")
+            self.assertNotIn("migration", entry)
+            self.assertEqual((entry["folder"], entry["server_folder"]), (dest, "DeadDropServer"))
+            self.assertEqual(os.stat(dest + "/config/config.php").st_ino, inode)
+            self.assertFalse(os.path.lexists(folder))
+            self.assertEqual(calls[-1], ("setup-web", ["DeadDropServer", "custom-mods"]))
+            # Reset for the next case.
+            os.rename(dest, folder)
+            mod.write_entry(self.entry())
+
+    def test_interrupted_migration_refuses_anything_but_its_exact_folder(self):
+        folder = self.legacy_install()
+        dest = mod.WEB_ROOT + "/DeadDropServer"
+        pending = self.interrupted("rename")
+
+        def refused(text, **kwargs):
+            error, calls = self.migrate_with(**kwargs)
+            self.assertIn(text, str(error), kwargs)
+            self.assertEqual([c for c in calls if c[0] != "answer"], [], kwargs)
+            self.assertEqual(mod.read_entry("example-server"), pending, kwargs)
+        refused("was to /DeadDropServer", name="OtherServer")
+        refused("changed locally", dirty=b" M lib/app.php")
+        refused("registered branch", head="b" * 40)
+        os.makedirs(dest)  # both paths: neither is adopted
+        refused("Both")
+        self.assertEqual(os.listdir(dest), [])
+        os.rmdir(dest)
+        os.rename(folder, folder + "-elsewhere")  # neither path
+        refused("Neither")
+        os.makedirs(folder)  # a different folder in its place is never taken over
+        refused("is not the folder that was being moved")
+        os.rmdir(folder)
+        os.rename(folder + "-elsewhere", folder)
+        for tamper in ({"backup": "/tmp/x"}, {"source": mod.WEB_ROOT + "/HerikaServer"}, {"folder_id": [1, 2, 3]},
+                       {"entry": dict(self.entry(), database="postgres")}):
+            mod.write_entry(dict(pending, migration=dict(pending["migration"], **tamper)))
+            error, calls = self.migrate_with()
+            self.assertIn("record of example-server is damaged", str(error), tamper)
+            self.assertEqual(calls, [])
+        mod.write_entry(dict(pending, commit="e" * 40))  # the entry no longer matches the recorded one
+        self.assertIn("damaged", str(self.migrate_with()[0]))
+        self.assertTrue(os.path.isdir(folder + "/config"))
+        mod.write_entry(pending)
+        self.assertIsNone(self.migrate_with()[0])
+        self.assertTrue(os.path.isdir(dest + "/config"))
+
+    def test_migrate_root_refuses_a_held_config_lock(self):
+        if os.name == "nt":
+            self.skipTest("needs flock")
+        import fcntl
+        folder = self.legacy_install()
+        with open(folder + "/config/config.php.lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            error, calls = self.migrate_with()
+        self.assertIn("lock is held", str(error))
+        self.assertEqual(calls, [])
+        self.assertTrue(os.path.isdir(folder))
+
+    def test_web_root_may_be_app_owned_but_never_writable_or_unknown(self):
+        if os.name == "nt" or os.geteuid() == 0:
+            self.skipTest("needs POSIX modes and a non-root test user")
+        os.makedirs(mod.WEB_ROOT)
+        saved = mod.pwd_uid
+        self.addCleanup(setattr, mod, "pwd_uid", saved)
+        # DwemerDistro's standard web root: dwemer:www-data 2755 (the test user stands in for dwemer).
+        mod.pwd_uid = lambda name: os.getuid()
+        os.chmod(mod.WEB_ROOT, 0o2755)
+        mod.require_safe_web_root()
+        for mode in (0o2775, 0o757):
+            os.chmod(mod.WEB_ROOT, mode)
+            with self.assertRaises(mod.ModError, msg=oct(mode)):
+                mod.require_safe_web_root()
+        os.chmod(mod.WEB_ROOT, 0o2755)
+        mod.pwd_uid = lambda name: os.getuid() + 1  # owned by neither root nor the app account
+        with self.assertRaises(mod.ModError) as caught:
+            mod.require_safe_web_root()
+        self.assertIn("owned by root or dwemer", str(caught.exception))
+        mod.pwd_uid = lambda name: os.getuid()
+        os.rename(mod.WEB_ROOT, mod.WEB_ROOT + "-real")
+        os.symlink(mod.WEB_ROOT + "-real", mod.WEB_ROOT)
+        with self.assertRaises(mod.ModError):
+            mod.require_safe_web_root()
+
+    def test_direct_root_creation_never_adopts_or_follows(self):
+        if os.name == "nt" or os.geteuid() == 0:
+            self.skipTest("needs POSIX links and a non-root test user")
+        os.makedirs(mod.WEB_ROOT + "/TakenServer/keep")
+        with self.assertRaises(mod.ModError) as caught:
+            mod.create_direct_root(mod.WEB_ROOT + "/TakenServer")
+        self.assertIn("appeared", str(caught.exception))
+        self.assertTrue(os.path.isdir(mod.WEB_ROOT + "/TakenServer/keep"))
+        # The app account swaps the new name for a link before root changes it: nothing is followed.
+        target = self.temp.name + "/elsewhere"
+        os.makedirs(target)
+        real_mkdir = os.mkdir
+        os.mkdir = lambda path, mode=0o777: (real_mkdir(path, mode), os.rmdir(path), os.symlink(target, path))
+        self.addCleanup(setattr, os, "mkdir", real_mkdir)
+        with self.assertRaises(mod.ModError) as caught:
+            mod.create_direct_root(mod.WEB_ROOT + "/SwapServer")
+        self.assertIn("replaced", str(caught.exception))
+        self.assertTrue(os.path.islink(mod.WEB_ROOT + "/SwapServer"))
+        # A real folder that is not root's fresh, empty one (here the test user's) is refused too.
+        os.mkdir = lambda path, mode=0o777: real_mkdir(path, mode)
+        with self.assertRaises(mod.ModError):
+            mod.create_direct_root(mod.WEB_ROOT + "/PlainServer")
 
     def test_status_asset_urls_use_fixed_route_for_installed_files(self):
         folder = mod.MOD_ROOT + "/example-server"
