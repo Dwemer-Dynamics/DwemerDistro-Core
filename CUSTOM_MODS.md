@@ -1,4 +1,67 @@
-# Custom mods (manifest version 1)
+# Custom mods
+
+## Published client/server packages (manifest version 2)
+
+Version 1 Git/branch installations keep their existing lifecycle. Version 2 adds
+`game` and `distribution` metadata and installs release packages, never the whole
+monorepo. Authors select runtime files before publishing; a source root such as
+`server/` is stripped from the server ZIP. Health/setup/artwork paths describe the
+installed server. Core's ready state proves the server only; Windows client progress
+and private pairing belong to the launcher.
+
+```bash
+ddistro_custom_mod release-check https://github.com/owner/mod --json
+sudo ddistro_custom_mod release-install https://github.com/owner/mod --tag v1.0.0 \
+  --expect-commit <commit> --expect-release <descriptor-sha256>
+sudo ddistro_custom_mod release-update my-mod --tag v1.1.0 \
+  --expect-commit <commit> --expect-release <descriptor-sha256>
+```
+
+Each published stable release contains `kagrenac-release.json` and separate server/client
+ZIP assets. The generated descriptor has schema_version 1, repository, exact commit,
+version/tag, the full version 2 manifest, and packages.server/client. Each package has
+asset, sha256, compressed size and files (relative path, sha256, unpacked size).
+The GitHub tag must resolve to that commit; default-branch changes are irrelevant.
+Changed preview pins, unexpected redirects or mismatched assets are refused. Prefer
+immutable releases. Authors maintain only `dwemer-mod.json`; packaging generates receipts.
+
+Version 2 game metadata: required id/name/executable; optional steam_app_id, version,
+loader, loader_path, executable_sha256, enable_in_game. Distribution has server/client
+selections: root (default `.`), include and exclude lists. The client also has install
+{profile: "game-directory", path, config_path}. That profile places files beneath a
+selected game folder and writes private Kagrenac JSON pairing. It is not evidence that
+the native engine adapter works. There are no manifest shell commands or elevated hooks.
+KAGRENAC's `docs/PUBLISHING.md` specifies the glob rules and publishing commands.
+
+Optional top-level features (up to 16 short strings) and testing (summary/evidence_path)
+describe gameplay and author-reported checks. Evidence paths are repository-relative,
+not server paths; docs excluded from installation remain available at the pinned commit.
+
+Limits: 4 MiB descriptor, 20,000 files, 512 MiB compressed/unpacked per package.
+Only regular relative files are accepted; links, special files, private config,
+duplicate/case-colliding paths and traversal are refused. Every ZIP member is checked
+against its receipt. Files and PHP migrations are applied as dwemer, never root.
+Existing ids, folders and databases are not adopted.
+
+Registry entries mark install_mode `release`, release identity and owned file receipts.
+Updates refuse local edits/collisions and back up config/database before changing code.
+They remove obsolete owned files and retain private config, its lock inode and unknown
+files. Interrupted operations record pending_release; retry that exact descriptor before
+another version. Failed migration/health does not claim automatic database rollback.
+Protection is installed before files. Unregister keeps files/database; adding the same
+reviewed repository can restore its package install.
+
+`release-pair <id>` is private launcher transport: fixed PHP runs as dwemer to read the
+ready server's token/route into private stdout. Never display or log it. The launcher
+writes an ACL-protected config and preserves an existing matching config byte-for-byte.
+There is no provider call or game launch.
+
+Administrator fixtures may use `release-check|release-install --local-release
+/absolute/path/kagrenac-release.json`; release-update accepts it with an id. Only root
+may use this mode. It validates actual local packages but does not prove GitHub
+publication or gameplay. Normal players use public GitHub release APIs.
+
+## Legacy branch installations (manifest version 1)
 
 `bin/ddistro_custom_mod` installs and manages user-added PHP 8.2 + PostgreSQL mod
 servers from public Git repositories. It is a narrow contract, not a plugin platform:

@@ -1352,6 +1352,52 @@ class RegistryLifecycleTests(unittest.TestCase):
             mod.run = saved
 
 
+class ReleasePackageTests(unittest.TestCase):
+    def test_cross_platform_package_paths_and_collisions(self):
+        release = mod.release_support()
+        for path in ("../file", "/file", "lib/.env", "con.txt", "mod/file.", "a\\b"):
+            with self.assertRaises(ValueError, msg=path):
+                release.relative(path)
+        package = {"files": [{"path": "Mod.lua", "sha256": "a" * 64, "size": 1},
+                             {"path": "mod.lua", "sha256": "a" * 64, "size": 1}]}
+        with self.assertRaises(ValueError):
+            release.inventory(package)
+
+    def test_v2_is_opt_in_and_package_rules_are_validated(self):
+        data = json.loads(json.dumps(MANIFEST))
+        data.update(schema_version=2, game={"id": "test", "name": "Test", "executable": "test.exe"},
+                    distribution={"server": {"root": "server", "include": ["**"]},
+                                  "client": {"include": ["**"], "exclude": ["**/*.pdb"],
+                                             "install": {"profile": "game-directory", "path": "mods/test", "config_path": "config.json"}}})
+        self.assertEqual(2, mod.parse_manifest(json.dumps(data))["schema_version"])
+        data["schema_version"] = 1
+        with self.assertRaises(mod.ModError):
+            mod.parse_manifest(json.dumps(data))
+        data["schema_version"] = 2
+        data["distribution"]["server"]["root"] = "../other"
+        with self.assertRaises(mod.ModError):
+            mod.parse_manifest(json.dumps(data))
+
+    def test_file_receipts_refuse_overwrite_and_allow_interrupted_retry(self):
+        release = mod.release_support()
+        import hashlib
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "file.php")
+            with open(path, "wb") as handle:
+                handle.write(b"new")
+            old = {"file.php": {"sha256": hashlib.sha256(b"old").hexdigest()}}
+            new = {"file.php": {"sha256": hashlib.sha256(b"new").hexdigest()}}
+            with self.assertRaises(ValueError):
+                release.verify_files(root, old, new)
+            release.verify_files(root, old, new, True)
+            with self.assertRaises(ValueError):
+                release.verify_files(root, {}, new)
+            with open(path, "wb") as handle:
+                handle.write(b"user edit")
+            with self.assertRaises(ValueError):
+                release.verify_files(root, old, new, True)
+
+
 class ExampleServerContractTests(unittest.TestCase):
     def test_example_server_manifest_and_template(self):
         if not EXAMPLE_SERVER:
