@@ -101,6 +101,7 @@ if [ $? -eq 0 ]; then
     # Assistant runtime helpers. Only the scripts are installed here: the pinned Codex runtime,
     # bubblewrap, and the ddagent account come from an explicit install_assistant_runtime run.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_agent /usr/local/bin/ddistro_agent || exit 1
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_api /usr/local/bin/ddistro_api || exit 1
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/install_assistant_runtime /usr/local/bin/install_assistant_runtime || exit 1
     printf "${GREEN}[SUCCESS] Scripts successfully copied to /usr/local/bin/${NC}\n"
 else
