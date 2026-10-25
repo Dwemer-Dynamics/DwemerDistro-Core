@@ -14,6 +14,10 @@ ddistro server update <product> --branch <branch> [--force]       # root only
 ddistro changes prepare --product herika [--path RELATIVE ...]    # root only, see File changes
 ddistro changes diff|stage|status|rollback TASK | changes list    # root only
 ddistro changes apply TASK --manifest-sha256 HASH                 # root only
+ddistro agent status | agent probe                                # probe root only, see Assistant agent
+ddistro agent serve --task TASK                                   # root only, raw JSONL
+ddistro models herika                                             # root only, see Model assignments
+ddistro inventory                                                 # any user, see Inventory
 ```
 
 Products are the five `ddistro_server` products: `herika` (aliases `chim`, `skyrim`),
@@ -53,7 +57,12 @@ stdout and failures are `[FAIL] ...` on stderr.
 | `timeout`, `cancelled` | 124, 130 | Helper stopped after timeout, or the caller cancelled |
 
 `capabilities` lists only implemented commands, aliases, log names, limits, and error
-codes; `features.file_changes` and `locks` are `true`, `agent` and `chat` are `false`.
+codes; `features.file_changes` and `locks` are `true` and `chat` is `false`. `features.agent`
+is `true` only when the trusted `ddistro_agent` helper is installed; it never means the
+assistant is ready. Readiness comes only from `agent status` (`installed` and `probe_passed`).
+`features.models` and `capabilities.models` describe `models herika` (roles and limits).
+`features.inventory` and `capabilities.inventory` describe `inventory` (scope, the products
+with an extension folder, component ids, and limits).
 
 ## Status and update
 
@@ -98,7 +107,9 @@ at `/var/www/html/HerikaServer` is editable; other products are `unsupported`.
   text file or a new file in an existing folder. `.git`, logs, caches, uploads, voices,
   `conf/conf*.php`, and likely credential files are refused even when named. No paths gives a
   diagnostic-only workspace with sanitized status and recent log lines in `.ddistro-context/`.
-- Task state is `/var/lib/dwemerdistro/assistant/tasks/<uuid>/` (root, `0700`; files `0600`)
+- Task state is `/var/lib/dwemerdistro/assistant/tasks/<uuid>/` (root `0700`, or
+  `root:ddagent 0710` when the workspace is `ddagent`'s so the assistant runtime can reach
+  `work/` without listing or reading anything else; files `0600`)
   with `task.json` (`schema_version`, `task_id`, `product`, `workspace`, baseline hashes and
   metadata). The workspace is `<task>/work`, owned by `ddagent` if it exists, otherwise
   `dwemer`; a root broker can bind it without exposing the task metadata.
@@ -131,10 +142,125 @@ nested updates work), while `changes apply` and `rollback` need it exclusively a
 `busy` otherwise. Root creates it if missing and never replaces it; unprivileged updaters
 only open it read-only and stop with a message if it is missing.
 
+## Assistant agent
+
+`agent` commands run the root-owned `/usr/local/bin/ddistro_agent` (installed `0755` by
+`update.sh` and trust-checked like the other helpers). See ASSISTANT_RUNTIME.md for the
+runtime, sandbox, and probe. `update.sh` never downloads the runtime or installs packages;
+that is an explicit `install_assistant_runtime` run as root.
+
+- `agent status` (any user) returns `{installed, probe_passed, provider: "codex", version,
+  reason}` exactly as the helper reports it. `reason` is a token such as `ready`,
+  `probe_required`, `probe_stale`, `not_installed`, or `bwrap_unsupported`. A runtime that
+  is not ready is still `ok`; only an unusable helper is an error.
+- `agent probe` (root, adds `operation_id`) runs the real isolation probe and returns
+  `{passed, checks: [{name, passed}], diagnostics, ...status fields}`, failed checks first.
+  A failed probe is `ok` with `passed: false`, and the helper has removed the attestation.
+  A running session gives `busy` (75) and leaves the attestation unchanged. `diagnostics`
+  holds per-step exit status and bounded, redacted stderr lines.
+- `agent serve --task TASK` (root) accepts exactly those arguments; `--json` and
+  `--request-id` are refused. After checking the helper, `ddistro` replaces itself with
+  `ddistro_agent serve --task TASK` (same process, a minimal environment, working directory
+  `/`), so stdin and stdout are the helper's raw Codex App Server JSONL with no envelope or
+  progress text. Refusals by `ddistro` itself are one `{"error", "reason"}` line on stderr
+  with exit `64` (bad arguments) or `3` (`requires_root`, `helper_unavailable`); the
+  helper's own refusals and exit codes are described in ASSISTANT_RUNTIME.md.
+
+## Model assignments
+
+`models herika` (aliases `chim`, `skyrim`; other products are `unsupported`, 69) reports the
+CHIM connector assigned to each role of each configured profile. These are configured profile
+assignments, not necessarily the profile an NPC is using.
+
+```json
+{"product": "herika", "available": true, "scope": "configured_profiles",
+ "captured_at": "2026-10-19T12:00:00Z", "truncated": false, "reason": "",
+ "assignments": [{"profile_id": 1, "profile": "Default", "role": "standard", "connector_id": 3,
+                  "connector": "OpenRouter", "model": "...", "provider": "...", "driver": "..."}]}
+```
+
+- Roles are `standard`, `fast`, `powerful`, `experimental`, `formatter`, `fallback`, and
+  `diary` (`core_profiles.llm_primary_id` ... `llm_quaternary_id`, `llm_formatter_id`,
+  `llm_fallback_id`, `diary_connector_id`), ordered by profile id then role. A role whose
+  field is absent from the schema is skipped; an unset or dangling connector id gives no row.
+- The read runs as `/usr/sbin/runuser -u postgres -- /usr/bin/psql -X -A -t -q --no-password`
+  over the local socket `/var/run/postgresql`, port `DDISTRO_POSTGRES_PORT` (digits) or 5432,
+  database `dwemer`, in one read-only transaction with connect, statement, and lock timeouts
+  and a minimal environment. Both binaries are trust-checked (`psql` may be one root-owned
+  link hop to `pg_wrapper`). There are no SQL, schema, or database arguments and no PHP.
+- Only fixed SQL runs: a names-only check of `information_schema.columns` for the known
+  `public` columns, then `public.core_profiles` `id`, `label`, and the role fields joined to
+  `public.core_llm_connector` `id`, `label`, `model`, `provider`, `driver`. URLs, metadata, API
+  keys and badges, prompts, and NPC data are never selected.
+- At most 200 assignments (`truncated: true` when there are more); each string is clipped,
+  redacted like log lines (URL credentials and queries, keys, tokens), made single-line, and
+  bounded to 256 characters. A missing label or model is `""`.
+- When the read cannot be made the result is still `ok` with `available: false`, no
+  assignments, and a `reason` token: `requires_root`, `helper_unavailable`,
+  `database_unavailable`, `schema_missing`, `query_failed`, `timeout`, or
+  `unexpected_output`. `psql` stderr and SQL are never returned, and no model is guessed.
+
+## Inventory
+
+`inventory` is one fresh, read-only, presence-only snapshot of the whole distro for the
+launcher's assistant. It runs no repository, plugin, or component code, reads no extension
+or component code, configuration, or credential contents itself, and follows no link. The
+server and custom mod rows come from the trusted `ddistro_server` and `ddistro_custom_mod`
+helpers, which consult their own records (version, catalog presence) internally; only an
+allowlisted status and presence projection of their output is kept. Presence is all it
+reports, never health: an extension that is present may be disabled or broken, and a
+component whose startup marker is present may not be running.
+
+```json
+{"captured_at": "2026-10-19T12:00:00Z", "scope": "presence_only", "read_as": "root", "complete": true,
+ "servers": {"available": true, "reason": "", "items": [{"product": "herika", "state": "installed",
+             "repository_state": "managed", "database_present": true, "branch": "aiagent", "version": "..."}]},
+ "extensions": {"items": [{"product": "herika", "root": "ext", "state": "listed", "total": 2, "truncated": false,
+                           "skipped": 0, "entries": [{"name": "example_mod", "kind": "dir"}]}],
+                "no_known_root": ["lorkhan", "stobe", "reign"]},
+ "components": {"basis": "startup_markers", "items": [{"id": "xtts", "name": "CHIM XTTS", "role": "tts",
+                                                        "state": "present"}]},
+ "custom_mods": {"available": true, "reason": "", "truncated": false,
+                 "items": [{"id": "example-server", "name": "...", "state": "ready", "branch": "main", "commit": "..."}]}}
+```
+
+- `servers` comes from the same validated `ddistro_server status all --json` as `status`
+  (bounded to 20 seconds here), reduced to product, state, repository state, database
+  presence (`null` when unknown), branch, and version; branch and version are redacted and
+  clipped to 128 characters. Database presence is the helper's own catalog check; no
+  product table is read.
+- `extensions` lists the names directly inside `ext/` of HerikaServer and DialecticServer,
+  the products whose repositories load add-ons from that folder; `no_known_root` names the
+  others. Each folder is opened from `/` one component at a time with `O_NOFOLLOW`, each
+  step anchored to the folder already opened; when a step fails, a no-follow stat of that
+  name under the same folder decides the state, so any link on the way (the product root,
+  `ext/`, or a parent) gives `redirected` and nothing is listed. `state` is `listed`,
+  `absent` (no `ext/`), `product_absent`, `redirected`, `not_directory` (a non-folder where a
+  folder should be), or `unreadable` (including a name that changed while being checked).
+  `kind` is `dir`, `file`, `link` (never followed), or `other`. Hidden names, names outside
+  `[A-Za-z0-9][A-Za-z0-9 ._+()@,=~-]{0,127}`, and names the log redaction would change are
+  counted in `skipped`, not listed; any skipped name makes `complete` false, because those
+  names are omitted. At most 200 names are returned, sorted; at most 4096
+  entries are examined, and `truncated` marks either limit (`total` is then a lower bound).
+- `components` checks the startup markers `start_env` and `update_gws` use (for example
+  `/home/dwemer/xtts-api-server/start.sh`, the Dwemer Dashboard's `.git`), without
+  following links: `present`, `absent`, `redirected` (the marker or any folder above it is a
+  link), or `unreadable`. Present means startup
+  would try the component, not that it runs or is healthy. Paths are never returned.
+- `custom_mods` runs the trusted `/usr/local/bin/ddistro_custom_mod status --json` (no
+  `--check-health`, no network, 10 seconds) and keeps only `id`, `name`, `state`, `branch`,
+  and a 40-hex `commit` for at most 100 mods; repository, URLs, folders, databases, and
+  messages are dropped.
+- A section that cannot be read is still `ok`: `available: false` with a `reason` token
+  (`helper_unavailable`, `helper_failed`, `helper_protocol`, `timeout`, or `failed`). `complete`
+  is true only when every section was read in full: nothing unavailable, truncated, or
+  skipped, and no folder or marker `redirected`, `not_directory`, or `unreadable`; cancellation stops the helper and the
+  whole command is `cancelled`. Run as a user other than root, folders that user cannot read
+  are `unreadable` and database presence may be `null`; the launcher runs it as root.
+
 ## Trust boundaries and future scope
 
 The CLI is a convenience and contract layer, not a sandbox or authorization boundary:
 anything it can do, the same user can do directly. Root-only work stays in
-`ddistro_server` and `ddistro_changes`, which own their locking. Later stages may add an
-isolated assistant agent and launcher chat; each will appear in `capabilities` only when
-implemented. The existing CHIM-MCP `/chat` is unchanged.
+`ddistro_server` and `ddistro_changes`, which own their locking. Launcher chat may come
+later and will appear in `capabilities` only when implemented. The existing CHIM-MCP `/chat` is unchanged.
