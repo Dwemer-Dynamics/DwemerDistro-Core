@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -36,6 +37,18 @@ MANIFEST = {
 }
 TREE = [("100644", "blob", p) for p in ("dwemer-mod.json", "health.php", "config/config.example.php",
                                          "scripts/migrate.php", "ui/index.php")]
+
+
+def rules_deny(rules, url):
+    """(LocationMatch denies, DirectoryMatch/FilesMatch denies) for a URL under the (source, project, URL) rules."""
+    import posixpath
+    import re
+    source_dir, project_dir, url_pattern = rules
+    path = "/var/www/html" + url
+    by_dir = re.search(source_dir, path) or re.search(source_dir, posixpath.dirname(path))
+    by_file = re.search(project_dir, posixpath.dirname(path)) and re.search(
+        "^(" + mod.PROJECT_PRIVATE_FILES + ")$", posixpath.basename(path))
+    return bool(re.search(url_pattern, url)), bool(by_dir or by_file)
 
 
 def manifest(**changes):
@@ -94,30 +107,90 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(mod.config_uses_port("<VirtualHost *:19042>", 19042))
         self.assertFalse(mod.config_uses_port("Listen 8081\n<VirtualHost *:8081>", 19042))
 
+    def assert_rules_rendered(self, text, rules):
+        source_dir, project_dir, url_pattern = rules
+        vhost, grant = text.index("<VirtualHost"), text.index("\t\tRequire all granted")
+        self.assertLess(text.index(f'<DirectoryMatch "{source_dir}">\n\tRequire all denied'), vhost)
+        self.assertLess(text.index(f'<DirectoryMatch "{project_dir}">\n\t<FilesMatch "^(config\\.json|\\.env)$">\n'
+                                   "\t\tRequire all denied"), vhost)
+        self.assertGreater(text.index(f'<LocationMatch "{url_pattern}">\n\t\tRequire all denied'), grant)
+
     def test_web_site_denies_git_and_kagrenac_source_folders(self):
         import re
         text = mod.web_site_text(19042)
         vhost = text.index("<VirtualHost")
-        for pattern in (mod.GIT_DENY_DIR, mod.SOURCE_DENY_DIR):
-            self.assertLess(text.index(f'<DirectoryMatch "{pattern}">\n\tRequire all denied'), vhost)
+        self.assertLess(text.index(f'<DirectoryMatch "{mod.GIT_DENY_DIR}">\n\tRequire all denied'), vhost)
         grant = text.index("\t\tRequire all granted")
-        for pattern in (mod.GIT_DENY_URL, mod.SOURCE_DENY_URL):
-            self.assertGreater(text.index(f'<LocationMatch "{pattern}">\n\t\tRequire all denied'), grant)
-        denied_urls = ["/custom-mods/any-mod/.git/HEAD", "/custom-mods/any-mod/.git", "/ExampleServer/.git/config",
-                       "/custom-mods/any-mod/sub/.git/HEAD", "//custom-mods//any-mod//.git/HEAD",
-                       "/custom-mods/example-server/client/config.json", "/custom-mods/KagrenacServer/docs",
-                       "/custom-mods/KagrenacServer/ports/x/build/a.dll", "/ExampleServer/client/"]
+        self.assertGreater(text.index(f'<LocationMatch "{mod.GIT_DENY_URL}">\n\t\tRequire all denied'), grant)
+        known = (mod.SOURCE_DENY_DIR, mod.PRIVATE_DENY_DIR, mod.SOURCE_DENY_URL)
+        self.assert_rules_rendered(text, known)
+        self.assertEqual(text.count("<DirectoryMatch"), 3)
+        self.assertEqual(text.count("<LocationMatch"), 3)
+        git_urls = ["/custom-mods/any-mod/.git/HEAD", "/custom-mods/any-mod/.git", "/ExampleServer/.git/config",
+                    "/custom-mods/any-mod/sub/.git/HEAD", "//custom-mods//any-mod//.git/HEAD"]
+        for url in git_urls:
+            self.assertTrue(re.search(mod.GIT_DENY_URL, url), url)
+        for url in git_urls[:4]:
+            self.assertTrue(re.search(mod.GIT_DENY_DIR, "/var/www/html" + url), url)
+        # Every known Kagrenac route hides all source folders and the private files at any depth.
+        for root in ("/custom-mods/example-server", "/custom-mods/KagrenacServer", "/ExampleServer"):
+            for url in [f"{root}/{d}/x" for d in ("client", "ports", "docs", "config", "lib", "sql", "scripts")] + [
+                    f"{root}/docs", f"{root}/client/", f"{root}/ports/x/build/a.dll", f"{root}/config/config.php",
+                    f"{root}/scripts/migrate.php", f"{root}/config.json", f"{root}/.env", f"{root}/ui/config.json",
+                    f"{root}/a/b/.env"]:
+                self.assertEqual(rules_deny(known, url), (True, True), url)
+            for url in (f"{root}/health.php", f"{root}/ui/", f"{root}/ui/index.php", f"{root}/assets/icon.png",
+                        f"{root}/clients.php", f"{root}/libs/x.js", f"{root}/config.json.php", f"{root}/.envrc",
+                        f"{root}/api/x.php"):
+                self.assertEqual(rules_deny(known, url), (False, False), url)
+        self.assertTrue(re.search(mod.SOURCE_DENY_URL, "//custom-mods//KagrenacServer//sql//x.sql"))
         served_urls = ["/custom-mods/any-mod/health.php", "/custom-mods/any-mod/client/x.php",
-                       "/custom-mods/example-server/ui/", "/custom-mods/KagrenacServer/health.php",
-                       "/custom-mods/KagrenacServer/.gitignore", "/custom-mods/KagrenacServer/clients.php"]
-        url_deny = lambda url: any(re.search(p, url) for p in (mod.GIT_DENY_URL, mod.SOURCE_DENY_URL))
-        dir_deny = lambda url: any(re.search(p, "/var/www/html" + url) for p in (mod.GIT_DENY_DIR, mod.SOURCE_DENY_DIR))
-        for url in denied_urls:
-            self.assertTrue(url_deny(url), url)
-        for url in denied_urls[:4] + denied_urls[5:]:
-            self.assertTrue(dir_deny(url), url)
+                       "/custom-mods/any-mod/docs/readme.txt", "/custom-mods/any-mod/config.json",
+                       "/custom-mods/any-mod/.env", "/custom-mods/any-mod/lib/x", "/custom-mods/kagrenacserver/sql/x",
+                       "/custom-mods/KagrenacServer2/lib/x", "/custom-mods/example-server2/config/x",
+                       "/ExampleServer2/config.json", "/custom-mods/KagrenacServer/.gitignore"]
         for url in served_urls:
-            self.assertFalse(url_deny(url) or dir_deny(url), url)
+            self.assertEqual(rules_deny(known, url), (False, False), url)
+            self.assertFalse(re.search(mod.GIT_DENY_URL, url) or re.search(mod.GIT_DENY_DIR, "/var/www/html" + url),
+                             url)
+
+    def test_opted_in_projects_get_scoped_denials(self):
+        import re
+        self.assertEqual(mod.web_site_text(19042, []), mod.web_site_text(19042))
+        text = mod.web_site_text(19042, ["kag-proj", "kag-two"])
+        # The fixed rules are still rendered unchanged, once.
+        for pattern in (mod.GIT_DENY_DIR, mod.SOURCE_DENY_DIR, mod.PRIVATE_DENY_DIR, mod.GIT_DENY_URL,
+                        mod.SOURCE_DENY_URL):
+            self.assertEqual(text.count(f'"{pattern}"'), 1, pattern)
+        rules = mod.project_deny_rules(["kag-proj", "kag-two"])
+        url_pattern = rules[2]
+        self.assertIn(r"(kag\-proj|kag\-two)", url_pattern)
+        self.assert_rules_rendered(text, rules)
+        # Opting in only adds the project's own blocks.
+        added = (mod.deny_dir_text(*rules[:2]),
+                 f'\t<LocationMatch "{url_pattern}">\n\t\tRequire all denied\n\t</LocationMatch>\n')
+        self.assertEqual(text.replace(added[0], "", 1).replace(added[1], "", 1), mod.web_site_text(19042))
+
+        def denied(url):
+            return rules_deny(rules, url)
+
+        for url in ["/custom-mods/kag-proj/" + d + "/x" for d in ("client", "ports", "docs", "config", "lib", "sql",
+                                                                   "scripts")] + [
+                "/custom-mods/kag-two/config/config.php", "/custom-mods/kag-proj/config.json",
+                "/custom-mods/kag-proj/.env", "/custom-mods/kag-proj/client/config.json",
+                "/custom-mods/kag-proj/sub/.env"]:
+            self.assertEqual(denied(url), (True, True), url)
+        self.assertTrue(re.search(url_pattern, "//custom-mods//kag-proj//lib//x.php"))
+        for url in ("/custom-mods/kag-proj/health.php", "/custom-mods/kag-proj/ui/", "/custom-mods/kag-proj/api/x.php",
+                    "/custom-mods/kag-proj/assets/icon.png", "/custom-mods/kag-proj/clients.php",
+                    "/custom-mods/kag-proj/config.json.php", "/custom-mods/kag-proj/libs/x.js",
+                    "/custom-mods/kag-proj2/lib/x", "/custom-mods/xkag-proj/config/x", "/custom-mods/any-mod/lib/x",
+                    "/custom-mods/any-mod/config.json", "/custom-mods/any-mod/.env", "/custom-mods/any-mod/client/x.php",
+                    "/custom-mods/example-server/scripts/migrate.php"):
+            self.assertEqual(denied(url), (False, False), url)
+        for bad in (["KagrenacServer"], ["herika"], ["a|.*"], ["kag-proj)|(.*"]):
+            with self.assertRaises(mod.ModError, msg=bad):
+                mod.web_site_text(19042, bad)
 
     def test_rejects_bad_ids(self):
         for bad in ("ab", "Example", "-abc", "abc-", "a--b", "a_b", "../x", "herika", "stobe", "custom-mods",
@@ -289,6 +362,19 @@ class CliTests(unittest.TestCase):
         switch = mod.parse_args(["switch", "example-server", "--branch", "dev", "--expect-commit", "a" * 40])
         self.assertEqual((switch["branch"], switch["expect_commit"]), ("dev", "a" * 40))
         self.assertEqual(mod.parse_args(["branches", "example-server", "--json"])["id"], "example-server")
+        self.assertEqual(mod.parse_args(["update", "example-server", "--expect-commit", "a" * 40])["expect_commit"],
+                         "a" * 40)
+        self.assertEqual(mod.parse_args(["setup-web", "--protect-project", "kag-proj"])["protect_project"], "kag-proj")
+        self.assertNotIn("protect_project", mod.parse_args(["setup-web"]))
+        for argv in (["setup-web", "--protect-project"], ["setup-web", "--protect-project", "KagrenacServer"],
+                     ["setup-web", "--protect-project", "herika"], ["setup-web", "--protect-project", "../x"],
+                     ["setup-web", "--protect-project", "a$(id)b"], ["setup-web", "--protect-project", ""],
+                     ["setup-web", "--protect-project", "kag-proj", "--protect-project", "kag-two"],
+                     ["setup-web", "kag-proj"], ["install", "https://github.com/o/r", "--protect-project", "kag-proj"],
+                     ["update", "example-server", "--protect-project", "kag-proj"],
+                     ["update", "example-server", "--branch", "dev", "--expect-commit", "a" * 40]):
+            with self.assertRaises(mod.ModError, msg=argv):
+                mod.parse_args(argv)
         for argv in (["update", "example-server", "--force"], ["update", "../x"], ["update"],
                      ["install", "https://github.com/o/r", "https://github.com/o/s"],
                      ["update", "example-server", "--local-source", "/tmp/x"], ["purge", "example-server"],
@@ -315,10 +401,13 @@ class RegistryLifecycleTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         root = self.temp.name.replace("\\", "/")
         self.saved = {name: getattr(mod, name) for name in
-                      ("STATE_ROOT", "REGISTRY_ROOT", "BACKUP_ROOT", "MOD_ROOT", "LOCK_PATH")}
+                      ("STATE_ROOT", "REGISTRY_ROOT", "BACKUP_ROOT", "MOD_ROOT", "LOCK_PATH", "PROTECTED_PROJECTS",
+                       "APACHE_DIR")}
         mod.STATE_ROOT = root + "/state"
         mod.REGISTRY_ROOT = mod.STATE_ROOT + "/registry"
         mod.BACKUP_ROOT = mod.STATE_ROOT + "/backups"
+        mod.PROTECTED_PROJECTS = mod.STATE_ROOT + "/protected-projects"
+        mod.APACHE_DIR = root + "/apache2"
         mod.MOD_ROOT = root + "/custom-mods"
         mod.LOCK_PATH = root + "/lock.d"
         self.chown = getattr(os, "chown", None)
@@ -385,9 +474,11 @@ class RegistryLifecycleTests(unittest.TestCase):
     def install_with(self, state_setup):
         calls = []
         saved = (mod.require_root, mod.acquire_lock, mod.inspect_repository, mod.restore_entry,
-                 mod.ensure_mod_root, mod.require_existing_role, mod.database_exists, mod.require_php_security)
+                 mod.ensure_mod_root, mod.require_existing_role, mod.database_exists, mod.require_php_security,
+                 mod.read_protected_projects)
         mod.require_root = mod.acquire_lock = mod.ensure_mod_root = mod.require_existing_role = lambda: None
         mod.require_php_security = lambda: calls.append("php-security")
+        mod.read_protected_projects = lambda: []
         policy = {"default": "main", "allowed": ["main"]}
         mod.inspect_repository = lambda source, local: (mod.parse_manifest(manifest()), "main", "b" * 40, policy)
         mod.restore_entry = lambda entry, manifest_, commit, policy_: calls.append((entry["id"], commit))
@@ -397,7 +488,8 @@ class RegistryLifecycleTests(unittest.TestCase):
             mod.command_install({"url": self.SOURCE, "expect_commit": "b" * 40})
         finally:
             (mod.require_root, mod.acquire_lock, mod.inspect_repository, mod.restore_entry,
-             mod.ensure_mod_root, mod.require_existing_role, mod.database_exists, mod.require_php_security) = saved
+             mod.ensure_mod_root, mod.require_existing_role, mod.database_exists, mod.require_php_security,
+             mod.read_protected_projects) = saved
         return calls
 
     def test_install_restores_only_own_tombstone(self):
@@ -438,11 +530,11 @@ class RegistryLifecycleTests(unittest.TestCase):
         mod.write_entry(entry)
         git_calls = []
         names = ("require_root", "acquire_lock", "checked_folder", "inspect_repository", "update_checkout",
-                 "git", "apply_permissions", "check_health", "require_php_security")
+                 "git", "apply_permissions", "check_health", "require_php_security", "read_protected_projects")
         saved = {name: getattr(mod, name) for name in names}
 
-        def update_checkout(entry_, folder, source, local, branch, progress, expect_commit=None):
-            self.assertEqual((branch, expect_commit), ("dev", "d" * 40))
+        def update_checkout(entry_, folder, source, local, branch, progress, expect_commit=None, switching=False):
+            self.assertEqual((branch, expect_commit, switching), ("dev", "d" * 40, True))
             if failure == "refused":
                 raise mod.ModError("Files tracked by the mod were changed locally. Nothing was updated.")
             progress["changed"] = True
@@ -452,6 +544,7 @@ class RegistryLifecycleTests(unittest.TestCase):
                 raise mod.ModError("The mod's database migration failed.")
 
         mod.require_root = mod.acquire_lock = mod.apply_permissions = mod.require_php_security = lambda *a, **k: None
+        mod.read_protected_projects = lambda: []
         mod.checked_folder = lambda e: mod.MOD_ROOT + "/example-server"
         mod.inspect_repository = lambda source, local, branch=None, policy_only=False: (
             mod.parse_manifest(manifest()), branch, "d" * 40, {"default": "main", "allowed": ["main", "dev"]})
@@ -495,8 +588,11 @@ class RegistryLifecycleTests(unittest.TestCase):
         self.assertEqual(entry["state"], "failed")
 
     def checkout_with(self, head="a" * 40, current="main", dest_exists=False, dest_ancestor=True,
-                      checkout_fails=False):
-        """Run update_checkout as a switch to dev with git answering from the given folder state."""
+                      checkout_fails=False, switching=True, pin="d" * 40, setup_fails=False):
+        """Run update_checkout (a switch to dev, or an update of main) with git answering from the given state.
+
+        The fetched commit is always d*40; the fourth result is the full git argument lists.
+        """
         calls = []
 
         class Result:
@@ -522,6 +618,8 @@ class RegistryLifecycleTests(unittest.TestCase):
         saved = {name: getattr(mod, name) for name in names}
         mod.git = git
         mod.backup = mod.apply_permissions = mod.write_config_if_missing = mod.run_setup_checks = lambda *a: None
+        if setup_fails:
+            mod.run_setup_checks = lambda *a: (_ for _ in ()).throw(mod.ModError("The mod's database migration failed."))
         mod.read_commit_manifest = lambda folder, ref: (mod.parse_manifest(manifest()), set(), "", "d" * 40)
         mod.database_exists = lambda name: True
         mod.database_owner = lambda name: mod.DATABASE_ROLE
@@ -529,15 +627,97 @@ class RegistryLifecycleTests(unittest.TestCase):
         mod.setup_web = lambda: None
         progress = {"changed": False}
         error = None
+        self.checked_entry = self.entry()
         try:
-            mod.update_checkout(self.entry(), mod.MOD_ROOT + "/example-server", self.SOURCE, False, "dev",
-                                progress, expect_commit="d" * 40)
+            mod.update_checkout(self.checked_entry, mod.MOD_ROOT + "/example-server", self.SOURCE, False,
+                                "dev" if switching else "main", progress, expect_commit=pin, switching=switching)
         except mod.ModError as caught:
             error = caught
         finally:
             for name, value in saved.items():
                 setattr(mod, name, value)
+        self.full_calls = calls
         return error, progress, [args[0] for args in calls]
+
+    def test_pinned_update_installs_only_the_reviewed_fast_forward(self):
+        error, progress, calls = self.checkout_with(switching=False)
+        self.assertIsNone(error)
+        self.assertIn(["merge", "--ff-only", "--quiet", "d" * 40], self.full_calls)
+        self.assertNotIn("checkout", calls)
+        self.assertTrue(progress["changed"])
+        # A different reviewed commit is refused before anything in the checkout changes.
+        error, progress, calls = self.checkout_with(switching=False, pin="e" * 40)
+        self.assertIn("changed after it was reviewed", str(error))
+        self.assertNotIn("merge", calls)
+        self.assertNotIn("merge-base", calls)
+        self.assertFalse(progress["changed"])
+        # The pin never permits divergence: a non-fast-forward stays refused even when it matches.
+        for pin in ("d" * 40, None):
+            error, progress, calls = self.checkout_with(switching=False, pin=pin, dest_ancestor=False)
+            self.assertIn("not a fast-forward", str(error), pin)
+            self.assertNotIn("merge", calls)
+            self.assertNotIn("checkout", calls)
+            self.assertFalse(progress["changed"])
+        # A pinned update needs the checkout on the registered branch and commit before backup or fetch.
+        for state in ({"head": "b" * 40}, {"current": "other"}, {"current": ""}):
+            error, progress, calls = self.checkout_with(switching=False, **state)
+            self.assertIn("not at its registered branch and commit", str(error), state)
+            self.assertNotIn("fetch", calls)
+            self.assertNotIn("merge", calls)
+            self.assertFalse(progress["changed"])
+        # Without a pin, update keeps its earlier behavior: no drift check, fast-forward only.
+        error, progress, calls = self.checkout_with(switching=False, pin=None, head="b" * 40, current="other")
+        self.assertIsNone(error)
+        self.assertNotIn("symbolic-ref", calls)
+        self.assertIn(["merge", "--ff-only", "--quiet", "d" * 40], self.full_calls)
+        # A failure after the fast-forward leaves the registry naming the checked-out commit, so a pinned retry runs.
+        error, progress, _ = self.checkout_with(switching=False, setup_fails=True)
+        self.assertIn("migration failed", str(error))
+        self.assertTrue(progress["changed"])
+        self.assertEqual((self.checked_entry["branch"], self.checked_entry["commit"]), ("main", "d" * 40))
+        # A switch still requires its reviewed commit.
+        error, progress, calls = self.checkout_with(pin=None)
+        self.assertIn("needs the reviewed commit", str(error))
+        self.assertEqual(calls, [])
+
+    def test_update_passes_pin_and_refusal_keeps_mod_ready(self):
+        mod.write_entry(self.entry())
+        seen = []
+        names = ("require_root", "acquire_lock", "checked_folder", "refresh_policy", "update_checkout",
+                 "read_protected_projects", "require_php_security")
+        saved = {name: getattr(mod, name) for name in names}
+
+        def update_checkout(entry_, folder, source, local, branch, progress, expect_commit=None, switching=False):
+            seen.append((branch, expect_commit, switching))
+            raise mod.ModError("Branch main changed after it was reviewed. Nothing was changed.")
+
+        mod.require_root = mod.acquire_lock = mod.refresh_policy = mod.require_php_security = lambda *a, **k: None
+        mod.checked_folder = lambda e: mod.MOD_ROOT + "/example-server"
+        mod.update_checkout = update_checkout
+
+        def damaged():
+            raise mod.ModError("protected-projects is not a private root-owned list (0600). Nothing was changed.")
+        try:
+            # A damaged protection list stops update before the registry, checkout, config or database change.
+            mod.read_protected_projects = damaged
+            with self.assertRaises(mod.ModError) as caught:
+                mod.command_update({"id": "example-server", "expect_commit": "e" * 40})
+            self.assertIn("private root-owned list", str(caught.exception))
+            self.assertEqual(seen, [])
+            self.assertEqual(mod.read_entry("example-server"), self.entry())
+            mod.read_protected_projects = lambda: []
+            with self.assertRaises(mod.ModError):
+                mod.command_update({"id": "example-server", "expect_commit": "e" * 40})
+            for bad in ("E" * 40, "e" * 39, "HEAD", ""):
+                with self.assertRaises(mod.ModError, msg=bad):
+                    mod.command_update({"id": "example-server", "expect_commit": bad})
+        finally:
+            for name, value in saved.items():
+                setattr(mod, name, value)
+        self.assertEqual(seen, [("main", "e" * 40, False)])
+        entry = mod.read_entry("example-server")
+        self.assertEqual((entry["state"], entry["commit"]), ("ready", "a" * 40))
+        self.assertIn("refused", entry["message"])
 
     def test_switch_refuses_unregistered_head_or_divergent_destination(self):
         for state in ({"head": "b" * 40}, {"current": "other"}, {"current": ""}):
@@ -559,6 +739,178 @@ class RegistryLifecycleTests(unittest.TestCase):
         error, progress, calls = self.checkout_with(checkout_fails=True)
         self.assertIn("Could not switch branches", str(error))
         self.assertFalse(progress["changed"])
+
+    def as_root_owner(self, files=True):
+        """Report temp paths (and opened files) as root-owned, as they are when the manager runs as root."""
+        real_lstat, real_fstat, root = os.lstat, os.fstat, self.temp.name
+
+        def rooted(s):
+            return os.stat_result((s.st_mode, s.st_ino, s.st_dev, s.st_nlink, 0, 0, s.st_size, 0, 0, 0))
+        os.lstat = lambda path, *a, **k: (rooted(real_lstat(path, *a, **k)) if str(path).startswith(root)
+                                          else real_lstat(path, *a, **k))
+        self.addCleanup(setattr, os, "lstat", real_lstat)
+        if files:
+            os.fstat = lambda fd: rooted(real_fstat(fd))
+            self.addCleanup(setattr, os, "fstat", real_fstat)
+
+    def test_protected_projects_persist_privately_and_fail_closed(self):
+        if os.name == "nt":
+            self.skipTest("needs POSIX modes and O_NOFOLLOW")
+        self.assertEqual(mod.read_protected_projects(), [])
+        self.as_root_owner()
+        # Order only (no crash is simulated): file data synced, then renamed, then the folder synced.
+        events, real_fsync, real_replace = [], os.fsync, os.replace
+
+        def fsync(fd):
+            events.append("sync-folder" if stat.S_ISDIR(os.fstat(fd).st_mode) else "sync-file")
+            real_fsync(fd)
+
+        def replace(*args):
+            events.append("rename")
+            real_replace(*args)
+        os.fsync, os.replace = fsync, replace
+        try:
+            mod.protect_project("kag-proj")
+        finally:
+            os.fsync, os.replace = real_fsync, real_replace
+        self.assertEqual(events, ["sync-file", "rename", "sync-folder"])
+        mod.protect_project("abc-proj")
+        mod.protect_project("kag-proj")
+        self.assertEqual(mod.read_protected_projects(), ["abc-proj", "kag-proj"])
+        self.assertEqual(os.stat(mod.PROTECTED_PROJECTS).st_mode & 0o777, 0o600)
+        self.assertNotIn("protected-projects", os.listdir(mod.REGISTRY_ROOT))
+        mod.write_entry(self.entry())
+        self.assertEqual([e["id"] for e in mod.list_entries()], ["example-server"])
+        # Unregistering a mod never drops its protection.
+        mod.write_entry(mod.unregistered_entry(self.entry()))
+        self.assertEqual(mod.read_protected_projects(), ["abc-proj", "kag-proj"])
+        os.chmod(mod.PROTECTED_PROJECTS, 0o644)
+        with self.assertRaises(mod.ModError):
+            mod.read_protected_projects()
+        for content in ("", "kag-proj", "kag-proj\nkag-proj\n", "KagrenacServer\n", "herika\n", "\n", "a|.*\n",
+                        "kag-proj\n\n", "".join("proj-%02d\n" % i for i in range(33)), "kag-pr\xf6j\n"):
+            with open(mod.PROTECTED_PROJECTS, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            os.chmod(mod.PROTECTED_PROJECTS, 0o600)
+            with self.assertRaises(mod.ModError, msg=content[:40]):
+                mod.read_protected_projects()
+        with self.assertRaises(mod.ModError):
+            mod.protect_project("new-proj")
+        os.unlink(mod.PROTECTED_PROJECTS)
+        target = mod.STATE_ROOT + "/elsewhere"
+        with open(target, "w") as handle:
+            handle.write("kag-proj\n")
+        os.chmod(target, 0o600)
+        os.symlink(target, mod.PROTECTED_PROJECTS)
+        with self.assertRaises(mod.ModError):
+            mod.read_protected_projects()
+        os.unlink(mod.PROTECTED_PROJECTS)
+        os.chmod(mod.STATE_ROOT, 0o775)
+        with self.assertRaises(mod.ModError):
+            mod.read_protected_projects()
+        os.chmod(mod.STATE_ROOT, 0o755)
+        # A full list refuses a new id and keeps the saved ones.
+        with open(mod.PROTECTED_PROJECTS, "w") as handle:
+            handle.write("".join("proj-%02d\n" % i for i in range(32)))
+        os.chmod(mod.PROTECTED_PROJECTS, 0o600)
+        with self.assertRaises(mod.ModError):
+            mod.protect_project("kag-proj")
+        self.assertEqual(len(mod.read_protected_projects()), 32)
+
+    def test_protected_list_must_be_root_owned(self):
+        if os.name == "nt" or os.geteuid() == 0:
+            self.skipTest("needs POSIX modes and a non-root test user")
+        os.makedirs(mod.STATE_ROOT)
+        with open(mod.PROTECTED_PROJECTS, "w") as handle:
+            handle.write("kag-proj\n")
+        os.chmod(mod.PROTECTED_PROJECTS, 0o600)
+        os.chmod(mod.STATE_ROOT, 0o755)
+        # Without a root-owned folder, refused; with one, the file's real (non-root) owner is still refused.
+        with self.assertRaises(mod.ModError) as caught:
+            mod.read_protected_projects()
+        self.assertIn("root-owned folder", str(caught.exception))
+        self.as_root_owner(files=False)
+        with self.assertRaises(mod.ModError) as caught:
+            mod.read_protected_projects()
+        self.assertIn("private root-owned list", str(caught.exception))
+
+    def test_protected_list_fifo_is_refused_without_blocking(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("needs POSIX FIFOs")
+        import threading
+        os.makedirs(mod.STATE_ROOT)
+        os.chmod(mod.STATE_ROOT, 0o755)
+        os.mkfifo(mod.PROTECTED_PROJECTS, 0o600)
+        self.as_root_owner()
+        outcome = []
+
+        def read():
+            try:
+                mod.read_protected_projects()
+            except mod.ModError as error:
+                outcome.append(str(error))
+        # A blocking open would wait forever for a writer; the daemon thread keeps a regression from hanging the run.
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        reader.join(10)
+        self.assertFalse(reader.is_alive(), "opening the FIFO blocked")
+        self.assertEqual(len(outcome), 1)
+        self.assertIn("private root-owned list", outcome[0])
+        with self.assertRaises(mod.ModError):
+            mod.protect_project("kag-proj")
+        self.assertTrue(stat.S_ISFIFO(os.lstat(mod.PROTECTED_PROJECTS).st_mode))
+
+    def test_protect_project_needs_root_before_any_write(self):
+        if os.name == "nt":
+            self.skipTest("needs os.geteuid")
+        real = os.geteuid
+        os.geteuid = lambda: 1000
+        try:
+            with self.assertRaises(mod.ModError) as caught:
+                mod.command_setup_web({"protect_project": "kag-proj"})
+        finally:
+            os.geteuid = real
+        self.assertIn("must run as root", str(caught.exception))
+        self.assertFalse(os.path.lexists(mod.STATE_ROOT))
+        self.assertFalse(os.path.lexists(mod.LOCK_PATH))
+
+    def test_failed_apply_keeps_saved_protection_and_no_partial_site(self):
+        if os.name == "nt":
+            self.skipTest("needs POSIX modes and O_NOFOLLOW")
+        self.as_root_owner()
+        for folder in ("sites-available", "sites-enabled"):
+            os.makedirs(mod.APACHE_DIR + "/" + folder)
+        site = mod.APACHE_DIR + "/sites-available/" + mod.WEB_SITE + ".conf"
+        names = ("require_root", "acquire_lock", "apache_running", "port_free", "run", "apply_apache")
+        saved = {name: getattr(mod, name) for name in names}
+
+        class Result:
+            returncode = 0
+
+        def rejected(reload, port):
+            raise mod.ModError("Apache rejected the custom mod listener on port 19000.")
+        mod.require_root = mod.acquire_lock = lambda: None
+        mod.apache_running = lambda: False
+        mod.port_free = lambda port: True
+        mod.run = lambda command, **kwargs: Result()
+        mod.apply_apache = rejected
+        try:
+            with self.assertRaises(mod.ModError) as caught:
+                mod.command_setup_web({"protect_project": "kag-proj"})
+            self.assertIn("saved but not active", str(caught.exception))
+            self.assertEqual(mod.read_protected_projects(), ["kag-proj"])
+            self.assertFalse(os.path.lexists(site))
+            mod.apply_apache = lambda reload, port: None
+            # The explicit retry without the flag applies the saved list.
+            mod.command_setup_web({})
+            with open(site) as handle:
+                text = handle.read()
+            self.assertEqual(text, mod.web_site_text(19000, ["kag-proj"]))
+            self.assertIn(r"(custom-mods/(kag\-proj))/(client|", text)
+            self.assertEqual(mod.read_protected_projects(), ["kag-proj"])
+        finally:
+            for name, value in saved.items():
+                setattr(mod, name, value)
 
     def test_status_asset_urls_use_fixed_route_for_installed_files(self):
         folder = mod.MOD_ROOT + "/example-server"
