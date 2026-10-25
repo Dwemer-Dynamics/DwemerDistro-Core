@@ -245,6 +245,7 @@ The broker relays JSONL both ways and forwards only these client methods:
 | `thread/list` | `cursor`, `limit`, `sortDirection`; answered by the broker from this task's thread mapping (below) |
 | `turn/start` | `threadId` (this task), `input` (only `text` items and `image` items with a `data:image/` or `https://` URL), `model`, `effort`, `summary`, `outputSchema`, `personality`, `serviceTier`, `clientUserMessageId` |
 | `turn/interrupt` | `threadId` (this task), `turnId` |
+| `thread/archive`, `thread/unarchive`, `thread/delete` | `threadId` (this task) only; see "Thread archive and delete" |
 
 For thread and turn requests, `approvalPolicy` may only be `never`, and `cwd` only
 `/work`; the broker sets both. `permissions` may only be `dwemer-scratch`.
@@ -343,6 +344,52 @@ queries, and secret-shaped values are redacted in every string, and the text is 
 reachable through the tool. Codex reports the call to the client as its usual
 `dynamicToolCall` item notifications.
 
+### ddistro_memory dynamic tool
+
+When the session starts, `serve` runs `ddistro memory status --json` (the same trusted-helper
+rules as below; it never creates the database). Only if that succeeds with `settings.retrieval`
+true does every `thread/start` of an opted-in client get `dynamicTools: [ddistro_read,
+ddistro_memory]`; otherwise only `ddistro_read` is declared and `ddistro_memory` calls are
+refused as an unknown tool. A setting changed during a session takes effect for the
+declaration in the next session, but the CLI checks the current settings on every call.
+
+The declaration (`MEMORY_SPEC`) is strict: `{"operation": "search"|"remember", "query"?:
+<= 200 chars, "text"?: <= 2000 chars, "kind"?: "preference"|"decision"}` with
+`additionalProperties: false`. The broker accepts exactly `search` with `query`, or `remember`
+with `text` and `kind`; any other key or operation (forget, reset, configure, task, thread),
+empty or over-long values, control characters, a value of `--json` or `--request-id`, a
+foreign thread, or a namespace runs nothing and returns `invalid_arguments`. It then runs:
+
+- `ddistro memory search --assistant --query Q --limit 5 --json`, refused by the CLI with
+  `disabled` when retrieval is off;
+- `ddistro memory add --source assistant --kind K --text T --task TASK --thread THREAD --json`,
+  where `TASK` is this session's task and `THREAD` the calling thread, both from the broker,
+  never from the model. The CLI refuses it with `disabled` and a message that only the user can
+  add notes unless both retrieval and automatic learning (default off) are on, refuses
+  secret-shaped text, and refuses a note that claims a verified fix.
+
+Configuration, forget, update, reset, and export are never reachable from the model; they
+are launcher actions the user takes. Memory calls share the `ddistro_read` children, process
+group supervision, concurrency, 90 s / 1 MiB bounds, reply envelope and redaction, and the same
+per-turn and per-session budgets (the two tools count together). Recalled notes are returned
+as tool data marked `non_authoritative`; a note cannot change the policy, the sandbox, the
+declarations, or what a tool may do, and it never replaces fresh `ddistro_read` evidence.
+
+### Thread archive and delete
+
+`thread/archive`, `thread/unarchive`, and `thread/delete` (Codex 0.163.0 stable,
+`{"threadId"}` params, `{}` result) are forwarded only for one of this task's threads, with no
+other parameter. The launcher sends them only from an explicit user click (delete after a
+confirmation); the model has no path to them. Archive and unarchive keep the thread in the
+task mapping. When Codex answers a delete with a result, the broker removes exactly that id
+from the task's thread mapping, so it is no longer readable, resumable, or listed; a failed
+delete changes nothing. Neither touches other threads, the account home or sign-in, the task's
+`task.json`, scratch, change receipts, or backups. Deleting a thread does not forget memory
+notes captured in it: that is a separate, optional user action, `ddistro memory forget
+--thread ID` (or `--task TASK`), which the launcher may offer next to the delete confirmation,
+unchecked by default. `ddistro capabilities` reports this as `features.thread_lifecycle: true`,
+a static fact that adds no command and opens no database.
+
 ## Known limitations
 
 - Codex 0.163 permission profiles are beta. The probe, not the configuration, is the
@@ -352,6 +399,9 @@ reachable through the tool. Codex reports the call to the client as its usual
 - `thread/resume` of a persisted thread and real turns need a signed-in account and are
   not covered by the no-inference probe. The probe also does not read history pages; it only
   checks that reads of another thread are refused.
+- Memory note text travels as argv to the root `ddistro` child, so for that child's
+  lifetime it is visible in `/proc/<pid>/cmdline` to processes outside the sandbox that can
+  read it; nothing logs it. Secret-shaped text is refused before it is stored.
 - The task mapping keeps the 256 most recently started threads in start order, so `thread/list`
   orders by start time and cannot list older threads. A thread started between two pages
   shifts nothing, because the cursor is a thread id, not an offset.

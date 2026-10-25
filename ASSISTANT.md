@@ -48,8 +48,9 @@ stdout and failures are `[FAIL] ...` on stderr.
 | `failed`, `internal_error`, `helper_failed`, `helper_protocol` | 1 | General, unexpected, helper failure, or invalid helper status |
 | `partial`, `conflict`, `rollback` | 10, 11, 12 | Some files written; live files changed (nothing written); rollback refused |
 | `invalid_argument` | 64 | Unknown command, product, option, branch, or value |
-| `not_found` | 66 | Update target is not installed |
-| `unsupported`, `helper_unavailable` | 69 | `ddistro_server` missing or not a trusted root-owned file |
+| `refused`, `limit_reached` | 65 | Memory text refused (secret shape, unverified assistant claim); memory full |
+| `not_found` | 66 | Update target is not installed; no memory note with that id |
+| `unsupported`, `helper_unavailable`, `disabled` | 69 | `ddistro_server` missing or not a trusted root-owned file; memory setting off |
 | `busy` | 75 | Another server operation, maintenance, or change holds a lock |
 | `permission_denied`, `unsafe_path` | 77 | Not root for an update, unreadable log, or redirected/non-regular log |
 | `update_blocked_tracked` | 79 | Tracked edits block the update; `--force` would discard them |
@@ -62,7 +63,13 @@ is `true` only when the trusted `ddistro_agent` helper is installed; it never me
 assistant is ready. Readiness comes only from `agent status` (`installed` and `probe_passed`).
 `features.models` and `capabilities.models` describe `models herika` (roles and limits).
 `features.inventory` and `capabilities.inventory` describe `inventory` (scope, the products
-with an extension folder, component ids, and limits).
+with an extension folder, component ids, and limits). `features.memory` and
+`capabilities.memory` describe `memory` (scope, kinds, defaults, limits) from constants only;
+`capabilities` never opens or creates the memory database. `features.thread_lifecycle` is
+`true`: `agent serve` forwards `thread/archive`, `thread/unarchive`, and `thread/delete` with
+`threadId` only, and only for one of the serving task's own threads; delete never removes the
+task's change receipts or backups (see "Thread archive and delete" in `ASSISTANT_RUNTIME.md`).
+It is a static fact, like the others, and adds no command.
 
 ## Status and update
 
@@ -299,3 +306,63 @@ There is no overall verdict: each check is `passed`, `failed`, or `skipped` with
 - `disk./`, `disk./var/lib/postgresql`, `disk./home/dwemer`: fails below 2 GiB or 5% free.
 
 A passing port check proves only that something accepts TCP there, not which service.
+
+## Assistant memory
+
+`memory <action> [flags] --json` (root) manages short, user-controlled notes that the assistant
+may recall in any chat of this installation (scope `installation`: one store shared by every
+task and thread; provenance is recorded, not used to filter). Notes are never authoritative:
+anything that can change (servers, ports, models, logs, health) must come from fresh
+diagnostics, and search results say so (`authority: "non_authoritative"`, `notice`). Nothing
+imports old chats, nothing stores transcripts, and Codex's own `features.memories` stays off.
+
+Storage is SQLite at `/var/lib/dwemerdistro/assistant/memory/memory.sqlite`, separate from
+Codex's conversation state and the broker's lock and thread mapping. Every component is opened
+without following links; the parents must be root-owned and not group/other-writable, the
+`memory` directory root `0700`, the database a root `0600` regular file with one link. Anything
+else (symlink, FIFO, hardlink, other owner, looser mode) fails with `unsafe_path`
+(`details.reason: "memory_untrusted"`, `details.location`) and is neither read nor repaired.
+Files are created under umask `0077`; `secure_delete` is on, so forgotten text is overwritten.
+`status`, `list`, `search`, `export`, `forget`, and `reset` never create the directory or
+database; only `add` and `configure` do. The schema (`PRAGMA user_version` 1) is upgraded in
+place and idempotently: an FTS5 index (with triggers) is added whenever SQLite has FTS5, also to
+a database made without it; a newer schema is refused (`unsupported`). Without FTS5, search is an
+escaped `LIKE` scan. Every statement is parameterized; query words are quoted FTS terms, never
+FTS or SQL syntax.
+
+| Action | Flags | `data` |
+|---|---|---|
+| `status` | - | `present`, `location`, `schema_version`, `search_engine` (`fts5`/`lexical`/`null`), `settings`, `notes`, `expired`, `scope`, `authority`, `limits` |
+| `list` | `--limit 1-200` (50), `--offset 0-1000` | `notes`, `total`, `limit`, `offset`, `next_offset` (newest update first; expired notes included with `expired: true`) |
+| `search` | `--query TEXT` (required, <= 200 chars, first 8 words), `--limit 1-10` (5), `--assistant` | `terms`, `engine`, `notes`, `authority`, `notice` (expired notes never match) |
+| `add` | `--text TEXT` (required), `--kind preference\|decision\|note` (`note`), `--expires-days 1-3650`, `--source user\|assistant` (`user`), `--task TASK`, `--thread ID` | `note`, `duplicate` (same kind and text returns the existing note) |
+| `update` | `--id N` (required), and any of `--text`, `--kind`, `--expires-days`, `--no-expiry` | `note` (an edited note becomes `source: "user"`; task/thread provenance is kept) |
+| `forget` | exactly one of `--id N`, `--task TASK`, `--thread ID`, `--expired` | `forgotten`, `by` |
+| `reset` | `--yes` (required) | `forgotten`, `settings_kept: true` (deletes every note, keeps settings) |
+| `export` | - | `exported_at`, `schema_version`, `scope`, `settings`, `notes` (all, including expired) |
+| `configure` | `--retrieval on\|off`, `--auto-learning on\|off` (at least one) | `settings` |
+
+A note is `{"id", "kind", "text", "source", "task_id", "thread_id", "captured_at", "updated_at",
+"expires_at", "expired"}` with UTC `...Z` times; `settings` is `{"retrieval": bool,
+"auto_learning": bool}`, defaulting to retrieval on and automatic learning off. Limits: 1000
+notes (`limit_reached`, exit 65), 2000 characters per note, 10 search results, 200 query
+characters, 8 query terms. `--task` is a ddistro task id; `--thread` is 1-128 letters, digits,
+`-` or `_`.
+
+Text is trimmed and refused (`invalid_argument`) when empty, too long, or holding control
+characters other than newline and tab. Text that looks like a credential is refused, never
+stored redacted: `refused` (exit 65, `details.reason: "secret_shape"`) for anything the log
+redaction would change (key or token assignments, `Bearer`/`Basic`, `sk-`/`ghp_`/`hf_`-style
+tokens, URL credentials or queries) and for private-key blocks, JWTs, cloud key ids, and long
+mixed letter-digit tokens. Refused text is never echoed in the error. Arguments are passed as
+plain argv; ddistro logs none of them, but `--json` and `--request-id` are global flags
+anywhere on the line, so neither can be a value.
+
+`--source assistant` is the broker's path only (see ASSISTANT_RUNTIME.md): it needs `--kind
+preference|decision`, `--task`, and `--thread`, and is refused with `disabled`
+(`details.reason: "auto_learning_off"`, exit 69) unless both retrieval and automatic learning
+are on. Such a note may not claim a verified fix or resolution (`refused`, `details.reason:
+"unverified_claim"`); only the user can record one. `search --assistant` is refused with
+`disabled` (`retrieval_off`) when retrieval is off; a user search without it always works.
+Errors from the database are `busy` (another writer for over 5 s) or `failed`
+(`details.reason: "memory_database"`). Every action requires root (`permission_denied`).
