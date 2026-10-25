@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
-"""Local CHIM 4 shared-key adapter. Never synchronizes or rewrites legacy credentials."""
+"""Root-local native provider editing and CHIM 4 shared keys. Secrets use bounded stdin only."""
 import json
+import contextlib
+import fcntl
+import importlib.machinery
+import importlib.util
 import os
 from pathlib import Path
 import re
 import stat
+import secrets
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
+NATIVE = Path('/usr/local/lib/dwemerdistro/native_keys.php')
 ROOT = Path('/opt/ChimServer')
 BRIDGE = Path('/usr/local/lib/dwemerdistro/keys.php')
 ENV_FILES = ('/etc/chim4-s5.env', '/etc/chim4-dialogue.env', '/etc/chim4-tts.env')
-OPERATIONS = frozenset(('status', 'create', 'edit', 'test', 'delete', 'bind', 'import-environment'))
+OPERATIONS = frozenset(('status', 'create', 'edit', 'test', 'delete', 'bind', 'import-environment', 'guard-ready', 'import-legacy', 'bind-legacy', 'native-status', 'save-direct', 'create-direct', 'save-connection', 'reveal-direct', 'reveal-connection', 'global-status', 'global-save', 'global-reveal', 'global-test'))
+ACCESS = '/usr/local/bin/ddistro_access'
+REGISTRY = Path('/etc/dwemer/shared-key-consumers.json')
+LEGACY_SQL = Path('/usr/local/lib/dwemerdistro/legacy_keys.sql')
+LOCK = Path('/run/lock/ddistro-shared-keys.lock')
+TABLES = ('core_api_badge', 'core_llm_connector', 'core_tts_connector')
+PRODUCTS = {'herika': 'CHIM legacy', 'stobe': 'STOBE', 'dialectic': 'Dialectic'}
 
 
 class Refusal(Exception):
@@ -46,15 +59,357 @@ def environment():
     return result
 
 
+def sql(database, query):
+    """Owner-only local SQL with bounded private capture; never return PostgreSQL errors or secret parameters."""
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,62}', database):
+        raise Refusal('Invalid registered database')
+    result = subprocess.run(['/usr/sbin/runuser', '-u', 'postgres', '--', '/usr/bin/psql', '-X', '-qAt', '--no-password',
+                             '-v', 'ON_ERROR_STOP=1', '-h', '/var/run/postgresql', '-d', database],
+                            input="SET standard_conforming_strings=on; SET TIME ZONE 'UTC';\n" + query,
+                            text=True, capture_output=True, timeout=15,
+                            env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'PGCONNECT_TIMEOUT': '3'})
+    if result.returncode or len(result.stdout) > 1048576:
+        raise Refusal('Legacy database is unavailable; existing credentials are unchanged')
+    return result.stdout.strip()
+
+
+def products():
+    """Reuse Core's root-owned component/database registry instead of guessing product roots."""
+    trusted_file(ACCESS)
+    spec = importlib.util.spec_from_loader('keys_access', importlib.machinery.SourceFileLoader('keys_access', ACCESS))
+    policy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy)
+    return [{'id': name, 'database': policy.DB_PRODUCTS[name], 'path': Path(policy.ACCESS_ROOTS[name]['path'])}
+            for name in PRODUCTS if name in policy.DB_PRODUCTS and name in policy.ACCESS_ROOTS
+            and Path(policy.ACCESS_ROOTS[name]['path']).is_dir()]
+
+
+@contextlib.contextmanager
+def migration_lock():
+    """Serialize preparation/imports without touching the previous private credential store or its backups."""
+    parent = LOCK.parent.lstat()
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or (parent.st_mode & 0o022 and not parent.st_mode & stat.S_ISVTX):
+        raise Refusal('Untrusted key migration lock directory')
+    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+            raise Refusal('Untrusted key migration lock')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refusal('Another key migration is running') from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def registered():
+    if not REGISTRY.exists() and not REGISTRY.is_symlink():
+        return []
+    trusted_file(REGISTRY)
+    value = json.loads(REGISTRY.read_text())
+    if value.get('version') != 1 or not isinstance(value.get('products'), list):
+        raise Refusal('Shared key usage registry is unavailable')
+    return value['products']
+
+
+def prepare_legacy():
+    """Install nullable references and least-privilege CAS functions, then atomically register every participating DB."""
+    ready = run('guard-ready', {})
+    if not ready['ok']:
+        raise Refusal('Update CHIM 4 key management before enabling legacy references')
+    env = environment()
+    if env.get('CHIM_SHARED_DB_HOST') not in ('127.0.0.1', 'localhost', '/var/run/postgresql') or env.get('CHIM_SHARED_DB_PORT') != '5432':
+        raise Refusal('Legacy integration requires the configured local PostgreSQL server')
+    role = env.get('CHIM_SHARED_DB_USER', '')
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,62}', role):
+        raise Refusal('Shared database role is not configured')
+    trusted_file(LEGACY_SQL)
+    entries = {p['id']: p for p in registered()}
+    warnings = []
+    for product in products():
+        manifest = product['path'] / 'lib/core/shared_keys.json'
+        if not manifest.is_file():
+            warnings.append(PRODUCTS[product['id']] + ': update the shared-key adapter; existing keys remain unchanged')
+            continue
+        info = json.loads(manifest.read_text())
+        if info.get('version') != 1 or info.get('tables') != list(TABLES):
+            raise Refusal('Unsupported server key adapter')
+        tables = [table for table in TABLES if sql(product['database'], "SELECT to_regclass('public." + table + "');")]
+        prior = entries.get(product['id'])
+        if prior and prior['database'] != product['database']:
+            raise Refusal('A registered server database changed; preserve and repair its existing references first')
+        sql(product['database'], 'BEGIN; SET LOCAL lock_timeout=2000; SET LOCAL statement_timeout=10000;\n'
+            + LEGACY_SQL.read_text().replace('__ROLE__', '"' + role + '"') + '\nCOMMIT;')
+        entries[product['id']] = {'id': product['id'], 'database': product['database'], 'tables': tables}
+    if not REGISTRY.parent.is_dir():
+        REGISTRY.parent.mkdir(mode=0o755)
+    for directory in (REGISTRY.parent, *REGISTRY.parent.parents):
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise Refusal('Untrusted key registry directory')
+    value = {'version': 1, 'shared': {'host': env['CHIM_SHARED_DB_HOST'], 'port': env['CHIM_SHARED_DB_PORT'],
+             'database': env['CHIM_SHARED_DB_NAME']}, 'products': list(entries.values())}
+    temporary = REGISTRY.with_name('shared-keys-' + secrets.token_hex(12))
+    try:
+        with temporary.open('x', encoding='utf-8') as output:
+            os.chmod(temporary, 0o644)
+            output.write(json.dumps(value))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, REGISTRY)
+        fd = os.open(REGISTRY.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+    return {'ok': True, 'outcome': 'prepared', 'warnings': warnings}
+
+
+def legacy_status():
+    """Return labels/reference IDs/configured flags only, without reading credentials into the UI response."""
+    enabled = {p['id']: p for p in registered()}
+    result = []
+    for product in products():
+        for table in TABLES:
+            try:
+                if not sql(product['database'], "SELECT to_regclass('public." + table + "');"):
+                    continue
+                query = ("SELECT COALESCE(json_agg(r),'[]') FROM (SELECT id, COALESCE(to_jsonb(t)->>'label',to_jsonb(t)->>'name','') AS label,"
+                         "t.xmin::text||':'||t.tableoid::text AS version, to_jsonb(t)->>'shared_key_id' AS key_id, COALESCE(to_jsonb(t)->>'api_badge_id',to_jsonb(t)->'config'->>'api_badge_id') AS badge_id, "
+                         "(COALESCE(to_jsonb(t)->>'api_key','')<>'' OR "
+                         "COALESCE(to_jsonb(t)->'config'->>'api_key','')<>'' OR COALESCE(to_jsonb(t)->'config'->>'apiKey','')<>'' OR "
+                         "COALESCE(to_jsonb(t)->'config'->>'apikey','')<>'' OR COALESCE(to_jsonb(t)->'config'->>'credential','')<>'' OR "
+                         "COALESCE(to_jsonb(t)->'config'->>'api_credential','')<>'' OR COALESCE(to_jsonb(t)->'metadata'->>'API_KEY','')<>'') AS configured "
+                         'FROM public.' + table + ' t ORDER BY id LIMIT 129) r;')
+                rows = json.loads(sql(product['database'], query))
+                if len(rows) > 128:
+                    raise Refusal('Too many legacy key entries')
+                available = table in enabled.get(product['id'], {}).get('tables', [])
+                for row in rows:
+                    result.append({'product': product['id'], 'table': table, **row, 'available': available,
+                        'reason': '' if available else 'Server shared-key adapter is not enabled'})
+            except (Refusal, ValueError, subprocess.TimeoutExpired):
+                result.append({'product': product['id'], 'table': table, 'id': 0, 'label': PRODUCTS[product['id']],
+                    'available': False, 'reason': 'Server key metadata unavailable', 'configured': False, 'key_id': None})
+    return result
+
+
+def endpoint_origins(product, table, record):
+    """Preflight existing dispatch destinations; never infer a provider from a badge's display label."""
+    driver = str(record.get('driver') or record.get('connector_type') or '').lower()
+    metadata = record.get('config' if product == 'stobe' else 'metadata') or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    if not isinstance(metadata, dict):
+        raise Refusal('Invalid legacy connector metadata; original settings are preserved')
+    kind = 'llm'
+    if table == 'core_tts_connector':
+        if product == 'stobe':
+            driver = str(metadata.get('provider') or driver).lower()
+        if driver == 'inworld':
+            return [{'kind': 'tts', 'origin': 'https://api.inworld.ai:443'}]
+        if product == 'herika' and driver == 'openai':
+            urls = [metadata.get('endpoint') or 'https://api.openai.com/v1/audio/speech']
+        else:
+            raise Refusal('This voice provider is preserved in its legacy format; its shared-key adapter is not supported yet')
+    elif table == 'core_stt_connector':
+        if driver == 'inworld':
+            return [{'kind': 'tts', 'origin': 'https://api.inworld.ai:443'}]
+        if driver == 'whisper':
+            return [{'kind': 'llm', 'origin': 'https://api.openai.com:443'}]
+        raise Refusal('This speech recognizer is preserved in its legacy format; its shared-key adapter is not supported yet')
+    elif table == 'core_itt_connector':
+        if product not in ('herika', 'dialectic'):
+            raise Refusal('This image adapter is not supported yet')
+        # Require a persisted destination; do not guess a provider from a display label or changing UI schema.
+        url = (record.get('url') or metadata.get('url') or metadata.get('URL')) if product == 'dialectic' else (metadata.get('url') or record.get('url') or metadata.get('URL'))
+        if not url:
+            raise Refusal('Save an explicit image provider endpoint before binding its shared key')
+        urls = [url]
+    else:
+        defaults = {'openaijson': 'https://openrouter.ai/api/v1', 'openrouterjson': 'https://openrouter.ai/api/v1',
+                    'google_openaijson': 'https://generativelanguage.googleapis.com/v1beta/openai' if product == 'stobe' else 'https://openrouter.ai/api/v1',
+                    'groqjson': 'https://api.groq.com/openai/v1', 'player2json': 'http://127.0.0.1:4315/v1'}
+        if product == 'stobe':
+            defaults.update({'openai': 'https://openrouter.ai/api/v1', 'openrouter': 'https://openrouter.ai/api/v1',
+                             'groq': 'https://api.groq.com/openai/v1', 'koboldcppjson': 'http://127.0.0.1:5001/v1'})
+        if driver not in defaults:
+            raise Refusal('This model driver is preserved in its legacy format; its shared-key adapter is not supported yet')
+        if product == 'stobe':
+            metadata = metadata.get('metadata', {})
+            if not isinstance(metadata, dict):
+                raise Refusal('Invalid legacy model metadata')
+        urls = [record.get('base_url' if product == 'stobe' else 'url') or defaults[driver]]
+        if 'url' in metadata:
+            if product != 'stobe':
+                urls.clear()
+            urls.append(metadata['url'])
+    result = []
+    for url in urls:
+        if not isinstance(url, str) or any(ord(c) < 33 for c in url):
+            raise Refusal('Invalid legacy provider endpoint')
+        parsed = urlsplit(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+            raise Refusal('Invalid legacy provider endpoint')
+        host = '[' + parsed.hostname + ']' if ':' in parsed.hostname else parsed.hostname
+        result.append({'kind': kind, 'origin': parsed.scheme + '://' + host.lower() + ':' + str(parsed.port or (443 if parsed.scheme == 'https' else 80))})
+    return result
+
+
+def legacy_snapshot(verb, payload):
+    """Capture one private CAS snapshot after validating the public selector against the installed registry."""
+    allowed = {'product', 'table', 'id', 'key_id', 'expected_key_id'} if verb == 'bind-legacy' else {'product', 'table', 'id', 'provider', 'label', 'origin', 'expected_key_id'}
+    if not isinstance(payload, dict) or set(payload) - allowed or type(payload.get('id')) is not int or payload['id'] <= 0:
+        raise Refusal('Invalid legacy key request')
+    product = next((p for p in products() if p['id'] == payload.get('product')), None)
+    entry = next((p for p in registered() if p['id'] == payload.get('product')), None)
+    table = payload.get('table')
+    if product is None or entry is None or entry['database'] != product['database'] or table not in TABLES or table not in entry.get('tables', []):
+        raise Refusal('This server shared-key adapter is not enabled')
+    # Capture record version and table identity in the same read. Only the digest, never the credential, returns to SQL.
+    rows = json.loads(sql(product['database'], "SELECT COALESCE(json_agg(json_build_object('record',to_jsonb(t)-'shared_key_id',"
+        "'prior',to_jsonb(t)->>'shared_key_id','etag',encode(sha256(convert_to((to_jsonb(t)-'shared_key_id')::text,'UTF8')),'hex'),"
+        "'generation',t.tableoid::text)),'[]') FROM public." + table + ' t WHERE id=' + str(payload['id']) + ';'))
+    if not rows:
+        raise Refusal('The legacy key entry changed; reload before retrying')
+    captured = rows[0]
+    record = captured['record']
+    prior = captured['prior']
+    if 'expected_key_id' in payload and payload['expected_key_id'] != prior:
+        raise Refusal('The server key assignment changed; reload before retrying')
+    secret = ''
+    if 'api_key' in record:
+        secret = record['api_key'] if isinstance(record['api_key'], str) else ''
+    else:
+        for field, key in (('config', 'api_key'), ('config', 'apiKey'), ('config', 'apikey'), ('config', 'credential'), ('config', 'api_credential'), ('metadata', 'API_KEY')):
+            values = record.get(field) or {}
+            if isinstance(values, str):
+                values = json.loads(values)
+            if isinstance(values, dict) and isinstance(values.get(key), str) and values[key].strip():
+                secret = values[key]
+                break
+    if verb == 'import-legacy' and product['id'] == 'stobe' and table == 'core_llm_connector' and record.get('api_key') and record.get('api_badge_id'):
+        # Native STOBE profiles prefer the badge; its legacy connector path prefers a direct key. Do not guess
+        # which one to pin when those existing values differ. Explicit key selection remains a separate user choice.
+        parent_id = int(record['api_badge_id'])
+        parent = json.loads(sql(product['database'], "SELECT COALESCE(json_agg(json_build_object('key',api_key,"
+            "'shared_key_id',to_jsonb(b)->>'shared_key_id')),'[]') FROM public.core_api_badge b WHERE id=" + str(parent_id) + ';'))
+        if parent and (parent[0]['shared_key_id'] or (parent[0]['key'] and parent[0]['key'] != record['api_key'])):
+            raise Refusal('This model mixes a direct key and a different saved badge. Both are preserved; choose its shared key explicitly instead of importing automatically.')
+    endpoints = []
+    if table == 'core_api_badge':
+        for target in ('core_llm_connector', 'core_tts_connector', 'core_itt_connector', 'core_stt_connector'):
+            if not sql(product['database'], "SELECT to_regclass('public." + target + "');"):
+                continue
+            consumers = json.loads(sql(product['database'], "SELECT COALESCE(json_agg(t),'[]') FROM (SELECT * FROM public."
+                + target + " t WHERE to_jsonb(t)->>'api_badge_id'=" + "'" + str(payload['id']) + "' AND to_jsonb(t)->>'shared_key_id' IS NULL LIMIT 65) t;"))
+            if len(consumers) > 64:
+                raise Refusal('Too many legacy key consumers; original assignments are preserved')
+            if product['id'] == 'stobe' and target == 'core_tts_connector':
+                voices = json.loads(sql(product['database'], "SELECT COALESCE(json_agg(t),'[]') FROM public.core_tts_connector t WHERE to_jsonb(t)->>'shared_key_id' IS NULL;"))
+                for voice in voices:
+                    config = voice.get('config') or {}
+                    if isinstance(config, str):
+                        config = json.loads(config)
+                    if any(str(config.get(k) or '').strip() for k in ('api_key','apiKey','apikey','credential','api_credential')):
+                        continue
+                    badge = int(config.get('api_badge_id') or 0)
+                    provider = str(config.get('provider') or voice.get('connector_type') or '').lower()
+                    if badge == payload['id'] or (badge == 0 and str(record.get('label') or '').lower() == provider and provider in ('inworld','cartesia')):
+                        consumers.append(voice)
+            for consumer in consumers:
+                endpoints.extend(endpoint_origins(product['id'], target, consumer))
+    else:
+        endpoints = endpoint_origins(product['id'], table, record)
+    snapshot = {'product': product['id'], 'database': product['database'], 'table': table, 'id': payload['id'],
+                'secret': secret, 'shared_key_id': prior, 'endpoints': endpoints,
+                'generation': captured['generation'], 'etag': captured['etag']}
+    if len(json.dumps(snapshot).encode()) > 98304:
+        raise Refusal('Legacy settings entry is too large to migrate here; original settings are preserved')
+    return snapshot
+
+
+def native_request(verb, payload):
+    """Fixed owner-side native badge edits; select the DB only from Core's trusted component registry."""
+    trusted_file(NATIVE)
+    if verb == 'native-status':
+        rows = []
+        for product in products():
+            result = native_invoke(product['database'], 'status', {})
+            if result['ok']:
+                rows.extend(dict(row, product=product['id'], table='core_api_badge', available=True, reason='') for row in result['data']['rows'])
+            else:
+                rows.append({'id': 0, 'product': product['id'], 'table': 'core_api_badge', 'label': PRODUCTS[product['id']], 'configured': False, 'available': False, 'reason': 'Provider metadata unavailable'})
+        for row in rows:
+            if row.get('key_id'):
+                try:
+                    shared = invoke('read-key', {'key_id': row['key_id'], 'reveal': False})
+                    row['preview'] = shared.get('data', {}).get('preview', '') if shared.get('ok') else ''
+                except (Refusal, OSError, ValueError, subprocess.TimeoutExpired):
+                    row['preview'] = ''
+        return {'ok': True, 'outcome': 'listed', 'data': {'legacy': rows, 'keys': [], 'connections': []}}
+    fields = {'product','id','version'} if verb == 'reveal-direct' else {'product', 'id', 'version', 'secret'} if verb == 'save-direct' else {'product', 'label', 'secret'}
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise Refusal('Invalid provider key request')
+    product = next((p for p in products() if p['id'] == payload.get('product')), None)
+    if product is None:
+        raise Refusal('This server is not installed')
+    with migration_lock():
+        result = native_invoke(product['database'], 'reveal' if verb == 'reveal-direct' else 'save' if verb == 'save-direct' else 'create', {k: v for k, v in payload.items() if k != 'product'})
+        if verb == 'reveal-direct' and result.get('ok') and result['data'].get('key_id'):
+            return invoke('read-key', {'key_id': result['data']['key_id'], 'reveal': True})
+        return result
+
+
+def native_invoke(database, verb, payload):
+    """Never put a credential in arguments, environment or errors; only explicit reveal returns the full value."""
+    result = subprocess.run(['/usr/sbin/runuser', '-u', 'postgres', '--', '/usr/bin/php', str(NATIVE), database, verb],
+        input=json.dumps(payload), text=True, capture_output=True, timeout=20, env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'})
+    if len(result.stdout) > 262144:
+        raise Refusal('Invalid provider key response')
+    try:
+        response = json.loads(result.stdout)
+    except ValueError:
+        raise Refusal('Provider key service unavailable; reload before retrying') from None
+    if not isinstance(response, dict) or not isinstance(response.get('ok'), bool):
+        raise Refusal('Invalid provider key response')
+    return response
+
+
 def run(verb, payload):
+    if verb in ('native-status', 'save-direct', 'create-direct', 'reveal-direct'):
+        return native_request(verb, payload)
     if verb == 'sync':
         # Older updater hooks remain valid. Shared references resolve at call time; copying is retired.
         return {'ok': True, 'outcome': 'references_only', 'warnings': []}
+    if verb == 'prepare-legacy':
+        with migration_lock():
+            return prepare_legacy()
     if verb not in OPERATIONS or not isinstance(payload, dict):
         raise Refusal('Unsupported operation; update the launcher')
     trusted_file(BRIDGE)
     if not (ROOT / 'Core/ApiKeyManager/ApiKeyManager.php').is_file():
         raise Refusal('CHIM 4 shared key service is not installed')
+    if verb in ('import-legacy', 'bind-legacy'):
+        with migration_lock():
+            source = legacy_snapshot(verb, payload)
+            return invoke(verb, dict(payload, _legacy=source))
+    if verb in ('save-connection', 'global-save'):
+        with migration_lock():
+            return invoke(verb, payload)
+    response = invoke(verb, payload)
+    if verb == 'status' and response['ok']:
+        response['data']['legacy'] = legacy_status()
+    return response
+
+
+def invoke(verb, payload):
+    """Only the root adapter calls this private stdin boundary with captured legacy records."""
     result = subprocess.run(['/usr/sbin/runuser', '-u', 'www-data', '-p', '--', '/usr/bin/php', str(BRIDGE), str(ROOT), verb],
                             input=json.dumps(payload), text=True, capture_output=True, timeout=40, env=environment())
     if len(result.stdout) > 262144:
@@ -72,11 +427,13 @@ def main(argv):
     try:
         if os.geteuid() != 0 or len(argv) != 2:
             raise Refusal('Root-local operation required')
-        raw = sys.stdin.buffer.read(16385) if argv[1] not in ('status', 'sync') else b'{}'
+        raw = sys.stdin.buffer.read(16385) if argv[1] not in ('status', 'native-status', 'global-status', 'sync', 'prepare-legacy') else b'{}'
         if len(raw) > 16384:
             raise Refusal('Request too large')
         response = run(argv[1], json.loads(raw))
-    except (Refusal, OSError, ValueError, subprocess.TimeoutExpired):
+    except Refusal as error:
+        response = {'ok': False, 'error': str(error)}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         # Never echo input, SQL, environment or process diagnostics containing credentials.
         response = {'ok': False, 'error': 'Shared API Keys is unavailable or the request was refused. Existing keys and assignments are preserved.'}
     print(json.dumps(response))

@@ -112,6 +112,10 @@ if [ $? -eq 0 ]; then
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_keys /usr/local/bin/ddistro_keys || exit 1
     install -d -o root -g root -m 755 /usr/local/lib/dwemerdistro || exit 1
     install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_keys.php /usr/local/lib/dwemerdistro/keys.php || exit 1
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_native_keys.php /usr/local/lib/dwemerdistro/native_keys.php || exit 1
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_shared_keys.php /usr/local/lib/dwemerdistro/shared_keys.php || exit 1
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_legacy_keys.php /usr/local/lib/dwemerdistro/legacy_keys.php || exit 1
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_legacy_keys.sql /usr/local/lib/dwemerdistro/legacy_keys.sql || exit 1
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/install_assistant_runtime /usr/local/bin/install_assistant_runtime || exit 1
     printf "${GREEN}[SUCCESS] Scripts successfully copied to /usr/local/bin/${NC}\n"
 else
@@ -216,6 +220,10 @@ fi
 # Existing and fresh users receive the same hash-verified runtime, without account sign-in.
 # An interrupted download can be retried; no user data or provider credentials are replaced.
 /usr/local/bin/install_assistant_runtime --install-prerequisites 7<&- || exit 1
+# Enable installed shared-key adapters only after their central deletion guard is ready; never import user keys here.
+if ! /usr/local/bin/ddistro_keys prepare-legacy >/dev/null; then
+    printf "${YELLOW}[WARNING] Shared API Keys setup is not ready. Existing keys are preserved; update CHIM 4 and the server adapters, then retry Update Distro.${NC}\n"
+fi
 # Shared key references resolve at request time; do not synchronize legacy copies.
 # Do not report a successful Assistant upgrade with a skipped or failed isolation check.
 if ! /usr/local/bin/ddistro --json agent probe 7<&- | /usr/bin/python3 -c '
