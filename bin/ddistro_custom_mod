@@ -14,6 +14,7 @@ Privilege split:
 import datetime
 import fcntl
 import grp
+import importlib.util
 import json
 import os
 import pwd
@@ -209,7 +210,7 @@ def validate_server_folder(name):
 
 
 def parse_manifest(raw):
-    """Parse and fully validate a version 1 manifest. Unknown keys are rejected."""
+    """Validate legacy branch manifests and opt-in version 2 release manifests."""
     if len(raw) > MAX_MANIFEST_BYTES:
         raise ModError(f"{MANIFEST_NAME} is larger than {MAX_MANIFEST_BYTES} bytes.")
     try:
@@ -218,14 +219,15 @@ def parse_manifest(raw):
         raise ModError(f"{MANIFEST_NAME} is not valid UTF-8 JSON.")
     if not isinstance(manifest, dict):
         raise ModError(f"{MANIFEST_NAME} must be a JSON object.")
-    if manifest.get("schema_version") != SCHEMA_VERSION or isinstance(manifest.get("schema_version"), bool):
-        raise ModError(f"Unsupported manifest schema_version. This distro supports version {SCHEMA_VERSION}.")
-    unknown = set(manifest) - MANIFEST_KEYS
+    version = manifest.get("schema_version")
+    if isinstance(version, bool) or version not in (1, 2) or (version == 2 and type(version) is not int):
+        raise ModError("Unsupported manifest schema_version. This distro supports versions 1 and 2.")
+    unknown = set(manifest) - (MANIFEST_KEYS | ({"game", "distribution", "features", "testing"} if version == 2 else set()))
     if unknown:
         raise ModError("Manifest has unsupported fields: " + ", ".join(sorted(unknown)[:5]))
 
     result = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": int(version),
         "id": validate_mod_id(manifest.get("id")),
         "name": text_field(manifest, "name", 60),
         "description": text_field(manifest, "description", 300, required=False),
@@ -267,6 +269,13 @@ def parse_manifest(raw):
     result["setup"] = clean_setup
     result["assets"] = parse_assets(manifest.get("assets"))
     result["branches"] = parse_branches(manifest.get("branches"))
+    if version == 2:
+        try:
+            release_support().validate_distribution(manifest)
+        except (ValueError, TypeError, KeyError) as error:
+            raise ModError(str(error))
+        result["game"] = manifest["game"]
+        result["distribution"] = manifest["distribution"]
     if result["server_folder"]:
         check_served_paths(result)
     return result
@@ -1473,6 +1482,8 @@ def command_install(args):
     require_php_security()
     read_protection_lists()  # a damaged list stops here, not in setup-web after the migration
     manifest, branch, commit, policy = inspect_repository(source, local)
+    if manifest["schema_version"] == 2:
+        raise ModError("This mod publishes release packages. Use release-check, then release-install.")
     if expected and commit != expected:
         raise ModError("The repository changed after it was checked. Check it again.")
     mod_id = manifest["id"]
@@ -1599,6 +1610,8 @@ def command_update(args):
     require_php_security()
     read_protection_lists()  # a damaged list stops here, not in setup-web after the migration
     entry = read_entry(args["id"])
+    if entry.get("install_mode") == "release":
+        raise ModError("This mod uses matched release packages; preview and use release-update.")
     folder = checked_folder(entry)
     source, local = entry_source(entry)
     # Update always stays on the installed branch, even when the author changed the default.
@@ -2262,6 +2275,8 @@ def status_entry(entry, check):
         "message": message, "folder": entry.get("folder", ""), "database": entry.get("database", ""),
         "dashboard_url": dashboard_url, "health_url": health_url, "updated_at": entry.get("updated_at", ""),
         "server_folder": entry.get("server_folder", ""),
+        "install_mode": entry.get("install_mode", "branch"),
+        "release": entry.get("release"), "pending_release": entry.get("pending_release"),
         # The old URL of a migrated mod, kept until its clients are rebuilt; dashboard_url is canonical.
         "legacy_url": (route_base(entry["id"]) + "/") if entry.get("legacy_route") else "",
     }
@@ -2316,11 +2331,32 @@ def command_status(args):
     print(json.dumps({"schema_version": STATUS_SCHEMA_VERSION, "mods": mods}))
 
 
+def release_support():
+    """Load the distro-owned sibling helper, never a module from an installed mod."""
+    name = "ddistro_mod_release"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, os.path.join(os.path.dirname(__file__), name + ".py"))
+        if spec is None or spec.loader is None:
+            raise ModError("Update Distro to install release package support.")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def command_release(args):
+    release_support().command(globals(), args)
+
+
 USAGE = """Usage: ddistro_custom_mod <command> [options]
 
   status [<id>] [--check-health] --json
   check <https-url> --json             Preview a repository's manifest (no changes).
   install <https-url> --expect-commit <sha>
+  release-check <github-url> [--tag <version>] --json
+  release-install <github-url> --tag <version> --expect-commit <sha> --expect-release <sha256>
+  release-update <id> --tag <version> --expect-commit <sha> --expect-release <sha256>
+                                       Install matching published server packages; never git pull.
   update <id> [--expect-commit <sha>]  Back up, then fast-forward and migrate (same branch);
                                        with --expect-commit, only to exactly that commit.
   branches <id> [--branch <name>] --json
@@ -2362,9 +2398,14 @@ def parse_args(argv):
             args["check_health"] = True
         elif token == "--drop-legacy-url" and command == "migrate-root":
             args["drop_legacy_url"] = True
+        elif token in ("--tag", "--expect-release", "--local-release") and index + 1 < len(rest):
+            if not command.startswith("release-") or token[2:].replace("-", "_") in args:
+                raise ModError(f"Unsupported or repeated option {token}.")
+            args[token[2:].replace("-", "_")] = rest[index + 1]
+            index += 1
         elif token in ("--expect-commit", "--local-source", "--branch", "--protect-project", "--protect-root",
                        "--server-folder") and index + 1 < len(rest):
-            allowed = {"--expect-commit": ("install", "update", "switch"), "--local-source": ("check", "install"),
+            allowed = {"--expect-commit": ("install", "update", "switch", "release-install", "release-update"), "--local-source": ("check", "install"),
                        "--branch": ("branches", "switch"), "--protect-project": ("setup-web",),
                        "--protect-root": ("setup-web",), "--server-folder": ("migrate-root",)}[token]
             if command not in allowed:
@@ -2380,7 +2421,25 @@ def parse_args(argv):
         else:
             positional.append(token)
         index += 1
-    if command in ("check", "install"):
+    if command == "release-pair":
+        if len(positional) != 1 or set(args) - {"command"}:
+            raise ModError("release-pair takes one installed mod id.")
+        args["id"] = validate_mod_id(positional[0])
+    elif command in ("release-check", "release-install", "release-update"):
+        if len(positional) > 1 or (positional and args.get("local_release") and command != "release-update"):
+            raise ModError("Provide one GitHub URL, or --local-release for an administrator's local package.")
+        if command == "release-update":
+            if len(positional) != 1:
+                raise ModError("release-update needs a registered mod id.")
+            args["id"] = validate_mod_id(positional[0])
+        else:
+            args["url"] = positional[0] if positional else None
+            if not args["url"] and not args.get("local_release"):
+                raise ModError("A GitHub repository URL is required.")
+        if command != "release-check" and (not SHA_PATTERN.fullmatch(args.get("expect_commit", "")) or
+                not re.fullmatch(r"[a-f0-9]{64}", args.get("expect_release", ""))):
+            raise ModError("Check the release first; install/update needs its commit and descriptor SHA-256.")
+    elif command in ("check", "install"):
         if len(positional) > 1 or (positional and args.get("local_source")):
             raise ModError(f"{command} takes one repository URL.")
         args["url"] = positional[0] if positional else None
@@ -2408,6 +2467,8 @@ def parse_args(argv):
 
 
 COMMANDS = {"status": command_status, "check": command_check, "install": command_install,
+            "release-check": command_release, "release-install": command_release, "release-update": command_release,
+            "release-pair": command_release,
             "update": command_update, "backup": command_backup, "unregister": command_unregister,
             "branches": command_branches, "switch": command_switch, "setup-web": command_setup_web,
             "migrate-root": command_migrate_root}
