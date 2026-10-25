@@ -12,7 +12,9 @@ Privilege split:
   * git, config syntax checks, and the repository migration run as dwemer.
 """
 import datetime
+import fcntl
 import grp
+import importlib.util
 import json
 import os
 import pwd
@@ -31,7 +33,8 @@ import urllib.request
 APP_USER = "dwemer"
 WEB_GROUP = "www-data"
 DATABASE_ROLE = "dwemer"
-MOD_ROOT = "/var/www/html/custom-mods"
+WEB_ROOT = "/var/www/html"
+MOD_ROOT = WEB_ROOT + "/custom-mods"
 # The shared loopback Apache listener for every custom mod (and a manual ExampleServer).
 # Official server ports are never touched; see setup_web.
 SERVICES_CONF = "/etc/dwemerdistro_services.conf"
@@ -44,6 +47,14 @@ WEB_MARKER = "# Managed by ddistro_custom_mod setup-web; do not edit."
 STATE_ROOT = "/var/lib/dwemerdistro-custom-mods"
 REGISTRY_ROOT = STATE_ROOT + "/registry"
 BACKUP_ROOT = STATE_ROOT + "/backups"
+# Root-only opt-in list, one mod id per line, of custom-mods/<id> folders that get the KAGRENAC
+# source denials (setup-web --protect-project). Outside the registry, so status never reads it.
+PROTECTED_PROJECTS = STATE_ROOT + "/protected-projects"
+MAX_PROTECTED_PROJECTS = 32
+# Root-only list, one server folder per line, of direct /var/www/html/<Name>Server roots. Each name
+# is saved here before its folder is created or moved in, and is never removed (see setup_web).
+PROTECTED_ROOTS = STATE_ROOT + "/protected-roots"
+MAX_PROTECTED_ROOTS = 64
 # Same lock protocol and path as ddistro_server, so official and custom
 # operations never run at the same time.
 LOCK_PATH = "/run/lock/dwemerdistro-server-manager.d"
@@ -60,6 +71,8 @@ ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,30}[a-z0-9]\Z")
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}\Z")
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}\Z")
 REL_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*\Z")
+# A direct server folder: ASCII letters and digits only (no dots, slashes or hyphens), ending in Server.
+SERVER_FOLDER_PATTERN = re.compile(r"^[A-Z][A-Za-z0-9]{0,40}Server\Z")
 HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 URL_PATH = re.compile(r"^(/[A-Za-z0-9._~-]+)+/?\Z")
 # IDs that name official products, their folders, or distro internals.
@@ -69,7 +82,7 @@ RESERVED_IDS = {
     "template", "custom-mods", "html", "admin", "root", "www-data",
 }
 MANIFEST_KEYS = {"schema_version", "id", "name", "description", "project_url", "dashboard_path",
-                 "health_path", "requirements", "setup", "assets", "branches"}
+                 "health_path", "requirements", "setup", "assets", "branches", "server_folder"}
 BRANCH_KEYS = {"default", "allowed"}
 MAX_BRANCHES = 10
 ASSET_KEYS = ("icon", "banner")
@@ -186,8 +199,18 @@ def validate_mod_id(mod_id):
     return mod_id
 
 
+def validate_server_folder(name):
+    """A direct /var/www/html/<name> folder: <Letters/digits>Server, never an official or Kagrenac product name."""
+    if not isinstance(name, str) or not SERVER_FOLDER_PATTERN.match(name):
+        raise ModError("Manifest server_folder must be 7-47 ASCII letters or digits, start with a capital "
+                       "letter and end in Server, such as CommonGroundServer.")
+    if name[:-len("Server")].lower() in RESERVED_IDS | {"example", "kagrenac", "custom", "custommods"}:
+        raise ModError("Manifest server_folder is reserved by DwemerDistro.")
+    return name
+
+
 def parse_manifest(raw):
-    """Parse and fully validate a version 1 manifest. Unknown keys are rejected."""
+    """Validate legacy branch manifests and opt-in version 2 release manifests."""
     if len(raw) > MAX_MANIFEST_BYTES:
         raise ModError(f"{MANIFEST_NAME} is larger than {MAX_MANIFEST_BYTES} bytes.")
     try:
@@ -196,14 +219,15 @@ def parse_manifest(raw):
         raise ModError(f"{MANIFEST_NAME} is not valid UTF-8 JSON.")
     if not isinstance(manifest, dict):
         raise ModError(f"{MANIFEST_NAME} must be a JSON object.")
-    if manifest.get("schema_version") != SCHEMA_VERSION or isinstance(manifest.get("schema_version"), bool):
-        raise ModError(f"Unsupported manifest schema_version. This distro supports version {SCHEMA_VERSION}.")
-    unknown = set(manifest) - MANIFEST_KEYS
+    version = manifest.get("schema_version")
+    if isinstance(version, bool) or version not in (1, 2) or (version == 2 and type(version) is not int):
+        raise ModError("Unsupported manifest schema_version. This distro supports versions 1 and 2.")
+    unknown = set(manifest) - (MANIFEST_KEYS | ({"game", "distribution", "features", "testing"} if version == 2 else set()))
     if unknown:
         raise ModError("Manifest has unsupported fields: " + ", ".join(sorted(unknown)[:5]))
 
     result = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": int(version),
         "id": validate_mod_id(manifest.get("id")),
         "name": text_field(manifest, "name", 60),
         "description": text_field(manifest, "description", 300, required=False),
@@ -213,6 +237,10 @@ def parse_manifest(raw):
     }
     if manifest.get("project_url") is not None:
         result["project_url"] = validate_repository_url(manifest.get("project_url"))
+    # Optional; without it the mod keeps the custom-mods/<id> layout. Chosen only at first install.
+    result["server_folder"] = ""
+    if manifest.get("server_folder") is not None:
+        result["server_folder"] = validate_server_folder(manifest.get("server_folder"))
 
     requirements = manifest.get("requirements")
     if not isinstance(requirements, dict) or set(requirements) != REQUIREMENT_KEYS:
@@ -241,7 +269,24 @@ def parse_manifest(raw):
     result["setup"] = clean_setup
     result["assets"] = parse_assets(manifest.get("assets"))
     result["branches"] = parse_branches(manifest.get("branches"))
+    if version == 2:
+        try:
+            release_support().validate_distribution(manifest)
+        except (ValueError, TypeError, KeyError) as error:
+            raise ModError(str(error))
+        result["game"] = manifest["game"]
+        result["distribution"] = manifest["distribution"]
+    if result["server_folder"]:
+        check_served_paths(result)
     return result
+
+
+def check_served_paths(manifest, suffix=""):
+    """A direct root always gets the project source denials, so nothing it serves may live there."""
+    for label, path in [("dashboard_path", manifest["dashboard_path"]), ("health_path", manifest["health_path"])] + \
+            [("assets." + k, v) for k, v in manifest["assets"].items()]:
+        if re.match(rf"^({PROJECT_SOURCE_DIRS})(/|$)", path) or re.search(rf"(^|/)({PROJECT_PRIVATE_FILES})$", path):
+            raise ModError(f"Manifest {label} is in a folder or file a server_folder install never serves.{suffix}")
 
 
 def validate_branch_name(branch, message="The repository default branch name is not supported."):
@@ -435,27 +480,42 @@ def custom_port():
     return CUSTOM_PORT
 
 
-def route_base():
-    return f"http://127.0.0.1:{custom_port()}/custom-mods"
+def route_path(mod_id, server_folder=""):
+    """The URL path of a mod: /<server_folder> for a direct root, else /custom-mods/<id>."""
+    if server_folder:
+        return "/" + validate_server_folder(server_folder)
+    return "/custom-mods/" + validate_mod_id(mod_id)
+
+
+def route_base(mod_id, server_folder=""):
+    return f"http://127.0.0.1:{custom_port()}{route_path(mod_id, server_folder)}"
 
 
 def mod_urls(mod_id, manifest):
-    base = f"{route_base()}/{mod_id}/"
+    """Dashboard and health URLs; manifest["server_folder"] must be the registered one for an installed mod."""
+    base = route_base(mod_id, manifest.get("server_folder", "")) + "/"
     return base + manifest["dashboard_path"], base + manifest["health_path"]
+
+
+def entry_folder(entry):
+    """The canonical folder of a registry entry: its validated server_folder under WEB_ROOT, else custom-mods/<id>."""
+    if entry.get("server_folder"):
+        return WEB_ROOT + "/" + validate_server_folder(entry["server_folder"])
+    return mod_folder(entry["id"])
 
 
 def asset_urls(entry):
     """Fixed-route icon/banner URLs for the installed revision; empty when absent, invalid, or not a plain file."""
     try:
         assets = parse_assets(entry.get("assets"))
+        folder = entry_folder(entry)
     except ModError:
         return {"icon_url": "", "banner_url": ""}
-    folder = mod_folder(entry["id"])
     urls = {}
     for key in ASSET_KEYS:
         path = assets.get(key, "")
         usable = path and not path_has_links(folder, path) and os.path.isfile(folder + "/" + path)
-        urls[key + "_url"] = f"{route_base()}/{entry['id']}/{path}" if usable else ""
+        urls[key + "_url"] = f"{route_base(entry['id'], entry.get('server_folder', ''))}/{path}" if usable else ""
     return urls
 
 
@@ -628,20 +688,9 @@ def read_entry(mod_id, include_unregistered=False):
 
 
 def write_entry(entry):
-    """Atomic, world-readable (no secrets), root-owned registry write."""
+    """Atomic, world-readable (no secrets), root-owned registry write, synced so an interrupted move resumes from it."""
     ensure_state_dirs()
-    path = registry_path(entry["id"])
-    fd, temp = tempfile.mkstemp(dir=REGISTRY_ROOT, prefix=".tmp-")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(entry, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.chmod(temp, 0o644)
-        os.replace(temp, path)
-    except BaseException:
-        if os.path.exists(temp):
-            os.unlink(temp)
-        raise
+    write_root_file(registry_path(entry["id"]), json.dumps(entry, indent=2, sort_keys=True) + "\n")
 
 
 def list_entries():
@@ -739,8 +788,10 @@ def registry_state(mod_id, source, local):
 
 
 def preview_document(manifest, branch, commit, source, local, policy):
-    dashboard_url, health_url = mod_urls(manifest["id"], manifest)
     state, entry = registry_state(manifest["id"], source, local)
+    # An existing install keeps its registered location; the manifest only chooses it for a new one.
+    server_folder = entry.get("server_folder", "") if state in ("registered", "restorable") else manifest["server_folder"]
+    dashboard_url, health_url = mod_urls(manifest["id"], dict(manifest, server_folder=server_folder))
     return {
         "branches": policy,
         "schema_version": STATUS_SCHEMA_VERSION,
@@ -752,7 +803,8 @@ def preview_document(manifest, branch, commit, source, local, policy):
         "branch": branch,
         "commit": commit,
         "requirements": manifest["requirements"],
-        "folder": f"{MOD_ROOT}/{manifest['id']}",
+        "folder": entry_folder({"id": manifest["id"], "server_folder": server_folder}),
+        "server_folder": server_folder,
         "database": database_name_for(manifest["id"]),
         "dashboard_url": dashboard_url,
         "health_url": health_url,
@@ -809,12 +861,84 @@ def ensure_mod_root():
     os.chmod(MOD_ROOT, 0o755)
 
 
+def require_safe_web_root():
+    """A direct root's parent is WEB_ROOT itself; it is checked, never changed.
+
+    DwemerDistro ships it as dwemer:www-data 2755, so root or the app account may own it; no group or
+    other write and no links. Because dwemer may then add names to it, root changes a new direct root
+    only through a no-follow handle (create_direct_root, apply_permissions).
+    """
+    try:
+        info_ = os.lstat(WEB_ROOT)
+    except FileNotFoundError:
+        raise ModError(f"{WEB_ROOT} is missing.")
+    if (not stat.S_ISDIR(info_.st_mode) or info_.st_uid not in (0, pwd_uid(APP_USER)) or info_.st_mode & 0o022
+            or path_has_linked_part(WEB_ROOT)):
+        raise ModError(f"{WEB_ROOT} must be a folder owned by root or {APP_USER} that no group or other user can "
+                       "change, reached without links, before a server folder can be placed in it. Nothing was changed.")
+
+
+def create_direct_root(folder):
+    """mkdir WEB_ROOT/<server folder> and hand it to dwemer; refuses a name or folder that appeared meanwhile."""
+    try:
+        os.mkdir(folder, 0o750)
+    except FileExistsError:
+        raise ModError(f"{folder} appeared during install. It was kept and is not adopted.")
+    try:
+        fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise ModError(f"{folder} was replaced during install. It was kept and is not adopted.")
+    try:
+        if os.fstat(fd).st_uid != 0 or os.listdir(fd):
+            raise ModError(f"{folder} was replaced during install. It was kept and is not adopted.")
+        os.fchown(fd, pwd_uid(APP_USER), group_id(WEB_GROUP))
+    finally:
+        os.close(fd)
+
+
+def server_folder_claims(name, mod_id):
+    """Why name cannot become mod_id's direct root (an entry, another registry claim, any letter case), or None."""
+    lower = name.lower()
+    try:
+        existing = os.listdir(WEB_ROOT)
+    except FileNotFoundError:
+        existing = []
+    for entry_name in existing:
+        if entry_name.lower() == lower:
+            return f"{WEB_ROOT}/{entry_name} already exists. It was kept and is not adopted."
+    try:
+        names = os.listdir(REGISTRY_ROOT)
+    except FileNotFoundError:
+        names = []
+    for file_name in names:
+        if not file_name.endswith(".json") or file_name.startswith(".") or file_name[:-5] == mod_id:
+            continue
+        try:
+            other = read_entry(file_name[:-5], include_unregistered=True)
+        except ModError:
+            continue
+        pending = other.get("migration") if isinstance(other.get("migration"), dict) else {}
+        if lower in (str(other.get("server_folder", "")).lower(), str(pending.get("server_folder", "")).lower()):
+            return f"Server folder {name} is already registered to {other['id']}."
+    return None
+
+
 def mod_folder(mod_id):
     return f"{MOD_ROOT}/{validate_mod_id(mod_id)}"
 
 
+def refuse_pending_move(entry):
+    """Nothing but migrate-root itself touches an entry whose move was interrupted."""
+    record = entry.get("migration")
+    if record is not None:
+        name = record.get("server_folder") if isinstance(record, dict) else None
+        raise ModError(f"A move of {entry['id']} to /{name} was interrupted. Run sudo ddistro_custom_mod migrate-root "
+                       f"{entry['id']} --server-folder {name} to finish or undo it. Nothing was changed.")
+
+
 def checked_folder(entry):
-    folder = mod_folder(entry["id"])
+    refuse_pending_move(entry)
+    folder = entry_folder(entry)
     if entry.get("folder") != folder or os.path.islink(folder) or not os.path.isdir(folder):
         raise ModError("The custom mod folder is missing or not a plain folder.")
     if os.path.realpath(folder) != folder:
@@ -837,14 +961,40 @@ def path_has_linked_part(path):
 def apply_permissions(folder):
     # Same contract as official servers: dwemer:www-data, group-readable, no world access.
     # find -P never follows links; validate_tree already rejected tracked links.
-    if folder != mod_folder(os.path.basename(folder)) or path_has_linked_part(folder) or not os.path.isdir(folder):
+    if not is_scoped_folder(folder) or path_has_linked_part(folder) or not os.path.isdir(folder):
         raise ModError("Refusing to set permissions outside a custom mod folder.")
-    for command in (["find", "-P", folder, "-exec", "chown", "-h", f"{APP_USER}:{WEB_GROUP}", "{}", "+"],
-                    ["find", "-P", folder, "-type", "d", "-exec", "chmod", "u+rwx,g+rxs,g-w,o-rwx", "{}", "+"],
-                    ["find", "-P", folder, "-type", "f", "-exec", "chmod", "u+rw,g+r,g-w,o-rwx", "{}", "+"],
-                    ["chmod", "u+rwx,g+rxs,o-rwx", "--", folder]):
+    direct = os.path.dirname(folder) == WEB_ROOT
+    commands = [["find", "-P", folder, "-exec", "chown", "-h", f"{APP_USER}:{WEB_GROUP}", "{}", "+"],
+                ["find", "-P", folder, "-type", "d", "-exec", "chmod", "u+rwx,g+rxs,g-w,o-rwx", "{}", "+"],
+                ["find", "-P", folder, "-type", "f", "-exec", "chmod", "u+rw,g+r,g-w,o-rwx", "{}", "+"]]
+    if not direct:
+        commands.append(["chmod", "u+rwx,g+rxs,o-rwx", "--", folder])
+    for command in commands:
         if run(command, timeout=300).returncode != 0:
             raise ModError("Could not set the mod folder's owner and permissions.")
+    if direct:
+        # dwemer may own WEB_ROOT and swap the name for a link; chmod would follow it, fchmod on O_NOFOLLOW cannot.
+        try:
+            fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            raise ModError("Could not set the mod folder's owner and permissions.")
+        try:
+            os.fchmod(fd, (stat.S_IMODE(os.fstat(fd).st_mode) | 0o750 | stat.S_ISGID) & ~0o007)
+        finally:
+            os.close(fd)
+
+
+def is_scoped_folder(folder):
+    """custom-mods/<valid id> or WEB_ROOT/<valid server folder>, exactly; nothing else under the web root."""
+    parent, name = os.path.split(folder)
+    try:
+        if parent == MOD_ROOT:
+            return folder == mod_folder(name)
+        if parent == WEB_ROOT:
+            return name == validate_server_folder(name)
+    except ModError:
+        return False
+    return False
 
 
 def path_has_links(folder, relative):
@@ -933,21 +1083,177 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 # --- Shared web listener (root; Apache config only, never repository code) -------------
 
 # Never served from a mod checkout: Git metadata in any custom mod or a manual ExampleServer,
-# and the source-only folders of the known Kagrenac install paths (launcher id, manual folder,
-# legacy path). A manually named or forked copy elsewhere needs its own server-side rules.
+# and the source-only folders and private files of the known Kagrenac install paths (launcher
+# id, manual folder, legacy path). A manually named or forked copy elsewhere needs setup-web
+# --protect-project (custom-mods/<id> only) or its own server-side rules.
 GIT_DENY_DIR = r"^/var/www/html/(ExampleServer|custom-mods/[^/]+)/(.+/)?\.git(/|$)"
-SOURCE_DENY_DIR = r"^/var/www/html/(ExampleServer|custom-mods/(example-server|KagrenacServer))/(client|ports|docs)(/|$)"
 GIT_DENY_URL = r"^/+(ExampleServer|custom-mods/+[^/]+)/+(.*/)?\.git(/|$)"
-SOURCE_DENY_URL = r"^/+(ExampleServer|custom-mods/+(example-server|KagrenacServer))/+(client|ports|docs)(/|$)"
+# Root-level folders and any-depth file names hidden for the known paths and opted-in projects.
+PROJECT_SOURCE_DIRS = "client|ports|docs|config|lib|sql|scripts"
+PROJECT_PRIVATE_FILES = r"config\.json|\.env"
 
 
-def web_site_text(port):
+def deny_rules(dir_roots, url_roots):
+    """(source folder, project folder, URL) patterns for project roots given as regex alternatives."""
+    return (rf"^/var/www/html/({dir_roots})/({PROJECT_SOURCE_DIRS})(/|$)",
+            rf"^/var/www/html/({dir_roots})(/|$)",
+            rf"^/+({url_roots})/+(({PROJECT_SOURCE_DIRS})(/|$)|(.*/)?({PROJECT_PRIVATE_FILES})(/|$))")
+
+
+SOURCE_DENY_DIR, PRIVATE_DENY_DIR, SOURCE_DENY_URL = deny_rules(
+    "ExampleServer|custom-mods/(example-server|KagrenacServer)", "ExampleServer|custom-mods/+(example-server|KagrenacServer)")
+
+
+def project_deny_rules(protected):
+    """The same patterns scoped to the opted-in custom-mods/<id> only, each id validated and escaped."""
+    ids = "|".join(re.escape(validate_mod_id(mod_id)) for mod_id in protected)
+    return deny_rules(f"custom-mods/({ids})", f"custom-mods/+({ids})")
+
+
+def deny_dir_text(source_dir, project_dir):
+    return (f'<DirectoryMatch "{source_dir}">\n\tRequire all denied\n</DirectoryMatch>\n'
+            f'<DirectoryMatch "{project_dir}">\n\t<FilesMatch "^({PROJECT_PRIVATE_FILES})$">\n'
+            "\t\tRequire all denied\n\t</FilesMatch>\n</DirectoryMatch>\n")
+
+
+def read_protected_projects():
+    return read_protected_list(PROTECTED_PROJECTS, validate_mod_id, MAX_PROTECTED_PROJECTS)
+
+
+def read_protected_roots():
+    return read_protected_list(PROTECTED_ROOTS, validate_server_folder, MAX_PROTECTED_ROOTS)
+
+
+def read_protection_lists():
+    read_protected_projects()
+    read_protected_roots()
+
+
+def read_protected_list(path, validate, maximum):
+    """The opted-in names; missing means none. Anything but a private root file of valid names is refused.
+
+    The writer never saves an empty list and nothing removes ids, so an empty file is damage, not "none".
+
+    Refusing (instead of skipping) means the listener is never rewritten without a protection
+    that was asked for.
+    """
+    try:
+        parent = os.lstat(STATE_ROOT)
+    except FileNotFoundError:
+        return []
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or parent.st_mode & 0o022:
+        raise ModError(f"{STATE_ROOT} is not a root-owned folder that only root can change. Nothing was changed.")
+    problem = f"{path} is not a private root-owned list (0600). Nothing was changed."
+    try:
+        # Non-blocking, so a FIFO or device returns at once and is then refused by the fstat check.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        raise ModError(problem)
+    with os.fdopen(fd, "rb") as handle:
+        info_ = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info_.st_mode) or info_.st_uid != 0 or info_.st_mode & 0o777 != 0o600:
+            raise ModError(problem)
+        raw = handle.read(maximum * 48 + 1)
+    try:
+        lines = raw.decode("ascii").split("\n")
+    except UnicodeDecodeError:
+        raise ModError(problem)
+    if lines[-1] != "" or len(lines) - 1 > maximum:
+        raise ModError(problem)
+    projects = lines[:-1]
+    if not projects:
+        raise ModError(problem)
+    try:
+        for name in projects:
+            validate(name)
+    except ModError:
+        raise ModError(problem)
+    if len(set(projects)) != len(projects):
+        raise ModError(problem)
+    return projects
+
+
+def protect_project(mod_id):
+    protect_name(PROTECTED_PROJECTS, read_protected_projects, MAX_PROTECTED_PROJECTS, mod_id, f"/custom-mods/{mod_id}")
+
+
+def protect_root(name):
+    protect_name(PROTECTED_ROOTS, read_protected_roots, MAX_PROTECTED_ROOTS, validate_server_folder(name), f"/{name}")
+
+
+def protect_name(path, reader, maximum, name, route):
+    """Persist the opt-in before it is applied, so a failed apply keeps it for the retry and later runs."""
+    names = reader()
+    if name in names:
+        info(f"{route} is already protected.")
+        return
+    if len(names) >= maximum:
+        raise ModError(f"At most {maximum} names can be protected in {path}. Nothing was changed.")
+    ensure_state_dirs()
+    write_root_file(path, "".join(p + "\n" for p in sorted(names + [name])), mode=0o600)
+    # Reading it back checks the real owner, mode, and content that later runs will see.
+    if name not in reader():
+        raise ModError(f"Could not save the protection for {route}.")
+    ok(f"Saved the protection for {route}.")
+
+
+def web_locations():
+    """Direct roots to protect and grant (the saved list plus every registry entry's, tombstones too), and the
+    (id, server_folder) legacy aliases of migrated entries. A root never loses protection while it is registered."""
+    roots, aliases = set(read_protected_roots()), []
+    try:
+        names = sorted(os.listdir(REGISTRY_ROOT))
+    except FileNotFoundError:
+        names = []
+    for file_name in names:
+        if not file_name.endswith(".json") or file_name.startswith("."):
+            continue
+        try:
+            entry = read_entry(file_name[:-5], include_unregistered=True)
+            if not entry.get("server_folder"):
+                continue
+            folder = validate_server_folder(entry["server_folder"])
+        except ModError:
+            continue
+        roots.add(folder)
+        if entry.get("legacy_route") == "/custom-mods/" + entry["id"]:
+            aliases.append((entry["id"], folder))
+    return sorted(roots), aliases
+
+
+def root_deny_rules(roots, alias_ids):
+    """(source folder, project folder, URL, git folder, git URL) patterns for direct roots and legacy alias URLs."""
+    dirs = "|".join(re.escape(validate_server_folder(name)) for name in roots)
+    urls = dirs + ("|custom-mods/+(" + "|".join(re.escape(validate_mod_id(i)) for i in alias_ids) + ")" if alias_ids else "")
+    return deny_rules(dirs, urls) + (rf"^/var/www/html/({dirs})/(.+/)?\.git(/|$)", rf"^/+({urls})/+(.*/)?\.git(/|$)")
+
+
+def web_site_text(port, protected=(), roots=(), aliases=()):
     """This manager's own Apache site: one loopback listener serving only the custom mod paths.
 
     The DirectoryMatch denials sit outside the virtual host, so they also apply on the other
     listeners that serve /var/www/html; the LocationMatch copies come after this listener's
-    grant, which would otherwise override them.
+    grant, which would otherwise override them. Opted-in projects only add their own copies.
+    Direct roots are granted on this listener by exact name only, with the same denials in place
+    everywhere; a migrated mod's old /custom-mods/<id> URL is an Alias to its one folder.
     """
+    outside = inside = grant = ""
+    if protected:
+        source_dir, project_dir, url = project_deny_rules(protected)
+        outside = deny_dir_text(source_dir, project_dir)
+        inside = f'\t<LocationMatch "{url}">\n\t\tRequire all denied\n\t</LocationMatch>\n'
+    if roots:
+        source_dir, project_dir, url, git_dir, git_url = root_deny_rules(roots, [i for i, _ in aliases])
+        outside += f'<DirectoryMatch "{git_dir}">\n\tRequire all denied\n</DirectoryMatch>\n' + \
+            deny_dir_text(source_dir, project_dir)
+        grant = "".join(f'\tAlias "/custom-mods/{validate_mod_id(i)}" "{WEB_ROOT}/{validate_server_folder(f)}"\n'
+                        for i, f in aliases)
+        names = "|".join(re.escape(name) for name in roots)
+        grant += f'\t<LocationMatch "^/({names})(/|$)">\n\t\tRequire all granted\n\t</LocationMatch>\n'
+        inside += "".join(f'\t<LocationMatch "{pattern}">\n\t\tRequire all denied\n\t</LocationMatch>\n'
+                          for pattern in (git_url, url))
     return f"""{WEB_MARKER} To change the port, set
 # CUSTOM_MODS_PORT ({CUSTOM_PORT_MIN}-{CUSTOM_PORT_MAX}) in {SERVICES_CONF}, then run:
 #   sudo ddistro_custom_mod setup-web
@@ -955,10 +1261,7 @@ Listen 127.0.0.1:{port}
 <DirectoryMatch "{GIT_DENY_DIR}">
 \tRequire all denied
 </DirectoryMatch>
-<DirectoryMatch "{SOURCE_DENY_DIR}">
-\tRequire all denied
-</DirectoryMatch>
-<VirtualHost 127.0.0.1:{port}>
+{deny_dir_text(SOURCE_DENY_DIR, PRIVATE_DENY_DIR)}{outside}<VirtualHost 127.0.0.1:{port}>
 \tDocumentRoot /var/www/html
 \t<Location "/">
 \t\tRequire all denied
@@ -966,13 +1269,13 @@ Listen 127.0.0.1:{port}
 \t<LocationMatch "^/(ExampleServer|custom-mods/[^/]+)(/|$)">
 \t\tRequire all granted
 \t</LocationMatch>
-\t<LocationMatch "{GIT_DENY_URL}">
+{grant}\t<LocationMatch "{GIT_DENY_URL}">
 \t\tRequire all denied
 \t</LocationMatch>
 \t<LocationMatch "{SOURCE_DENY_URL}">
 \t\tRequire all denied
 \t</LocationMatch>
-\tErrorLog ${{APACHE_LOG_DIR}}/custom_mods_error.log
+{inside}\tErrorLog ${{APACHE_LOG_DIR}}/custom_mods_error.log
 \tCustomLog ${{APACHE_LOG_DIR}}/custom_mods_access.log combined
 </VirtualHost>
 """
@@ -1015,17 +1318,31 @@ def apache_running():
     return run(["/etc/init.d/apache2", "status"], timeout=30).returncode == 0
 
 
-def write_root_file(path, text):
-    fd, temp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+def write_root_file(path, text, mode=0o644):
+    """Atomic replace; the data is synced before the rename and the folder after it, before returning."""
+    folder = os.path.dirname(path)
+    fd, temp = tempfile.mkstemp(dir=folder, prefix=".tmp-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
-        os.chmod(temp, 0o644)
+            handle.flush()
+            os.chmod(temp, mode)
+            os.fsync(handle.fileno())
         os.replace(temp, path)
     except BaseException:
         if os.path.exists(temp):
             os.unlink(temp)
         raise
+    sync_folder(folder)
+
+
+def sync_folder(folder):
+    if hasattr(os, "O_DIRECTORY"):  # always on Linux; Windows cannot open a folder to sync it
+        folder_fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(folder_fd)
+        finally:
+            os.close(folder_fd)
 
 
 def apply_apache(reload, port):
@@ -1070,7 +1387,7 @@ def setup_web():
         if not previous.startswith(WEB_MARKER):
             raise ModError(f"{site} was not written by this manager. Nothing was changed.")
     was_enabled = os.path.lexists(link)
-    text = web_site_text(port)
+    text = web_site_text(port, read_protected_projects(), *web_locations())
     conflict = apache_conflict(port, site)
     retry = f"Choose another CUSTOM_MODS_PORT ({CUSTOM_PORT_MIN}-{CUSTOM_PORT_MAX}) in {SERVICES_CONF}, then run " \
             "ddistro_custom_mod setup-web again. Nothing was changed."
@@ -1163,11 +1480,15 @@ def command_install(args):
         raise ModError("Check the repository first; install needs the checked commit.")
     acquire_lock()
     require_php_security()
+    read_protection_lists()  # a damaged list stops here, not in setup-web after the migration
     manifest, branch, commit, policy = inspect_repository(source, local)
+    if manifest["schema_version"] == 2:
+        raise ModError("This mod publishes release packages. Use release-check, then release-install.")
     if expected and commit != expected:
         raise ModError("The repository changed after it was checked. Check it again.")
     mod_id = manifest["id"]
-    folder = mod_folder(mod_id)
+    server_folder = manifest["server_folder"]
+    folder = entry_folder({"id": mod_id, "server_folder": server_folder})
     database = database_name_for(mod_id)
     state, previous = registry_state(mod_id, source, local)
     if state == "registered":
@@ -1180,26 +1501,43 @@ def command_install(args):
         same_branch = previous.get("branch") == branch
         restore_entry(previous, manifest, commit if same_branch else None, policy)
         return
-    ensure_mod_root()
+    if server_folder:
+        require_safe_web_root()
+        claim = server_folder_claims(server_folder, mod_id)
+        if claim:
+            raise ModError(claim)
+    else:
+        ensure_mod_root()
     if os.path.lexists(folder):
         raise ModError(f"{folder} already exists. It was kept; remove or rename it before installing.")
     require_existing_role()
     if database_exists(database):
         raise ModError(f"Database {database} already exists. It was kept and is not adopted.")
+    if server_folder:
+        # Denied on every listener before the folder exists, so no source is ever served from it.
+        protect_root(server_folder)
+        try:
+            setup_web()
+        except ModError as error:
+            raise ModError(f"{error} The protection for /{server_folder} is saved but not active; nothing was installed.")
 
     entry = {
         "schema_version": STATUS_SCHEMA_VERSION, "id": mod_id, "name": manifest["name"],
         "description": manifest["description"], "project_url": manifest["project_url"],
         "repository": source, "local_source": local, "branch": branch, "commit": commit,
-        "folder": folder, "database": database, "dashboard_path": manifest["dashboard_path"],
+        "folder": folder, "server_folder": server_folder, "database": database,
+        "dashboard_path": manifest["dashboard_path"],
         "health_path": manifest["health_path"], "setup": manifest["setup"], "assets": manifest["assets"],
         "branches": policy, "branches_checked_at": now_utc(),
         "state": "installing", "message": "Installing.", "installed_at": now_utc(), "updated_at": now_utc(),
         "operation_pid": os.getpid(),
     }
 
-    os.mkdir(folder, 0o750)
-    os.chown(folder, pwd_uid(APP_USER), group_id(WEB_GROUP))
+    if server_folder:
+        create_direct_root(folder)
+    else:
+        os.mkdir(folder, 0o750)
+        os.chown(folder, pwd_uid(APP_USER), group_id(WEB_GROUP))
     info(f"Downloading {manifest['name']} from branch {branch}.")
     clone = git(["clone", "--quiet", "--no-checkout", "--single-branch", "--no-tags", "--branch", branch,
                  "--", source, folder], local_source=local, timeout=CLONE_TIMEOUT, check=False)
@@ -1265,9 +1603,15 @@ def refresh_policy(entry, source, local):
 
 def command_update(args):
     require_root()
+    expected = args.get("expect_commit")
+    if expected is not None and not SHA_PATTERN.match(expected):
+        raise ModError("--expect-commit must be a full commit id.")
     acquire_lock()
     require_php_security()
+    read_protection_lists()  # a damaged list stops here, not in setup-web after the migration
     entry = read_entry(args["id"])
+    if entry.get("install_mode") == "release":
+        raise ModError("This mod uses matched release packages; preview and use release-update.")
     folder = checked_folder(entry)
     source, local = entry_source(entry)
     # Update always stays on the installed branch, even when the author changed the default.
@@ -1278,7 +1622,7 @@ def command_update(args):
     write_entry(entry)
     progress = {"changed": False}
     try:
-        update_checkout(entry, folder, source, local, branch, progress)
+        update_checkout(entry, folder, source, local, branch, progress, expect_commit=expected)
     except ModError as error:
         # A refusal before any change keeps a ready mod ready; a failure after it is visible.
         if previous_state == "ready" and not progress["changed"]:
@@ -1307,6 +1651,7 @@ def command_branches(args):
     require_root()
     acquire_lock()
     entry = read_entry(args["id"])
+    refuse_pending_move(entry)
     source, local = entry_source(entry)
     target = branch_target(args, entry) if args.get("branch") else None
     manifest, branch, commit, policy = inspect_repository(source, local, target, policy_only=target is None)
@@ -1337,6 +1682,7 @@ def command_switch(args):
         raise ModError("Review the branch first; switch needs the reviewed commit.")
     acquire_lock()
     require_php_security()
+    read_protection_lists()  # a damaged list stops here, not in setup-web after the migration
     entry = read_entry(args["id"])
     folder = checked_folder(entry)
     source, local = entry_source(entry)
@@ -1354,7 +1700,7 @@ def command_switch(args):
     write_entry(entry)
     progress = {"changed": False}
     try:
-        update_checkout(entry, folder, source, local, target, progress, expect_commit=expected)
+        update_checkout(entry, folder, source, local, target, progress, expect_commit=expected, switching=True)
     except ModError as error:
         entry.clear()
         entry.update(before)
@@ -1383,7 +1729,8 @@ def switch_rollback(entry, folder, old_branch, old_commit, target, error, progre
         return {"state": "failed", "message": f"Switch to {target} failed: {error} {rollback_error} "
                                               "Choose Update to retry." + database_note}
     healthy, _ = check_health(entry["id"], {"dashboard_path": entry.get("dashboard_path", ""),
-                                            "health_path": entry.get("health_path", "")})
+                                            "health_path": entry.get("health_path", ""),
+                                            "server_folder": entry.get("server_folder", "")})
     state = "ready" if healthy and entry.get("state") == "ready" else "failed"
     return {"state": state, "message": f"Switch to {target} failed: {error} The code was returned to branch "
                                        f"{old_branch} at {old_commit[:7]}." + database_note}
@@ -1404,15 +1751,18 @@ def incoming_collisions(folder, new_paths):
     return collisions
 
 
-def update_checkout(entry, folder, source, local, branch, progress, expect_commit=None):
-    """Update fast-forwards the installed branch; a branch switch (expect_commit) may diverge."""
+def update_checkout(entry, folder, source, local, branch, progress, expect_commit=None, switching=False):
+    """Update fast-forwards the installed branch (to expect_commit when pinned); only a switch may diverge."""
+    if switching and not expect_commit:
+        raise ModError("A branch switch needs the reviewed commit. Nothing was changed.")
     # Custom mods never discard edits: there is no force option here.
     status = git(["status", "--porcelain", "--untracked-files=no"], cwd=folder,
                  message="Could not read the mod folder status.")
     if status.stdout.strip():
         raise ModError("Files tracked by the mod were changed locally. Nothing was updated.")
-    if expect_commit:
-        # Rollback recreates the registered branch at the registered commit, so both must be what is installed.
+    if switching or expect_commit:
+        # Rollback recreates the registered branch at the registered commit, and a pinned update records the
+        # reviewed commit for the registered branch, so both must be what is installed.
         head = git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], cwd=folder, check=False)
         current = git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=folder, check=False)
         if (head.stdout.decode().strip() != entry["commit"]
@@ -1429,11 +1779,18 @@ def update_checkout(entry, folder, source, local, branch, progress, expect_commi
         raise ModError("The update changes the mod id. Nothing was updated.")
     if manifest["setup"]["config_path"] != entry["setup"]["config_path"]:
         raise ModError("The update moves the private config path. Nothing was updated.")
-    if not expect_commit and git(["merge-base", "--is-ancestor", "HEAD", incoming], cwd=folder,
-                                 check=False).returncode != 0:
+    if entry.get("server_folder"):
+        # The registered root decides the denials, even while this manifest has no server_folder.
+        check_served_paths(manifest, " Nothing was updated.")
+    if manifest["server_folder"] != entry.get("server_folder", ""):
+        info(f"The repository declares server_folder {manifest['server_folder'] or '(none)'}; this install stays in "
+             f"{entry['folder']}. Only migrate-root moves an installed mod.")
+    # The validated commit, not the ref, is what lands, so a pinned update installs exactly the reviewed one.
+    if not switching and git(["merge-base", "--is-ancestor", "HEAD", commit], cwd=folder,
+                             check=False).returncode != 0:
         raise ModError("The update is not a fast-forward of the installed version. Nothing was updated.")
     local_ref = f"refs/heads/{branch}"
-    if expect_commit and git(["show-ref", "--verify", "--quiet", local_ref], cwd=folder, check=False).returncode == 0 \
+    if switching and git(["show-ref", "--verify", "--quiet", local_ref], cwd=folder, check=False).returncode == 0 \
             and git(["merge-base", "--is-ancestor", local_ref, expect_commit], cwd=folder,
                     check=False).returncode != 0:
         # checkout -B would discard local commits on an existing destination branch.
@@ -1444,11 +1801,13 @@ def update_checkout(entry, folder, source, local, branch, progress, expect_commi
     collisions = incoming_collisions(folder, new_paths - old_paths)
     if collisions:
         raise ModError(f"The update would replace local file {collisions[0]}. Nothing was updated.")
-    if expect_commit:
+    if switching:
         git(["checkout", "--quiet", "-B", branch, expect_commit], cwd=folder, message="Could not switch branches.")
     else:
-        git(["merge", "--ff-only", "--quiet", incoming], cwd=folder, message="Fast-forward update failed.")
+        git(["merge", "--ff-only", "--quiet", commit], cwd=folder, message="Fast-forward update failed.")
     progress["changed"] = True
+    # Recorded now, so a later failure leaves the registry naming what is checked out and a pinned retry works.
+    entry.update(commit=commit, branch=branch)
     apply_permissions(folder)
     write_config_if_missing(folder, manifest, template, entry["id"])
     if not database_exists(entry["database"]):
@@ -1459,11 +1818,10 @@ def update_checkout(entry, folder, source, local, branch, progress, expect_commi
     progress["migrated"] = True
     run_setup_checks(folder, manifest)
     setup_web()
-    healthy, message = check_health(entry["id"], manifest)
+    healthy, message = check_health(entry["id"], dict(manifest, server_folder=entry.get("server_folder", "")))
     entry.update(name=manifest["name"], description=manifest["description"],
                  project_url=manifest["project_url"], dashboard_path=manifest["dashboard_path"],
-                 health_path=manifest["health_path"], setup=manifest["setup"], assets=manifest["assets"],
-                 commit=commit, branch=branch)
+                 health_path=manifest["health_path"], setup=manifest["setup"], assets=manifest["assets"])
     if not healthy:
         raise ModError(message)
 
@@ -1472,6 +1830,326 @@ def command_backup(args):
     require_root()
     acquire_lock()
     backup(read_entry(args["id"]))
+
+
+def http_status(url):
+    request = urllib.request.Request(url, method="GET", headers={"User-Agent": "ddistro_custom_mod"})
+    try:
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=10) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
+    except (urllib.error.URLError, OSError):
+        return 0
+
+
+def route_problem(entry, server_folder):
+    """Why one route of the entry's folder is not serving it safely: health 200, .git and the private config 403."""
+    manifest = {"dashboard_path": entry["dashboard_path"], "health_path": entry["health_path"],
+                "server_folder": server_folder}
+    healthy, message = check_health(entry["id"], manifest)
+    base = route_base(entry["id"], server_folder)
+    if not healthy:
+        return f"{base}: {message}"
+    config = entry["setup"]["config_path"]
+    for probe in [".git/HEAD"] + ([config] if re.match(rf"^({PROJECT_SOURCE_DIRS})/", config) else []):
+        code = http_status(f"{base}/{probe}")
+        if code != 403:
+            return f"{base}/{probe} answered HTTP {code}, not 403."
+    return None
+
+
+def hold_config_lock(folder, entry):
+    """The app's config lock (<config_path>.lock), taken without waiting so no config save runs during a move.
+
+    A missing lock is not created: root would make a file the app may not open. A save that creates it
+    meanwhile is still safe, because the app's config writer uses absolute paths under the old folder;
+    after the rename each of its path steps fails (the root-owned custom-mods cannot gain the name
+    back) and it saves nothing, while a step before the rename completes in place and moves with it.
+    """
+    relative = entry["setup"]["config_path"] + ".lock"
+    lock = folder + "/" + relative
+    if not os.path.lexists(lock):
+        return None
+    if path_has_links(folder, relative) or not os.path.isfile(lock):
+        raise ModError("The config lock is not a regular file. Nothing was changed.")
+    fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise ModError("A config save is running (its lock is held). Try again when it is finished. Nothing was changed.")
+    return fd
+
+
+def backup_for_move(entry):
+    """The usual backup (config and database), plus the registry entry and this manager's Apache site."""
+    target = backup(entry)
+    site = f"{APACHE_DIR}/sites-available/{WEB_SITE}.conf"
+    for source, name in ((registry_path(entry["id"]), "registry.json"), (site, "apache-site.conf")):
+        if os.path.isfile(source) and not os.path.islink(source):
+            with open(source, "rb") as handle, \
+                    os.fdopen(os.open(f"{target}/{name}", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as dest:
+                shutil.copyfileobj(handle, dest)
+    return target
+
+
+def command_migrate_root(args):
+    """Move a ready custom-mods/<id> install to WEB_ROOT/<server folder> in one same-filesystem rename.
+
+    Nothing is copied: owners, modes, the private config and its lock keep their inodes, and the
+    database, token and history are not touched. The new folder is denied on every listener, and
+    Apache is seen answering with those denials, before the rename; the old URL is served from the
+    same folder by an Alias until --drop-legacy-url. The registry records the move (exact source,
+    destination, backup and folder inode) before the rename, so a rerun after a crash finishes or
+    restarts exactly that move.
+    """
+    require_root()
+    acquire_lock()
+    read_protection_lists()
+    entry = read_entry(args["id"])
+    if args.get("drop_legacy_url"):
+        drop_legacy_url(entry)
+        return
+    name = args["server_folder"]
+    if entry.get("migration") is not None:
+        entry = resume_move(entry, name)
+        if entry is None:
+            return
+    if entry.get("server_folder"):
+        raise ModError(f"{entry['name']} is already in {entry['folder']}. Nothing was changed.")
+    if entry.get("state") != "ready":
+        raise ModError(f"Only a ready mod is moved; {entry['name']} is {entry.get('state')}. Choose Update first. "
+                       "Nothing was changed.")
+    source = checked_folder(entry)
+    dest = f"{WEB_ROOT}/{name}"
+    require_safe_web_root()
+    claim = server_folder_claims(name, entry["id"])
+    if claim:
+        raise ModError(claim + " Nothing was changed.")
+    if os.lstat(source).st_dev != os.lstat(WEB_ROOT).st_dev:
+        raise ModError(f"{source} and {WEB_ROOT} are on different filesystems, so it cannot be moved in place. "
+                       "Nothing was changed.")
+    require_clean_checkout(source, entry)
+    lock_fd = hold_config_lock(source, entry)
+    try:
+        target = backup_for_move(entry)
+        try:
+            protect_root(name)
+            setup_web()  # the destination is denied everywhere before anything appears there
+            wait_for_root_grant(entry["id"], name)
+            record = move_record(entry, name, target, source)
+            write_entry(dict(entry, migration=record))
+        except (OSError, ModError) as error:
+            raise ModError(f"{error} Nothing was moved (backup in {target}).")
+        try:
+            os.rename(source, dest)
+        except OSError as error:
+            write_entry(entry)
+            raise ModError(f"{error} Nothing was moved (backup in {target}).")
+        sync_folder(MOD_ROOT)
+        sync_folder(WEB_ROOT)
+        finish_move(record)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def require_clean_checkout(folder, entry):
+    if git(["status", "--porcelain", "--untracked-files=no"], cwd=folder,
+           message="Could not read the mod folder status.").stdout.strip():
+        raise ModError("Files tracked by the mod were changed locally. Nothing was changed.")
+    head = git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], cwd=folder, check=False).stdout.decode().strip()
+    current = git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=folder, check=False).stdout.decode().strip()
+    if head != entry["commit"] or current != entry["branch"]:
+        raise ModError("The mod folder is not at its registered branch and commit. Nothing was changed.")
+
+
+# Seconds an admin move waits for a graceful reload to be what answers; probes of a not-yet-existing root.
+RELOAD_TIMEOUT = 20
+RELOAD_CONFIRMATIONS = 3
+ROOT_PROBES = (".git/HEAD", "config/config.php", "lib/", "config.json")
+
+
+def wait_for_root_grant(mod_id, name):
+    """Until Apache answers with the config that grants and protects the still-missing /<name>.
+
+    A graceful reload returns before its children serve, and the custom port was already open, so
+    neither proves anything. The old config denies all of /<name> (403); the new one grants it, so an
+    unknown path is 404 while each protected path stays 403. Several fresh connections in a row must agree.
+    """
+    base = route_base(mod_id, name)
+    nonce = "ddistro-reload-" + secrets.token_hex(8)
+    expected = [404] + [403] * len(ROOT_PROBES)
+    deadline, agreed = time.monotonic() + RELOAD_TIMEOUT, 0
+    while True:
+        answers = [http_status(f"{base}/{path}") for path in (nonce,) + ROOT_PROBES]
+        agreed = agreed + 1 if answers == expected else 0
+        if agreed >= RELOAD_CONFIRMATIONS:
+            return
+        if time.monotonic() >= deadline:
+            raise ModError(f"Apache did not answer with the protection for /{name} within {RELOAD_TIMEOUT} seconds "
+                           f"(HTTP {answers}, expected {expected}); is it running?")
+        if not agreed:
+            time.sleep(0.2)
+
+
+def wait_for_routes(entry, name):
+    """Both routes of the moved folder, retried until the reload that adds the alias answers, within a deadline."""
+    deadline = time.monotonic() + RELOAD_TIMEOUT
+    while True:
+        problem = route_problem(entry, name) or route_problem(entry, "")
+        if problem is None:
+            return
+        if time.monotonic() >= deadline:
+            raise ModError(problem)
+        time.sleep(0.2)
+
+
+MOVE_RECORD_KEYS = {"server_folder", "source", "dest", "backup", "folder_id", "entry"}
+# The only entry fields a move changes; every other field must match the recorded entry exactly.
+MOVE_FIELDS = {"migration", "folder", "server_folder", "legacy_route", "message", "updated_at"}
+
+
+def move_record(entry, name, target, source):
+    info_ = os.lstat(source)
+    return {"server_folder": name, "source": source, "dest": f"{WEB_ROOT}/{name}", "backup": target,
+            "folder_id": [info_.st_dev, info_.st_ino], "entry": entry}
+
+
+def same_folder(path, folder_id):
+    """True only for the plain folder that was being moved (same device and inode), reached without links."""
+    try:
+        info_ = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return (stat.S_ISDIR(info_.st_mode) and [info_.st_dev, info_.st_ino] == folder_id
+            and os.path.realpath(path) == path)
+
+
+def kept_fields(entry):
+    return {key: value for key, value in entry.items() if key not in MOVE_FIELDS}
+
+
+def pending_move(entry, name):
+    """(entry before the move, record) of an interrupted move, once the record names exactly that move."""
+    record, mod_id = entry["migration"], entry["id"]
+    damaged = ModError(f"The interrupted move record of {mod_id} is damaged. Nothing was changed; restore the "
+                       "registry entry from the backup it names, or move the folder back by hand.")
+    if not isinstance(record, dict) or set(record) != MOVE_RECORD_KEYS:
+        raise damaged
+    if record["server_folder"] != name:
+        raise ModError(f"The interrupted move of {mod_id} was to /{record['server_folder']}. Run migrate-root {mod_id} "
+                       f"--server-folder {record['server_folder']} to finish or undo it. Nothing was changed.")
+    before, backup_dir, folder_id = record["entry"], record["backup"], record["folder_id"]
+    source = mod_folder(mod_id)
+    if (not isinstance(before, dict) or before.get("id") != mod_id or before.get("folder") != source
+            or before.get("state") != "ready" or set(before) & {"migration", "server_folder", "legacy_route"}
+            or record["source"] != source or record["dest"] != f"{WEB_ROOT}/{validate_server_folder(name)}"
+            or entry.get("folder") not in (source, record["dest"]) or entry.get("server_folder", "") not in ("", name)
+            or kept_fields(entry) != kept_fields(before)
+            or not isinstance(backup_dir, str) or os.path.dirname(backup_dir) != f"{BACKUP_ROOT}/{mod_id}"
+            or not re.match(r"^[0-9]{14}-[0-9]+\Z", os.path.basename(backup_dir))
+            or os.path.islink(backup_dir) or not os.path.isdir(backup_dir)
+            or not isinstance(folder_id, list) or len(folder_id) != 2
+            or not all(type(part) is int for part in folder_id)):
+        raise damaged
+    return before, record
+
+
+def resume_move(entry, name):
+    """Finish, or restart, a move that stopped part way. Returns the entry to restart from, or None when finished.
+
+    Only the exact folder that was being moved is used, at exactly one of its two paths, and only while its
+    checkout is clean at the registered commit; anything else is refused and left as it is.
+    """
+    before, record = pending_move(entry, name)
+    source, dest, target = record["source"], record["dest"], record["backup"]
+    at_source, at_dest = os.path.lexists(source), os.path.lexists(dest)
+    if at_source and at_dest:
+        raise ModError(f"Both {source} and {dest} exist, so the interrupted move of {entry['id']} cannot be resumed. "
+                       f"Nothing was changed and neither is adopted; compare them by hand (backup in {target}).")
+    if not at_source and not at_dest:
+        raise ModError(f"Neither {source} nor {dest} exists, so the interrupted move of {entry['id']} cannot be "
+                       f"resumed. Nothing was changed (backup in {target}).")
+    folder = source if at_source else dest
+    if not same_folder(folder, record["folder_id"]):
+        raise ModError(f"{folder} is not the folder that was being moved. It is not adopted. Nothing was changed.")
+    require_clean_checkout(folder, before)
+    if at_source:
+        write_entry(before)
+        info(f"The interrupted move had not renamed {source} yet; starting it again.")
+        return before
+    info(f"The interrupted move had already renamed the folder to {dest}; finishing it.")
+    lock_fd = hold_config_lock(dest, before)
+    try:
+        finish_move(record)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+    return None
+
+
+def finish_move(record):
+    """After the rename: record it, add the alias and check both routes; any failure moves everything back."""
+    before, name, dest = record["entry"], record["server_folder"], record["dest"]
+    moved = dict(before, server_folder=name, folder=dest, legacy_route=route_path(before["id"]), updated_at=now_utc(),
+                 message=f"Moved to /{name}; the old /custom-mods/{before['id']} URL is kept as an alias.")
+    try:
+        write_entry(dict(moved, migration=record))
+        setup_web()
+        wait_for_routes(moved, name)
+        write_entry(moved)
+    except BaseException as error:
+        raise ModError(f"The move failed: {error} {undo_move(record)}")
+    ok(f"{before['name']} moved to {dest} (database {before['database']}, config and token kept). Canonical URL: "
+       f"{route_base(before['id'], name)}/; the old {route_base(before['id'])}/ stays an alias until "
+       f"ddistro_custom_mod migrate-root {before['id']} --drop-legacy-url.")
+
+
+def undo_move(record):
+    """Folder, then registry, then listener back as they were; reports anything it could not undo.
+
+    The registry keeps the move record until the moved folder is back, so an interrupted undo is resumable too.
+    """
+    before, source, dest, target = record["entry"], record["source"], record["dest"], record["backup"]
+    problems = []
+    try:
+        write_entry(dict(before, migration=record))
+        if same_folder(dest, record["folder_id"]) and not os.path.lexists(source):
+            os.rename(dest, source)
+        if same_folder(source, record["folder_id"]) and not os.path.lexists(dest):
+            write_entry(before)
+        else:
+            problems.append(f"folder ({dest} is not back at {source})")
+    except (OSError, ModError) as error:
+        problems.append(f"folder or registry entry ({error})")
+    try:
+        setup_web()
+    except ModError as error:
+        problems.append(f"web listener ({error})")
+    if problems:
+        return (f"Could not undo: {'; '.join(problems)}. The backup in {target} holds the config, database, registry "
+                f"entry and Apache site; run sudo ddistro_custom_mod migrate-root {before['id']} --server-folder "
+                f"{record['server_folder']} again to resume the move.")
+    return f"It was undone: {source} and its registry entry are as before (backup in {target})."
+
+
+def drop_legacy_url(entry):
+    refuse_pending_move(entry)
+    if not entry.get("legacy_route"):
+        raise ModError(f"{entry['name']} has no old URL alias. Nothing was changed.")
+    before = dict(entry)
+    entry = dict(entry, message=f"Served only at /{entry['server_folder']}.", updated_at=now_utc())
+    entry.pop("legacy_route")
+    write_entry(entry)
+    try:
+        setup_web()
+    except ModError:
+        write_entry(before)
+        raise
+    ok(f"The old URL {route_base(entry['id'])}/ was removed; {entry['name']} is served at "
+       f"{route_base(entry['id'], entry['server_folder'])}/.")
 
 
 def unregistered_entry(entry):
@@ -1489,6 +2167,7 @@ def command_unregister(args):
     require_root()
     acquire_lock()
     entry = read_entry(args["id"])
+    refuse_pending_move(entry)
     write_entry(unregistered_entry(entry))
     ok(f"{entry['name']} was removed from the list. Its folder {entry['folder']} and database "
        f"{entry['database']} were kept; add the same repository again to restore it.")
@@ -1498,7 +2177,11 @@ def tombstone_problem(entry, mod_id):
     """Pure checks that a tombstone still names exactly what this manager created for mod_id."""
     if entry.get("state") != UNREGISTERED or entry.get("id") != mod_id:
         return "The removed custom mod record does not match this repository."
-    if entry.get("folder") != mod_folder(mod_id) or entry.get("database") != database_name_for(mod_id):
+    try:
+        folder = entry_folder(entry)
+    except ModError:
+        folder = None
+    if entry.get("folder") != folder or entry.get("database") != database_name_for(mod_id):
         return "The removed custom mod record names an unexpected folder or database."
     branch = entry.get("branch") or ""
     if (not SHA_PATTERN.match(entry.get("commit") or "") or entry.get("unregistered_from") not in ("ready", "failed")
@@ -1578,7 +2261,12 @@ def status_entry(entry, check):
     message = entry.get("message", "")
     if state in ("installing", "updating") and not operation_running(entry):
         state, message = "failed", "The last operation was interrupted. Choose Update to retry."
-    manifest = {"dashboard_path": entry.get("dashboard_path", ""), "health_path": entry.get("health_path", "")}
+    try:
+        refuse_pending_move(entry)
+    except ModError as error:
+        state, message = "failed", str(error)
+    manifest ={"dashboard_path": entry.get("dashboard_path", ""), "health_path": entry.get("health_path", ""),
+                "server_folder": entry.get("server_folder", "")}
     dashboard_url, health_url = mod_urls(entry["id"], manifest)
     document = {
         "id": entry["id"], "name": entry.get("name", entry["id"]), "description": entry.get("description", ""),
@@ -1586,6 +2274,11 @@ def status_entry(entry, check):
         "branch": entry.get("branch", ""), "commit": entry.get("commit", ""), "state": state,
         "message": message, "folder": entry.get("folder", ""), "database": entry.get("database", ""),
         "dashboard_url": dashboard_url, "health_url": health_url, "updated_at": entry.get("updated_at", ""),
+        "server_folder": entry.get("server_folder", ""),
+        "install_mode": entry.get("install_mode", "branch"),
+        "release": entry.get("release"), "pending_release": entry.get("pending_release"),
+        # The old URL of a migrated mod, kept until its clients are rebuilt; dashboard_url is canonical.
+        "legacy_url": (route_base(entry["id"]) + "/") if entry.get("legacy_route") else "",
     }
     document.update(asset_urls(entry))
     # The last checked author policy, read from the registry only: status never contacts the remote.
@@ -1607,7 +2300,19 @@ def operation_running(entry):
 def command_setup_web(args):
     require_root()
     acquire_lock()
-    setup_web()
+    mod_id = args.get("protect_project") or args.get("protect_root")
+    if not mod_id:
+        setup_web()
+        return
+    if args.get("protect_root"):
+        protect_root(mod_id)
+    else:
+        protect_project(mod_id)
+    try:
+        setup_web()
+    except ModError as error:
+        raise ModError(f"{error} The protection for {mod_id} is saved but not active; do not place its "
+                       "source until sudo ddistro_custom_mod setup-web succeeds.")
 
 
 def command_status(args):
@@ -1619,10 +2324,28 @@ def command_status(args):
     for entry in entries:
         try:
             validate_mod_id(entry.get("id"))
+            entry_folder(entry)
         except ModError:
             continue
         mods.append(status_entry(entry, args.get("check_health", False)))
     print(json.dumps({"schema_version": STATUS_SCHEMA_VERSION, "mods": mods}))
+
+
+def release_support():
+    """Load the distro-owned sibling helper, never a module from an installed mod."""
+    name = "ddistro_mod_release"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, os.path.join(os.path.dirname(__file__), name + ".py"))
+        if spec is None or spec.loader is None:
+            raise ModError("Update Distro to install release package support.")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def command_release(args):
+    release_support().command(globals(), args)
 
 
 USAGE = """Usage: ddistro_custom_mod <command> [options]
@@ -1630,7 +2353,12 @@ USAGE = """Usage: ddistro_custom_mod <command> [options]
   status [<id>] [--check-health] --json
   check <https-url> --json             Preview a repository's manifest (no changes).
   install <https-url> --expect-commit <sha>
-  update <id>                          Back up, then fast-forward and migrate (same branch).
+  release-check <github-url> [--tag <version>] --json
+  release-install <github-url> --tag <version> --expect-commit <sha> --expect-release <sha256>
+  release-update <id> --tag <version> --expect-commit <sha> --expect-release <sha256>
+                                       Install matching published server packages; never git pull.
+  update <id> [--expect-commit <sha>]  Back up, then fast-forward and migrate (same branch);
+                                       with --expect-commit, only to exactly that commit.
   branches <id> [--branch <name>] --json
                                        Refresh the offered branches; with --branch, preview its commit.
   switch <id> --branch <name> --expect-commit <sha>
@@ -1640,6 +2368,14 @@ USAGE = """Usage: ddistro_custom_mod <command> [options]
                                        and adding the same repository again restores it.
   setup-web                            Create or move the shared loopback listener on
                                        CUSTOM_MODS_PORT from /etc/dwemerdistro_services.conf.
+  setup-web --protect-project <id>     Also deny /custom-mods/<id> source folders and private
+                                       files from now on; run before placing the source.
+  setup-web --protect-root <Name>Server
+                                       The same for /var/www/html/<Name>Server, and serve it here.
+  migrate-root <id> --server-folder <Name>Server
+                                       Back up, then move a ready custom-mods/<id> install to
+                                       /var/www/html/<Name>Server; the old URL stays an alias.
+  migrate-root <id> --drop-legacy-url  Remove that alias once every client uses the new URL.
 
 Admin/test only: check|install --local-source </absolute/path/repo.git> (root).
 For a bundle, first: git clone --bare /path/example.bundle /path/example.git
@@ -1660,11 +2396,24 @@ def parse_args(argv):
             args["json"] = True
         elif token == "--check-health" and command == "status":
             args["check_health"] = True
-        elif token in ("--expect-commit", "--local-source", "--branch") and index + 1 < len(rest):
-            allowed = {"--expect-commit": ("install", "switch"), "--local-source": ("check", "install"),
-                       "--branch": ("branches", "switch")}[token]
+        elif token == "--drop-legacy-url" and command == "migrate-root":
+            args["drop_legacy_url"] = True
+        elif token in ("--tag", "--expect-release", "--local-release") and index + 1 < len(rest):
+            if not command.startswith("release-") or token[2:].replace("-", "_") in args:
+                raise ModError(f"Unsupported or repeated option {token}.")
+            args[token[2:].replace("-", "_")] = rest[index + 1]
+            index += 1
+        elif token in ("--expect-commit", "--local-source", "--branch", "--protect-project", "--protect-root",
+                       "--server-folder") and index + 1 < len(rest):
+            allowed = {"--expect-commit": ("install", "update", "switch", "release-install", "release-update"), "--local-source": ("check", "install"),
+                       "--branch": ("branches", "switch"), "--protect-project": ("setup-web",),
+                       "--protect-root": ("setup-web",), "--server-folder": ("migrate-root",)}[token]
             if command not in allowed:
                 raise ModError(f"{token} is not supported for {command}.")
+            if token in ("--protect-project", "--protect-root") and ("protect_project" in args or "protect_root" in args):
+                raise ModError(f"{token} takes one name, once.")
+            if token == "--server-folder" and "server_folder" in args:
+                raise ModError("--server-folder takes one folder name.")
             args[token[2:].replace("-", "_")] = rest[index + 1]
             index += 1
         elif token.startswith("-"):
@@ -1672,27 +2421,57 @@ def parse_args(argv):
         else:
             positional.append(token)
         index += 1
-    if command in ("check", "install"):
+    if command == "release-pair":
+        if len(positional) != 1 or set(args) - {"command"}:
+            raise ModError("release-pair takes one installed mod id.")
+        args["id"] = validate_mod_id(positional[0])
+    elif command in ("release-check", "release-install", "release-update"):
+        if len(positional) > 1 or (positional and args.get("local_release") and command != "release-update"):
+            raise ModError("Provide one GitHub URL, or --local-release for an administrator's local package.")
+        if command == "release-update":
+            if len(positional) != 1:
+                raise ModError("release-update needs a registered mod id.")
+            args["id"] = validate_mod_id(positional[0])
+        else:
+            args["url"] = positional[0] if positional else None
+            if not args["url"] and not args.get("local_release"):
+                raise ModError("A GitHub repository URL is required.")
+        if command != "release-check" and (not SHA_PATTERN.fullmatch(args.get("expect_commit", "")) or
+                not re.fullmatch(r"[a-f0-9]{64}", args.get("expect_release", ""))):
+            raise ModError("Check the release first; install/update needs its commit and descriptor SHA-256.")
+    elif command in ("check", "install"):
         if len(positional) > 1 or (positional and args.get("local_source")):
             raise ModError(f"{command} takes one repository URL.")
         args["url"] = positional[0] if positional else None
-    elif command in ("update", "backup", "unregister", "status", "branches", "switch"):
+    elif command in ("update", "backup", "unregister", "status", "branches", "switch", "migrate-root"):
         if len(positional) > 1 or (command != "status" and len(positional) != 1):
             raise ModError(f"{command} takes one custom mod id.")
         args["id"] = validate_mod_id(positional[0]) if positional else None
         if command == "switch" and not (args.get("branch") and args.get("expect_commit")):
             raise ModError("switch needs --branch and --expect-commit.")
+        if command == "migrate-root":
+            if ("server_folder" in args) == bool(args.get("drop_legacy_url")):
+                raise ModError("migrate-root needs exactly one of --server-folder <Name>Server or --drop-legacy-url.")
+            if "server_folder" in args:
+                args["server_folder"] = validate_server_folder(args["server_folder"])
     elif command == "setup-web":
         if positional:
             raise ModError("setup-web takes no arguments.")
+        if "protect_project" in args:
+            args["protect_project"] = validate_mod_id(args["protect_project"])
+        if "protect_root" in args:
+            args["protect_root"] = validate_server_folder(args["protect_root"])
     else:
         raise ModError(f"Unknown command {command[:40]}.")
     return args
 
 
 COMMANDS = {"status": command_status, "check": command_check, "install": command_install,
+            "release-check": command_release, "release-install": command_release, "release-update": command_release,
+            "release-pair": command_release,
             "update": command_update, "backup": command_backup, "unregister": command_unregister,
-            "branches": command_branches, "switch": command_switch, "setup-web": command_setup_web}
+            "branches": command_branches, "switch": command_switch, "setup-web": command_setup_web,
+            "migrate-root": command_migrate_root}
 
 
 def main(argv):
