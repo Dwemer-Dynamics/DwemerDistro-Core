@@ -5,6 +5,7 @@ See ASSISTANT.md for the command and JSON contract. This tool is not a sandbox o
 authorization boundary: it runs with the caller's privileges, never elevates, and calls
 only the trusted root-owned helpers below, always with explicit argument vectors.
 """
+import calendar
 import errno
 import json
 import os
@@ -101,16 +102,17 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
 
   version | capabilities | products
   status [product]
-  logs <product|apache|postgres> [--log NAME] [--lines N]   (N <= 400)
+  logs <product|apache|postgres> [--log NAME] [--lines N] [--query TEXT] [--since YYYY-MM-DDTHH:MM:SSZ]   (N <= 400)
   server status [product]
   server update <product> --branch <main|dev|...> [--force]   (root)
   changes prepare --product herika [--path RELATIVE ...]       (root)
   changes diff|stage|status|rollback TASK | changes list         (root)
   changes apply TASK --manifest-sha256 HASH                     (root)
   agent status | agent probe                                    (probe: root)
+  agent home-config | agent home-config-repair --sha256 HASH    (root; account-home config status or quarantine)
   models herika                 (root; configured CHIM profile model assignments, read-only)
   inventory                     (read-only presence snapshot: servers, ext folders, components, custom mods)
-  health [product]              (bounded local checks: servers, ports, database presence, disk; no repair)
+  health [product]              (bounded local checks: servers, ports, fixed local HTTP health, database presence, disk)
   agent serve --task TASK      (root; raw Codex App Server JSONL, no --json envelope)
   memory status|list|search|add|update|forget|reset|export|configure   (root; assistant notes, see ASSISTANT.md)
 
@@ -370,13 +372,15 @@ def cmd_capabilities(opts, ctx):
             {"name": "version", "mutates": False}, {"name": "capabilities", "mutates": False},
             {"name": "products", "mutates": False},
             {"name": "status", "arguments": ["[product]"], "mutates": False},
-            {"name": "logs", "arguments": ["<target>"], "flags": ["--log", "--lines"], "mutates": False},
+            {"name": "logs", "arguments": ["<target>"], "flags": ["--log", "--lines", "--query", "--since"], "mutates": False},
             {"name": "server status", "arguments": ["[product]"], "mutates": False},
             {"name": "server update", "arguments": ["<product>"], "flags": ["--branch", "--force"],
              "mutates": True, "requires_root": True},
         ] + [dict(CHANGES_SPEC[name], name="changes " + name, requires_root=True) for name in CHANGES_SPEC] + [
             {"name": "agent status", "mutates": False},
             {"name": "agent probe", "mutates": True, "requires_root": True},
+            {"name": "agent home-config", "mutates": False, "requires_root": True},
+            {"name": "agent home-config-repair", "flags": ["--sha256"], "mutates": True, "requires_root": True},
             {"name": "agent serve", "flags": ["--task"], "mutates": False, "requires_root": True,
              "transport": "jsonl"},
             {"name": "models", "arguments": ["herika"], "mutates": False, "requires_root": True},
@@ -392,6 +396,13 @@ def cmd_capabilities(opts, ctx):
         "limits": {"log_lines": MAX_LOG_LINES, "log_bytes": MAX_LOG_BYTES, "line_chars": MAX_LINE_CHARS,
                    "change_files": 200, "change_file_bytes": 1024 * 1024, "change_batch_bytes": 8 * 1024 * 1024,
                    "change_diff_bytes": CHANGES_DIFF_BYTES},
+        # logs --query/--since search only the bounded tail and say in filter.complete whether it covered everything.
+        "log_search": {"filters": ["query", "since"], "query_chars": LOG_QUERY_CHARS, "query_match": "literal_case_insensitive",
+                       "since_format": "YYYY-MM-DDTHH:MM:SSZ", "scope": "bounded_tail", "tail_bytes": MAX_LOG_BYTES,
+                       "timestamps": ["iso8601", "apache_error", "common_log"], "naive_timestamps": "distro_local_time"},
+        # Only the exact Codex-format project-trust entry for /work (origin unverified) is repairable; it is quarantined with a receipt, never deleted.
+        "home_config_repair": {"status_command": "agent home-config", "repair_command": "agent home-config-repair",
+                               "confirmation": "sha256", "repairable": ["workspace_trust_entry"], "lock": "serve"},
         # A diff with diff_truncated true is a preview only; changes stage refuses it, so a
         # staged manifest always comes with its complete diff.
         "change_review": {"truncated_flag": "diff_truncated", "stage_refuses_truncated": True},
@@ -401,6 +412,7 @@ def cmd_capabilities(opts, ctx):
         "features": {"file_changes": True, "locks": True, "agent": agent_helper_trusted(), "chat": False,
                      "models": True, "inventory": True,
                      "health": True, "assistant_tools": agent_helper_trusted(), "memory": True,
+                     "log_search": True, "home_config_repair": agent_helper_trusted(), "tool_coverage": True,
                      # agent serve forwards thread/archive, unarchive and delete for this task's threads only.
                      "thread_lifecycle": True},
         "agent": {"provider": "codex", "readiness_command": "agent status", "ready_when": ["installed", "probe_passed"]},
@@ -412,15 +424,22 @@ def cmd_capabilities(opts, ctx):
                       "scan_limit": INVENTORY_SCAN_LIMIT, "max_custom_mods": INVENTORY_MAX_MODS,
                       "string_chars": INVENTORY_STRING_CHARS},
         "health": {"scope": "local_bounded", "results": ["passed", "failed", "skipped"], "overall_verdict": False,
-                   "scope_limits": HEALTH_SCOPE_LIMITS},
+                   "scope_limits": HEALTH_SCOPE_LIMITS,
+                   "application_checks": {"servers": {name: path for name, (path, _) in HEALTH_SERVER_HTTP.items()},
+                                          "components": HEALTH_COMPONENT_HTTP},
+                   "http_timeout_seconds": HEALTH_HTTP_TIMEOUT, "http_bytes": HEALTH_HTTP_LIMIT},
         # The broker declares and runs this one tool itself; see ASSISTANT_RUNTIME.md.
         "assistant_tools": {"requires": "initialize capabilities.experimentalApi true", "declared_on": "thread/start",
                             "tools": [{"name": "ddistro_read", "mutates": False,
                                        "operations": ["inventory", "status", "models", "logs", "health"],
-                                       "max_log_lines": 100},
+                                       "max_log_lines": 400, "log_filters": ["query", "since"]},
                                       {"name": "ddistro_memory", "mutates": True, "operations": ["search", "remember"],
                                        "declared_when": "memory retrieval on at session start",
-                                       "remember_requires": "auto_learning on"}]},
+                                       "remember_requires": "auto_learning on"}],
+                            # Every reply carries coverage: result (checked, failed, skipped, refused, truncated,
+                            # budget_hit) and what the turn and session budgets leave.
+                            "coverage": {"results": ["checked", "failed", "skipped", "refused", "truncated", "budget_hit"],
+                                         "turn_calls": 16, "turn_output_kib": 512, "session_calls": 256}},
         # Static facts only: capabilities never opens or creates the memory database.
         "memory": {"scope": "installation", "authority": "non_authoritative", "kinds": list(MEMORY_KINDS),
                    "assistant_kinds": list(MEMORY_ASSISTANT_KINDS), "defaults": MEMORY_DEFAULTS,
@@ -460,7 +479,93 @@ def postgres_log_name(root):
     return f"postgresql-{max(versions)}-main.log" if versions else None
 
 
-def read_tail(path, lines):
+# logs --query and --since filter the same bounded tail; nothing older than it is ever read. A query is literal text,
+# matched case-insensitively against the redacted line. A line's time comes only from these fixed prefixes; a line
+# without one belongs to the dated line above it (a continuation); undated lines before the first dated one, and lines
+# with an invalid time, are excluded from a since filter, counted, and make it incomplete, as do times that go
+# backwards. Times without a zone are read in the distro's local time.
+LOG_QUERY_CHARS = 200
+SINCE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+STAMP_ISO = re.compile(r'^(?:\[|\{"(?:time|timestamp|ts)"\s*:\s*")?([0-9]{4})-([0-9]{2})-([0-9]{2})[T ]([0-9]{2}):([0-9]{2}):'
+                       r'([0-9]{2})(?:[.,][0-9]{1,9})?\s?(Z|UTC|[+-][0-9]{2}:?[0-9]{2})?')
+STAMP_APACHE = re.compile(r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (" + "|".join(MONTHS) + r") ([ 0-9][0-9]) ([0-9]{2}):([0-9]{2}):"
+                          r"([0-9]{2})(?:\.[0-9]{1,9})? ([0-9]{4})\]")
+STAMP_COMMON = re.compile(r"\[([0-9]{2})/(" + "|".join(MONTHS) + r")/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2}) ([+-][0-9]{4})\]")
+
+
+def log_stamp(row):
+    """(epoch seconds, has_zone) from a fixed timestamp prefix, None without one, or False for a prefix that is not a
+    valid time (bad date or zone offset). Only the first 200 characters are examined."""
+    head = row[:200]
+    try:
+        match = STAMP_ISO.match(head)
+        if match:
+            year, month, day, hour, minute, second = (int(value) for value in match.groups()[:6])
+            zone = match.group(7)
+        elif (match := STAMP_APACHE.match(head)):
+            month, day = MONTHS.index(match.group(1)) + 1, int(match.group(2))
+            hour, minute, second, year = (int(value) for value in match.groups()[2:])
+            zone = None
+        elif (match := STAMP_COMMON.search(head)):
+            day, month, year = int(match.group(1)), MONTHS.index(match.group(2)) + 1, int(match.group(3))
+            hour, minute, second = (int(value) for value in match.groups()[3:6])
+            zone = match.group(7)
+        else:
+            return None
+        fields = (year, month, day, hour, minute, second, 0, 0, -1)
+        time.strptime("%04d-%02d-%02d %02d:%02d:%02d" % fields[:6], "%Y-%m-%d %H:%M:%S")
+        if zone is None:
+            return int(time.mktime(fields)), False
+        offset = 0
+        if zone not in ("Z", "UTC"):
+            digits = zone.replace(":", "")
+            if int(digits[1:3]) > 14 or int(digits[3:5]) > 59:
+                return False
+            offset = (1 if digits[0] == "+" else -1) * (int(digits[1:3]) * 3600 + int(digits[3:5]) * 60)
+        return calendar.timegm(fields) - offset, True
+    except (ValueError, OverflowError):
+        return False
+
+
+def filter_rows(rows, query, since, whole_file):
+    """The rows a query/since filter keeps, oldest first, and what the filter covered."""
+    needle = query.casefold() if query else None
+    cutoff = calendar.timegm(time.strptime(since, "%Y-%m-%dT%H:%M:%SZ")) if since else None
+    kept, stamp, first, dated, naive, excluded, disordered = [], None, None, 0, False, 0, False
+    for row in rows:
+        found = log_stamp(row)
+        if found is False:
+            stamp = None  # an invalid time and its continuation lines have an unknown time
+        elif found is not None:
+            disordered = disordered or (stamp is not None and found[0] < stamp)
+            stamp, dated = found[0], dated + 1
+            naive = naive or not found[1]
+            first = stamp if first is None else first
+        if cutoff is not None:
+            if stamp is None:
+                excluded += 1
+                continue
+            if stamp < cutoff:
+                continue
+        text = clean_line(row)
+        if needle is None or needle in text.casefold():
+            kept.append(text)
+    # The tail covers a since window only if it starts at the file's beginning or at a dated line before the cutoff,
+    # every line in it has a known time, and those times never go backwards (otherwise the cutoff is uncertain).
+    # A query alone never covers what lies before the tail.
+    since_covered = None if cutoff is None else (
+        (whole_file or (first is not None and first < cutoff)) and not excluded and not disordered)
+    info = {"query": query, "since": since, "scanned_lines": len(rows), "dated_lines": dated,
+            "undated_lines": len(rows) - dated, "excluded_undated": excluded, "matched": len(kept),
+            "whole_file": whole_file, "since_covered": since_covered, "out_of_order": disordered,
+            "naive_timestamps": "distro_local_time" if naive else None,
+            "local_utc_offset": time.strftime("%z")}
+    info["complete"] = bool(since_covered) if cutoff is not None else whole_file
+    return kept, info
+
+
+def read_tail(path, lines, query=None, since=None):
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     fd = os.open(path, flags)
     try:
@@ -482,17 +587,27 @@ def read_tail(path, lines):
         rows.pop()
     if start > 0 and len(rows) > 1:
         rows.pop(0)  # partial first line
+    search = None
+    if query or since:
+        rows, search = filter_rows(rows, query, since, start == 0)
     truncated = start > 0 or len(rows) > lines
     output, size = [], 0
     for row in reversed(rows[-lines:]):
-        row = clean_line(row)
+        row = clean_line(row) if search is None else row
         size += len(row.encode("utf-8")) + 1
         if size > MAX_LOG_BYTES:
             truncated = True
             break
         output.append(row)
     output.reverse()
-    return {"size_bytes": info.st_size, "modified": int(info.st_mtime), "truncated": truncated, "lines": output}
+    result = {"size_bytes": info.st_size, "modified": int(info.st_mtime), "truncated": truncated, "lines": output}
+    if search is not None:
+        # Older matches left out by --lines or the byte bound also make the result incomplete.
+        search["returned"] = len(output)
+        search["complete"] = search["complete"] and len(output) == len(rows)
+        search["tail_bytes"] = MAX_LOG_BYTES
+        result["filter"] = search
+    return result
 
 
 def cmd_logs(opts, ctx):
@@ -517,7 +632,8 @@ def cmd_logs(opts, ctx):
     try:
         if root_info is None or filename is None:
             raise FileNotFoundError
-        data.update(read_tail(data["path"], opts.get("lines", DEFAULT_LOG_LINES)), available=True)
+        data.update(read_tail(data["path"], opts.get("lines", DEFAULT_LOG_LINES), opts.get("query"), opts.get("since")),
+                    available=True)
     except FileNotFoundError:
         data["reason"] = "missing"
     except PermissionError:
@@ -531,6 +647,11 @@ def cmd_logs(opts, ctx):
     if not data["available"]:
         return data, f"{data['path']}: not present (no log written yet)."
     header = f"== {data['path']} ({len(data['lines'])} lines" + (", truncated" if data["truncated"] else "") + ")"
+    if data.get("filter"):
+        search = data["filter"]
+        header += (f" filtered: {search['matched']} of {search['scanned_lines']} tail lines matched"
+                   + ("" if search["complete"] else "; INCOMPLETE: only the last "
+                      f"{MAX_LOG_BYTES // 1024} KiB were searched or older matches were left out"))
     return data, "\n".join([header] + data["lines"])
 
 
@@ -794,6 +915,63 @@ def cmd_agent_probe(opts, ctx):
     human = "\n".join([("Isolation check passed." if data["passed"] else "Isolation check failed.") + " " + agent_human(data)]
                       + [f"  {'ok  ' if row['passed'] else 'FAIL'} {row['name']}" for row in rows])
     return data, human
+
+
+HOME_CONFIG_KEYS = {"state", "reason", "file", "sha256", "size", "receipt"}
+HOME_CONFIG_STATES = ("clean", "repairable", "refused", "busy", "repaired")
+
+
+def agent_home_config(args, repair):
+    """Validated ddistro_agent home-config document: the status (a dry run with its proposal) or a repair result."""
+    code, out, _ = run_helper(args, AGENT_STATUS_TIMEOUT, AGENT_STDOUT_LIMIT + 1, helper=AGENT_HELPER)
+    doc = agent_document(out, HOME_CONFIG_KEYS)
+    state, receipt = doc["state"], doc["receipt"]
+    # Exit status per state: a refusal before inspection (root, identity, layout) exits 1 even for a status.
+    if state == "busy":
+        codes = (75,)
+    elif state == "refused":
+        codes = (1,) if repair else (0, 1)
+    elif state == "repaired":
+        codes = (0,) if repair else ()
+    else:
+        codes = (0,)
+    valid = (state in HOME_CONFIG_STATES and code in codes and doc["file"] == "config.toml"
+             and (doc["reason"] is None or type(doc["reason"]) is str and bool(AGENT_TOKEN.match(doc["reason"])))
+             and (doc["sha256"] is None or type(doc["sha256"]) is str and bool(HASH.match(doc["sha256"])))
+             and (state != "repairable" or doc["sha256"] is not None)
+             and (doc["size"] is None or type(doc["size"]) is int and 0 <= doc["size"] <= 64 * 1024)
+             and (receipt is None or type(receipt) is dict and set(receipt) == {"id", "path"}
+                  and all(type(value) is str and len(value) <= 256 for value in receipt.values())))
+    if not valid:
+        raise CliError("helper_protocol", "ddistro_agent returned an unexpected home-config result.", {"helper_exit": code})
+    if doc["state"] == "busy":
+        raise CliError("busy", "An assistant session or isolation check is running. Close it before repairing.")
+    if repair and doc["state"] != "repaired":
+        raise CliError("refused", "The account-home config was not repaired.", {"reason": doc["reason"]})
+    return doc
+
+
+def home_config_human(data):
+    if data["state"] == "repairable":
+        return f"config.toml holds only the known workspace trust entry; repair with --sha256 {data['sha256']}"
+    if data["state"] == "repaired":
+        return f"config.toml moved to quarantine {data['receipt']['path']}"
+    return f"account home config: {data['state']}" + (f" ({data['reason']})" if data["reason"] else "")
+
+
+def cmd_agent_home_config(opts, ctx):
+    if os.geteuid() != 0:
+        raise CliError("permission_denied", "agent home-config must run as root. ddistro never elevates by itself.")
+    data = agent_home_config(["home-config"], False)
+    return data, home_config_human(data)
+
+
+def cmd_agent_home_config_repair(opts, ctx):
+    if os.geteuid() != 0:
+        raise CliError("permission_denied", "agent home-config-repair must run as root. ddistro never elevates by itself.")
+    ctx["operation_id"] = str(uuid.uuid4())
+    data = agent_home_config(["home-config", "--repair", "--sha256", opts["sha256"]], True)
+    return data, home_config_human(data)
 
 
 def serve_refusal(error, reason, exit_code):
@@ -1213,8 +1391,22 @@ HEALTH_COMPONENT_PORTS = {
     "pocket_tts": (None, 8020, "/home/dwemer/pocket-tts/.dwemerdistro-port"),
     "pockettts_audiocpp": ("POCKETTTS_AUDIOCPP_PORT", 8086, None),
 }
+# Fixed local application contracts, each defined by the service's own source and already relied on by DwemerDistro:
+# DialecticServer/health.php and StobeServer/health.php ({"service", "status": "ok"|...}), OmniVoice GET /health
+# ({"status": "ok"|"no_voices"}), and the TTS identity GET /provider_info ({"provider"}) that ddistro_doctor checks.
+# Nothing else is requested; servers and components without one are reported skipped, never passed.
+HEALTH_HTTP_TIMEOUT = 2.0
+HEALTH_HTTP_LIMIT = 64 * 1024
+HEALTH_SERVER_HTTP = {"dialectic": ("/DialecticServer/health.php", "DialecticServer"),
+                      "stobe": ("/StobeServer/health.php", "StobeServer")}
+HEALTH_COMPONENT_HTTP = {"omnivoice": "/health", "xtts": "/provider_info", "chatterbox": "/provider_info",
+                         "pocket_tts": "/provider_info"}
+HEALTH_PROVIDERS = {"xtts": ("xtts", "xtts-fastapi"), "chatterbox": ("chatterbox",),
+                    "pocket_tts": ("pockettts", "pocket_tts", "pocket-tts")}
 HEALTH_SCOPE_LIMITS = [
     "A port check proves only that something accepts TCP on 127.0.0.1, not which service or that it answers correctly.",
+    "HTTP checks request only fixed local endpoints the services define (Dialectic and Stobe health.php, OmniVoice "
+    "/health, the TTS /provider_info identity); other servers and components get no application check (skipped).",
     "Database checks report presence as seen by ddistro_server status; tables, credentials, and queries are not checked.",
     "Components without a known local port are skipped; marker presence alone is never reported as passed.",
     "No external provider, model, network, or in-game path is tested, and nothing is repaired.",
@@ -1292,6 +1484,57 @@ def health_connect(port):
         return False, f"tcp 127.0.0.1:{port} {errno.errorcode.get(error.errno, 'timeout') if error.errno else 'timeout'}"
 
 
+def health_http_get(port, path):
+    """GET a fixed path on 127.0.0.1 within HEALTH_HTTP_TIMEOUT in total and HEALTH_HTTP_LIMIT bytes.
+
+    Returns (status code or None, JSON object or None, problem or None); never raises for network failures."""
+    deadline = time.monotonic() + HEALTH_HTTP_TIMEOUT
+    data = bytearray()
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=HEALTH_HTTP_TIMEOUT)
+    except OSError as error:
+        return None, None, "connect " + (errno.errorcode.get(error.errno, "timeout") if error.errno else "timeout")
+    try:
+        sock.sendall(b"GET " + path.encode("ascii") + b" HTTP/1.0\r\nHost: 127.0.0.1\r\nAccept: application/json\r\n"
+                     b"Connection: close\r\n\r\n")
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, None, f"no complete answer within {HEALTH_HTTP_TIMEOUT:g} s"
+            sock.settimeout(remaining)
+            chunk = sock.recv(16384)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > HEALTH_HTTP_LIMIT:
+                return None, None, f"answer over {HEALTH_HTTP_LIMIT // 1024} KiB"
+    except socket.timeout:
+        return None, None, f"no complete answer within {HEALTH_HTTP_TIMEOUT:g} s"
+    except OSError as error:
+        return None, None, "read " + errno.errorcode.get(error.errno or 0, "error")
+    finally:
+        sock.close()
+    head, _, body = bytes(data).partition(b"\r\n\r\n")
+    match = re.match(rb"^HTTP/1\.[01] ([0-9]{3})", head)
+    if not match:
+        return None, None, "not an HTTP answer"
+    status = int(match.group(1))
+    if b"transfer-encoding: chunked" in head.lower():
+        return status, None, f"HTTP {status} with a chunked body (not read)"
+    try:
+        document = json.loads(body.decode("utf-8"), parse_constant=reject_constant)
+    except ValueError:
+        document = None
+    if type(document) is not dict:
+        return status, None, f"HTTP {status} without a JSON object"
+    return status, document, None
+
+
+def health_word(document, key):
+    value = document.get(key)
+    return clean_line(value[:64]) if type(value) is str else None
+
+
 def cmd_health(opts, ctx):
     product = opts.get("product")
     captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1304,6 +1547,50 @@ def cmd_health(opts, ctx):
     def port_check(check_id, component, port, source):
         passed, evidence = health_connect(port)
         add(check_id, component, "passed" if passed else "failed", f"{evidence} (port from {source})")
+        return passed
+
+    def http_check(check_id, component, port, path, judge):
+        """One fixed GET; judge(status, document) gives (result, evidence[, reason]) for an answer with a JSON object."""
+        if path is None:
+            add(check_id, component, "skipped", "no application check", "no known local health contract")
+            return
+        status, document, problem = health_http_get(port, path)
+        where = f"GET 127.0.0.1:{port}{path}"
+        if document is None:
+            add(check_id, component, "failed", f"{where}: {problem}")
+            return
+        result, evidence, *reason = judge(status, document)
+        add(check_id, component, result, f"{where}: HTTP {status}, {evidence}", *reason)
+
+    def server_health(service):
+        def judge(status, document):
+            if document.get("service") != service:
+                return "failed", f"answered, but not as {service}"
+            facts = "".join(f", {key} {str(document[key]).lower()}" for key in
+                            ("database", "schema", "database_schema_ready", "background_processor")
+                            if type(document.get(key)) is bool)
+            state = health_word(document, "status") or "unknown"
+            return ("passed" if status == 200 and state == "ok" else "failed"), f"status {state}{facts}"
+        return judge
+
+    def omnivoice_health(status, document):
+        state = health_word(document, "status") or "unknown"
+        return ("passed" if status == 200 and state == "ok" else "failed"), f"status {state}"
+
+    def provider_identity(component_id):
+        def judge(status, document):
+            provider = (health_word(document, "provider") or "").lower()
+            if status == 404 and not provider:
+                return "skipped", "no provider_info endpoint", "older releases predate provider_info"
+            if status != 200:
+                # A failing answer is unhealthy even when it names the right service.
+                return "failed", f"provider {provider or 'not given'}", f"expected HTTP 200, got HTTP {status}"
+            if provider in HEALTH_PROVIDERS[component_id]:
+                return "passed", f"provider {provider}"
+            if provider:
+                return "failed", f"answered as provider {provider}; another service owns this port"
+            return "skipped", "no provider field", "service did not identify itself; older releases predate provider_info"
+        return judge
 
     try:
         records = helper_status(product, timeout=HEALTH_STATUS_TIMEOUT)
@@ -1319,7 +1606,9 @@ def cmd_health(opts, ctx):
             continue
         add(f"server.{name}.installed", name, "passed" if state == "installed" else "failed",
             f"state {state}, repository {record['repository_state']}")
-        port_check(f"server.{name}.port", name, record["port"], "ddistro_server status")
+        if port_check(f"server.{name}.port", name, record["port"], "ddistro_server status"):
+            path, service = HEALTH_SERVER_HTTP.get(name, (None, None))
+            http_check(f"server.{name}.http", name, record["port"], path, server_health(service))
         present = record["database_present"]
         add(f"server.{name}.database", name, {True: "passed", False: "failed", None: "skipped"}[present],
             f"database {DATABASE_WORDS[present]}", None if present is not None else "PostgreSQL not ready for status")
@@ -1344,7 +1633,10 @@ def cmd_health(opts, ctx):
             saved = health_port_value(health_read_small(port_file, health_owners(True)) or "") if port_file else None
             if saved:
                 port, source = saved, port_file
-            port_check(f"component.{component_id}.port", component_id, port, source)
+            if port_check(f"component.{component_id}.port", component_id, port, source):
+                judge = omnivoice_health if component_id == "omnivoice" else provider_identity(component_id)
+                http_check(f"component.{component_id}.http", component_id, port, HEALTH_COMPONENT_HTTP.get(component_id),
+                           judge)
     for path in ("/", "/var/lib/postgresql", "/home/dwemer"):
         try:
             usage = shutil.disk_usage(path)
@@ -1883,7 +2175,8 @@ def command_words(argv):
 COMMANDS = {"version": cmd_version, "capabilities": cmd_capabilities, "products": cmd_products,
             "status": cmd_status, "logs": cmd_logs, "server status": cmd_server_status,
             "server update": cmd_server_update, "agent status": cmd_agent_status, "agent probe": cmd_agent_probe,
-            "models": cmd_models, "inventory": cmd_inventory, "health": cmd_health}
+            "models": cmd_models, "inventory": cmd_inventory, "health": cmd_health,
+            "agent home-config": cmd_agent_home_config, "agent home-config-repair": cmd_agent_home_config_repair}
 COMMANDS.update({"changes " + name: cmd_changes for name in CHANGES_SPEC})
 COMMANDS.update({"memory " + name: cmd_memory for name in MEMORY_SPEC})
 
@@ -1923,13 +2216,15 @@ def parse_command(rest, ctx):
             raise CliError("invalid_argument", "Expected server status or server update.")
         name, rest = "server " + rest[1], rest[1:]
     elif name == "agent":
-        if len(rest) < 2 or rest[1] not in ("status", "probe"):
-            raise CliError("invalid_argument", "Expected agent status, agent probe, or agent serve --task TASK.")
+        if len(rest) < 2 or rest[1] not in ("status", "probe", "home-config", "home-config-repair"):
+            raise CliError("invalid_argument", "Expected agent status, agent probe, agent home-config, "
+                           "agent home-config-repair --sha256 HASH, or agent serve --task TASK.")
         name, rest = "agent " + rest[1], rest[1:]
     if name not in COMMANDS:
         raise CliError("invalid_argument", "Unknown command.\n" + USAGE)
     ctx["command"] = name
-    valued = {"logs": ("--log", "--lines"), "server update": ("--branch",)}.get(name, ())
+    valued = {"logs": ("--log", "--lines", "--query", "--since"), "server update": ("--branch",),
+              "agent home-config-repair": ("--sha256",)}.get(name, ())
     switches = ("--force",) if name == "server update" else ()
     opts, positional, index, args = {}, [], 0, rest[1:]
     while index < len(args):
@@ -1958,6 +2253,21 @@ def parse_command(rest, ctx):
             if not re.match(r"^[0-9]{1,4}\Z", opts["lines"]) or not 1 <= int(opts["lines"]) <= MAX_LOG_LINES:
                 raise CliError("invalid_argument", f"--lines must be between 1 and {MAX_LOG_LINES}.")
             opts["lines"] = int(opts["lines"])
+        query = opts.get("query")
+        if query is not None and (not query.strip() or len(query) > LOG_QUERY_CHARS or CONTROL.search(query)
+                                  or "\n" in query):
+            raise CliError("invalid_argument", f"--query must be 1-{LOG_QUERY_CHARS} characters of plain text.")
+        since = opts.get("since")
+        if since is not None:
+            try:
+                valid = bool(SINCE.match(since)) and bool(time.strptime(since, "%Y-%m-%dT%H:%M:%SZ"))
+            except ValueError:
+                valid = False
+            if not valid:
+                raise CliError("invalid_argument", "--since must be a UTC time like 2026-10-20T14:00:00Z.")
+    elif name == "agent home-config-repair":
+        if not re.match(r"^[0-9a-f]{64}\Z", opts.get("sha256", "")):
+            raise CliError("invalid_argument", "agent home-config-repair needs --sha256 with the 64-hex hash from agent home-config.")
     elif positional:
         opts["product"] = resolve_product(positional[0])
     return opts

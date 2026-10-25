@@ -4,6 +4,7 @@
   ddistro_agent status            # any user; bounded JSON installation/attestation state
   ddistro_agent probe             # root; real sandbox probe, writes the root-owned attestation
   ddistro_agent serve --task ID   # root; raw Codex App Server JSONL on stdin/stdout
+  ddistro_agent home-config [--repair --sha256 HASH]   # root; account-home config status or its quarantine
 
 See ASSISTANT_RUNTIME.md for the task contract, sandbox layout, and client parameters.
 
@@ -91,6 +92,18 @@ ETC_BINDS = ("alternatives", "ssl", "ca-certificates", "ca-certificates.conf", "
 # environment (Codex loads $CODEX_HOME/.env before reading any config).
 UNMANAGED_HOME_FILES = ("config.toml", "managed_config.toml", "requirements.toml", "hooks.json",
                         "AGENTS.md", "AGENTS.override.md", ".env")
+# The one unmanaged file home-config can repair: a config.toml whose whole content is a Codex-format project-trust
+# entry for the sandbox workspace (which process wrote it is not verified; only its content is checked).
+# Anything else in it, or any other unmanaged file, is refused and left alone.
+HOME_CONFIG_NAME = "config.toml"
+HOME_CONFIG_LIMIT = 4096
+KNOWN_SAFE_HOME_CONFIG = re.compile(rb'\A\n*\[projects\."/work"\][ \t]*\n[ \t]*trust_level[ \t]*=[ \t]*"trusted"[ \t]*\n*\Z')
+QUARANTINE_NAME = "quarantine"
+QUARANTINE_LIMIT = 64
+# Root-owned guard written before the move and removed only after a verified receipt: while it exists, serve and
+# home-config refuse (home_config_repair_pending), so a failed or interrupted repair can never leave a cleared home.
+HOME_CONFIG_PENDING = "home-config.pending"
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}\Z")
 
 SCHEMA_VERSION = 1
 ATTESTATION_SCHEMA = 1
@@ -157,8 +170,19 @@ TOOL_SPEC = {
                     "description": "status/health: a server; models: herika; logs (required): a server, apache, or postgres"},
         "log": {"type": "string", "enum": sorted({name for names in TOOL_LOGS.values() for name in names}),
                 "description": "logs only; must belong to product"},
-        "lines": {"type": "integer", "minimum": 1, "maximum": 100, "description": "logs only; default 50"}}},
+        "lines": {"type": "integer", "minimum": 1, "maximum": 400,
+                  "description": "logs only; default 50; with query or since, the newest matching lines"},
+        "query": {"type": "string", "maxLength": 200,
+                  "description": "logs only: literal text (not a pattern), case-insensitive, matched in the bounded tail"},
+        "since": {"type": "string", "maxLength": 20,
+                  "description": "logs only: UTC time exactly like 2026-10-20T14:00:00Z; keeps lines dated at or after it"}}},
 }
+TOOL_LOG_LINES = 400
+TOOL_LOG_QUERY = 200
+TOOL_SINCE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+# Every tool reply carries a compact coverage object computed by the broker, so the model and the launcher see what
+# a call covered (and what the turn's budget leaves) from broker data, not from the model's own account.
+COVERAGE_RESULTS = ("checked", "failed", "skipped", "refused", "truncated", "budget_hit")
 # The memory tool. Declared next to ddistro_read only when the user's memory retrieval setting is on at session
 # start; it runs fixed `ddistro memory search|add` argv, so the CLI enforces the settings again on every call.
 # Configuration, forget, and reset are user actions in the launcher and are not reachable from the model.
@@ -625,7 +649,8 @@ def sanitize_task(document, task_id):
             "workspace": workspace, "scratch": SANDBOX_WORK}
 
 
-def open_account_home(identity):
+def open_account_home(identity, managed=True):
+    """The account home as an O_PATH descriptor; managed (serve) also refuses any unmanaged config file in it."""
     state_fd = open_root_dir(STATE_ROOT, "state_untrusted")
     try:
         home_fd = os.open(ACCOUNT_HOME_NAME, O_PATH_DIR, dir_fd=state_fd)
@@ -637,7 +662,24 @@ def open_account_home(identity):
     if st.st_uid != identity.pw_uid or st.st_mode & 0o077:
         os.close(home_fd)
         raise Refusal("account_home_untrusted")
-    for name in UNMANAGED_HOME_FILES:
+    try:
+        agent_fd = open_root_dir(AGENT_STATE, "state_untrusted")
+        try:
+            os.stat(HOME_CONFIG_PENDING, dir_fd=agent_fd, follow_symlinks=False)
+            pending = True
+        except FileNotFoundError:
+            pending = False
+        except OSError:
+            pending = True
+        finally:
+            os.close(agent_fd)
+    except Refusal:
+        os.close(home_fd)
+        raise
+    if pending:
+        os.close(home_fd)
+        raise Refusal("home_config_repair_pending")
+    for name in UNMANAGED_HOME_FILES if managed else ():
         try:
             os.stat(name, dir_fd=home_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -1010,12 +1052,12 @@ def tool_argv(arguments):
     """Exact ddistro argv and envelope command for validated ddistro_read arguments."""
     if not isinstance(arguments, dict):
         raise PolicyError(-32602, "arguments must be an object")
-    reject_unknown(arguments, ("operation", "product", "log", "lines"))
+    reject_unknown(arguments, ("operation", "product", "log", "lines", "query", "since"))
     operation, product = arguments.get("operation"), arguments.get("product")
     if operation not in TOOL_OPERATIONS:
         raise PolicyError(-32602, "operation must be one of " + ", ".join(TOOL_OPERATIONS))
-    if operation != "logs" and ("log" in arguments or "lines" in arguments):
-        raise PolicyError(-32602, "log and lines apply only to logs")
+    if operation != "logs" and any(key in arguments for key in ("log", "lines", "query", "since")):
+        raise PolicyError(-32602, "log, lines, query and since apply only to logs")
     if operation == "inventory":
         if "product" in arguments:
             raise PolicyError(-32602, "inventory takes no product")
@@ -1033,13 +1075,27 @@ def tool_argv(arguments):
     if product not in TOOL_LOGS:
         raise PolicyError(-32602, "logs needs product: one of " + ", ".join(TOOL_LOGS))
     lines = arguments.get("lines", 50)
-    if isinstance(lines, bool) or not isinstance(lines, int) or not 1 <= lines <= 100:
-        raise PolicyError(-32602, "lines must be 1-100")
+    if isinstance(lines, bool) or not isinstance(lines, int) or not 1 <= lines <= TOOL_LOG_LINES:
+        raise PolicyError(-32602, "lines must be 1-%d" % TOOL_LOG_LINES)
     argv = ["logs", product, "--lines", str(lines)]
     if "log" in arguments:
         if arguments["log"] not in TOOL_LOGS[product]:
             raise PolicyError(-32602, "log must be one of " + ", ".join(TOOL_LOGS[product]))
         argv += ["--log", arguments["log"]]
+    if "query" in arguments:
+        query = memory_value(arguments, "query", TOOL_LOG_QUERY)
+        if "\n" in query:
+            raise PolicyError(-32602, "query must be one line of plain text")
+        argv += ["--query", query]
+    if "since" in arguments:
+        since = arguments["since"]
+        if not isinstance(since, str) or not TOOL_SINCE.match(since):
+            raise PolicyError(-32602, "since must be a UTC time like 2026-10-20T14:00:00Z")
+        try:
+            time.strptime(since, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            raise PolicyError(-32602, "since is not a valid date and time")
+        argv += ["--since", since]
     return argv
 
 
@@ -1813,13 +1869,20 @@ class Broker:
         tool = MEMORY_TOOL if params.get("tool") == MEMORY_TOOL and self.memory else TOOL_NAME
         operations = MEMORY_OPERATIONS if tool == MEMORY_TOOL else TOOL_OPERATIONS
         operation = arguments.get("operation") if arguments.get("operation") in operations else None
+        payload = sanitize(payload)
+        trimmed = self._fit_log_lines(payload) if ok and operation == "logs" else 0
+        coverage = self._coverage(params, ok, payload, operation, trimmed)
         document = {"tool": tool, "operation": operation,
                     "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "ok": ok,
-                    "data" if ok else "error": sanitize(payload)}
+                    "data" if ok else "error": payload, "coverage": coverage}
         line = bounded_line({"result": document}, TOOL_TEXT_BUDGET)
+        if line is not None and b'"ddistroTruncation"' in line and coverage["result"] == "checked":
+            coverage["result"] = "truncated"
+            line = bounded_line({"result": document}, TOOL_TEXT_BUDGET)
         if line is None:
+            coverage["result"] = "failed"
             ok, text = False, json.dumps({"tool": tool, "operation": operation, "ok": False, "error": {
-                "code": "output_too_large", "message": "narrow the request"}})
+                "code": "output_too_large", "message": "narrow the request"}, "coverage": coverage})
         else:
             text = json.dumps(json.loads(line)["result"], separators=(",", ":"))
         if key is not None:
@@ -1829,6 +1892,72 @@ class Broker:
                     budget[1] += len(text)
         self._to_server({"id": request_id, "result": {"success": ok,
                                                       "contentItems": [{"type": "inputText", "text": text}]}})
+
+    @staticmethod
+    def _fit_log_lines(payload):
+        """Drops the oldest log lines until the reply fits TOOL_TEXT_BUDGET unclipped; returns how many were dropped."""
+        lines = payload.get("lines") if isinstance(payload, dict) else None
+        if not isinstance(lines, list):
+            return 0
+        dropped = 0
+        # Room for the envelope and the coverage object around the data.
+        while lines and len(encode(payload)) > TOOL_TEXT_BUDGET - 2048:
+            step = max(1, len(lines) // 4)
+            lines = lines[step:]
+            dropped += step
+            payload["lines"] = lines
+        if dropped:
+            payload["budget_trimmed_lines"] = dropped
+            payload["truncated"] = True
+        return dropped
+
+    def _coverage(self, params, ok, payload, operation, trimmed):
+        """What this call covered, and what the turn and session budgets leave, from the broker's own counters."""
+        thread_id, turn_id = params.get("threadId"), params.get("turnId")
+        with self.state_lock:
+            budget = self.turn_budgets.get((thread_id, turn_id)) if isinstance(turn_id, str) else None
+            calls, text = (budget[0], budget[1]) if budget else (0, 0)
+            session = self.session_calls
+        code = payload.get("code") if not ok and isinstance(payload, dict) else None
+        if ok:
+            # Read from each operation's own completeness fields: a plain tail that returned the lines asked for is
+            # complete; a search or since window says so in filter.complete; models and inventory flag truncated
+            # lists, and inventory.complete covers its sections (an unavailable section makes it incomplete).
+            # Unavailable models are failed, a log not written yet skipped.
+            data = payload if isinstance(payload, dict) else {}
+            search = data.get("filter")
+            sections = []
+            if operation == "inventory":
+                extensions = data.get("extensions")
+                items = extensions.get("items") if isinstance(extensions, dict) else None
+                sections = [data.get("custom_mods")] + [
+                    item for item in (items if isinstance(items, list) else []) if isinstance(item, dict)]
+            incomplete = (isinstance(search, dict) and search.get("complete") is not True
+                          or operation == "models" and data.get("truncated") is not False
+                          or operation == "inventory" and (data.get("complete") is not True or any(
+                              isinstance(section, dict) and section.get("truncated") is True for section in sections)))
+            if operation == "logs" and data.get("available") is False:
+                result = "skipped"
+            elif operation == "models" and data.get("available") is not True:
+                result = "failed"
+            else:
+                result = "truncated" if trimmed or incomplete else "checked"
+        elif code in ("turn_tool_limit", "session_tool_limit"):
+            result = "budget_hit"
+        elif code == "invalid_arguments":
+            result = "refused"
+        elif code in ("busy", "cancelled"):
+            result = "skipped"
+        else:
+            result = "failed"
+        coverage = {"result": result, "turn_calls": calls, "turn_calls_left": max(0, TOOL_TURN_CALLS - calls),
+                    "turn_output_kib_left": max(0, TOOL_TURN_TEXT - text) // 1024,
+                    "session_calls_left": max(0, TOOL_SESSION_CALLS - session)}
+        summary = payload.get("summary") if ok and operation == "health" and isinstance(payload, dict) else None
+        if isinstance(summary, dict):
+            coverage["health"] = {key: summary[key] for key in ("passed", "failed", "skipped")
+                                  if type(summary.get(key)) is int}
+        return coverage
 
     def _to_client(self, data):
         try:
@@ -1955,6 +2084,198 @@ def cmd_serve(task_id):
         return 4
     del lock
     return 0 if returncode in (0, -signal.SIGTERM) else 4
+
+
+# ---------------------------------------------------------------- account-home config repair
+
+def inspect_home_config(identity, home_fd):
+    """Classifies the account home for home-config: clean, repairable, or refused with a reason.
+
+    Only a config.toml that is ddagent's own private regular file (0600 or stricter, one link, at most 4 KiB) and
+    whose whole content is the known project-trust entry is repairable, and only when no other unmanaged file is
+    present. Returns (report, fd, st); fd is a read-only descriptor of that file, set only when it is repairable."""
+    report = {"state": "clean", "reason": None, "file": HOME_CONFIG_NAME, "sha256": None, "size": None}
+
+    def refuse(reason, fd=None):
+        if fd is not None:
+            os.close(fd)
+        report.update(state="refused", reason=reason)
+        return report, None, None
+    others = False
+    for name in UNMANAGED_HOME_FILES:
+        try:
+            if name != HOME_CONFIG_NAME:
+                os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+                others = True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            others = True
+    try:
+        before = os.stat(HOME_CONFIG_NAME, dir_fd=home_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return refuse("other_unmanaged_file") if others else (report, None, None)
+    except OSError:
+        return refuse("config_unreadable")
+    if others:
+        return refuse("other_unmanaged_file")
+    if stat.S_ISLNK(before.st_mode):
+        return refuse("config_symlink")
+    if not stat.S_ISREG(before.st_mode):
+        return refuse("config_not_regular")
+    if before.st_size > HOME_CONFIG_LIMIT:
+        return refuse("config_oversize")
+    if before.st_uid != identity.pw_uid or before.st_gid != identity.pw_gid:
+        return refuse("config_wrong_owner")
+    if before.st_mode & 0o7077:
+        return refuse("config_unsafe_mode")
+    if before.st_nlink != 1:
+        return refuse("config_hard_linked")
+    try:
+        fd = os.open(HOME_CONFIG_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC,
+                     dir_fd=home_fd)
+    except OSError:
+        return refuse("config_unreadable")
+    st = os.fstat(fd)
+    if ((st.st_dev, st.st_ino) != (before.st_dev, before.st_ino) or not stat.S_ISREG(st.st_mode)
+            or st.st_nlink != 1 or st.st_mode & 0o7077):
+        return refuse("config_changed", fd)
+    data = os.pread(fd, HOME_CONFIG_LIMIT + 1, 0)
+    report["size"] = len(data)
+    if len(data) > HOME_CONFIG_LIMIT:
+        return refuse("config_oversize", fd)
+    if not KNOWN_SAFE_HOME_CONFIG.match(data):
+        return refuse("config_unknown_content", fd)
+    report.update(state="repairable", sha256=sha256_bytes(data))
+    return report, fd, st
+
+
+def sync_dir(dir_fd):
+    fd = os.open(".", O_DIR, dir_fd=dir_fd)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def quarantine_home_config(home_fd, fd, st, found):
+    """Moves the validated config.toml, unchanged, into a new root-only quarantine folder and writes its receipt.
+
+    The pending guard is written first and removed only once the moved file is verified and its receipt is durable.
+    A move that cannot be verified is put back without overwriting anything; if that is not possible the guard stays.
+    Any exception after the guard is written leaves it in place, so serve keeps refusing."""
+    agent_fd = open_root_dir(AGENT_STATE, "state_untrusted")
+    root_fd = entry_fd = None
+    try:
+        try:
+            os.mkdir(QUARANTINE_NAME, 0o700, dir_fd=agent_fd)
+        except FileExistsError:
+            pass
+        root_fd = os.open(QUARANTINE_NAME, O_DIR, dir_fd=agent_fd)
+        info = os.fstat(root_fd)
+        if info.st_uid != 0 or info.st_mode & 0o077:
+            return {"state": "refused", "reason": "quarantine_untrusted"}
+        if len(os.listdir(root_fd)) >= QUARANTINE_LIMIT:
+            return {"state": "refused", "reason": "quarantine_full"}
+        name = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(4)
+        os.mkdir(name, 0o700, dir_fd=root_fd)
+        entry_fd = os.open(name, O_DIR, dir_fd=root_fd)
+        os.fchmod(entry_fd, 0o700)
+        write_root_file(agent_fd, HOME_CONFIG_PENDING, json.dumps({"id": name}).encode(), 0o600)
+        sync_dir(agent_fd)
+        try:
+            os.rename(HOME_CONFIG_NAME, HOME_CONFIG_NAME, src_dir_fd=home_fd, dst_dir_fd=entry_fd)
+        except OSError:
+            os.rmdir(name, dir_fd=root_fd)
+            os.unlink(HOME_CONFIG_PENDING, dir_fd=agent_fd)
+            return {"state": "refused", "reason": "quarantine_failed"}
+        moved = os.stat(HOME_CONFIG_NAME, dir_fd=entry_fd, follow_symlinks=False)
+        verified = ((moved.st_dev, moved.st_ino) == (st.st_dev, st.st_ino) and stat.S_ISREG(moved.st_mode)
+                    and moved.st_nlink == 1 and sha256_bytes(os.pread(fd, HOME_CONFIG_LIMIT + 1, 0)) == found["sha256"])
+        if not verified:
+            # Something replaced or changed the file between inspection and the move: put whatever was moved back
+            # (link fails rather than overwrite a new file), then drop the guard; the home is exactly as found.
+            try:
+                os.link(HOME_CONFIG_NAME, HOME_CONFIG_NAME, src_dir_fd=entry_fd, dst_dir_fd=home_fd, follow_symlinks=False)
+                sync_dir(home_fd)
+                os.unlink(HOME_CONFIG_NAME, dir_fd=entry_fd)
+                os.rmdir(name, dir_fd=root_fd)
+                os.unlink(HOME_CONFIG_PENDING, dir_fd=agent_fd)
+                return {"state": "refused", "reason": "config_changed"}
+            except OSError:
+                pass
+        receipt = {"schema_version": SCHEMA_VERSION, "action": "quarantine_account_home_config", "id": name,
+                   "file": HOME_CONFIG_NAME, "sha256": found["sha256"], "size": found["size"], "uid": st.st_uid,
+                   "gid": st.st_gid, "mode": "%04o" % stat.S_IMODE(st.st_mode), "mtime": int(st.st_mtime),
+                   "quarantined_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "verified": verified}
+        write_root_file(entry_fd, "receipt.json", json.dumps(receipt).encode(), 0o600)
+        # The moved file's data, the entry (file and receipt), the new entry in the quarantine folder, the
+        # quarantine folder in the agent state, and the home's removed name are all durable before the guard goes;
+        # any failure here raises with the guard still pending and every file kept.
+        os.fsync(fd)
+        os.fsync(entry_fd)
+        sync_dir(root_fd)
+        sync_dir(agent_fd)
+        sync_dir(home_fd)
+        result = {"id": name, "path": "%s/%s/%s" % (AGENT_STATE, QUARANTINE_NAME, name)}
+        if not verified:
+            # Could not be put back: kept in quarantine with its receipt and the guard stays; nothing is deleted.
+            return {"state": "refused", "reason": "home_config_repair_pending", "receipt": result}
+        os.unlink(HOME_CONFIG_PENDING, dir_fd=agent_fd)
+        sync_dir(agent_fd)
+        return {"state": "repaired", "reason": None, "receipt": result}
+    finally:
+        for handle in (entry_fd, root_fd, agent_fd):
+            if handle is not None:
+                os.close(handle)
+
+
+def cmd_home_config(repair=False, expected=None):
+    """Status of the account home's unmanaged config (the dry run, with the proposal's sha256), or its repair.
+
+    The repair takes the serve lock without waiting, so it never runs beside a session or probe, and needs the
+    exact sha256 that status proposed; it refuses while any ddagent process exists. Exit 0 for a status or a
+    completed repair, 75 when the lock is held, otherwise 1."""
+    report = {"state": "refused", "reason": None, "file": HOME_CONFIG_NAME, "sha256": None, "size": None,
+              "receipt": None}
+    code = 1
+    try:
+        require_root()
+        if repair and not SHA256_PATTERN.match(expected or ""):
+            raise Refusal("sha256_required")
+        identity = agent_identity()
+        state_layout(identity)
+        lock = SingletonLock()
+        home_fd = fd = None
+        try:
+            home_fd = open_account_home(identity, managed=False)
+            found, fd, st = inspect_home_config(identity, home_fd)
+            report.update(found)
+            if not repair:
+                code = 0
+            elif found["state"] == "clean":
+                # The proposal is stale: the file it named is gone. A refusal, so the wrapper sees no repair.
+                report.update(state="refused", reason="proposal_changed")
+            elif found["state"] != "repairable":
+                pass
+            elif found["sha256"] != expected:
+                report.update(state="refused", reason="proposal_changed")
+            elif not no_agent_processes(identity, timeout=0):
+                report.update(state="refused", reason="agent_running")
+            else:
+                report.update(quarantine_home_config(home_fd, fd, st, found))
+                code = 0 if report["state"] == "repaired" else 1
+        finally:
+            for handle in (fd, home_fd, lock.fd):
+                if handle is not None:
+                    os.close(handle)
+    except Refusal as exc:
+        report.update(state="busy" if exc.reason == "busy" else "refused", reason=exc.reason)
+        code = 75 if exc.reason == "busy" else 1
+    except OSError:
+        report.update(state="refused", reason="state_untrusted")
+    print(json.dumps(report))
+    return code
 
 
 # ---------------------------------------------------------------- probe
@@ -2389,11 +2710,19 @@ def main(argv):
     commands.add_parser("probe", allow_abbrev=False, help="root: run the real sandbox probe and attest")
     serve = commands.add_parser("serve", allow_abbrev=False, help="root: Codex App Server JSONL for one task")
     serve.add_argument("--task", required=True, help="task UUID prepared under " + TASKS_ROOT)
+    home = commands.add_parser("home-config", allow_abbrev=False,
+                               help="root: account-home config status, or --repair --sha256 HASH to quarantine it")
+    home.add_argument("--repair", action="store_true")
+    home.add_argument("--sha256")
     args = parser.parse_args(argv)
     if args.command == "status":
         return cmd_status()
     if args.command == "probe":
         return cmd_probe()
+    if args.command == "home-config":
+        if args.sha256 is not None and not args.repair:
+            parser.error("--sha256 needs --repair")
+        return cmd_home_config(args.repair, args.sha256)
     return cmd_serve(args.task)
 
 
