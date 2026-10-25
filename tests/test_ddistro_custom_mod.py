@@ -684,14 +684,14 @@ class RegistryLifecycleTests(unittest.TestCase):
         mod.write_entry(self.entry())
         seen = []
         names = ("require_root", "acquire_lock", "checked_folder", "refresh_policy", "update_checkout",
-                 "read_protected_projects")
+                 "read_protected_projects", "require_php_security")
         saved = {name: getattr(mod, name) for name in names}
 
         def update_checkout(entry_, folder, source, local, branch, progress, expect_commit=None, switching=False):
             seen.append((branch, expect_commit, switching))
             raise mod.ModError("Branch main changed after it was reviewed. Nothing was changed.")
 
-        mod.require_root = mod.acquire_lock = mod.refresh_policy = lambda *a, **k: None
+        mod.require_root = mod.acquire_lock = mod.refresh_policy = mod.require_php_security = lambda *a, **k: None
         mod.checked_folder = lambda e: mod.MOD_ROOT + "/example-server"
         mod.update_checkout = update_checkout
 
