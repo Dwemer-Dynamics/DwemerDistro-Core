@@ -1,0 +1,1684 @@
+#!/usr/bin/env python3
+"""Code-owned read-only access policy for the assistant: roots, deny rules, bounded file reads,
+data-only config parsing, and a structured PostgreSQL query builder.
+
+This file is a library loaded by ddistro (after a root-ownership check), not a command. The only
+command-line uses are --emit-databases, --emit-grant-sql DATABASE and --emit-refresh-sql DATABASE, which print the reviewed
+database names and the ddreader grant scripts built from the constants below for install_assistant_runtime
+--db-reader; they never connect to anything themselves. The same fixed refresh script is the only thing the
+db commands run as postgres, once per request, when CHIM's playthrough save/load has removed ddreader's
+grants or managed view (see refresh_grants).
+
+Nothing here takes a root path, SQL text, or a command from the caller: roots, databases, tables and
+columns come only from the tables in this file. The component catalog cannot add or widen a root.
+"""
+import configparser
+import datetime
+import errno
+import fnmatch
+import json
+import os
+import re
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None
+
+POLICY_VERSION = 1
+
+# --- Roots ----------------------------------------------------------------------------
+
+PHP_PRODUCT_DENY = re.compile(r"^(conf/conf\.php|conf/conf_(?!loader\.php\Z|schema\.php\Z).*|conf/character_map\.json"
+                              r"|data/CurrentModel_.*|data/pictures/.*)\Z")
+PHP_CONFIG = (("conf/conf.php", "php_assign"),)
+
+# kind, path (None when there is no meaningful fixed root), reason when unsupported, extra denied
+# top-level names, product-relative deny pattern, fixed PHP config files.
+ACCESS_ROOTS = {
+    "herika": {"kind": "product", "path": "/var/www/html/HerikaServer", "deny_rel": PHP_PRODUCT_DENY,
+               "php_config": PHP_CONFIG},
+    "lorkhan": {"kind": "product", "path": "/opt/dwemerdistro/sources/LorkhanServer"},
+    "stobe": {"kind": "product", "path": "/var/www/html/StobeServer", "deny_rel": PHP_PRODUCT_DENY,
+              "php_config": PHP_CONFIG},
+    "dialectic": {"kind": "product", "path": "/var/www/html/DialecticServer", "deny_rel": PHP_PRODUCT_DENY,
+                  "php_config": PHP_CONFIG},
+    "reign": {"kind": "product", "path": "/var/www/html/ReignServer"},
+    "cuda": {"kind": "component", "path": None, "unsupported": "gpu_global_mount"},
+    "lmstudio": {"kind": "component", "path": None, "unsupported": "account_state_folder"},
+    "minime": {"kind": "component", "path": "/home/dwemer/minime-t5"},
+    "chimmcp": {"kind": "component", "path": "/home/dwemer/CHIM-MCP"},
+    "audiocpp": {"kind": "component", "path": "/home/dwemer/audio.cpp", "deny_top": ("build",)},
+    "pockettts": {"kind": "component", "path": "/home/dwemer/pocket-tts"},
+    "higgs": {"kind": "component", "path": "/home/dwemer/higgs-tts", "deny_top": ("runtime",)},
+    "chatterbox": {"kind": "component", "path": "/home/dwemer/chatterbox"},
+    "omnivoice": {"kind": "component", "path": "/home/dwemer/omnivoice-tts"},
+    "xtts": {"kind": "component", "path": "/home/dwemer/xtts-api-server"},
+    "pipertts": {"kind": "component", "path": "/home/dwemer/piper"},
+    "parakeet": {"kind": "component", "path": "/home/dwemer/parakeet-api-server"},
+    "localwhisper": {"kind": "component", "path": "/home/dwemer/remote-faster-whisper"},
+    "text2vec": {"kind": "component", "path": "/home/dwemer/text2vec-api"},
+    "llamacpp": {"kind": "component", "path": "/home/dwemer/llama-cpp", "deny_top": ("build",)},
+    "melotts": {"kind": "component", "path": "/home/dwemer/MeloTTS"},
+    "mimic3": {"kind": "component", "path": "/home/dwemer/mimic3"},
+    "dashboard": {"kind": "component", "path": "/var/www/html/Dwemer-Dashboard"},
+}
+# Python components point at their service source/startup folder, not their virtualenv; venvs, build output
+# and caches inside are excluded by DENY_DIRS and deny_top. Presence is only "the folder exists".
+
+# Roots whose text files ddistro_changes may propose edits to (still subject to deny_reason and its own type
+# rules). Fixed here; never extended from the model, environment, or catalog. cuda and lmstudio have no root.
+CHANGE_ROOTS = frozenset(("herika", "lorkhan", "stobe", "dialectic", "reign", "minime", "chimmcp", "audiocpp",
+                          "pockettts", "higgs", "chatterbox", "omnivoice", "xtts", "pipertts", "parakeet",
+                          "localwhisper", "text2vec", "llamacpp", "melotts", "mimic3", "dashboard"))
+for _root_id, _spec in ACCESS_ROOTS.items():
+    _spec["change"] = _root_id in CHANGE_ROOTS and bool(_spec["path"]) and not _spec.get("unsupported")
+
+# Never listed into, searched, or read, at any depth (compared lower-case).
+DENY_DIRS = {
+    ".git": "vcs", ".svn": "vcs", ".hg": "vcs",
+    "venv": "dependency", ".venv": "dependency", "node_modules": "dependency", "site-packages": "dependency",
+    "dist-packages": "dependency", "__pycache__": "dependency", "vendor": "dependency", ".tox": "dependency",
+    ".nox": "dependency", ".eggs": "dependency", ".mypy_cache": "runtime", ".pytest_cache": "runtime",
+    ".ruff_cache": "runtime", ".ipynb_checkpoints": "runtime", ".codex-worktrees": "vcs", ".worktrees": "vcs",
+    ".claude": "secret",
+    "log": "runtime", "logs": "runtime", "cache": "runtime", "caches": "runtime", ".cache": "runtime",
+    "soundcache": "runtime", "uploads": "runtime", "voices": "runtime", "tmp": "runtime", "temp": "runtime",
+    "models": "runtime", "checkpoints": "runtime", "weights": "runtime", "backups": "runtime", "backup": "runtime",
+    ".ssh": "secret", ".gnupg": "secret", ".config": "secret", ".codex": "secret", ".aws": "secret",
+}
+SECRET_NAME = re.compile(r"(?i)^(\.env(\..*)?|.*\.env|\.htpasswd|\.netrc|\.pgpass|\.git-credentials|\.npmrc|\.pypirc"
+                         r"|id_(rsa|dsa|ecdsa|ed25519).*|.*\.(pem|key|p12|pfx|crt|kdbx|keystore|jks)"
+                         r"|.*(secret|credential|passw|token|api_?key|private).*)\Z")
+MEDIA_EXT = re.compile(r"(?i).*\.(wav|mp3|ogg|flac|opus|m4a|png|jpe?g|gif|webp|bmp|ico|mp4|webm|avi|gguf|safetensors"
+                       r"|bin|onnx|pt|pth|ckpt|npy|npz|pkl|pickle|h5|zip|tar|gz|tgz|bz2|xz|7z|rar|so|dll|exe|o|a"
+                       r"|pyc|whl|sqlite3?|db|dump|backup|bak|iso|img)\Z")
+
+PATH_PART = re.compile(r"^[A-Za-z0-9._@+=,-][A-Za-z0-9._@+=, -]{0,254}\Z")
+GLOB = re.compile(r"^[A-Za-z0-9._*?\[\]-]{1,64}\Z")
+MAX_PATH_CHARS = 1024
+
+LIMITS = {
+    "list_depth": 3, "list_entries": 500, "dir_scan": 4096, "walk_entries": 20000, "walk_seconds": 10,
+    "search_results": 100, "search_query_chars": 200, "search_file_bytes": 1024 * 1024,
+    "search_total_bytes": 32 * 1024 * 1024, "search_files": 5000, "search_seconds": 20, "search_per_file": 20,
+    "read_lines": 400, "read_file_bytes": 1024 * 1024, "line_chars": 4096, "match_chars": 400,
+    "config_files": 20, "config_file_bytes": 256 * 1024, "config_keys": 500, "config_value_chars": 512,
+    "config_depth": 6,
+    "db_rows": 500, "db_default_rows": 100, "db_cell_chars": 512, "db_output_bytes": 1024 * 1024,
+    "db_seconds": 15, "db_statement_ms": 5000, "db_tables": 300, "db_filters": 16, "db_in_values": 50,
+    "db_aggregates": 8, "db_group_by": 4, "db_order_by": 4, "db_columns": 32, "db_value_chars": 512,
+    "db_offset": 100000, "db_refresh_seconds": 20, "db_refresh_statement_ms": 10000, "db_refresh_lock_ms": 2000,
+}
+
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | NOFOLLOW
+FILE_FLAGS = os.O_RDONLY | NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+
+
+class AccessError(Exception):
+    """code is one of ddistro's error names; details never carry file content."""
+
+    def __init__(self, code, message, details=None):
+        super().__init__(message)
+        self.code, self.message, self.details = code, message, details or {}
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def iso_mtime(epoch):
+    return datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def result(data, complete=True, reason=None, coverage=None):
+    """Every read response: captured_at, complete, truncated, reason, coverage."""
+    out = {"captured_at": now_iso(), "complete": complete, "truncated": not complete, "reason": reason,
+           "coverage": coverage or {}}
+    out.update(data)
+    return out
+
+
+# --- Redaction (shared with later snapshot code) -------------------------------------
+
+CONTROL = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]")
+URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]{1,15}://)[^\s/@\"'<>]+@")
+SECRET_WORDS = (r"authorization|api[_-]?key|apikey|pairing[_-]?key|(?:access|refresh|auth|id|bearer|session)[_-]?token"
+                r"|(?:access|secret|session|signing|encryption|client)[_-]?key|token|password|passwd|passphrase|pwd"
+                r"|secret|private[_-]?key|credentials?|dsn|connection[_-]?string|cookie")
+# A key is one whole identifier ending in a secret word, so /etc/passwd, max_tokens and my_password_count are not.
+SECRET_IDENT = r"(?:[A-Za-z0-9_.-]*[_.-])?(?:%s)(?:[_.-]?(?:value|hash|b64|base64))?(?![A-Za-z0-9_])" % SECRET_WORDS
+URL_QUERY = re.compile(r"(?i)\bhttps?://[^\s\"'<>?#]+[?#][^\s\"'<>]*")
+URL_PARAM = re.compile(r"(?i)([?&#;](?:%s|[A-Za-z0-9_.-]*(?:sig|signature|code|auth|jwt|x-amz-[a-z-]+)|key)=)"
+                       r"[^&#;\s\"'<>]+" % SECRET_IDENT)
+AUTH_SCHEME = re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}")
+# One key and its value: a quoted string (JSON stays parseable) or an unquoted run up to the next quoted key/close.
+KEY_VALUE = re.compile(r"(?im)((?<![A-Za-z0-9_/\\.-])%s([\"'\]\)]{0,3})\s*(?:=>|[:=])\s*)(?!\[redacted)"
+                       r"(?:\"((?:[^\"\\\r\n]|\\.)+)\"|'((?:[^'\\\r\n]|\\.)+)'"
+                       r"|([^\s\"',}\]][^\r\n]*?)(?=\s*(?:,\s*[\"']|(?<!\[redacted)[}\]]\s*(?:[,}\]]|$)|$)))" % SECRET_IDENT)
+# Clearly non-literal right-hand sides: a $variable (PHP $_POST[...] included) or an environment lookup.
+CODE_VALUE = re.compile(r"^(?:\$[A-Za-z_]|(?:process\.env|os\.environ|getenv|env)\b)")
+DSN_PASSWORD = re.compile(r"(?i)(?<![\w$./-])(password|pwd)=(?!\$|\[redacted\])[^\s;'\"]+")
+TOKEN_SHAPES = re.compile(r"\b(?:hf_|sk-|sk_|gh[pousr]_|github_pat_|xox[abp]-|AKIA|AIza)[A-Za-z0-9_-]{16,}")
+JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*")
+PEM = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S)
+SECRET_KEY = re.compile(r"(?i)(key|token|secret|passw|pwd|auth|cookie|credential|private|dsn|bearer|session_id)")
+OPAQUE_VALUE = re.compile(r"^[A-Za-z0-9_\-+/=.]{32,}\Z")
+
+
+def redact_text(text):
+    """Returns (redacted text, number of substitutions). Control bytes become '?'."""
+    count = 0
+    text = CONTROL.sub("?", text)
+
+    def url(match):
+        nonlocal count
+        clean, n = URL_PARAM.subn(r"\1[redacted]", match.group(0))
+        count += n
+        return clean
+
+    def key_value(match):
+        nonlocal count
+        double, single, bare = match.group(3), match.group(4), match.group(5)
+        if bare is not None and CODE_VALUE.match(bare):
+            return match.group(0)
+        count += 1
+        if double is not None or (bare is not None and '"' in match.group(2)):
+            return match.group(1) + '"[redacted]"'
+        if single is not None:
+            return match.group(1) + "'[redacted]'"
+        return match.group(1) + "[redacted]"
+
+    text, n = PEM.subn("[redacted private key]", text)
+    count += n
+    text, n = URL_USERINFO.subn(r"\1[redacted]@", text)
+    count += n
+    text = URL_QUERY.sub(url, text)
+    text, n = AUTH_SCHEME.subn(r"\1 [redacted]", text)
+    count += n
+    text = KEY_VALUE.sub(key_value, text)
+    for pattern, replacement in ((DSN_PASSWORD, r"\1=[redacted]"), (JWT, "[redacted]"), (TOKEN_SHAPES, "[redacted]")):
+        text, n = pattern.subn(replacement, text)
+        count += n
+    return text, count
+
+
+def clip(text, limit):
+    return text if len(text) <= limit else text[:limit] + " [truncated]"
+
+
+def clean_line(text, limit=None):
+    text, n = redact_text(text)
+    return clip(text, limit or LIMITS["line_chars"]), n
+
+
+# --- Policy checks ------------------------------------------------------------------
+
+def get_root(root_id):
+    """The policy row for an id; ids come only from ACCESS_ROOTS."""
+    if not isinstance(root_id, str) or root_id not in ACCESS_ROOTS:
+        raise AccessError("invalid_argument", "Unknown root. Use ddistro access roots for the valid ids.",
+                          {"roots": sorted(ACCESS_ROOTS)})
+    spec = ACCESS_ROOTS[root_id]
+    if spec.get("unsupported"):
+        raise AccessError("unsupported", f"{root_id} has no readable root.",
+                          {"root": root_id, "reason": spec["unsupported"]})
+    return spec
+
+
+def normalize_rel(raw):
+    """A relative path inside a root as a list of parts; '' or '.' is the root itself."""
+    if raw is None or raw in ("", "."):
+        return []
+    if not isinstance(raw, str) or len(raw) > MAX_PATH_CHARS or raw.startswith("/") or "\\" in raw \
+            or CONTROL.search(raw):
+        raise AccessError("invalid_argument", "--path must be a relative path inside the root.")
+    parts = raw.strip("/").split("/")
+    if any(part in ("", ".", "..") or not PATH_PART.match(part) for part in parts):
+        raise AccessError("invalid_argument", "--path must be a plain relative path without . or .. parts.")
+    return parts
+
+
+def deny_reason(spec, parts, is_dir):
+    """None when allowed, else secret|vcs|dependency|runtime|media. parts are relative to the root."""
+    for index, part in enumerate(parts):
+        lower = part.lower()
+        last = index == len(parts) - 1
+        if (not last or is_dir) and lower in DENY_DIRS:
+            return DENY_DIRS[lower]
+        if index == 0 and part in spec.get("deny_top", ()):
+            return "dependency"
+    if not parts:
+        return None
+    rel = "/".join(parts)
+    deny_rel = spec.get("deny_rel")
+    if deny_rel and (deny_rel.match(rel) or (is_dir and deny_rel.match(rel + "/"))):
+        return "secret"
+    if not is_dir:
+        if SECRET_NAME.match(parts[-1]):
+            return "secret"
+        if MEDIA_EXT.match(parts[-1]):
+            return "media"
+    return None
+
+
+def require_allowed(spec, parts, is_dir):
+    reason = deny_reason(spec, parts, is_dir)
+    if reason:
+        code = "secret_path" if reason == "secret" else "excluded_" + reason
+        raise AccessError("refused", "That path is not readable through the assistant (" + code + ").",
+                          {"path": "/".join(parts), "reason": code})
+
+
+# --- No-follow filesystem access ------------------------------------------------------
+
+def os_reason(error, dir_fd=None, name=None):
+    """Linux reports ENOTDIR, not ELOOP, for O_DIRECTORY|O_NOFOLLOW on a symlink; lstat tells them apart."""
+    if error.errno == errno.ENOTDIR and dir_fd is not None:
+        try:
+            if stat.S_ISLNK(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
+                return "symlink"
+        except OSError:
+            pass
+    return {errno.ENOENT: "absent", errno.ELOOP: "symlink", errno.ENOTDIR: "not_directory",
+            errno.EACCES: "permission", errno.EPERM: "permission"}.get(error.errno, "unreadable")
+
+
+def open_root(root_id):
+    """Open a policy root from / without following links. Returns an fd; the caller closes it."""
+    spec = get_root(root_id)
+    path = spec["path"]
+    fd = os.open("/", DIR_FLAGS)
+    try:
+        for part in path.strip("/").split("/"):
+            try:
+                child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            except OSError as error:
+                reason = os_reason(error, fd, part)
+                code = "not_found" if reason == "absent" else "unsafe_path" if reason == "symlink" else "failed"
+                raise AccessError(code, f"{root_id} root is {reason.replace('_', ' ')}.",
+                                  {"root": root_id, "path": path, "reason": reason})
+            info = os.fstat(child)
+            os.close(fd)
+            fd = child
+            if info.st_mode & 0o002 and not info.st_mode & stat.S_ISVTX:
+                raise AccessError("unsafe_path", f"A folder in the {root_id} root path is world-writable.",
+                                  {"root": root_id, "reason": "world_writable"})
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def open_dir(root_fd, parts):
+    fd = os.dup(root_fd)
+    try:
+        for part in parts:
+            try:
+                child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            except OSError as error:
+                reason = os_reason(error, fd, part)
+                code = {"absent": "not_found", "symlink": "unsafe_path", "not_directory": "invalid_argument"}
+                raise AccessError(code.get(reason, "failed"), f"{'/'.join(parts)} cannot be opened ({reason}).",
+                                  {"path": "/".join(parts), "reason": reason})
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_regular(root_fd, parts, limit):
+    """Bytes of one regular, single-link file opened without following links; refuses oversize."""
+    parent = open_dir(root_fd, parts[:-1])
+    try:
+        try:
+            fd = os.open(parts[-1], FILE_FLAGS, dir_fd=parent)
+        except OSError as error:
+            reason = os_reason(error, parent, parts[-1])
+            code = {"absent": "not_found", "symlink": "unsafe_path"}.get(reason, "failed")
+            raise AccessError(code, f"{'/'.join(parts)} cannot be opened ({reason}).",
+                              {"path": "/".join(parts), "reason": reason})
+    finally:
+        os.close(parent)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise AccessError("invalid_argument", "Only regular files can be read.", {"reason": "not_regular"})
+        if info.st_nlink != 1:
+            raise AccessError("unsafe_path", "Hard-linked files are not read.", {"reason": "hard_link"})
+        if info.st_size > limit:
+            raise AccessError("limit_reached", f"The file is larger than {limit} bytes.",
+                              {"reason": "oversize", "size": info.st_size, "limit": limit})
+        data = os.read(fd, limit + 1)
+        if len(data) > limit:
+            raise AccessError("limit_reached", "The file grew past the read limit.", {"reason": "oversize"})
+        return data, info
+    finally:
+        os.close(fd)
+
+
+def decode_text(data):
+    """UTF-8 text or None for binary."""
+    if b"\0" in data[:8192]:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def scan_dir(fd, limit):
+    """Up to limit entries of an open directory: (name, kind, size, mtime); complete flag."""
+    rows, complete = [], True
+    with os.scandir(fd) as entries:
+        for count, entry in enumerate(entries):
+            if count >= limit:
+                complete = False
+                break
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                rows.append((entry.name, "unreadable", None, None))
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                kind = "link"
+            elif stat.S_ISDIR(info.st_mode):
+                kind = "dir"
+            elif stat.S_ISREG(info.st_mode):
+                kind = "file"
+            else:
+                kind = "other"
+            rows.append((entry.name, kind, info.st_size if kind == "file" else None, info.st_mtime))
+    rows.sort()
+    return rows, complete
+
+
+def walk(root_fd, spec, start_parts, max_depth, deadline, budget):
+    """Breadth-first nofollow walk. Yields (parts, kind, size, mtime, deny); records cut reasons in budget."""
+    queue = [(start_parts, 0)]
+    while queue:
+        parts, depth = queue.pop(0)
+        if time.monotonic() > deadline:
+            budget["reason"] = "time_limit"
+            return
+        try:
+            fd = open_dir(root_fd, parts)
+        except AccessError as error:
+            budget["skipped"][error.details.get("reason", "unreadable")] = \
+                budget["skipped"].get(error.details.get("reason", "unreadable"), 0) + 1
+            continue
+        try:
+            rows, complete = scan_dir(fd, LIMITS["dir_scan"])
+        finally:
+            os.close(fd)
+        budget["dirs"] += 1
+        if not complete:
+            budget["reason"] = budget["reason"] or "dir_scan_limit"
+        for name, kind, size, mtime in rows:
+            budget["entries"] += 1
+            if budget["entries"] > LIMITS["walk_entries"]:
+                budget["reason"] = "scan_limit"
+                return
+            if PATH_PART.match(name):
+                child = parts + [name]
+                deny = deny_reason(spec, child, kind == "dir")
+            else:  # shown with control characters replaced, never opened
+                child, deny = parts + [CONTROL.sub("?", name)], "unsupported_name"
+            yield child, kind, size, mtime, deny
+            if kind == "dir" and not deny and depth + 1 < max_depth:
+                queue.append((child, depth + 1))
+
+
+def new_budget():
+    return {"dirs": 0, "entries": 0, "reason": None, "skipped": {}}
+
+
+def bounded_int(value, name, low, high, default):
+    if value is None:
+        return default
+    if isinstance(value, str):
+        if not re.match(r"^[0-9]{1,7}\Z", value):
+            raise AccessError("invalid_argument", f"{name} must be a whole number from {low} to {high}.")
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise AccessError("invalid_argument", f"{name} must be a whole number from {low} to {high}.")
+    return value
+
+
+def roots(presence=None):
+    """Policy rows; presence is an optional {catalog id: state} map used only as a label."""
+    rows = []
+    for root_id, spec in ACCESS_ROOTS.items():
+        row = {"id": root_id, "kind": spec["kind"], "path": spec["path"], "read": not spec.get("unsupported"),
+               "change": spec["change"], "db": root_id in DB_PRODUCTS, "config": "data_only" if spec["path"] else None,
+               "unsupported": spec.get("unsupported")}
+        if spec["path"]:
+            try:
+                info = os.lstat(spec["path"])
+                row["present"] = "present" if stat.S_ISDIR(info.st_mode) else "unsafe"
+            except FileNotFoundError:
+                row["present"] = "absent"
+            except OSError:
+                row["present"] = "unknown"
+        else:
+            row["present"] = (presence or {}).get(root_id, "unknown")
+        rows.append(row)
+    return result({"roots": rows, "policy_version": POLICY_VERSION})
+
+
+def list_files(root_id, path=None, depth=None, limit=None):
+    spec = get_root(root_id)
+    parts = normalize_rel(path)
+    require_allowed(spec, parts, True)
+    depth = bounded_int(depth, "--depth", 1, LIMITS["list_depth"], 1)
+    limit = bounded_int(limit, "--limit", 1, LIMITS["list_entries"], 200)
+    root_fd = open_root(root_id)
+    budget, entries = new_budget(), []
+    try:
+        fd = open_dir(root_fd, parts)  # a clear error when the start folder itself is missing
+        os.close(fd)
+        for child, kind, size, mtime, deny in walk(root_fd, spec, parts, depth, time.monotonic() + LIMITS["walk_seconds"],
+                                                   budget):
+            if len(entries) >= limit:
+                budget["reason"] = "entry_limit"
+                break
+            entries.append({"path": "/".join(child), "type": kind, "size": size,
+                            "mtime": iso_mtime(mtime) if mtime is not None else None, "masked": deny})
+    finally:
+        os.close(root_fd)
+    return result({"root": root_id, "path": "/".join(parts), "depth": depth, "entries": entries},
+                  complete=budget["reason"] is None, reason=budget["reason"],
+                  coverage={"dirs": budget["dirs"], "entries_seen": budget["entries"], "skipped": budget["skipped"],
+                            "masked_not_descended": True, "links_followed": False})
+
+
+def search_files(root_id, query=None, path=None, name_glob=None, limit=None):
+    """Literal case-insensitive content search (matching redacted lines), or a name search with only a glob."""
+    spec = get_root(root_id)
+    parts = normalize_rel(path)
+    require_allowed(spec, parts, True)
+    if query is not None and (not isinstance(query, str) or not query.strip()
+                              or len(query) > LIMITS["search_query_chars"] or CONTROL.search(query)):
+        raise AccessError("invalid_argument", f"--query must be 1-{LIMITS['search_query_chars']} characters of plain text.")
+    if name_glob is not None and (not isinstance(name_glob, str) or not GLOB.match(name_glob)):
+        raise AccessError("invalid_argument", "--name-glob must be up to 64 characters of letters, digits, . _ - * ? [ ].")
+    if query is None and name_glob is None:
+        raise AccessError("invalid_argument", "files search needs --query, --name-glob, or both.")
+    limit = bounded_int(limit, "--limit", 1, LIMITS["search_results"], 50)
+    needle = query.lower() if query else None
+    deadline = time.monotonic() + LIMITS["search_seconds"]
+    budget, matches = new_budget(), []
+    skipped = {"masked": 0, "binary": 0, "oversize": 0, "unreadable": 0, "link": 0, "hard_link": 0}
+    scanned_files = scanned_bytes = 0
+    root_fd = open_root(root_id)
+    try:
+        for child, kind, size, mtime, deny in walk(root_fd, spec, parts, 32, deadline, budget):
+            if len(matches) >= limit:
+                budget["reason"] = "result_limit"
+                break
+            if kind == "link":
+                skipped["link"] += 1
+                continue
+            if kind != "file":
+                continue
+            if deny:
+                skipped["masked"] += 1
+                continue
+            if name_glob and not fnmatch.fnmatch(child[-1].lower(), name_glob.lower()):
+                continue
+            if needle is None:
+                matches.append({"path": "/".join(child), "size": size, "mtime": iso_mtime(mtime)})
+                continue
+            if size is None or size > LIMITS["search_file_bytes"]:
+                skipped["oversize"] += 1
+                continue
+            if scanned_files >= LIMITS["search_files"] or scanned_bytes + size > LIMITS["search_total_bytes"]:
+                budget["reason"] = "byte_limit"
+                break
+            try:
+                data, _ = read_regular(root_fd, child, LIMITS["search_file_bytes"])
+            except AccessError as error:
+                skipped["hard_link" if error.details.get("reason") == "hard_link" else "unreadable"] += 1
+                continue
+            scanned_files += 1
+            scanned_bytes += len(data)
+            text = decode_text(data)
+            if text is None:
+                skipped["binary"] += 1
+                continue
+            hits = 0
+            for number, line in enumerate(text.split("\n"), 1):
+                clean, _ = redact_text(line.rstrip("\r"))
+                if needle in clean.lower():
+                    matches.append({"path": "/".join(child), "line": number,
+                                    "text": clip(clean, LIMITS["match_chars"])})
+                    hits += 1
+                    if hits >= LIMITS["search_per_file"] or len(matches) >= limit:
+                        break
+    finally:
+        os.close(root_fd)
+    return result({"root": root_id, "path": "/".join(parts), "query": query, "name_glob": name_glob,
+                   "mode": "content" if needle else "name", "match": "literal_case_insensitive_redacted",
+                   "matches": matches},
+                  complete=budget["reason"] is None, reason=budget["reason"],
+                  coverage={"dirs": budget["dirs"], "entries_seen": budget["entries"], "files_scanned": scanned_files,
+                            "bytes_scanned": scanned_bytes, "skipped": dict(skipped, **budget["skipped"]),
+                            "per_file_match_limit": LIMITS["search_per_file"]})
+
+
+def read_file(root_id, path, start=None, lines=None):
+    spec = get_root(root_id)
+    parts = normalize_rel(path)
+    if not parts:
+        raise AccessError("invalid_argument", "files read needs --path to a file.")
+    require_allowed(spec, parts, False)
+    start = bounded_int(start, "--start", 1, 10 ** 7, 1)
+    count = bounded_int(lines, "--lines", 1, LIMITS["read_lines"], 200)
+    root_fd = open_root(root_id)
+    try:
+        data, info = read_regular(root_fd, parts, LIMITS["read_file_bytes"])
+    finally:
+        os.close(root_fd)
+    text = decode_text(data)
+    if text is None:
+        raise AccessError("refused", "The file is binary or not UTF-8 text.", {"path": "/".join(parts), "reason": "binary"})
+    rows = text.split("\n")
+    if rows and rows[-1] == "":
+        rows.pop()
+    window, redactions = [], 0
+    for line in rows[start - 1:start - 1 + count]:
+        clean, n = clean_line(line.rstrip("\r"))
+        redactions += n
+        window.append(clean)
+    end = start + len(window) - 1
+    complete = end >= len(rows)
+    return result({"root": root_id, "path": "/".join(parts), "start": start, "end": end if window else None,
+                   "total_lines": len(rows), "size": info.st_size, "mtime": iso_mtime(info.st_mtime),
+                   "lines": window, "redactions": redactions},
+                  complete=complete, reason=None if complete else "line_window",
+                  coverage={"next_start": None if complete else end + 1})
+
+
+# --- Config: parsed data only, never executed ----------------------------------------
+
+CONFIG_DIRS = ([], ["conf"], ["config"])
+CONFIG_FORMATS = {".json": "json", ".ini": "ini", ".cfg": "ini", ".conf": "ini", ".toml": "toml",
+                  ".yaml": "unsupported", ".yml": "unsupported"}
+PHP_TARGET = re.compile(r'^\$([A-Za-z_][A-Za-z0-9_]{0,63})((?:\[\s*(?:"[A-Za-z0-9_. -]{1,64}"|\'[A-Za-z0-9_. -]{1,64}\''
+                        r'|[0-9]{1,6})\s*\])*)\s*=\s*(.*?)\s*;\s*\Z', re.S)
+PHP_INDEX = re.compile(r'\[\s*(?:"([^"]*)"|\'([^\']*)\'|([0-9]+))\s*\]')
+PHP_NUMBER = re.compile(r"^-?(?:[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\Z")
+
+
+def php_literal(text):
+    """(True, value) for a plain literal, else (False, reason). Never evaluates anything."""
+    lower = text.lower()
+    if lower in ("true", "false"):
+        return True, lower == "true"
+    if lower == "null":
+        return True, None
+    if PHP_NUMBER.match(text):
+        return True, float(text) if any(c in text for c in ".eE") else int(text)
+    if lower in ("[]", "array()"):
+        return True, {}
+    if len(text) >= 2 and text[0] == text[-1] == "'":
+        body = text[1:-1]
+        if re.search(r"(?<!\\)(?:\\\\)*'", body):
+            return False, "expression"
+        return True, body.replace("\\'", "'").replace("\\\\", "\\")
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        body = text[1:-1]
+        if re.search(r'(?<!\\)(?:\\\\)*"', body):
+            return False, "expression"
+        if re.search(r"(?<!\\)\$", body):
+            return False, "interpolation"
+        return True, body.replace('\\"', '"').replace("\\$", "$").replace("\\\\", "\\")
+    return False, "expression"
+
+
+def php_statements(text):
+    """Top-level statements split on ; outside strings and comments; (start line, text)."""
+    out, buf, line, start, index, quote = [], [], 1, None, 0, None
+    while index < len(text):
+        char = text[index]
+        if quote:
+            buf.append(char)
+            if char == "\\" and index + 1 < len(text):
+                buf.append(text[index + 1])
+                index += 1
+            elif char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+            buf.append(char)
+            start = start or line
+        elif text.startswith("//", index) or char == "#":
+            end = text.find("\n", index)
+            index = len(text) if end < 0 else end
+            continue
+        elif text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            line += text[index:len(text) if end < 0 else end].count("\n")
+            index = len(text) if end < 0 else end + 2
+            continue
+        elif text.startswith("<?php", index) or text.startswith("?>", index):
+            index += 5 if text.startswith("<?php", index) else 2
+            continue
+        elif char == ";":
+            buf.append(char)
+            out.append((start or line, "".join(buf).strip()))
+            buf, start = [], None
+        else:
+            if not char.isspace():
+                start = start or line
+            buf.append(char)
+        if char == "\n":
+            line += 1
+        index += 1
+    if "".join(buf).strip():
+        out.append((start or line, "".join(buf).strip()))
+    return out
+
+
+def parse_php_assignments(text):
+    """{dotted key: value} for literal assignments; unparsed lists the key or line only, never the value."""
+    values, unparsed = {}, []
+    for line, statement in php_statements(text):
+        match = PHP_TARGET.match(statement)
+        if not match:
+            unparsed.append({"line": line, "key": None, "reason": "statement"})
+            continue
+        name, indexes, rhs = match.groups()
+        keys = [name] + [a or b or c for a, b, c in PHP_INDEX.findall(indexes)]
+        if name == "GLOBALS" and len(keys) > 1:
+            keys = keys[1:]
+        ok, value = php_literal(rhs)
+        key = ".".join(keys)
+        if ok:
+            values[key] = value
+        else:
+            unparsed.append({"line": line, "key": key, "reason": value})
+    return values, unparsed
+
+
+def flatten(value, prefix, out, depth=0):
+    if isinstance(value, dict) and value and depth < LIMITS["config_depth"]:
+        for key, child in value.items():
+            flatten(child, f"{prefix}.{key}" if prefix else str(key), out, depth + 1)
+    elif isinstance(value, list) and value and depth < LIMITS["config_depth"]:
+        for index, child in enumerate(value[:50]):
+            flatten(child, f"{prefix}[{index}]", out, depth + 1)
+    elif isinstance(value, (dict, list)):
+        out[prefix] = "[nested]" if value else value
+    else:
+        out[prefix] = value
+
+
+def public_value(key, value):
+    """(value, redacted?) for one flattened config entry."""
+    if SECRET_KEY.search(key):
+        return ("<set>" if value not in (None, "", {}, []) else "<unset>"), True
+    if isinstance(value, str):
+        if OPAQUE_VALUE.match(value) or JWT.search(value):
+            return "[redacted]", True
+        clean, n = redact_text(value)
+        return clip(clean, LIMITS["config_value_chars"]), n > 0
+    return value, False
+
+
+def parse_config(data, fmt):
+    """(values, unparsed, error) from file bytes. Formats: json, ini, toml, php_assign."""
+    text = decode_text(data)
+    if text is None:
+        return {}, [], "binary"
+    values, unparsed = {}, []
+    try:
+        if fmt == "json":
+            flatten(json.loads(text), "", values)
+        elif fmt == "toml":
+            if tomllib is None:
+                return {}, [], "toml_unavailable"
+            flatten(tomllib.loads(text), "", values)
+        elif fmt == "ini":
+            parser = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                parser.read_string(text)
+            except configparser.MissingSectionHeaderError:
+                parser.read_string("[_]\n" + text)
+            for section in parser.sections():
+                for key, value in parser.items(section, raw=True):
+                    values[(key if section == "_" else f"{section}.{key}")] = value
+        elif fmt == "php_assign":
+            values, unparsed = parse_php_assignments(text)
+        else:
+            return {}, [], "unsupported_format"
+    except (ValueError, configparser.Error, RecursionError):
+        return {}, [], "parse_error"
+    return values, unparsed, None
+
+
+def config_candidates(root_fd, spec):
+    """(rel parts, format, deny) for the root's fixed PHP config and data files in '', conf/, config/."""
+    seen, out = set(), []
+    for rel, fmt in spec.get("php_config", ()):
+        out.append((rel.split("/"), fmt, None))
+        seen.add(rel)
+    for parts in CONFIG_DIRS:
+        try:
+            fd = open_dir(root_fd, parts)
+        except AccessError:
+            continue
+        try:
+            rows, _ = scan_dir(fd, LIMITS["dir_scan"])
+        finally:
+            os.close(fd)
+        for name, kind, size, _ in rows:
+            ext = os.path.splitext(name)[1].lower()
+            rel = "/".join(parts + [name])
+            if kind != "file" or ext not in CONFIG_FORMATS or rel in seen or not PATH_PART.match(name):
+                continue
+            seen.add(rel)
+            out.append((parts + [name], CONFIG_FORMATS[ext], deny_reason(spec, parts + [name], False)))
+    return out
+
+
+def config_get(root_id, key=None):
+    """Parsed public values with provenance. Values are file data, not the effective runtime setting."""
+    spec = get_root(root_id)
+    if key is not None and (not isinstance(key, str) or not re.match(r"^[A-Za-z0-9_.\[\] -]{1,128}\Z", key)):
+        raise AccessError("invalid_argument", "--key must be up to 128 letters, digits, and . _ - [ ].")
+    root_fd = open_root(root_id)
+    files, reason, total = [], None, 0
+    try:
+        candidates = config_candidates(root_fd, spec)
+        if len(candidates) > LIMITS["config_files"]:
+            candidates, reason = candidates[:LIMITS["config_files"]], "file_limit"
+        php_paths = {rel for rel, _ in spec.get("php_config", ())}
+        for parts, fmt, deny in candidates:
+            rel = "/".join(parts)
+            entry = {"path": rel, "format": fmt, "parsed": False, "reason": None, "values": {}, "unparsed": [],
+                     "redacted_keys": 0}
+            files.append(entry)
+            if deny and rel not in php_paths:
+                entry["reason"] = "secret_path" if deny == "secret" else "excluded_" + deny
+                continue
+            if fmt == "unsupported":
+                entry["reason"] = "unsupported_format"
+                continue
+            try:
+                data, _ = read_regular(root_fd, parts, LIMITS["config_file_bytes"])
+            except AccessError as error:
+                entry["reason"] = error.details.get("reason", error.code)
+                continue
+            values, unparsed, error = parse_config(data, fmt)
+            if error:
+                entry["reason"] = error
+                continue
+            entry["parsed"] = True
+            for name, value in values.items():
+                if key and not (name == key or name.startswith(key + ".") or name.startswith(key + "[")):
+                    continue
+                if total >= LIMITS["config_keys"]:
+                    reason = "key_limit"
+                    break
+                shown, redacted = public_value(name, value)
+                entry["values"][name] = shown
+                entry["redacted_keys"] += int(redacted)
+                total += 1
+            entry["unparsed"] = [row for row in unparsed if not key or (row["key"] or "").startswith(key)][:100]
+    finally:
+        os.close(root_fd)
+    return result({"root": root_id, "key": key, "files": files, "execution": "none",
+                   "effective_value": "uncertain",
+                   "note": "Values are parsed from files without running them. Loaders, includes, profiles, and "
+                           "database settings may override them; unparsed entries name the key only."},
+                  complete=reason is None, reason=reason, coverage={"files": len(files), "keys": total})
+
+
+# --- Database: dedicated reader role and a structured query builder ---------------
+
+DB_PRODUCTS = {"herika": "dwemer", "lorkhan": "lorkhan", "stobe": "stobe", "dialectic": "dialectic", "reign": "reign"}
+DB_ROLE = "ddreader"
+DB_ROLE_COMMENT = "DwemerDistro assistant read-only reader"
+DB_RUNUSER = "/usr/sbin/runuser"
+DB_PSQL = "/usr/bin/psql"
+DB_SOCKET = "/var/run/postgresql"
+DB_PORT = "5432"
+
+# Column classes: n numeric/boolean/time passes through; t text is cast, clipped, and redacted.
+_EVENTLOG = {"type": "t", "data": "t", "sess": "t", "gamets": "n", "localts": "n", "ts": "n", "rowid": "n",
+             "people": "t", "location": "t", "party": "t", "utterance_id": "t", "delivery_state": "t"}
+_MEMORY = {"speaker": "t", "message": "t", "session": "t", "uid": "n", "listener": "t", "localts": "n", "gamets": "n",
+           "momentum": "t", "rowid": "n", "event": "t", "ts": "n"}
+_MEMORY_SUMMARY = {"gamets_truncated": "n", "n": "n", "packed_message": "t", "summary": "t", "classifier": "t",
+                   "uid": "n", "rowid": "n", "companions": "t", "tags": "t", "scope": "t"}
+_QUESTS = {"ts": "t", "sess": "t", "id_quest": "t", "name": "t", "editor_id": "t", "giver_actor_id": "t", "reward": "t",
+           "target_id": "t", "is_unique": "n", "mod": "t", "stage": "n", "briefing": "t", "localts": "n", "gamets": "n",
+           "status": "t", "rowid": "n"}
+# Derived values over one fixed JSON path, served only through an installer-managed view owned by the
+# installing superuser. ddreader is granted the view, never the source column; the builder targets the view
+# only when a projection column is used, so id/npc_name/count queries keep reading the base table.
+PROJECTION_COMMENT = "DwemerDistro assistant managed projection v1 (ddistro_access); safe to drop"
+HERIKA_PROJECTION = {
+    "core_npc_master": {"view": "ddreader_core_npc_master", "source": "extended_data", "path": "middle_term_memory",
+                        "base": ["id", "npc_name"],
+                        "columns": {"middle_term_memory_count": "n", "middle_term_memory_type": "t",
+                                    "middle_term_memory_present": "n"}},
+}
+# Format args: 1 schema, 2 view, 3 table. search_path is pg_catalog while it is created; functions are qualified.
+PROJECTION_VIEW_SQL = (
+    "CREATE OR REPLACE VIEW %1$I.%2$I WITH (security_barrier = true) AS SELECT m.id, m.npc_name, "
+    "CASE WHEN x.v IS NULL OR pg_catalog.jsonb_typeof(x.v) = 'null' THEN 0::pg_catalog.int8 "
+    "WHEN pg_catalog.jsonb_typeof(x.v) = 'array' THEN pg_catalog.jsonb_array_length(x.v)::pg_catalog.int8 "
+    "WHEN pg_catalog.jsonb_typeof(x.v) = 'object' THEN (SELECT pg_catalog.count(*) FROM pg_catalog.jsonb_object_keys(x.v)) "
+    "ELSE NULL END AS middle_term_memory_count, "
+    "COALESCE(pg_catalog.jsonb_typeof(x.v), 'absent') AS middle_term_memory_type, "
+    "CASE WHEN x.v IS NULL OR x.v IN ('null'::pg_catalog.jsonb, '\"\"'::pg_catalog.jsonb, '[]'::pg_catalog.jsonb, "
+    "'{}'::pg_catalog.jsonb) THEN 0 ELSE 1 END AS middle_term_memory_present "
+    "FROM %1$I.%3$I m CROSS JOIN LATERAL (SELECT (m.extended_data)::pg_catalog.jsonb -> 'middle_term_memory' AS v) x")
+DB_POLICY = {
+    "herika": {"profile_schema": re.compile(r"^chim_profile_[a-z0-9_]{1,48}\Z"),
+               "meta": {"schema": "chim_meta", "table": "playthrough_profiles", "columns": ["id", "schema_name", "is_active"]},
+               "tables": {"memory": _MEMORY, "memory_summary": _MEMORY_SUMMARY, "eventlog": _EVENTLOG,
+                          "quests": _QUESTS, "questlog": _QUESTS,
+                          "core_npc_master": {"id": "n", "npc_name": "t"}},
+               "projection": HERIKA_PROJECTION,
+               "notes": ["memory: dialogue lines recorded per speaker/listener (one row per line).",
+                         "memory_summary: packed and summarized memories; scope tells what each summary covers.",
+                         "eventlog: raw game events, not memories.",
+                         "core_npc_master.middle_term_memory_count: entries in each NPC's extended_data "
+                         "middle_term_memory (NULL when it is stored as text, see middle_term_memory_type); "
+                         "middle_term_memory_present is 1 when it is a non-empty value. Raw extended_data is never "
+                         "readable; these come from the installer-managed ddreader_core_npc_master view.",
+                         "The public schema is the current live game: answer about 'now' from public (the default). "
+                         "Each chim_profile_* schema is a stored playthrough snapshot that CHIM clones back into "
+                         "public when loaded, so it may lag the live game, including the one "
+                         "chim_meta.playthrough_profiles.is_active names. Label snapshot results as snapshots and "
+                         "never treat an is_active snapshot as live.",
+                         "Zero rows in public is a valid live answer (for example a new game). Do not add counts "
+                         "across schemas or across these tables as one 'memory' total."]},
+    "dialectic": {"tables": {"memory": _MEMORY, "memory_summary": _MEMORY_SUMMARY, "eventlog": _EVENTLOG,
+                             "quests": _QUESTS},
+                  "notes": ["memory, memory_summary, and eventlog are separate categories; do not add them together."]},
+    "stobe": {"tables": {"memory": {"id": "n", "people": "t", "content": "t", "event_type": "t", "gamets": "n",
+                                    "localts": "n", "location": "t", "created_at": "n"},
+                         "memory_summary": {"id": "n", "people": "t", "scope": "t", "summary": "t", "period_start": "n",
+                                            "period_end": "n", "n": "n", "packed_message": "t",
+                                            "source_from_memory_id": "n", "source_to_memory_id": "n", "localts": "n",
+                                            "gamets_start": "n", "gamets_end": "n", "created_at": "n"},
+                         "eventlog": {"rowid": "n", "type": "t", "data": "t", "sess": "t", "gamets": "n", "localts": "n",
+                                      "ts": "n", "people": "t", "location": "t", "utterance_id": "t",
+                                      "delivery_state": "t"},
+                         "diarylog": {"rowid": "n", "ts": "t", "sess": "t", "topic": "t", "content": "t", "tags": "t",
+                                      "people": "t", "localts": "n", "location": "t", "gamets": "n"},
+                         "core_npc": {"id": "n", "name": "t", "original_name": "t", "race": "t", "faction": "t",
+                                      "gender": "t", "occupation": "t", "profile_id": "n", "tags": "t",
+                                      "is_animal": "n", "is_slave": "n", "gamets_last_updated": "n",
+                                      "created_at": "n", "updated_at": "n"}},
+              "notes": ["Only the public schema is reviewed for Stobe; playthrough schemas are not granted."]},
+    "lorkhan": {"tables": {}, "unsupported": "no_reviewed_tables"},
+    "reign": {"tables": {}, "unsupported": "no_reviewed_tables"},
+}
+IDENT = re.compile(r"^[a-z_][a-z0-9_]{0,62}\Z")
+AGGREGATES = ("count", "count_distinct", "sum", "min", "max", "avg")
+OPERATORS = {"eq": "=", "ne": "<>", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
+QUERY_KEYS = {"schema", "table", "columns", "aggregates", "filters", "group_by", "order_by", "limit", "offset"}
+RAW_SQL_HINT = ("Raw SQL is not accepted. Send a JSON object with table, and optionally schema, columns, aggregates "
+                "[{fn: count|count_distinct|sum|min|max|avg, column, as}], filters [{column, op, value}], group_by, "
+                "order_by [{key, dir}], limit, offset. Run db schema first for the approved tables and columns.")
+
+
+def db_policy(product):
+    if product not in DB_PRODUCTS:
+        raise AccessError("invalid_argument", "Unknown product for db. Expected one of: " + ", ".join(DB_PRODUCTS) + ".")
+    policy = DB_POLICY[product]
+    if policy.get("unsupported"):
+        raise AccessError("unsupported", f"No tables are reviewed for {product} yet.",
+                          {"product": product, "reason": policy["unsupported"]})
+    return policy
+
+
+def qi(name):
+    """Quote an identifier that already matched IDENT."""
+    if not IDENT.match(name):
+        raise AccessError("invalid_argument", "Invalid identifier.")
+    return '"' + name + '"'
+
+
+def check_schema(policy, schema):
+    if schema in (None, "public"):
+        return "public"
+    pattern = policy.get("profile_schema")
+    if not isinstance(schema, str) or not pattern or not pattern.match(schema):
+        raise AccessError("invalid_argument", "schema must be public" + (" or a chim_profile_* playthrough schema"
+                                                                         if pattern else "") + ".")
+    return schema
+
+
+def table_columns(policy, table):
+    """{name: (class, sql expression template)} for one approved table."""
+    if not isinstance(table, str) or table not in policy["tables"]:
+        raise AccessError("invalid_argument", "table must be one of: " + ", ".join(sorted(policy["tables"])) + ".",
+                          {"hint": "db schema"})
+    cols = {name: (cls, qi(name)) for name, cls in policy["tables"][table].items()}
+    for name, cls in policy.get("projection", {}).get(table, {}).get("columns", {}).items():
+        cols[name] = (cls, qi(name))
+    return cols
+
+
+class Params:
+    """Values as psql variables (-v pN=value), referenced as :'pN', so psql quotes them as literals."""
+
+    def __init__(self):
+        self.values = []
+
+    def add(self, value):
+        if isinstance(value, bool):
+            return "TRUE" if value else "FALSE"
+        if isinstance(value, int):
+            if not -2 ** 63 <= value < 2 ** 63:
+                raise AccessError("invalid_argument", "Integer value out of range.")
+            return str(value)
+        if isinstance(value, float):
+            if value != value or value in (float("inf"), float("-inf")):
+                raise AccessError("invalid_argument", "Number values must be finite.")
+            return repr(value)
+        if isinstance(value, str):
+            if len(value) > LIMITS["db_value_chars"] or "\0" in value:
+                raise AccessError("invalid_argument", f"Text values are limited to {LIMITS['db_value_chars']} characters.")
+            self.values.append(value)
+            return f":'p{len(self.values)}'"
+        raise AccessError("invalid_argument", "Filter values must be text, numbers, or true/false.")
+
+
+def parse_query_json(raw):
+    """The structured query object from the --query-json text; raw SQL is refused with a hint."""
+    if not isinstance(raw, str) or len(raw) > 16384:
+        raise AccessError("invalid_argument", "--query-json must be a JSON object of up to 16 KiB.")
+    try:
+        query = json.loads(raw)
+    except ValueError:
+        query = None
+    if not isinstance(query, dict):
+        raise AccessError("refused", RAW_SQL_HINT, {"reason": "raw_sql_refused" if re.search(
+            r"(?i)\b(select|insert|update|delete|with|copy|set|create|drop|alter|grant|call|do)\b", raw)
+            else "not_json_object"})
+    if any(key in query for key in ("sql", "query", "raw", "expression", "where")):
+        raise AccessError("refused", RAW_SQL_HINT, {"reason": "raw_sql_refused"})
+    unknown = set(query) - QUERY_KEYS
+    if unknown:
+        raise AccessError("invalid_argument", "Unknown query fields: " + ", ".join(sorted(unknown)[:8]) + ". " + RAW_SQL_HINT)
+    return query
+
+
+def as_list(query, key, limit):
+    value = query.get(key, [])
+    if not isinstance(value, list) or len(value) > limit:
+        raise AccessError("invalid_argument", f"{key} must be a list of at most {limit} items.")
+    return value
+
+
+def build_query(product, query):
+    """(sql, params, output column names, limit) from a validated structured query. Only identifiers from
+    the policy and generated operators reach the SQL text; every value is a typed literal or psql variable."""
+    policy = db_policy(product)
+    schema = check_schema(policy, query.get("schema"))
+    table = query.get("table")
+    cols = table_columns(policy, table)
+    params = Params()
+    projection = policy.get("projection", {}).get(table)
+    used = set()
+
+    def column(name, what):
+        if not isinstance(name, str) or name not in cols:
+            raise AccessError("invalid_argument", f"Unknown {what} column for {table}: use a column from db schema.",
+                              {"column": name if isinstance(name, str) and len(name) < 64 else None,
+                               "allowed": sorted(cols), "hint": "db schema"})
+        used.add(name)
+        return cols[name]
+
+    def output(name):
+        cls, expr = column(name, "selected")
+        return f"left(({expr})::text, {LIMITS['db_cell_chars']})" if cls == "t" else expr
+
+    columns = as_list(query, "columns", LIMITS["db_columns"])
+    aggregates = as_list(query, "aggregates", LIMITS["db_aggregates"])
+    group_by = as_list(query, "group_by", LIMITS["db_group_by"])
+    if not columns and not aggregates:
+        columns = sorted(cols)
+    if aggregates and any(name not in group_by for name in columns):
+        raise AccessError("invalid_argument", "With aggregates, every listed column must also be in group_by.")
+    if group_by and not aggregates:
+        raise AccessError("invalid_argument", "group_by needs at least one aggregate.")
+    if len(set(columns)) != len(columns):
+        raise AccessError("invalid_argument", "columns must not repeat.")
+    items, names = [], []
+    for name in columns:
+        items.append(f"{output(name)} AS {qi(name)}")
+        names.append(name)
+    for index, agg in enumerate(aggregates):
+        if not isinstance(agg, dict) or set(agg) - {"fn", "column", "as"} or agg.get("fn") not in AGGREGATES:
+            raise AccessError("invalid_argument", "Each aggregate is {fn: count|count_distinct|sum|min|max|avg, column, as}.")
+        fn, target = agg["fn"], agg.get("column")
+        alias = agg.get("as") or (f"{fn}_{target}" if target else fn)
+        if not isinstance(alias, str) or not IDENT.match(alias) or alias in names:
+            raise AccessError("invalid_argument", "aggregate 'as' must be a new lower-case identifier.")
+        if target is None:
+            if fn != "count":
+                raise AccessError("invalid_argument", f"{fn} needs a column.")
+            expr = "count(*)"
+        else:
+            cls, source = column(target, "aggregate")
+            if fn in ("sum", "avg") and cls != "n":
+                raise AccessError("invalid_argument", f"{fn} works on numeric columns only.")
+            if fn == "count_distinct":
+                expr = f"count(DISTINCT {source})"
+            elif fn in ("min", "max") and cls == "t":
+                expr = f"left({fn}(({source})::text), {LIMITS['db_cell_chars']})"
+            else:
+                expr = f"{fn}({source})"
+        items.append(f"{expr} AS {qi(alias)}")
+        names.append(alias)
+    where = []
+    for flt in as_list(query, "filters", LIMITS["db_filters"]):
+        if not isinstance(flt, dict) or set(flt) - {"column", "op", "value", "values"}:
+            raise AccessError("invalid_argument", "Each filter is {column, op, value} or {column, op: in|not_in, values}.")
+        cls, expr = column(flt.get("column"), "filter")
+        op = flt.get("op")
+        if op in OPERATORS:
+            where.append(f"{expr} {OPERATORS[op]} {params.add(flt.get('value'))}")
+        elif op in ("in", "not_in"):
+            values = flt.get("values")
+            if not isinstance(values, list) or not 1 <= len(values) <= LIMITS["db_in_values"]:
+                raise AccessError("invalid_argument", f"{op} needs values: a list of 1-{LIMITS['db_in_values']}.")
+            where.append(f"{expr} {'IN' if op == 'in' else 'NOT IN'} ({', '.join(params.add(v) for v in values)})")
+        elif op in ("is_null", "not_null"):
+            where.append(f"{expr} IS {'NOT ' if op == 'not_null' else ''}NULL")
+        elif op in ("contains", "starts_with"):
+            value = flt.get("value")
+            if not isinstance(value, str) or not value:
+                raise AccessError("invalid_argument", f"{op} needs a text value.")
+            ref = params.add(value)
+            if op == "contains":
+                where.append(f"strpos(lower(({expr})::text), lower({ref})) > 0")
+            else:
+                where.append(f"starts_with(lower(({expr})::text), lower({ref}))")
+        else:
+            raise AccessError("invalid_argument", "op must be eq, ne, lt, le, gt, ge, in, not_in, is_null, not_null, "
+                                                  "contains, or starts_with.")
+    groups = [column(name, "group_by")[1] for name in group_by]
+    order = []
+    for entry in as_list(query, "order_by", LIMITS["db_order_by"]):
+        if not isinstance(entry, dict) or set(entry) - {"key", "dir"} or entry.get("dir", "asc") not in ("asc", "desc"):
+            raise AccessError("invalid_argument", "Each order_by entry is {key: column or aggregate alias, dir: asc|desc}.")
+        key = entry.get("key")
+        if key not in names:
+            raise AccessError("invalid_argument", "order_by keys must be selected columns or aggregate aliases.")
+        order.append(f"{qi(key)} {entry.get('dir', 'asc').upper()}")
+    limit = bounded_int(query.get("limit"), "limit", 1, LIMITS["db_rows"], LIMITS["db_default_rows"])
+    offset = bounded_int(query.get("offset"), "offset", 0, LIMITS["db_offset"], 0)
+    source = table
+    if projection and used & set(projection["columns"]):
+        source = projection["view"]  # code-owned view name; never taken from the query
+    sql = f"SELECT {', '.join(items)} FROM {qi(schema)}.{qi(source)}"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    if groups:
+        sql += " GROUP BY " + ", ".join(groups)
+    if order:
+        sql += " ORDER BY " + ", ".join(order)
+    sql += f" LIMIT {limit + 1} OFFSET {offset}"
+    wrapped = f"SELECT coalesce(json_agg(r), '[]'::json) FROM ({sql}) r"
+    return wrapped, params.values, names, limit, schema
+
+
+# --- Bounded subprocess (process group, timeout, output cap, cancellation) ----------
+
+def trusted_binary(path):
+    """A root-owned, non-group/other-writable file in a root-owned directory, following one link hop."""
+    try:
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode):
+            parent = os.stat(os.path.dirname(path))
+            if info.st_uid != 0 or parent.st_uid != 0 or parent.st_mode & 0o022:
+                return False
+            path = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+            info = os.lstat(path)
+        parent = os.stat(os.path.dirname(path))
+    except OSError:
+        return False
+    return (stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022 and parent.st_uid == 0
+            and not parent.st_mode & 0o022 and os.access(path, os.X_OK))
+
+
+def run_bounded(argv, stdin=b"", timeout=15, limit=1024 * 1024, env=None):
+    """(exit code, stdout bytes, stderr tail). The child runs in its own session and its whole process
+    group is stopped on timeout, overflow, or cancellation (which is re-raised)."""
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env or {},
+                            cwd="/", close_fds=True, start_new_session=True)
+    out, err, state = bytearray(), bytearray(), {"overflow": False}
+
+    def drain(stream, buf, cap, flag):
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                return
+            if len(buf) + len(chunk) > cap:
+                buf += chunk[:max(0, cap - len(buf))]
+                if flag:
+                    state["overflow"] = True
+                    kill_group(proc)
+                    return
+            else:
+                buf += chunk
+
+    def feed():
+        try:
+            proc.stdin.write(stdin)
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    threads = [threading.Thread(target=drain, args=(proc.stdout, out, limit, True), daemon=True),
+               threading.Thread(target=drain, args=(proc.stderr, err, 16 * 1024, False), daemon=True),
+               threading.Thread(target=feed, daemon=True)]
+    for thread in threads:
+        thread.start()
+    try:
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_group(proc)
+            raise AccessError("timeout", f"The read did not finish within {timeout} seconds.", {"reason": "timeout"})
+    except BaseException:
+        kill_group(proc)
+        raise
+    finally:
+        for thread in threads:
+            thread.join(2)
+    if state["overflow"]:
+        raise AccessError("limit_reached", "The result was larger than the output limit.", {"reason": "output_limit"})
+    return proc.returncode, bytes(out), bytes(err).decode("utf-8", "replace")
+
+
+def kill_group(proc):
+    for sig in (signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError, AttributeError, OSError):
+            return
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def psql_argv(database, params):
+    argv = [DB_RUNUSER, "-u", DB_ROLE, "--", DB_PSQL, "-X", "-A", "-t", "-q", "--no-password", "-v", "ON_ERROR_STOP=1",
+            "-h", DB_SOCKET, "-p", DB_PORT, "-d", database]
+    for index, value in enumerate(params, 1):
+        argv += ["-v", f"p{index}={value}"]
+    return argv + ["-f", "-"]
+
+
+def psql_script(sql):
+    return ("BEGIN TRANSACTION READ ONLY;\n"
+            f"SET LOCAL statement_timeout = {LIMITS['db_statement_ms']};\n"
+            "SET LOCAL lock_timeout = 1000;\n"
+            "SET LOCAL search_path = pg_catalog;\n"
+            f"{sql};\nROLLBACK;\n").encode("utf-8")
+
+
+def psql_env():
+    return {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PGCONNECT_TIMEOUT": "5",
+            "PGAPPNAME": "ddistro-access", "PGTZ": "UTC",
+            "PGOPTIONS": "-c default_transaction_read_only=on -c statement_timeout=5000 -c lock_timeout=1000 "
+                         "-c idle_in_transaction_session_timeout=5000"}
+
+
+def psql_failure(stderr):
+    """Map a psql error to an AccessError without echoing data."""
+    text = stderr.strip().split("\n")[0] if stderr.strip() else ""
+    lower = text.lower()
+    if "does not exist" in lower and ("user " + DB_ROLE in lower or "role \"" + DB_ROLE in lower):
+        return AccessError("unsupported", "The ddreader database role is not provisioned. Root runs "
+                           "install_assistant_runtime --db-reader.", {"reason": "db_reader_missing"})
+    if "peer authentication failed" in lower or "no pg_hba.conf entry" in lower:
+        return AccessError("unsupported", "PostgreSQL does not accept local peer login for ddreader.",
+                           {"reason": "unsupported_auth"})
+    if "permission denied" in lower:
+        return AccessError("permission_denied", "ddreader has no read grant for that table or column. Use db schema "
+                           "for what is granted. Saving or loading a CHIM playthrough rebuilds those tables without grants; "
+                           "the automatic grant refresh did not restore it (see details.refresh), so root reruns "
+                           "install_assistant_runtime --db-reader.",
+                           {"reason": "not_granted", "hint": "db schema"})
+    if "does not exist" in lower and any(spec["view"] in lower for policy in DB_POLICY.values()
+                                         for spec in policy.get("projection", {}).values()):
+        return AccessError("unsupported", "The derived NPC memory view is not provisioned in that schema (loading a "
+                           "CHIM playthrough removes it from public) and the automatic grant refresh did not restore it "
+                           "(see details.refresh). Root reruns install_assistant_runtime --db-reader.", {"reason": "projection_missing"})
+    if "statement timeout" in lower or "lock timeout" in lower:
+        return AccessError("timeout", "PostgreSQL stopped the read at its time limit.", {"reason": "statement_timeout"})
+    if "does not exist" in lower:
+        return AccessError("not_found", "That schema, table, or column does not exist here.", {"hint": "db schema"})
+    clean, _ = redact_text(text)
+    return AccessError("failed", "The read-only query failed.", {"psql": clip(clean, 300)})
+
+
+def run_db(product, sql, params, runner=None):
+    """Run one generated SELECT as ddreader; returns decoded JSON. runner is a test seam with run_bounded's signature."""
+    database = DB_PRODUCTS[product]
+    if runner is None:
+        if not (trusted_binary(DB_RUNUSER) and trusted_binary(DB_PSQL)):
+            raise AccessError("helper_unavailable", "runuser or psql is not a trusted root-owned program.")
+        runner = run_bounded
+    code, out, err = runner(psql_argv(database, params), stdin=psql_script(sql), timeout=LIMITS["db_seconds"],
+                            limit=LIMITS["db_output_bytes"], env=psql_env())
+    if code != 0:
+        raise psql_failure(err)
+    try:
+        return json.loads(out.decode("utf-8").strip() or "null")
+    except ValueError:
+        raise AccessError("failed", "PostgreSQL returned unexpected output.", {"reason": "protocol"})
+
+
+def clean_cell(value):
+    if isinstance(value, str):
+        text, n = redact_text(value)
+        return clip(text, LIMITS["db_cell_chars"]), n
+    if isinstance(value, (dict, list)):
+        return "[structured]", 0
+    return value, 0
+
+
+def db_query(product, raw_json, runner=None, refresher=None):
+    query = parse_query_json(raw_json)
+    sql, params, names, limit, schema = build_query(product, query)
+    refresher = default_refresher(runner, refresher)
+    refresh = no_refresh()
+    started = time.monotonic()
+    try:
+        rows = run_db(product, sql, params, runner) or []
+    except AccessError as error:
+        trigger = error.details.get("reason")
+        # Only a gap in public (the schema CHIM drops on load) triggers the one refresh; a snapshot never does.
+        if refresher is None or schema != "public" or trigger not in REFRESH_TRIGGERS:
+            raise
+        refresh = refresher(product, trigger)
+        if not refresh["ok"]:
+            error.details["refresh"] = refresh
+            raise
+        try:
+            rows = run_db(product, sql, params, runner) or []
+        except AccessError as again:
+            again.details["refresh"] = refresh
+            raise
+    elapsed = int((time.monotonic() - started) * 1000)
+    truncated = len(rows) > limit
+    out, redactions = [], 0
+    for row in rows[:limit]:
+        cells = []
+        for name in names:
+            value, n = clean_cell(row.get(name) if isinstance(row, dict) else None)
+            redactions += n
+            cells.append(value)
+        out.append(cells)
+    return result({"product": product, "database": DB_PRODUCTS[product], "schema": schema, "table": query["table"],
+                   "columns": names, "rows": out, "row_count": len(out), "redactions": redactions, "ms": elapsed,
+                   "transaction": "read_only", "role": DB_ROLE},
+                  complete=not truncated, reason="row_limit" if truncated else None,
+                  coverage={"limit": limit, "offset": query.get("offset", 0), "cell_chars": LIMITS["db_cell_chars"],
+                            "refresh": refresh})
+
+
+def schema_sql(policy, schema, table):
+    """Granted columns of approved tables (information_schema shows only columns ddreader may read)."""
+    tables = sorted(policy["tables"]) if table is None else [table]
+    names = ", ".join("'" + name + "'" for name in tables)
+    views = [spec["view"] for name, spec in sorted(policy.get("projection", {}).items()) if name in tables]
+    relations = f"(k.relkind = 'r' AND c.table_name IN ({names}))"
+    if views:
+        relations = f"({relations} OR (k.relkind = 'v' AND c.table_name IN ({', '.join(repr(v) for v in views)})))"
+    if schema is None:
+        schemas = "c.table_schema = 'public'"
+        if policy.get("profile_schema"):
+            schemas = "(c.table_schema = 'public' OR c.table_schema LIKE 'chim\\_profile\\_%')"
+    else:
+        schemas = "c.table_schema = '" + schema + "'"
+    return ("SELECT coalesce(json_agg(t ORDER BY t.schema, t.table), '[]'::json) FROM ("
+            "SELECT c.table_schema AS schema, c.table_name AS table, json_agg(json_build_array(c.column_name, c.data_type)"
+            " ORDER BY c.ordinal_position) AS columns, max(k.reltuples)::bigint AS row_estimate "
+            "FROM information_schema.columns c JOIN pg_class k ON k.relname = c.table_name "
+            "JOIN pg_namespace n ON n.oid = k.relnamespace AND n.nspname = c.table_schema "
+            f"WHERE {schemas} AND {relations} GROUP BY c.table_schema, c.table_name "
+            f"LIMIT {LIMITS['db_tables'] + 1}) t")
+
+
+def db_schema(product, schema=None, table=None, runner=None, refresher=None):
+    policy = db_policy(product)
+    if schema is not None:
+        schema = check_schema(policy, schema)
+    if table is not None:
+        table_columns(policy, table)
+    refresher = default_refresher(runner, refresher)
+    data = schema_result(product, policy, schema, table, runner, no_refresh())
+    # Only a gap in public (the schema CHIM drops on load) triggers the one refresh; a snapshot never does.
+    gap = data["reason"] == "public_not_granted" or any(
+        entry.get("derived") == "projection_missing" and entry["schema"] == "public" for entry in data["tables"])
+    if refresher is None or not gap:
+        return data
+    trigger = "public_not_granted" if data["reason"] == "public_not_granted" else "projection_missing"
+    refresh = refresher(product, trigger)
+    if not refresh["ok"]:
+        data["coverage"]["refresh"] = refresh
+        return data
+    return schema_result(product, policy, schema, table, runner, refresh)
+
+
+def schema_result(product, policy, schema, table, runner, refresh):
+    rows = run_db(product, schema_sql(policy, schema, table), [], runner) or []
+    projections = policy.get("projection", {})
+    by_view = {spec["view"]: base for base, spec in projections.items()}
+    # Granted projection-view columns per (schema, base table); the view itself is not listed as a table.
+    derived = {(row.get("schema"), by_view[row.get("table")]): {name for name, _ in row.get("columns") or []}
+               for row in rows if row.get("table") in by_view}
+    rows = [row for row in rows if row.get("table") not in by_view]
+    truncated = len(rows) > LIMITS["db_tables"]
+    tables = []
+    for row in rows[:LIMITS["db_tables"]]:
+        approved = policy["tables"].get(row.get("table"), {})
+        projection = projections.get(row.get("table"), {})
+        granted = derived.get((row.get("schema"), row.get("table")), set())
+        columns = [{"name": name, "type": kind, "class": "text" if approved.get(name) == "t" else "value"}
+                   for name, kind in row.get("columns") or [] if name in approved]
+        columns += [{"name": name, "type": "derived", "class": "text" if cls == "t" else "value",
+                     "source": projection["source"] + "." + projection["path"], "via": projection["view"]}
+                    for name, cls in projection.get("columns", {}).items() if name in granted]
+        entry = {"schema": row.get("schema"), "table": row.get("table"), "columns": columns,
+                 "row_estimate": row.get("row_estimate"), "row_estimate_kind": "planner_estimate"}
+        if projection and not granted:
+            entry["derived"] = "projection_missing"  # its derived columns are unavailable, never zero
+        tables.append(entry)
+    # CHIM drops and re-clones public on every playthrough load, which removes ddreader's grants there.
+    public_missing = schema in (None, "public") and not any(row.get("schema") == "public" for row in rows)
+    playthroughs, playthrough_reason = None, None
+    meta = policy.get("meta")
+    if meta:
+        fields = ", ".join(qi(c) for c in meta["columns"])
+        pairs = ", ".join(f"'{c}', {qi(c)}" for c in meta["columns"])
+        sql = (f"SELECT coalesce(json_agg(json_build_object({pairs}) ORDER BY m.{qi('id')}), '[]'::json) "
+               f"FROM (SELECT {fields} FROM {qi(meta['schema'])}.{qi(meta['table'])} LIMIT 200) m")
+        try:
+            playthroughs = run_db(product, sql, [], runner)
+        except AccessError as error:
+            playthrough_reason = error.details.get("reason", error.code)
+    reason = None
+    if truncated:
+        reason = "table_limit"
+    elif public_missing:
+        reason = "public_not_granted"
+    elif playthrough_reason:
+        reason = "playthroughs_unavailable"
+    return result({"product": product, "database": DB_PRODUCTS[product], "tables": tables,
+                   "playthroughs": playthroughs, "playthroughs_reason": playthrough_reason,
+                   "notes": policy.get("notes", []),
+                   "query_contract": "db query PRODUCT --query-json OBJECT (see ASSISTANT.md)"},
+                  complete=reason is None, reason=reason,
+                  coverage={"tables": len(tables), "approved_tables": sorted(policy["tables"]),
+                            "missing_tables_mean": "not granted or not present, not empty",
+                            "refresh": refresh,
+                            "recovery": "the automatic grant refresh did not restore public (see coverage.refresh); root "
+                                        "reruns install_assistant_runtime --db-reader" if public_missing else None})
+
+
+# --- Grant script for install_assistant_runtime --db-reader -----------------------
+
+def grant_sql(database):
+    """Idempotent grants for one product database, from the policy only. Runs as postgres via the installer.
+
+    First drops every table-, view- and column-level privilege and schema USAGE that ddreader itself holds in
+    this database (REVOKE ALL ON TABLE does not remove column grants, so columns are revoked by name), then
+    grants the reviewed columns and the managed projection views again, all in the installer's one
+    transaction. Only ddreader's own ACL entries change: no other role, PUBLIC default, owner, or row."""
+    product = next((key for key, name in DB_PRODUCTS.items() if name == database), None)
+    if product is None:
+        raise AccessError("invalid_argument", "Unknown database.")
+    policy = DB_POLICY[product]
+    plan = {"tables": {table: list(cols) for table, cols in policy["tables"].items()},
+            "profile_regex": policy["profile_schema"].pattern.replace("\\Z", "$") if policy.get("profile_schema") else None,
+            "meta": policy.get("meta"),
+            "projections": [{"table": table, "view": spec["view"], "source": spec["source"], "base": spec["base"]}
+                            for table, spec in sorted(policy.get("projection", {}).items())]}
+    literal = json.dumps(plan, sort_keys=True).replace("'", "''")
+    view_sql = PROJECTION_VIEW_SQL.replace("'", "''")
+    comment = PROJECTION_COMMENT.replace("'", "''")
+    return f"""DO $ddreader$
+DECLARE
+  plan jsonb := '{literal}';
+  reader oid; me oid; r record; p jsonb; s text; t text; keep text; rel oid;
+  schemas text[] := ARRAY['public']; profiles text[];
+BEGIN
+  PERFORM pg_catalog.set_config('search_path', 'pg_catalog', true);
+  SELECT oid INTO reader FROM pg_catalog.pg_roles WHERE rolname = '{DB_ROLE}';
+  IF reader IS NULL THEN
+    RAISE EXCEPTION 'role {DB_ROLE} is missing';
+  END IF;
+  SELECT oid INTO me FROM pg_catalog.pg_roles WHERE rolname = current_user;
+  -- 1. Drop ddreader's own relation, column and schema privileges everywhere in this database.
+  FOR r IN SELECT n.nspname, c.relname, c.oid FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+        AND (EXISTS (SELECT 1 FROM pg_catalog.aclexplode(c.relacl) a WHERE a.grantee = reader)
+          OR EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a, pg_catalog.aclexplode(a.attacl) x
+                     WHERE a.attrelid = c.oid AND a.attnum > 0 AND x.grantee = reader)) LOOP
+    EXECUTE format('REVOKE ALL ON TABLE %I.%I FROM {DB_ROLE}', r.nspname, r.relname);
+    SELECT string_agg(quote_ident(a.attname), ', ') INTO keep FROM pg_catalog.pg_attribute a
+      WHERE a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
+        AND EXISTS (SELECT 1 FROM pg_catalog.aclexplode(a.attacl) x WHERE x.grantee = reader);
+    IF keep IS NOT NULL THEN
+      EXECUTE format('REVOKE ALL (%s) ON TABLE %I.%I FROM {DB_ROLE}', keep, r.nspname, r.relname);
+    END IF;
+  END LOOP;
+  FOR s IN SELECT n.nspname FROM pg_catalog.pg_namespace n
+      WHERE EXISTS (SELECT 1 FROM pg_catalog.aclexplode(n.nspacl) a WHERE a.grantee = reader) LOOP
+    EXECUTE format('REVOKE ALL ON SCHEMA %I FROM {DB_ROLE}', s);
+  END LOOP;
+  -- 2. public plus the playthrough snapshot schemas listed in playthrough_profiles.
+  IF plan->>'profile_regex' IS NOT NULL AND to_regclass('chim_meta.playthrough_profiles') IS NOT NULL THEN
+    EXECUTE 'SELECT array_agg(schema_name) FROM chim_meta.playthrough_profiles WHERE schema_name ~ $1'
+      INTO profiles USING plan->>'profile_regex';
+    SELECT schemas || coalesce(array_agg(nspname::text), '{{}}') INTO schemas FROM pg_catalog.pg_namespace
+      WHERE nspname = ANY(coalesce(profiles, '{{}}'));
+  END IF;
+  FOREACH s IN ARRAY schemas LOOP
+    EXECUTE format('GRANT USAGE ON SCHEMA %I TO {DB_ROLE}', s);
+    FOR t IN SELECT jsonb_object_keys(plan->'tables') LOOP
+      SELECT c.oid INTO rel FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = s AND c.relname = t AND c.relkind = 'r';
+      CONTINUE WHEN rel IS NULL;
+      SELECT string_agg(quote_ident(a.attname), ', ') INTO keep FROM pg_catalog.pg_attribute a
+        WHERE a.attrelid = rel AND a.attnum > 0 AND NOT a.attisdropped
+          AND a.attname IN (SELECT jsonb_array_elements_text(plan->'tables'->t));
+      IF keep IS NOT NULL THEN
+        EXECUTE format('GRANT SELECT (%s) ON TABLE %I.%I TO {DB_ROLE}', keep, s, t);
+      END IF;
+    END LOOP;
+    -- 3. Managed projection views: created or refreshed only when the source table has the reviewed columns
+    -- (the JSON source as json/jsonb); a same-named object that is not ours stops the whole run.
+    FOR p IN SELECT jsonb_array_elements(plan->'projections') LOOP
+      SELECT c.oid INTO rel FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = s AND c.relname = p->>'table' AND c.relkind = 'r';
+      CONTINUE WHEN rel IS NULL OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+          WHERE a.attrelid = rel AND a.attname = p->>'source' AND NOT a.attisdropped
+            AND a.atttypid IN ('pg_catalog.json'::pg_catalog.regtype, 'pg_catalog.jsonb'::pg_catalog.regtype))
+        OR (SELECT count(*) FROM pg_catalog.pg_attribute a WHERE a.attrelid = rel AND NOT a.attisdropped
+              AND a.attname IN (SELECT jsonb_array_elements_text(p->'base'))) < jsonb_array_length(p->'base');
+      SELECT c.oid INTO rel FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = s AND c.relname = p->>'view';
+      IF rel IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = rel AND c.relkind = 'v'
+          AND c.relowner = me AND pg_catalog.obj_description(c.oid, 'pg_class') = '{comment}') THEN
+        RAISE EXCEPTION 'refusing to replace %.%: it exists and is not the DwemerDistro-managed view', s, p->>'view';
+      END IF;
+      EXECUTE format('{view_sql}', s, p->>'view', p->>'table');
+      EXECUTE format('COMMENT ON VIEW %I.%I IS %L', s, p->>'view', '{comment}');
+      EXECUTE format('REVOKE ALL ON TABLE %I.%I FROM PUBLIC', s, p->>'view');
+      EXECUTE format('GRANT SELECT ON TABLE %I.%I TO {DB_ROLE}', s, p->>'view');
+    END LOOP;
+  END LOOP;
+  IF plan->'meta' IS NOT NULL AND plan->'meta' <> 'null'::jsonb THEN
+    SELECT c.oid INTO rel FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = plan->'meta'->>'schema' AND c.relname = plan->'meta'->>'table' AND c.relkind = 'r';
+    IF rel IS NOT NULL THEN
+      EXECUTE format('GRANT USAGE ON SCHEMA %I TO {DB_ROLE}', plan->'meta'->>'schema');
+      SELECT string_agg(quote_ident(a.attname), ', ') INTO keep FROM pg_catalog.pg_attribute a
+        WHERE a.attrelid = rel AND a.attnum > 0 AND NOT a.attisdropped
+          AND a.attname IN (SELECT jsonb_array_elements_text(plan->'meta'->'columns'));
+      IF keep IS NOT NULL THEN
+        EXECUTE format('GRANT SELECT (%s) ON TABLE %I.%I TO {DB_ROLE}', keep, plan->'meta'->>'schema',
+                       plan->'meta'->>'table');
+      END IF;
+    END IF;
+  END IF;
+  RAISE NOTICE 'ddreader grants refreshed for % schema(s)', array_length(schemas, 1);
+END
+$ddreader$;
+"""
+
+
+# --- Automatic, bounded refresh after a CHIM playthrough save/load -------------------
+# CHIM's load drops public CASCADE and clones a snapshot back without views or grants, so ddreader loses
+# access on every load. A db command that hits exactly that gap runs the installer's refresh script once as
+# postgres for the one reviewed database being read, then retries once. The script is fixed: it takes only a
+# database name from DB_PRODUCTS, never model text, and it stops unchanged unless ddreader is already the
+# dedicated, unprivileged reader the installer created. It never creates accounts or roles, and never touches
+# other roles, PUBLIC defaults, owners, rows, pg_hba or services.
+REFRESH_TRIGGERS = ("not_granted", "projection_missing", "public_not_granted")
+REFRESH_NOTICE = re.compile(r"ddreader grants refreshed for (\d+) schema")
+
+
+def refresh_sql(database):
+    """grant_sql wrapped in a dedicated-role check and before/after fingerprints of ddreader's privileges and
+    the managed views. Run as postgres in one transaction (psql -1); prints two md5 lines."""
+    comment = DB_ROLE_COMMENT.replace("'", "''")
+    view_comment = PROJECTION_COMMENT.replace("'", "''")
+    reader = f"(SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '{DB_ROLE}')"
+    fingerprint = f"""SELECT pg_catalog.md5(coalesce(pg_catalog.string_agg(x, ',' ORDER BY x), '')) FROM (
+  SELECT c.oid::regclass::text || ':' || a.privilege_type FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) a
+    WHERE a.grantee = {reader}
+  UNION ALL SELECT c.oid::regclass::text || '.' || t.attname || ':' || a.privilege_type
+    FROM pg_catalog.pg_attribute t JOIN pg_catalog.pg_class c ON c.oid = t.attrelid, pg_catalog.aclexplode(t.attacl) a
+    WHERE a.grantee = {reader}
+  UNION ALL SELECT n.nspname || ':' || a.privilege_type FROM pg_catalog.pg_namespace n, pg_catalog.aclexplode(n.nspacl) a
+    WHERE a.grantee = {reader}
+  UNION ALL SELECT 'view:' || c.oid::regclass::text FROM pg_catalog.pg_class c
+    WHERE c.relkind = 'v' AND pg_catalog.obj_description(c.oid, 'pg_class') = '{view_comment}') s(x);
+"""
+    return f"""SET LOCAL search_path = pg_catalog;
+SET LOCAL statement_timeout = {LIMITS['db_refresh_statement_ms']};
+SET LOCAL lock_timeout = {LIMITS['db_refresh_lock_ms']};
+DO $ddcheck$
+DECLARE r record;
+BEGIN
+  SELECT g.rolsuper OR g.rolcreatedb OR g.rolcreaterole OR g.rolreplication OR g.rolbypassrls OR NOT g.rolcanlogin
+           OR g.rolinherit AS privileged,
+         coalesce(pg_catalog.shobj_description(g.oid, 'pg_authid'), '') AS note,
+         NOT coalesce('default_transaction_read_only=on' = ANY(g.rolconfig), false) AS writable,
+         (SELECT count(*) FROM pg_catalog.pg_auth_members m WHERE m.member = g.oid OR m.roleid = g.oid)
+           + (SELECT count(*) FROM pg_catalog.pg_database d WHERE d.datdba = g.oid)
+           + (SELECT count(*) FROM pg_catalog.pg_class c WHERE c.relowner = g.oid)
+           + (SELECT count(*) FROM pg_catalog.pg_namespace n WHERE n.nspowner = g.oid)
+           + (SELECT count(*) FROM pg_catalog.pg_proc f WHERE f.proowner = g.oid) AS ties,
+         pg_catalog.has_database_privilege(g.oid, pg_catalog.current_database(), 'CONNECT') AS can_connect
+    INTO r FROM pg_catalog.pg_roles g WHERE g.rolname = '{DB_ROLE}';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'ddreader_not_installed';
+  END IF;
+  IF r.privileged OR r.writable OR r.note <> '{comment}' OR r.ties <> 0 OR NOT r.can_connect THEN
+    RAISE EXCEPTION 'ddreader_not_dedicated';
+  END IF;
+END
+$ddcheck$;
+{fingerprint}{grant_sql(database)}{fingerprint}"""
+
+
+def refresh_argv(database):
+    return [DB_RUNUSER, "-u", "postgres", "--", DB_PSQL, "-X", "-A", "-t", "-q", "--no-password", "-v", "ON_ERROR_STOP=1",
+            "-h", DB_SOCKET, "-p", DB_PORT, "-d", database, "-1", "-f", "-"]
+
+
+def refresh_env():
+    return {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PGCONNECT_TIMEOUT": "5",
+            "PGAPPNAME": "ddistro-access-refresh", "PGTZ": "UTC",
+            "PGOPTIONS": f"-c statement_timeout={LIMITS['db_refresh_statement_ms']} "
+                         f"-c lock_timeout={LIMITS['db_refresh_lock_ms']} -c idle_in_transaction_session_timeout=10000"}
+
+
+def no_refresh():
+    return {"count": 0, "trigger": None, "ok": None, "metadata_changed": False, "schemas": None, "reason": None}
+
+
+def default_refresher(runner, refresher):
+    """Production reads (runner None) refresh with refresh_grants; a test runner refreshes only when given one."""
+    if refresher is not None:
+        return refresher
+    return refresh_grants if runner is None else None
+
+
+def refresh_grants(product, trigger, runner=None):
+    """Run refresh_sql once as postgres for the product's database. Returns a coverage record and never raises
+    an AccessError: a refusal or failure is reported (ok false) and the caller keeps the original error."""
+    info = dict(no_refresh(), count=1, trigger=trigger, ok=False, database=DB_PRODUCTS.get(product))
+    if product not in DB_PRODUCTS or not DB_POLICY.get(product, {}).get("tables"):
+        return dict(info, count=0, reason="not_reviewed")
+    if runner is None:
+        if not hasattr(os, "geteuid") or os.geteuid() != 0:
+            return dict(info, count=0, reason="not_root")
+        if not (trusted_binary(DB_RUNUSER) and trusted_binary(DB_PSQL)):
+            return dict(info, count=0, reason="helper_unavailable")
+        runner = run_bounded
+    database = DB_PRODUCTS[product]
+    try:
+        code, out, err = runner(refresh_argv(database), stdin=refresh_sql(database).encode("utf-8"),
+                                timeout=LIMITS["db_refresh_seconds"], limit=64 * 1024, env=refresh_env())
+    except AccessError as error:
+        return dict(info, reason=error.details.get("reason", error.code))
+    if code != 0:
+        lower = err.lower()
+        for marker, reason in (("ddreader_not_installed", "db_reader_missing"),
+                               ("ddreader_not_dedicated", "role_not_dedicated"),
+                               ("refusing to replace", "view_collision"), ("lock timeout", "lock_timeout"),
+                               ("statement timeout", "statement_timeout"), ("does not exist", "database_missing")):
+            if marker in lower:
+                return dict(info, reason=reason)
+        clean, _ = redact_text(err.strip().split("\n")[0] if err.strip() else "")
+        return dict(info, reason="failed", psql=clip(clean, 300))
+    prints = [line.strip() for line in out.decode("utf-8", "replace").splitlines() if line.strip()]
+    if len(prints) != 2:
+        return dict(info, reason="protocol")
+    match = REFRESH_NOTICE.search(err)
+    return dict(info, ok=True, metadata_changed=prints[0] != prints[1], schemas=int(match.group(1)) if match else None)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--emit-databases"]:  # product databases with reviewed tables, one per line
+        sys.stdout.write("".join(DB_PRODUCTS[key] + "\n" for key, spec in DB_POLICY.items() if spec["tables"]))
+        sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == "--emit-grant-sql" and sys.argv[2] in DB_PRODUCTS.values():
+        sys.stdout.write(grant_sql(sys.argv[2]))
+        sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == "--emit-refresh-sql" and sys.argv[2] in DB_PRODUCTS.values():
+        sys.stdout.write(refresh_sql(sys.argv[2]))
+        sys.exit(0)
+    sys.stderr.write("ddistro_access is a library for ddistro. Only --emit-databases, --emit-grant-sql DATABASE and "
+                     "--emit-refresh-sql DATABASE are commands.\n")
+    sys.exit(64)

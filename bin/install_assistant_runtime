@@ -3,9 +3,17 @@
 # See ASSISTANT_RUNTIME.md. Root only; idempotent; never touches an existing sign-in.
 #
 #   install_assistant_runtime [--archive PATH] [--host-archive PATH] [--install-prerequisites]
+#   install_assistant_runtime --db-reader
+#   install_assistant_runtime --reprobe
 #
 # Without --archive/--host-archive the pinned release assets are downloaded over HTTPS. Each
 # archive hash is verified before extraction and the extracted binary hash before install.
+# A regular run also does the --db-reader step when PostgreSQL and ddistro_access are already present
+# (a warning, never a failure, when they are not). --db-reader only creates or refreshes the ddreader
+# account, role and column grants, and the one DwemerDistro-managed derived view per reviewed schema
+# (metadata only), then exits.
+# --reprobe only reruns the isolation check (ddistro agent probe) when the runtime is installed and no
+# session is running, as a regular run also does last; it never fails, downloads, or signs in.
 set -euo pipefail
 umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -34,6 +42,153 @@ die() {
     exit 1
 }
 
+# --- --db-reader: the read-only PostgreSQL identity for ddistro db schema/query. Nothing else runs:
+# no download, runtime, service, or pg_hba change. Idempotent. Per database, in one transaction, it drops
+# every table/column/schema privilege ddreader itself holds, regrants the reviewed columns, and creates or
+# refreshes the managed ddreader_core_npc_master view (derived NPC memory counts, never raw extended_data).
+# A same-named object it does not own and label stops that database unchanged. No rows, tables, other
+# roles, owners, or PUBLIC defaults change. CHIM playthrough save/load clones tables without views or
+# grants (load drops public CASCADE); ddistro db then runs the same refresh script (--emit-refresh-sql) once,
+# as postgres, only if this step already created the dedicated role. Rerun by hand if that refresh fails.
+READER_USER="ddreader"
+READER_COMMENT="DwemerDistro assistant read-only reader"
+ACCESS_MODULE="/usr/local/bin/ddistro_access"
+
+reader_sql() {  # reader_sql DATABASE SQL -> unaligned tuples, as postgres over the local socket
+    runuser -u postgres -- psql -X -A -t -q --no-password -v ON_ERROR_STOP=1 -h /var/run/postgresql -d "$1" -c "$2"
+}
+
+install_db_reader() {
+    [ "$(id -u)" = "0" ] || die "run as root (wsl -u root install_assistant_runtime --db-reader)"
+    cd /
+    [ -x /usr/bin/psql ] && [ -x /usr/sbin/runuser ] && [ -x /usr/bin/python3 ] || die "psql, runuser and python3 are required"
+    [ -f "$ACCESS_MODULE" ] && [ ! -L "$ACCESS_MODULE" ] || die "$ACCESS_MODULE is not installed"
+    [ "$(stat -c %u "$ACCESS_MODULE")" = "0" ] && [ $(( 0$(stat -c %a "$ACCESS_MODULE") & 022 )) = 0 ] \
+        && [ "$(stat -c %u /usr/local/bin)" = "0" ] && [ $(( 0$(stat -c %a /usr/local/bin) & 022 )) = 0 ] \
+        || die "$ACCESS_MODULE is not a root-owned file that only root can change"
+
+    # Local peer login must already apply to ddreader; pg_hba.conf is never edited here.
+    local db first
+    for db in $(/usr/bin/python3 -I -B "$ACCESS_MODULE" --emit-databases); do
+        case "$db" in *[!a-z0-9_]*|"") die "unexpected database name from the access policy" ;; esac
+        first="$(reader_sql postgres "SELECT auth_method FROM pg_hba_file_rules WHERE type = 'local' AND error IS NULL
+            AND database && ARRAY['all', '$db'] AND user_name && ARRAY['all', '$READER_USER']
+            ORDER BY line_number LIMIT 1")" || die "cannot read pg_hba_file_rules as postgres"
+        [ "$first" = "peer" ] || die "db_reader: unsupported_auth (the first local pg_hba rule for $db is '${first:-none}', not peer); nothing was changed"
+    done
+
+    # Dedicated OS identity for peer login: no shell, no home, no supplementary groups.
+    if ! getent passwd "$READER_USER" >/dev/null; then
+        useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$READER_USER"
+        printf '>> Created system user %s\n' "$READER_USER"
+    fi
+    local uid gid shell
+    uid="$(id -u "$READER_USER")"
+    gid="$(id -g "$READER_USER")"
+    shell="$(getent passwd "$READER_USER" | cut -d: -f7)"
+    [ "$uid" != "0" ] && [ "$gid" != "0" ] && [ "$uid" -lt 1000 ] || die "$READER_USER must be an unprivileged system account"
+    case "$shell" in
+        /usr/sbin/nologin|/sbin/nologin|/bin/false|/usr/bin/false) ;;
+        *) die "$READER_USER has a login shell ($shell); refusing to use it" ;;
+    esac
+    [ "$(id -G "$READER_USER")" = "$gid" ] || die "$READER_USER has supplementary groups; refusing to use it"
+    [ "$(getent group "$gid" | cut -d: -f1,4)" = "$READER_USER:" ] || die "group $gid must be named $READER_USER and have no members"
+
+    # Dedicated role: created here (marked by its comment) or refused. A foreign or privileged role is never reused.
+    local state
+    state="$(reader_sql postgres "SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls,
+        coalesce(shobj_description(oid, 'pg_authid'), ''),
+        (SELECT count(*) FROM pg_auth_members m WHERE m.member = r.oid OR m.roleid = r.oid),
+        (SELECT count(*) FROM pg_database d WHERE d.datdba = r.oid)
+        FROM pg_roles r WHERE rolname = '$READER_USER'")" || die "cannot read pg_roles as postgres"
+    if [ -z "$state" ]; then
+        reader_sql postgres "CREATE ROLE $READER_USER LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT CONNECTION LIMIT 2" >/dev/null \
+            || die "cannot create role $READER_USER"
+        reader_sql postgres "COMMENT ON ROLE $READER_USER IS '$READER_COMMENT'" >/dev/null || die "cannot mark role $READER_USER"
+        printf '>> Created PostgreSQL role %s\n' "$READER_USER"
+    elif [ "$state" != "f|$READER_COMMENT|0|0" ]; then
+        die "PostgreSQL role $READER_USER exists but is not the dedicated unprivileged reader (privileged, foreign, member, or owner); nothing was changed"
+    fi
+    reader_sql postgres "ALTER ROLE $READER_USER LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT CONNECTION LIMIT 2 PASSWORD NULL" >/dev/null \
+        || die "cannot set role attributes"
+    local setting
+    for setting in "default_transaction_read_only = on" "statement_timeout = '5s'" "lock_timeout = '1s'" \
+        "idle_in_transaction_session_timeout = '5s'"; do
+        reader_sql postgres "ALTER ROLE $READER_USER SET $setting" >/dev/null || die "cannot set $setting"
+    done
+
+    local owned prints
+    for db in $(/usr/bin/python3 -I -B "$ACCESS_MODULE" --emit-databases); do
+        if [ -z "$(reader_sql postgres "SELECT 1 FROM pg_database WHERE datname = '$db'")" ]; then
+            printf '>> Database %s is absent; skipped\n' "$db"
+            continue
+        fi
+        owned="$(reader_sql "$db" "SELECT (SELECT count(*) FROM pg_class WHERE relowner = r.oid)
+            + (SELECT count(*) FROM pg_namespace WHERE nspowner = r.oid) + (SELECT count(*) FROM pg_proc WHERE proowner = r.oid)
+            FROM pg_roles r WHERE rolname = '$READER_USER'")" || die "cannot inspect $db"
+        [ "$owned" = "0" ] || die "$READER_USER owns objects in $db; it is not a dedicated reader"
+        reader_sql postgres "GRANT CONNECT ON DATABASE $db TO $READER_USER" >/dev/null || die "cannot grant CONNECT on $db"
+        # The same fixed script ddistro db runs once after a playthrough load: dedicated-role check, then the
+        # grants, between two fingerprints of ddreader's privileges and the managed views.
+        prints="$(/usr/bin/python3 -I -B "$ACCESS_MODULE" --emit-refresh-sql "$db" \
+            | runuser -u postgres -- psql -X -A -t -q --no-password -v ON_ERROR_STOP=1 -h /var/run/postgresql -d "$db" -1 -f -)" \
+            || die "granting the reviewed columns in $db failed (rolled back for $db)"
+        if [ "$(printf '%s\n' "$prints" | sed -n 1p)" = "$(printf '%s\n' "$prints" | sed -n 2p)" ]; then
+            printf '>> Reader grants and managed view already current for %s\n' "$db"
+        else
+            printf '>> Reader grants and managed view refreshed for %s (metadata changed)\n' "$db"
+        fi
+    done
+    printf '[SUCCESS] ddreader is ready. Check with: ddistro --json db schema herika\n'
+    printf '>> After a CHIM playthrough save/load, ddistro db reruns this grant refresh once automatically.\n'
+}
+
+# --- --reprobe: rerun the code-owned isolation probe once after the runtime or a bound helper was replaced, so
+# the attestation is not left probe_stale. Only the fixed root-owned ddistro CLI runs it, under its own bound and
+# process group; the probe takes serve.lock without waiting, so a running session is left alone (busy, exit 75).
+# Nothing is downloaded, signed in, killed, or retried, and a skipped, busy, or failed probe never fails the caller:
+# the Assistant just stays off until the isolation check passes.
+reprobe_installed_runtime() {
+    local cli=/usr/local/bin/ddistro out rc
+    if [ "$(id -u)" != "0" ]; then
+        printf '[WARNING] The assistant isolation check needs root and was not rerun. Later, as root: ddistro agent probe\n' >&2
+        return 0
+    fi
+    if [ ! -f "$RUNTIME_DIR/$BINARY_NAME" ] || [ -L "$RUNTIME_DIR/$BINARY_NAME" ] || ! getent passwd "$AGENT_USER" >/dev/null; then
+        printf '>> The Assistant runtime is not installed, so its isolation check was skipped.\n'
+        return 0
+    fi
+    if [ ! -f "$cli" ] || [ -L "$cli" ] || [ "$(stat -c %u "$cli")" != "0" ] || [ $(( 0$(stat -c %a "$cli") & 022 )) -ne 0 ]; then
+        printf '[WARNING] %s is not a root-owned file only root can change, so the assistant isolation check was not rerun; the Assistant stays off.\n' "$cli" >&2
+        return 0
+    fi
+    printf '>> Rerunning the assistant isolation check for the installed runtime and helpers...\n'
+    rc=0
+    out="$("$cli" agent probe 2>&1 7<&-)" || rc=$?
+    if [ "$rc" = "0" ] && [ "${out#Isolation check passed.}" != "$out" ]; then
+        printf '%s\n' "$out"
+        printf '[SUCCESS] Assistant isolation check passed. ddistro capabilities shows which Assistant tools are enabled.\n'
+    elif [ "$rc" = "75" ]; then
+        printf '[WARNING] An assistant session is running, so the isolation check was not rerun and the session was left alone. The Assistant and its new tools stay off until you end the session and press Run isolation check (or run as root: ddistro agent probe).\n' >&2
+    else
+        printf '%s\n' "$out" >&2
+        printf '[WARNING] The assistant isolation check did not pass (see above); the Assistant and its new tools stay off. Fix the reported check, then press Run isolation check (or run as root: ddistro agent probe).\n' >&2
+    fi
+    return 0
+}
+
+if [ "${1:-}" = "--db-reader" ]; then
+    [ "$#" = "1" ] || die "--db-reader takes no other options"
+    install_db_reader
+    exit 0
+fi
+
+if [ "${1:-}" = "--reprobe" ]; then
+    [ "$#" = "1" ] || die "--reprobe takes no other options"
+    reprobe_installed_runtime
+    exit 0
+fi
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --archive)
@@ -51,7 +206,7 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         -h|--help)
-            sed -n '2,9p' "$0"
+            sed -n '2,15p' "$0"
             exit 0
             ;;
         *)
@@ -191,4 +346,16 @@ if [ "$RUNTIME_CHANGED" = "1" ]; then
     rm -f "$STATE_ROOT/agent/attestation.json"
 fi
 
-printf '[SUCCESS] Assistant runtime installed. Next: ddistro_agent probe\n'
+# --- read-only database reader: set up in a separate --db-reader run when PostgreSQL and the access policy are
+# already here. Nothing is downloaded or started, and a reader failure leaves the runtime install above as it is.
+if [ -x /usr/bin/psql ] && [ -x /usr/sbin/runuser ] && [ -f "$ACCESS_MODULE" ]     && compgen -G '/var/run/postgresql/.s.PGSQL.*' >/dev/null; then
+    /bin/bash "$0" --db-reader         || printf '[WARNING] The read-only database reader was not set up (see the error above); the runtime is installed. ddistro db reports it unavailable until: install_assistant_runtime --db-reader
+' >&2
+else
+    printf '[WARNING] PostgreSQL is not running or ddistro_access is not installed, so the read-only database reader was skipped; the runtime is installed. Later: install_assistant_runtime --db-reader
+' >&2
+fi
+
+printf '[SUCCESS] Assistant runtime installed.\n'
+# Last, after the reader and every runtime file above are final; its outcome never fails this install.
+reprobe_installed_runtime
