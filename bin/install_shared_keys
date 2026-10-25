@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Install the pinned shared-key library and initialize an empty store without changing existing credentials."""
+import argparse
+import fcntl
+import hashlib
+import importlib.machinery
+import io
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
+
+SOURCE = Path('/home/dwemer/dwemerdistro')
+RUNTIME = Path('/opt/dwemerdistro-keys')
+CONFIG = Path('/etc/dwemer/shared-keys.env')
+STATE = Path('/var/lib/dwemerdistro/shared-keys')
+LIMIT = 32 * 1024 * 1024
+
+
+def trusted(path):
+    """Only root-controlled regular files can configure a credential store or executable library."""
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError('Shared-key setup contains an untrusted file')
+
+
+def sql(database, statement, port):
+    """Keep owner SQL and any newly generated database password off arguments and diagnostic output."""
+    result = subprocess.run(['/usr/sbin/runuser', '-u', 'postgres', '--', '/usr/bin/psql', '-X', '-qAt',
+                             '--no-password', '-v', 'ON_ERROR_STOP=1', '-p', str(port), '-d', database],
+                            input="SET log_statement='none'; SET log_min_error_statement='panic';\n" + statement,
+                            text=True, capture_output=True, timeout=20)
+    if result.returncode:
+        raise RuntimeError('Shared-key database setup failed; existing credentials were preserved')
+    return result.stdout.strip()
+
+
+def install_runtime(bundle):
+    """Verify a code-only bundle before extracting regular files into a root-owned, atomic installation."""
+    manifest_path = Path('/etc/dwemer/shared-key-runtime.json')
+    trusted(manifest_path)
+    manifest = json.loads(manifest_path.read_text())
+    digest = manifest['sha256']
+    if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+        raise RuntimeError('Invalid shared-key runtime pin')
+    marker = RUNTIME / '.bundle-sha256'
+    if marker.exists():
+        trusted(marker)
+        if marker.read_text().strip() == digest:
+            return
+    if bundle:
+        with open(bundle, 'rb') as source:
+            data = source.read(LIMIT + 1)
+    else:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(manifest['url'], timeout=30) as response:
+            data = response.read(LIMIT + 1)
+    if len(data) > LIMIT or hashlib.sha256(data).hexdigest() != digest:
+        raise RuntimeError('Shared-key runtime hash mismatch; installed runtime was preserved')
+    if RUNTIME.is_symlink() or (RUNTIME.exists() and (RUNTIME.stat().st_uid != 0 or RUNTIME.stat().st_mode & 0o022)):
+        raise RuntimeError('Shared-key runtime directory is not trusted')
+    temporary = Path(tempfile.mkdtemp(prefix='dwemer-keys-stage-', dir='/opt'))
+    try:
+        total = 0
+        entries = 0
+        with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
+            for member in archive:
+                entries += 1
+                if entries > 256:
+                    raise RuntimeError('Shared-key runtime has too many files')
+                relative = Path(member.name)
+                if relative.is_absolute() or '..' in relative.parts or not (member.isdir() or member.isfile()):
+                    raise RuntimeError('Unsafe shared-key runtime archive')
+                total += member.size
+                if total > LIMIT:
+                    raise RuntimeError('Shared-key runtime archive exceeds its limit')
+                target = temporary / relative
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True, mode=0o755)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+                    with archive.extractfile(member) as source, target.open('xb') as output:
+                        shutil.copyfileobj(source, output)
+                    target.chmod(0o644)
+        for relative in ('Config/Autoloader.php', 'Core/ApiKeyManager/ApiKeyManager.php', 'schema.sql'):
+            if not (temporary / relative).is_file():
+                raise RuntimeError('Shared-key runtime is incomplete')
+        (temporary / '.bundle-sha256').write_text(digest + '\n')
+        temporary.chmod(0o755)
+        if RUNTIME.exists():
+            backup = STATE / ('runtime-before-' + secrets.token_hex(6))
+            os.rename(RUNTIME, backup)
+        os.rename(temporary, RUNTIME)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+
+
+def ensure_store(port):
+    """Reuse configured stores; otherwise create one empty, independent global database on first use."""
+    helper = Path('/usr/local/bin/ddistro_keys')
+    trusted(helper)
+    keys = importlib.machinery.SourceFileLoader('shared_key_setup', str(helper)).load_module()
+    environment = keys.environment()
+    if port != '5432' and environment.get('CHIM_SHARED_DB_NAME'):
+        raise RuntimeError('Non-default build port requires an empty store')
+    configured = bool(environment.get('CHIM_SHARED_DB_NAME'))
+    if configured:
+        if environment.get('CHIM_SHARED_DB_HOST') not in ('127.0.0.1', 'localhost', '/var/run/postgresql'):
+            raise RuntimeError('Shared-key setup only manages the configured local database')
+        database = environment['CHIM_SHARED_DB_NAME']
+        if not database.replace('_', '').isalnum() or len(database) > 63:
+            raise RuntimeError('Invalid shared-key database name')
+        port = environment.get('CHIM_SHARED_DB_PORT', port)
+    else:
+        database = 'dwemerdistro_keys'
+        role = 'ddistro_keys_runtime'
+        password = secrets.token_hex(32)
+        exists = sql('postgres', "SELECT 1 FROM pg_database WHERE datname='dwemerdistro_keys';", port)
+        if exists:
+            # A missing config must never reset a role or encryption key for a pre-existing credential store.
+            raise RuntimeError('A global key database already exists without configuration; preserve and repair it')
+        sql('postgres', "DO $$ BEGIN IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='ddistro_keys_runtime') THEN "
+            "RAISE EXCEPTION 'Existing unconfigured key role'; END IF; END $$;\n"
+            "CREATE ROLE ddistro_keys_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '" + password + "';", port)
+        sql('postgres', 'CREATE DATABASE dwemerdistro_keys TEMPLATE template0 ENCODING \'UTF8\';', port)
+        environment.update(CHIM_SHARED_DB_HOST='127.0.0.1', CHIM_SHARED_DB_PORT=port,
+                           CHIM_SHARED_DB_NAME=database, CHIM_SHARED_DB_USER=role,
+                           CHIM_SHARED_DB_PASSWORD=password, CHIM_API_KEY_FILE='/etc/dwemer/api-keys.key')
+    key = Path(environment.get('CHIM_API_KEY_FILE', '/etc/dwemer/api-keys.key'))
+    if key.exists() or key.is_symlink():
+        trusted(key)
+        if len(key.read_bytes()) != 32:
+            raise RuntimeError('Existing encryption key is not usable; it was not replaced')
+    else:
+        existing = sql(database, "SELECT to_regclass('public.api_keys');", port)
+        if existing and sql(database, 'SELECT count(*) FROM public.api_keys;', port) != '0':
+            raise RuntimeError('Saved keys exist without their encryption key; preserve and recover the original key')
+        key.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        subprocess.run(['/usr/sbin/groupadd', '-f', 'dwemer-keys'], check=True, capture_output=True)
+        subprocess.run(['/usr/sbin/usermod', '-a', '-G', 'dwemer-keys', 'www-data'], check=True, capture_output=True)
+        import grp
+        with key.open('xb') as output:
+            os.chmod(key, 0o640)
+            os.chown(key, 0, grp.getgrnam('dwemer-keys').gr_gid)
+            output.write(secrets.token_bytes(32))
+    sql(database, 'BEGIN; SET LOCAL lock_timeout=2000; SET LOCAL statement_timeout=10000;\n'
+        + (RUNTIME / 'schema.sql').read_text() + '\nCOMMIT;', port)
+    if not configured:
+        sql(database, 'REVOKE ALL ON DATABASE dwemerdistro_keys FROM PUBLIC; GRANT CONNECT ON DATABASE dwemerdistro_keys TO ddistro_keys_runtime; '
+            'GRANT USAGE ON SCHEMA public TO ddistro_keys_runtime; GRANT SELECT,INSERT ON public.api_keys TO ddistro_keys_runtime; '
+            'GRANT UPDATE(label,status,nonce,ciphertext,revision,updated_at,deleted_at) ON public.api_keys TO ddistro_keys_runtime;', port)
+        CONFIG.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        temporary = CONFIG.with_name('shared-keys-' + secrets.token_hex(6))
+        try:
+            with temporary.open('x') as output:
+                os.chmod(temporary, 0o640)
+                import grp
+                os.chown(temporary, 0, grp.getgrnam('www-data').gr_gid)
+                for name, value in environment.items():
+                    if name.startswith('CHIM_SHARED_DB_') or name == 'CHIM_API_KEY_FILE':
+                        output.write(name + '=' + value + '\n')
+            os.rename(temporary, CONFIG)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bundle')
+    parser.add_argument('--install-runtime', action='store_true')
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        raise RuntimeError('Root-local setup required')
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (STATE / 'setup.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        install_runtime(args.bundle or os.environ.get('DDISTRO_KEYS_RUNTIME_BUNDLE'))
+        if not args.install_runtime:
+            marker = STATE / 'initialized.json'
+            digest = (RUNTIME / '.bundle-sha256').read_text().strip()
+            configuration = b''.join(Path(p).read_bytes() for p in ('/etc/chim4-s5.env','/etc/chim4-dialogue.env','/etc/chim4-tts.env',str(CONFIG)) if Path(p).is_file())
+            fingerprint = hashlib.sha256(configuration + digest.encode()).hexdigest()
+            if not marker.exists() or marker.read_text().strip() != fingerprint:
+                ensure_store(os.environ.get('DDISTRO_POSTGRES_PORT', '5432'))
+                configuration = b''.join(Path(p).read_bytes() for p in ('/etc/chim4-s5.env','/etc/chim4-dialogue.env','/etc/chim4-tts.env',str(CONFIG)) if Path(p).is_file())
+                marker.write_text(hashlib.sha256(configuration + digest.encode()).hexdigest() + '\n')
+                marker.chmod(0o600)
+    print(json.dumps({'ok': True, 'runtime_ready': True, 'store_checked': not args.install_runtime}))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        # Do not expose subprocess/database exceptions containing credentials or SQL.
+        message = str(error) if type(error) is RuntimeError else 'Shared-key setup failed; existing credentials were preserved'
+        print(json.dumps({'ok': False, 'error': message}))
+        sys.exit(1)

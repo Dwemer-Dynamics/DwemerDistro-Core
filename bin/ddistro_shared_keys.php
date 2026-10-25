@@ -89,7 +89,8 @@ final class DistroSharedKeys {
     public static function resolve(string $keyId, string $kind, string $endpoint): string {
         try {
             self::loadConfiguration();
-            require_once '/opt/ChimServer/Config/Autoloader.php';
+            $runtime=is_file('/opt/dwemerdistro-keys/Config/Autoloader.php') ? '/opt/dwemerdistro-keys' : '/opt/ChimServer';
+            require_once $runtime . '/Config/Autoloader.php';
             Autoloader::register();
             if (!in_array($kind, ['llm', 'tts'], true) || !ProviderEndpoint::isValid($endpoint)) {
                 throw new RuntimeException();
@@ -112,7 +113,7 @@ final class DistroSharedKeys {
     /** Read the server's fixed literal shared-store settings, never evaluate shell syntax or accept caller overrides. */
     private static function loadConfiguration(): void {
         $values = [];
-        foreach (['/etc/chim4-s5.env', '/etc/chim4-dialogue.env', '/etc/chim4-tts.env'] as $file) {
+        foreach (['/etc/chim4-s5.env', '/etc/chim4-dialogue.env', '/etc/chim4-tts.env', '/etc/dwemer/shared-keys.env'] as $file) {
             if (!file_exists($file)) {
                 continue;
             }

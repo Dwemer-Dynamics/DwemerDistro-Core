@@ -109,6 +109,7 @@ if [ $? -eq 0 ]; then
     # bubblewrap, and the ddagent account come from an explicit install_assistant_runtime run.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_agent /usr/local/bin/ddistro_agent || exit 1
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_api /usr/local/bin/ddistro_api || exit 1
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/install_shared_keys /usr/local/bin/install_shared_keys || exit 1
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_keys /usr/local/bin/ddistro_keys || exit 1
     install -d -o root -g root -m 755 /usr/local/lib/dwemerdistro || exit 1
     install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_keys.php /usr/local/lib/dwemerdistro/keys.php || exit 1
@@ -174,6 +175,8 @@ if [ $? -eq 0 ]; then
     # The LM Studio helper runs as dwemer and must read the public model catalog.
     install_shipped_config /home/dwemer/dwemerdistro/etc/dwemerdistro-lmstudio.json /etc/dwemerdistro-lmstudio.json 644 || exit 1
     install_shipped_config /home/dwemer/dwemerdistro/etc/cuda_config /etc/cuda_config 644 || exit 1
+    install -d -o root -g root -m 755 /etc/dwemer || exit 1
+    install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/shared-key-runtime.json /etc/dwemer/shared-key-runtime.json || exit 1
     # The validated shared component catalog is shipped with the Assistant.
     install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/dwemerdistro-components.json /etc/dwemerdistro-components.json || exit 1
     # Keep the existing service ports, including CUSTOM_MODS_PORT; only a missing file gets the defaults.
@@ -220,8 +223,10 @@ fi
 # Existing and fresh users receive the same hash-verified runtime, without account sign-in.
 # An interrupted download can be retried; no user data or provider credentials are replaced.
 /usr/local/bin/install_assistant_runtime --install-prerequisites 7<&- || exit 1
+# Install the immutable credential library without provisioning operator keys into redistributable images.
+/usr/local/bin/install_shared_keys --install-runtime 7<&- || exit 1
 # Enable installed shared-key adapters only after their central deletion guard is ready; never import user keys here.
-if ! /usr/local/bin/ddistro_keys prepare-legacy >/dev/null; then
+if [ "${DDISTRO_KEYS_IMAGE_BUILD:-}" != 1 ] && ! /usr/local/bin/ddistro_keys prepare-legacy >/dev/null; then
     printf "${YELLOW}[WARNING] Shared API Keys setup is not ready. Existing keys are preserved; update CHIM 4 and the server adapters, then retry Update Distro.${NC}\n"
 fi
 # Shared key references resolve at request time; do not synchronize legacy copies.

@@ -16,8 +16,10 @@ from urllib.parse import urlsplit
 
 NATIVE = Path('/usr/local/lib/dwemerdistro/native_keys.php')
 ROOT = Path('/opt/ChimServer')
+GLOBAL_ROOT = Path('/opt/dwemerdistro-keys')
+GLOBAL_OPERATIONS = ('global-status', 'global-save', 'global-reveal', 'global-test', 'guard-ready')
 BRIDGE = Path('/usr/local/lib/dwemerdistro/keys.php')
-ENV_FILES = ('/etc/chim4-s5.env', '/etc/chim4-dialogue.env', '/etc/chim4-tts.env')
+ENV_FILES = ('/etc/chim4-s5.env', '/etc/chim4-dialogue.env', '/etc/chim4-tts.env', '/etc/dwemer/shared-keys.env')
 OPERATIONS = frozenset(('status', 'create', 'edit', 'test', 'delete', 'bind', 'import-environment', 'guard-ready', 'import-legacy', 'bind-legacy', 'native-status', 'save-direct', 'create-direct', 'save-connection', 'reveal-direct', 'reveal-connection', 'global-status', 'global-save', 'global-reveal', 'global-test'))
 ACCESS = '/usr/local/bin/ddistro_access'
 REGISTRY = Path('/etc/dwemer/shared-key-consumers.json')
@@ -381,6 +383,15 @@ def native_invoke(database, verb, payload):
     return response
 
 
+def ensure_global_runtime():
+    """Provision the pinned code and first-use store without depending on a game server."""
+    setup = Path('/usr/local/bin/install_shared_keys')
+    trusted_file(setup)
+    result = subprocess.run([str(setup)], capture_output=True, text=True, timeout=90)
+    if result.returncode:
+        raise Refusal('Global key setup is unavailable; update the distro and retry. Existing keys are preserved.')
+
+
 def run(verb, payload):
     if verb in ('native-status', 'save-direct', 'create-direct', 'reveal-direct'):
         return native_request(verb, payload)
@@ -393,7 +404,9 @@ def run(verb, payload):
     if verb not in OPERATIONS or not isinstance(payload, dict):
         raise Refusal('Unsupported operation; update the launcher')
     trusted_file(BRIDGE)
-    if not (ROOT / 'Core/ApiKeyManager/ApiKeyManager.php').is_file():
+    if verb in GLOBAL_OPERATIONS:
+        ensure_global_runtime()
+    elif not (ROOT / 'Core/ApiKeyManager/ApiKeyManager.php').is_file():
         raise Refusal('CHIM 4 shared key service is not installed')
     if verb in ('import-legacy', 'bind-legacy'):
         with migration_lock():
@@ -410,7 +423,7 @@ def run(verb, payload):
 
 def invoke(verb, payload):
     """Only the root adapter calls this private stdin boundary with captured legacy records."""
-    result = subprocess.run(['/usr/sbin/runuser', '-u', 'www-data', '-p', '--', '/usr/bin/php', str(BRIDGE), str(ROOT), verb],
+    result = subprocess.run(['/usr/sbin/runuser', '-u', 'www-data', '-p', '--', '/usr/bin/php', str(BRIDGE), str(GLOBAL_ROOT if verb in GLOBAL_OPERATIONS else ROOT), verb],
                             input=json.dumps(payload), text=True, capture_output=True, timeout=40, env=environment())
     if len(result.stdout) > 262144:
         raise Refusal('Invalid shared key response')

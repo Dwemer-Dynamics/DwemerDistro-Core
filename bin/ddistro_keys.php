@@ -89,9 +89,12 @@ try {
         throw new InvalidArgumentException();
     }
     $keys = ApiKeyManager::fromEnvironment();
-    $settings = new SettingsManager(DBManager::fromEnvironment(), $keys);
-    $service = new ApiKeysService($keys, $settings);
     $operation = $argv[2];
+    // Global credentials do not require an installed game server or its runtime settings database.
+    if (!in_array($operation, ['global-status','global-save','global-reveal','global-test','guard-ready'], true)) {
+        $settings = new SettingsManager(DBManager::fromEnvironment(), $keys);
+        $service = new ApiKeysService($keys, $settings);
+    }
     $fields = match ($operation) {
         'status', 'global-status' => [],
         'global-save' => ['key_id','revision','provider','label','origin','secret'],
@@ -128,17 +131,23 @@ try {
         elseif($meta['data']['revision']!==$request['revision']) $result=['outcome'=>'conflict','data'=>null];
         elseif(ApiKeyCheck::checkUrl($meta['data']['provider'],$meta['data']['origin'])===null)
             $result=['outcome'=>'tested','data'=>['result'=>'unsupported','message'=>'No quick check is available for this provider and origin.']];
-        else $result=$service->testKey($request['key_id']);
+        else {
+            $key=$meta['data'];
+            $resolved=$keys->resolveSecret($key['key_id'],$key['kind'],$key['origin']);
+            $result=$resolved['outcome']!=='resolved' ? ['outcome'=>'unavailable','data'=>null]
+                : ['outcome'=>'tested','data'=>ApiKeyCheck::run($key['provider'],$key['origin'],$resolved['secret'])];
+            unset($resolved);
+        }
     } elseif ($operation === 'global-save') {
         if(isset($request['key_id'])) {
             if(!isset($request['revision'])||array_diff(array_keys($request),['key_id','revision','label','secret'])!==[]) throw new InvalidArgumentException();
             $changes=array_intersect_key($request,array_flip(['label','secret']));
             $current=$keys->getKey($request['key_id']);
             if($current['outcome']==='found' && ($changes['label']??null)===$current['data']['label']) unset($changes['label']);
-            $result=$service->updateKey($request['key_id'],$request['revision'],$changes);
+            $result=$keys->updateKey($request['key_id'],$request['revision'],$changes['label']??null,$changes['secret']??null);
         } else {
             if(array_diff(array_keys($request),['provider','label','origin','secret'])!==[]) throw new InvalidArgumentException();
-            $result=$service->createKey($request);
+            $result=$keys->createKey($request['provider']??null,$request['label']??null,$request['origin']??null,$request['secret']??null);
         }
         if(in_array($result['outcome'],['created','updated','unchanged'],true) && $result['data']!==null) {
             $preview=readStoredKey($keys,$result['data']['key_id'],false);
@@ -151,7 +160,8 @@ try {
         $result=$meta['outcome']!=='found' ? $meta : ($meta['data']['revision']!==$request['revision']
             ? ['outcome'=>'conflict','data'=>null] : readStoredKey($keys,$request['key_id'],true));
     } elseif ($operation === 'global-status') {
-        $result=$service->listKeys();
+        $result=$keys->listKeys();
+        $result['data']['providers']=ApiKeyManager::PROVIDERS;
         if($result['outcome']==='listed') {
             foreach($result['data']['keys'] as &$key) {
                 $preview=readStoredKey($keys,$key['key_id'],false);
