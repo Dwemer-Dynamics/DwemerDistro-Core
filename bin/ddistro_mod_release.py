@@ -429,6 +429,7 @@ def command(manager, args):
                          pending_release=release_record, name=manifest["name"], description=manifest["description"],
                          project_url=manifest["project_url"], dashboard_path=manifest["dashboard_path"],
                          health_path=manifest["health_path"], assets=manifest["assets"], updated_at=m.now_utc())
+            m.apply_display_metadata(entry, manifest)
             m.write_entry(entry)
             receipt = os.path.join(temporary, "apply.json")
             Path(receipt).write_text(json.dumps({"old": old_files, "new": files, "interrupted": bool(pending)}), encoding="utf-8")

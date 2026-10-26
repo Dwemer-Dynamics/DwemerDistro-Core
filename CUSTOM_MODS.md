@@ -37,6 +37,13 @@ Optional top-level features (up to 16 short strings) and testing (summary/eviden
 describe gameplay and author-reported checks. Evidence paths are repository-relative,
 not server paths; docs excluded from installation remain available at the pinned commit.
 
+Catalog text comes from the manifest: `name` is the mod title, `game.name` its game and
+optional top-level `author` (see [Repository manifest](#repository-manifest)) its credit.
+Install, update and branch switch record `game_name` and `author` in the registry, and
+`status` reports both (empty when absent). A version 1 manifest has no game, so none is
+shown. Older registry entries show none until their next normal update; a field the
+author removes is cleared then. Status never fetches it.
+
 Limits: 4 MiB descriptor, 20,000 files, 512 MiB compressed/unpacked per package.
 Only regular relative files are accepted; links, special files, private config,
 duplicate/case-colliding paths and traversal are refused. Every ZIP member is checked
@@ -310,6 +317,7 @@ fields are rejected.
 |---|---|
 | `id` | 3-32 characters, `a-z`, `0-9`, single hyphens, starts with a letter, not an official product name. Never changes after install. |
 | `name`, `description` | Plain text, at most 60 and 300 characters. `description` and `project_url` are optional. |
+| `author` | Optional author or team display name: text of at most 80 characters after trimming, with no control characters. Allowed in versions 1 and 2. Without it the launcher shows the repository owner. |
 | `dashboard_path`, `health_path` | Relative paths inside the mod folder. Segments use `A-Z a-z 0-9 . _ -`, may not start with `.`, and may not be `..`. `health_path` must be a tracked file. |
 | `requirements` | Exactly `{"php": "8.2", "postgresql": true}`. |
 | `setup.config_template` | Tracked `.php` file. It must contain `'<token_placeholder>'` and `'<database_placeholder>'` exactly once each, as quoted PHP strings. |

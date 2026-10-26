@@ -1321,6 +1321,13 @@ class RegistryLifecycleTests(unittest.TestCase):
         for tampered in ({"icon": "https://evil.example/a.png"}, {"icon": "../x/ui/icon.png"}, "ui/icon.png"):
             self.assertEqual(mod.status_entry(dict(old, assets=tampered), False)["icon_url"], "", tampered)
 
+    def test_status_projects_optional_metadata_and_tolerates_old_entries(self):
+        old = self.entry()
+        self.assertEqual((mod.status_entry(old, False)["game_name"], mod.status_entry(old, False)["author"]), ("", ""))
+        document = mod.status_entry(dict(old, game_name="Test Game", author="Mod Team"), False)
+        self.assertEqual((document["game_name"], document["author"]), ("Test Game", "Mod Team"))
+        self.assertEqual(mod.status_entry(dict(old, author=["x"]), False)["author"], "")
+
     def test_permission_failures_propagate(self):
         folder = mod.MOD_ROOT + "/example-server"
         os.makedirs(folder)
@@ -1381,6 +1388,29 @@ class ReleasePackageTests(unittest.TestCase):
         data["distribution"]["server"]["root"] = "../other"
         with self.assertRaises(mod.ModError):
             mod.parse_manifest(json.dumps(data))
+
+    def test_optional_author_and_game_metadata(self):
+        self.assertEqual("", mod.parse_manifest(manifest())["author"])
+        self.assertEqual("Mod Team", mod.parse_manifest(manifest(author="  Mod Team "))["author"])
+        self.assertEqual("x" * 80, mod.parse_manifest(manifest(author="x" * 80))["author"])
+        for bad in ("", "   ", "x" * 81, 7, True, ["a"], {"a": 1}, "a\nb", "a\u202eb", "a\x7fb"):
+            with self.assertRaises(mod.ModError, msg=repr(bad)):
+                mod.parse_manifest(json.dumps(dict(MANIFEST, author=bad)))
+        with self.assertRaises(mod.ModError):
+            mod.parse_manifest(json.dumps(dict(MANIFEST, author=None)))
+        legacy = mod.parse_manifest(manifest())
+        self.assertEqual({"game_name": "", "author": ""}, mod.display_metadata(legacy))
+        data = json.loads(json.dumps(MANIFEST))
+        data.update(schema_version=2, author="Mod Team", game={"id": "test", "name": "Test Game", "executable": "test.exe"},
+                    distribution={"server": {"include": ["**"]},
+                                  "client": {"include": ["**"], "install": {"profile": "game-directory", "path": "mods/test", "config_path": "config.json"}}})
+        parsed = mod.parse_manifest(json.dumps(data))
+        self.assertEqual({"game_name": "Test Game", "author": "Mod Team"}, mod.display_metadata(parsed))
+        entry = {"game_name": "Old Game", "author": "Old Team"}
+        mod.apply_display_metadata(entry, legacy)
+        self.assertEqual({}, entry)
+        mod.apply_display_metadata(entry, parsed)
+        self.assertEqual({"game_name": "Test Game", "author": "Mod Team"}, entry)
 
     def test_file_receipts_refuse_overwrite_and_allow_interrupted_retry(self):
         release = mod.release_support()

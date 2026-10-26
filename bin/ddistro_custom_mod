@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 
@@ -82,7 +83,10 @@ RESERVED_IDS = {
     "template", "custom-mods", "html", "admin", "root", "www-data",
 }
 MANIFEST_KEYS = {"schema_version", "id", "name", "description", "project_url", "dashboard_path",
-                 "health_path", "requirements", "setup", "assets", "branches", "server_folder"}
+                 "health_path", "requirements", "setup", "assets", "branches", "server_folder", "author"}
+MAX_AUTHOR = 80
+# Control, format (including bidirectional overrides), surrogate and line/paragraph separator characters.
+DISPLAY_TEXT_REJECTED = {"Cc", "Cf", "Cs", "Zl", "Zp"}
 BRANCH_KEYS = {"default", "allowed"}
 MAX_BRANCHES = 10
 ASSET_KEYS = ("icon", "banner")
@@ -186,6 +190,39 @@ def text_field(manifest, key, maximum, required=True):
     return value.strip()
 
 
+def author_field(manifest):
+    """Optional author or team display name; plain text, never an identity or verification claim."""
+    if "author" not in manifest:
+        return ""
+    value = manifest["author"]
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > MAX_AUTHOR:
+        raise ModError(f"Manifest author must be a name of at most {MAX_AUTHOR} characters.")
+    if any(unicodedata.category(c) in DISPLAY_TEXT_REJECTED for c in value):
+        raise ModError("Manifest author contains control characters.")
+    return value.strip()
+
+
+def display_metadata(manifest):
+    """Optional catalog text kept in the registry: a version 2 game's name and the author credit.
+
+    A version 1 manifest has no game, so none is shown; nothing is guessed.
+    """
+    game = manifest.get("game")
+    game_name = game.get("name") if isinstance(game, dict) else None
+    if not isinstance(game_name, str) or any(unicodedata.category(c) in DISPLAY_TEXT_REJECTED for c in game_name):
+        game_name = ""
+    return {"game_name": game_name.strip(), "author": manifest.get("author", "")}
+
+
+def apply_display_metadata(entry, manifest):
+    """Store the current manifest's optional metadata; a field the author removed is cleared."""
+    for key, value in display_metadata(manifest).items():
+        if value:
+            entry[key] = value
+        else:
+            entry.pop(key, None)
+
+
 def database_name_for(mod_id):
     return "custom_" + mod_id.replace("-", "_")
 
@@ -231,6 +268,7 @@ def parse_manifest(raw):
         "id": validate_mod_id(manifest.get("id")),
         "name": text_field(manifest, "name", 60),
         "description": text_field(manifest, "description", 300, required=False),
+        "author": author_field(manifest),
         "project_url": "",
         "dashboard_path": validate_relative_path(manifest.get("dashboard_path"), "dashboard_path", True),
         "health_path": validate_relative_path(manifest.get("health_path"), "health_path"),
@@ -798,6 +836,7 @@ def preview_document(manifest, branch, commit, source, local, policy):
         "id": manifest["id"],
         "name": manifest["name"],
         "description": manifest["description"],
+        **display_metadata(manifest),
         "project_url": manifest["project_url"],
         "repository": source,
         "branch": branch,
@@ -1532,6 +1571,7 @@ def command_install(args):
         "state": "installing", "message": "Installing.", "installed_at": now_utc(), "updated_at": now_utc(),
         "operation_pid": os.getpid(),
     }
+    apply_display_metadata(entry, manifest)
 
     if server_folder:
         create_direct_root(folder)
@@ -1822,6 +1862,7 @@ def update_checkout(entry, folder, source, local, branch, progress, expect_commi
     entry.update(name=manifest["name"], description=manifest["description"],
                  project_url=manifest["project_url"], dashboard_path=manifest["dashboard_path"],
                  health_path=manifest["health_path"], setup=manifest["setup"], assets=manifest["assets"])
+    apply_display_metadata(entry, manifest)
     if not healthy:
         raise ModError(message)
 
@@ -2270,6 +2311,9 @@ def status_entry(entry, check):
     dashboard_url, health_url = mod_urls(entry["id"], manifest)
     document = {
         "id": entry["id"], "name": entry.get("name", entry["id"]), "description": entry.get("description", ""),
+        # Optional manifest metadata from the last install or update; older entries have none until then.
+        "game_name": entry.get("game_name") if isinstance(entry.get("game_name"), str) else "",
+        "author": entry.get("author") if isinstance(entry.get("author"), str) else "",
         "project_url": entry.get("project_url", ""), "repository": entry.get("repository", ""),
         "branch": entry.get("branch", ""), "commit": entry.get("commit", ""), "state": state,
         "message": message, "folder": entry.get("folder", ""), "database": entry.get("database", ""),
