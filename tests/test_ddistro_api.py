@@ -5,6 +5,7 @@ import io
 import collections
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import threading
@@ -177,6 +178,252 @@ class Scheduling(unittest.TestCase):
         session.jobs.clear()
         session.finish_if_safe()
         self.assertEqual(released, [session])
+
+
+class ExternalEngine(unittest.TestCase):
+    """The external-engine broker methods reach the same tool handlers; Codex stays byte-compatible."""
+    def setUp(self):
+        self.restarts = []
+        def run_tool(argv):
+            if argv[:2] == ["service", "restart"]:
+                self.restarts.append(argv[2])
+                return True, {"executed": True, "verified": True, "state": "verified"}
+            return True, {"probe": "fixture"}
+        self.threads = agent.ThreadStore(None)
+        self.threads.ids = ["codex-thread"]
+        self.server = io.BytesIO()
+        self.client = io.BytesIO()
+        self.broker = agent.Broker(types.SimpleNamespace(stdin=self.server), None, self.client, self.threads,
+                                   run_tool=run_tool)
+        self.seq = 0
+
+    def send(self, method, params=None):
+        self.seq += 1
+        self.broker._handle_client(json.dumps({"id": self.seq, "method": method, "params": params or {}}).encode())
+        return self.seq
+
+    def messages(self):
+        return [json.loads(line) for line in self.client.getvalue().splitlines()]
+
+    def wait_for(self, match):
+        for _ in range(500):
+            found = [m for m in self.messages() if match(m)]
+            if found:
+                return found[0]
+            threading.Event().wait(0.01)
+        self.fail("no matching broker message")
+
+    def reply(self, request_id):
+        return self.wait_for(lambda m: m.get("id") == request_id and "method" not in m)
+
+    def start(self, engine="claude", actions=()):
+        capabilities = {"experimentalApi": True, "ddistroEngine": engine}
+        if actions:
+            capabilities["ddistroActions"] = list(actions)
+        self.send("initialize", {"capabilities": capabilities})
+        self.assertNotIn(b"ddistroEngine", self.server.getvalue())
+        started = self.reply(self.send("ddistro/external/thread/start", {"engine": engine}))["result"]
+        turn = self.reply(self.send("ddistro/external/turn/start", {"threadId": started["threadId"]}))["result"]
+        return started, turn["turn"]["id"]
+
+    def call(self, thread, turn, tool="ddistro_read", arguments=None, call_id="call-1"):
+        return self.send("ddistro/external/tool/call", {"threadId": thread, "turnId": turn, "callId": call_id,
+                                                        "tool": tool, "arguments": arguments or {"operation": "status"}})
+
+    def test_valid_tool_call_round_trip_and_catalog_is_broker_owned(self):
+        started, turn = self.start()
+        # The id is a v4 UUID, which ddistro memory add --thread (THREAD_ID) accepts.
+        self.assertTrue(agent.EXTERNAL_THREAD_PATTERN.match(started["threadId"]))
+        self.assertTrue(re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z", started["threadId"]))
+        self.assertEqual([tool["name"] for tool in started["tools"]], ["ddistro_read"])
+        self.assertEqual(started["tools"][0]["inputSchema"], agent.TOOL_SPEC["inputSchema"])
+        result = self.reply(self.call(started["threadId"], turn))["result"]
+        self.assertTrue(result["success"])
+        self.assertEqual(json.loads(result["contentItems"][0]["text"])["tool"], "ddistro_read")
+        self.assertEqual(self.server.getvalue().count(b'"result"'), 0)  # never sent to Codex
+        self.assertFalse(self.broker.external_calls)
+
+    def test_unknown_foreign_native_duplicate_and_ended_calls_are_refused(self):
+        started, turn = self.start()
+        thread = started["threadId"]
+        foreign = "00000000-0000-4000-8000-000000000000"
+        refusals = [self.call(thread, turn, tool="client_tool"), self.call(foreign, turn, call_id="c2"),
+                    self.call("codex-thread", turn, call_id="c3"), self.call(thread, "other-turn", call_id="c4")]
+        self.reply(self.call(thread, turn, call_id="dup"))
+        refusals.append(self.call(thread, turn, call_id="dup"))
+        self.reply(self.send("ddistro/external/turn/end", {"threadId": thread, "turnId": turn, "status": "completed"}))
+        refusals.append(self.call(thread, turn, call_id="late"))
+        for request_id in refusals:
+            self.assertFalse(self.reply(request_id)["result"]["success"])
+        self.wait_for(lambda m: m.get("method") == "turn/completed")
+        self.assertEqual(self.broker.session_calls, 1)  # refusals never reached a handler
+
+    def test_engines_and_sessions_never_mix(self):
+        started, turn = self.start()
+        for method, params in (("turn/start", {"threadId": "codex-thread", "input": [{"type": "text", "text": "x"}]}),
+                               ("thread/start", {}), ("thread/resume", {"threadId": started["threadId"]}),
+                               ("thread/read", {"threadId": started["threadId"]}),
+                               ("ddistro/external/thread/start", {"engine": "openrouter"})):
+            self.assertIn("error", self.reply(self.send(method, params)))
+        # A Codex item/tool/call naming an external thread is refused, never run.
+        self.broker._start_tool({"id": 9, "params": {"threadId": started["threadId"], "turnId": turn,
+                                                     "tool": "ddistro_read", "arguments": {"operation": "status"}}})
+        self.assertIn(b"permission_denied", self.server.getvalue())
+        codex = agent.Broker(types.SimpleNamespace(stdin=io.BytesIO()), None, io.BytesIO(), self.threads)
+        codex._handle_client(b'{"id":1,"method":"initialize","params":{"capabilities":{"experimentalApi":true}}}')
+        codex._handle_client(json.dumps({"id": 2, "method": "ddistro/external/turn/start",
+                                         "params": {"threadId": started["threadId"]}}).encode())
+        codex._handle_client(json.dumps({"id": 3, "method": "turn/interrupt",
+                                         "params": {"threadId": started["threadId"], "turnId": turn}}).encode())
+        errors = [json.loads(line) for line in codex.client_out.getvalue().splitlines()]
+        self.assertEqual([m["id"] for m in errors if "error" in m], [2, 3])
+        for engine, experimental in (("external", True), ("openrouter", False)):
+            other = agent.Broker(types.SimpleNamespace(stdin=io.BytesIO()), None, io.BytesIO(), self.threads)
+            with self.assertRaises(agent.PolicyError):
+                other._authorize("initialize", {"capabilities": {"experimentalApi": experimental,
+                                                                 "ddistroEngine": engine}})
+        with patch.object(agent.ThreadStore, "_load", side_effect=[None, {"schema_version": 1, "task_id": "t",
+                          "threads": [{"id": "not-a-uuid", "engine": "claude"}]}]):
+            with self.assertRaises(agent.Refusal):
+                agent.ThreadStore("t")
+
+    def test_approval_round_trip_then_stop_cancels_pending_proposal(self):
+        started, turn = self.start(actions=["restart_service"])
+        thread, service = started["threadId"], next(iter(agent.ACTION_SERVICES))
+        arguments = {"operation": "propose_restart", "service": service, "reason": "fixture"}
+        first = self.call(thread, turn, tool="ddistro_action", arguments=arguments)
+        proposal = self.wait_for(lambda m: m.get("method") == "ddistro/action/proposed")["params"]
+        self.reply(self.send("ddistro/action/decide", {"proposalId": proposal["proposalId"], "threadId": thread,
+                                                       "decision": "approve"}))
+        self.assertTrue(self.reply(first)["result"]["success"])
+        self.assertEqual(self.restarts, [service])
+        self.reply(self.send("ddistro/external/turn/end", {"threadId": thread, "turnId": turn, "status": "completed"}))
+        turn = self.reply(self.send("ddistro/external/turn/start", {"threadId": thread}))["result"]["turn"]["id"]
+        pending = self.call(thread, turn, tool="ddistro_action", arguments=arguments, call_id="second")
+        self.wait_for(lambda m: m.get("method") == "ddistro/action/proposed"
+                      and m["params"]["proposalId"] != proposal["proposalId"])
+        self.assertEqual(self.reply(self.send("turn/interrupt", {"threadId": thread, "turnId": turn}))["result"], {})
+        self.assertEqual(self.reply(pending)["error"]["data"]["reason"], "turn_ended")
+        self.wait_for(lambda m: m.get("method") == "ddistro/action/updated" and m["params"]["state"] == "cancelled")
+        self.assertEqual(self.restarts, [service])
+        self.assertFalse(self.broker.external_calls)
+        self.assertIsNone(self.broker.external_turn)
+
+    def test_ignoring_the_turn_limit_until_doubled_ends_the_turn(self):
+        started, turn = self.start()
+        thread = started["threadId"]
+        ids = []
+        for index in range(2 * agent.TOOL_TURN_CALLS):
+            ids.append(self.call(thread, turn, call_id="c%d" % index))
+            self.reply(ids[-1])
+        refused = self.reply(ids[-2])["result"]
+        self.assertEqual(json.loads(refused["contentItems"][0]["text"])["error"]["code"], "turn_tool_limit")
+        self.assertEqual(self.reply(ids[-1])["error"]["data"]["reason"], "turn_ended")
+        done = self.wait_for(lambda m: m.get("method") == "turn/completed")
+        self.assertEqual(done["params"]["turn"], {"id": turn, "status": "interrupted"})
+        self.assertIsNone(self.broker.external_turn)
+
+    def test_native_codex_tool_reply_is_unchanged(self):
+        self.broker._handle_client(b'{"id":1,"method":"initialize","params":{"capabilities":{"experimentalApi":true}}}')
+        self.broker._inspect_server(json.dumps({"id": 7, "method": "item/tool/call", "params": {
+            "threadId": "codex-thread", "turnId": "t", "callId": "c", "tool": "ddistro_read",
+            "arguments": {"operation": "status"}}}).encode())
+        for _ in range(500):
+            if b'"id":7' in self.server.getvalue():
+                break
+            threading.Event().wait(0.01)
+        line = self.server.getvalue().splitlines()[-1]
+        self.assertTrue(line.startswith(b'{"id":7,"result":{"success":true,"contentItems":[{"type":"inputText"'))
+        self.assertNotIn(b'"id":7', self.client.getvalue())
+
+
+class ExternalReservation(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = patch.object(api, "ROOT", self.temp.name)
+        self.root.start()
+        self.app = api.App.__new__(api.App)
+        self.app.store = api.Store()
+        self.app.lock = threading.Condition(threading.RLock())
+        self.started = []
+        self.app.launcher_turn = lambda session, message: self.started.append(message)
+        self.handler = api.Handler.__new__(api.Handler)
+        self.handler.server = types.SimpleNamespace(app=self.app)
+        self.cid = "20000000-0000-0000-0000-000000000000"
+        self.app.store.write("INSERT INTO conversations VALUES(?,?,?,?,NULL,?)", (self.cid, "launcher", "task", "launcher", 1))
+        self.emitted, self.calls = [], []
+        self.session = types.SimpleNamespace(closed=False, active=False, queued=False, queue_cancel=False,
+            external=False, attached=True, emit=self.emitted.append,
+            interrupt_external=lambda: self.calls.append("interrupt"), close=lambda: self.calls.append("close"))
+        self.app.sessions = {self.cid: self.session}
+
+    def tearDown(self):
+        self.app.store.db.close()
+        self.root.stop()
+        self.temp.cleanup()
+
+    def post(self, suffix, body):
+        return self.handler.route("POST", "/v1/conversations/" + self.cid + suffix, body, "launcher", "launcher")
+
+    def test_external_start_queues_like_turn_start_and_queued_stop_cancels(self):
+        start = {"id": 5, "method": "ddistro/external/turn/start", "params": {"threadId": "x"}}
+        self.assertEqual(self.post("/messages", {"message": start})["state"], "queued")
+        threading.Event().wait(0.05)
+        self.assertEqual(self.started, [start])
+        self.assertTrue(self.session.external and self.session.queued)
+        with self.assertRaises(api.ApiError):
+            self.post("/messages", {"message": start})
+        self.post("/messages", {"message": {"id": 6, "method": "turn/interrupt", "params": {}}})
+        self.assertTrue(self.session.queue_cancel)
+        self.assertEqual(self.emitted, [{"id": 6, "result": {}}])
+
+    def test_watchdog_interrupts_only_a_silent_external_turn(self):
+        class Stop(Exception):
+            pass
+        stopped = []
+        def worker(name, external, age):
+            return types.SimpleNamespace(active=True, external=external, jobs=set(), queued=False, attached=True,
+                                         last=api.time.monotonic() - age,
+                                         interrupt_external=lambda: stopped.append(name))
+        self.app.sessions = {"silent": worker("silent", True, api.EXTERNAL_SILENCE + 5),
+                             "polling": worker("polling", True, 1), "codex": worker("codex", False, 999)}
+        with patch.object(api.time, "sleep", side_effect=[None, Stop()]):
+            with self.assertRaises(Stop):
+                self.app.reap_idle()
+        self.assertEqual(stopped, ["silent"])
+
+    def test_detach_interrupts_before_close(self):
+        self.post("/detach", {})
+        self.assertEqual(self.calls, ["interrupt", "close"])
+        self.assertTrue(self.session.queue_cancel)
+
+    def test_worker_interrupts_a_detached_external_turn_and_releases(self):
+        read, write = os.pipe()
+        stdin, released = io.BytesIO(), []
+        proc = types.SimpleNamespace(stdin=stdin, stdout=os.fdopen(read, "rb"), wait=lambda *args: 0)
+        app = types.SimpleNamespace(owner=types.SimpleNamespace(fd=0), store=types.SimpleNamespace(write=lambda *a: 1),
+                                    release=released.append)
+        with patch.object(api.subprocess, "Popen", return_value=proc):
+            session = api.Session(app, {"task": "t", "kind": "launcher", "thread": None})
+        session.active, session.external, session.turn_done = True, True, False
+        session.interrupt_external()  # detached before turn/started: sent once the turn is known
+        self.assertEqual(stdin.getvalue(), b"")
+        os.write(write, b'{"method":"turn/started","params":{"threadId":"th","turn":{"id":"tu"}}}\n')
+        for _ in range(500):
+            if stdin.getvalue():
+                break
+            threading.Event().wait(0.01)
+        sent = json.loads(stdin.getvalue())
+        self.assertEqual((sent["method"], sent["params"]), ("turn/interrupt", {"threadId": "th", "turnId": "tu"}))
+        os.write(write, b'{"method":"turn/completed","params":{"threadId":"th","turn":{"id":"tu","status":"interrupted"}}}\n')
+        os.close(write)
+        for _ in range(500):
+            if released:
+                break
+            threading.Event().wait(0.01)
+        self.assertFalse(session.active)
+        self.assertEqual(session.final_state, "cancelled")
+        self.assertIn(session, released)
 
 
 class Maintenance(unittest.TestCase):

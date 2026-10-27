@@ -130,6 +130,25 @@ TASK_METADATA_LIMIT = 4 * 1024 * 1024
 TEXT_LIMIT = 256 * 1024
 MAX_THREADS_PER_TASK = 256
 MAX_TRACKED_REQUESTS = 1024
+# External engine (ASSISTANT_RUNTIME.md "External engine"): a trusted Launcher runs the model loop itself and sends
+# each tool call to this broker, which answers it through the same handlers as a Codex item/tool/call. The revision
+# is read by ddistro capabilities from this file and ddistro_api; raise it only when both honor the new contract.
+EXTERNAL_ENGINE_REVISION = 1
+# claude: the Launcher runs the loop and relays tool calls.
+EXTERNAL_ENGINES = ("claude",)
+# Named so a stored entry or a negotiation for it fails as "not available" rather than as unknown.
+EXTERNAL_RESERVED_ENGINES = ("openrouter",)
+EXTERNAL_THREADS_SUFFIX = ".external.json"
+EXTERNAL_THREADS_PER_TASK = 64
+EXTERNAL_THREAD_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
+EXTERNAL_CALL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+# Unanswered ddistro/external/tool/call requests per session (each is bounded by the turn budgets as well).
+EXTERNAL_PENDING_CALLS = 32
+EXTERNAL_METHODS = ("ddistro/external/thread/start", "ddistro/external/thread/resume", "ddistro/external/turn/start",
+                    "ddistro/external/tool/call", "ddistro/external/turn/end")
+# Codex methods that run or continue a Codex turn; an external-engine session never sends them, so its one App Server
+# stays idle (no model call) and a session never mixes engines.
+EXTERNAL_REFUSED_CODEX = ("thread/start", "thread/resume", "turn/start")
 # History reads (Codex 0.163 stable App Server schema): (default, maximum) page sizes. The broker always
 # sends a limit so a page stays far below SERVER_LINE_LIMIT; full-item turn pages get a smaller cap.
 TURN_PAGE = (20, 50)
@@ -138,6 +157,7 @@ ITEM_PAGE = (100, 200)
 THREAD_PAGE = (25, 50)
 CURSOR_LIMIT = 4096
 INTERNAL_ID_PREFIX = "ddistro-broker:"
+EXTERNAL_ID_PREFIX = "ddistro-ext:"
 # Page counts do not bound bytes (one tool item or full turn can be huge), and the launcher refuses lines over
 # 4 MiB. Larger server lines are re-encoded with long strings clipped (marked in place and in ddistroTruncation);
 # a response that still does not fit is replaced by a JSON-RPC error. Ids, cursors, and types are never clipped.
@@ -1894,41 +1914,83 @@ class SingletonLock:
 
 
 class ThreadStore:
-    """Root-owned task -> Codex thread mapping; resume and turns are limited to these threads."""
+    """Root-owned task -> Codex thread mapping; resume and turns are limited to these threads.
+
+    External-engine threads (broker-minted UUIDs, see ASSISTANT_RUNTIME.md "External engine") live in a sibling file
+    under the same rules. Ownership checks (``in``) cover both; Codex methods and external methods each check only
+    their own set, so a history or turn never crosses engines."""
 
     def __init__(self, task_id):
         self.task_id = task_id
         self.ids = []
+        # External thread id -> engine, oldest first; metadata only, never a transcript.
+        self.external = collections.OrderedDict()
         if task_id is None:
             return
+        document = self._load(task_id + ".json")
+        if document is not None:
+            ids = document.get("thread_ids")
+            if not isinstance(ids, list):
+                raise Refusal("state_untrusted")
+            self.ids = [i for i in ids if isinstance(i, str) and 0 < len(i) <= 128]
+        document = self._load(task_id + EXTERNAL_THREADS_SUFFIX)
+        if document is not None:
+            entries = document.get("threads")
+            if (document.get("schema_version") != SCHEMA_VERSION or not isinstance(entries, list)
+                    or len(entries) > EXTERNAL_THREADS_PER_TASK):
+                raise Refusal("state_untrusted")
+            for entry in entries:
+                if (not isinstance(entry, dict) or set(entry) != {"id", "engine"}
+                        or not isinstance(entry["id"], str) or not EXTERNAL_THREAD_PATTERN.match(entry["id"])
+                        or entry["engine"] not in EXTERNAL_ENGINES + EXTERNAL_RESERVED_ENGINES
+                        or entry["id"] in self.external):
+                    raise Refusal("state_untrusted")
+                self.external[entry["id"]] = entry["engine"]
+
+    def _load(self, name, limit=METADATA_LIMIT):
         dir_fd = open_root_dir(THREADS_DIR, "state_untrusted", private=True)
         try:
-            fd = os.open(task_id + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
         except FileNotFoundError:
-            return
+            return None
         except OSError:
             raise Refusal("state_untrusted")
         finally:
             os.close(dir_fd)
         try:
             st = os.fstat(fd)
-            # Same rule as task.json: a regular root file with mode 0600 or stricter.
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o177:
+            # Same rule as task.json: a regular root file with mode 0600 or stricter, and (like the journal) one link.
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o177 or st.st_nlink != 1:
                 raise Refusal("state_untrusted")
-            document = json.loads(read_bounded(fd, METADATA_LIMIT))
-            if not isinstance(document, dict) or document.get("task_id") != task_id:
+            document = json.loads(read_bounded(fd, limit))
+            if not isinstance(document, dict) or document.get("task_id") != self.task_id:
                 raise Refusal("state_untrusted")
-            ids = document.get("thread_ids")
-            if not isinstance(ids, list):
-                raise Refusal("state_untrusted")
-            self.ids = [i for i in ids if isinstance(i, str) and 0 < len(i) <= 128]
+            return document
         except ValueError:
             raise Refusal("state_untrusted")
         finally:
             os.close(fd)
 
     def __contains__(self, thread_id):
-        return isinstance(thread_id, str) and thread_id in self.ids
+        return isinstance(thread_id, str) and (thread_id in self.ids or thread_id in self.external)
+
+    def engine(self, thread_id):
+        """The external engine of one of this task's external threads, or None (a Codex or unknown id)."""
+        return self.external.get(thread_id) if isinstance(thread_id, str) else None
+
+    def add_external(self, thread_id, engine):
+        """Records a broker-minted external thread; the oldest is forgotten beyond EXTERNAL_THREADS_PER_TASK."""
+        if not EXTERNAL_THREAD_PATTERN.match(thread_id) or engine not in EXTERNAL_ENGINES or thread_id in self:
+            raise Refusal("state_untrusted")
+        previous = collections.OrderedDict(self.external)
+        self.external[thread_id] = engine
+        while len(self.external) > EXTERNAL_THREADS_PER_TASK:
+            self.external.popitem(last=False)
+        try:
+            self._save_external()
+        except (OSError, Refusal):
+            self.external = previous
+            raise
 
     def add(self, thread_id):
         if not isinstance(thread_id, str) or not 0 < len(thread_id) <= 128 or thread_id in self.ids:
@@ -1940,6 +2002,22 @@ class ThreadStore:
         if thread_id in self.ids:
             self.ids = [i for i in self.ids if i != thread_id]
             self._save()
+
+    def remove_external(self, thread_id):
+        if thread_id in self.external:
+            self.external.pop(thread_id)
+            self._save_external()
+
+    def _save_external(self):
+        if self.task_id is None:
+            return
+        document = {"schema_version": SCHEMA_VERSION, "task_id": self.task_id,
+                    "threads": [{"id": i, "engine": e} for i, e in self.external.items()]}
+        dir_fd = open_root_dir(THREADS_DIR, "state_untrusted", private=True)
+        try:
+            write_root_file(dir_fd, self.task_id + EXTERNAL_THREADS_SUFFIX, json.dumps(document).encode(), 0o600)
+        finally:
+            os.close(dir_fd)
 
     def _save(self):
         if self.task_id is None:
@@ -3012,6 +3090,11 @@ DENIED_SERVER_REQUESTS = ("item/commandExecution/requestApproval", "item/fileCha
                           "mcpServer/elicitation/request", "account/chatgptAuthTokens/refresh")
 
 
+class ExternalCall(str):
+    """Routing key of one ddistro/external/tool/call, minted by the broker. A tool handler's reply to it goes back to
+    the client's request; JSON parsing never yields this type, so no Codex request id can be mistaken for one."""
+
+
 class Broker:
     """Bidirectional JSONL relay that only forwards the launcher's allowed method surface."""
 
@@ -3091,6 +3174,14 @@ class Broker:
         self.journal = journal
         self.recovery = False
         self.journal_error = None
+        # External engine: the one engine this session negotiated (None: a Codex session), its one active turn
+        # {"thread", "turn", "calls"} and the unanswered external tool calls by routing key.
+        self.engine = None
+        # Set by the first accepted initialize: a later one may not switch engines (Codex included) mid-session.
+        self.engine_locked = False
+        self.external_turn = None
+        self.external_calls = {}
+        self.external_seq = 0
 
     def _journal_session(self, opening):
         if self.journal is None:
@@ -3288,6 +3379,11 @@ class Broker:
                 if method in ("ddistro/run/revoke", "ddistro/run/cancel", "ddistro/task/recovery"):
                     self._run_client(request_id, method, message.get("params"))
                     return
+                if method in EXTERNAL_METHODS:
+                    self._external_client(request_id, method, message.get("params"))
+                    return
+                if self.engine is not None and self._external_local(request_id, method, message.get("params")):
+                    return
                 message["params"] = self._authorize(method, message.get("params"))
                 if method in ("turn/start", "turn/interrupt"):
                     # A new or stopped turn ends any pending proposal: it can no longer be approved.
@@ -3344,6 +3440,10 @@ class Broker:
             experimental = capabilities.get("experimentalApi") if isinstance(capabilities, dict) else None
             if experimental not in (None, True, False):
                 raise PolicyError(-32602, "invalid parameter: capabilities.experimentalApi")
+            asked = capabilities.get("ddistroEngine") if isinstance(capabilities, dict) else None
+            if self.engine_locked and asked != self.engine:
+                # Checked before any capability changes, so the active session and its turn keep their engine.
+                raise PolicyError(-32602, "capabilities.ddistroEngine cannot change within a session")
             self.experimental = experimental is True
             actions = capabilities.pop("ddistroActions", None) if isinstance(capabilities, dict) else None
             known = tuple(ACTION_OPERATIONS) + (RUN_CAPABILITY, RUN_AUTO_CAPABILITY, RECOVERY_CAPABILITY,
@@ -3381,6 +3481,16 @@ class Broker:
             # Like change_files, exec is dropped silently where this installation cannot honor it.
             if not self.managed_exec:
                 self.tools -= {EXEC_CAPABILITY}
+            engine = capabilities.pop("ddistroEngine", None) if isinstance(capabilities, dict) else None
+            if engine is not None:
+                # Broker-only like ddistroTools; refused rather than dropped, so a client never runs a model loop that
+                # believes it has tools this session will not answer.
+                if engine in EXTERNAL_RESERVED_ENGINES:
+                    raise PolicyError(-32602, "capabilities.ddistroEngine is not available yet: " + engine)
+                if engine not in EXTERNAL_ENGINES or not self.experimental or self.client_kind != "launcher":
+                    raise PolicyError(-32602, "invalid parameter: capabilities.ddistroEngine")
+                self.engine = engine
+            self.engine_locked = True
             return params
         if method in SIMPLE_METHODS:
             reject_unknown(params, SIMPLE_METHODS[method])
@@ -3395,13 +3505,7 @@ class Broker:
             reject_unknown(params, THREAD_START_KEYS)
             # Client tool declarations are never accepted; the broker owns the exact declaration.
             if self.experimental:
-                params["dynamicTools"] = ([] if self.client_kind == "game" else [TOOL_SPEC] + ([MEMORY_SPEC] if self.memory else [])
-                                          + ([explore_spec(self._checkout(), self._services())]
-                                             if EXPLORE_CAPABILITY in self.tools else [])
-                                          + ([EXEC_SPEC] if EXEC_CAPABILITY in self.tools else [])
-                                          + ([action_spec(self.actions)] if self.actions else [])
-                                          + ([run_tool_spec(self.live_run_auto, self.recovery, self.live_service)]
-                                             if self.live_run else []))
+                params["dynamicTools"] = self._declared_tools()
             self._cancel_proposals(None, "cancelled")
             return enforce_sandbox(params)
         if method == "thread/resume":
@@ -3458,6 +3562,165 @@ class Broker:
             return params
         raise PolicyError(-32601, "method not available in DwemerDistro assistant: " + method[:64])
 
+    # external engine
+    def _external_client(self, request_id, method, params):
+        """ddistro/external/*: answered here, never forwarded; only in a session that negotiated ddistroEngine."""
+        if self.engine is None:
+            raise PolicyError(-32601, "method not available in DwemerDistro assistant: " + method)
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise PolicyError(-32602, "params must be an object")
+        if method == "ddistro/external/tool/call":
+            self._external_tool_call(request_id, params)
+            return
+        if method in ("ddistro/external/thread/start", "ddistro/external/thread/resume"):
+            with self.state_lock:
+                active = self.external_turn is not None
+            if active:
+                raise PolicyError(-32001, "an external turn is active; end or interrupt it first")
+            if method == "ddistro/external/thread/start":
+                reject_unknown(params, ("engine",))
+                if params.get("engine") != self.engine:
+                    raise PolicyError(-32602, "engine must be this session's ddistroEngine")
+                thread_id = str(uuid.uuid4())
+                with self.state_lock:
+                    try:
+                        self.threads.add_external(thread_id, self.engine)
+                    except (OSError, Refusal):
+                        self.failure = self.failure or "state_untrusted"
+                        raise PolicyError(-32001, "the task's thread mapping could not be saved")
+            else:
+                reject_unknown(params, ("threadId",))
+                self._require_thread(params, external=True)
+                thread_id = params["threadId"]
+            # As thread/start and thread/resume: a pending proposal can no longer be approved.
+            self._cancel_proposals(None, "cancelled")
+            tools = [{"name": spec["name"], "description": spec["description"], "inputSchema": spec["inputSchema"]}
+                     for spec in self._declared_tools()]
+            result = {"threadId": thread_id, "engine": self.engine, "tools": tools}
+        elif method == "ddistro/external/turn/start":
+            reject_unknown(params, ("threadId",))
+            self._require_thread(params, external=True)
+            thread_id = params["threadId"]
+            with self.state_lock:
+                if self.stopping:
+                    raise PolicyError(-32001, "the session is closing")
+                if self.external_turn is not None:
+                    raise PolicyError(-32001, "an external turn is already active")
+                turn_id = str(uuid.uuid4())
+                self.external_turn = {"thread": thread_id, "turn": turn_id, "calls": set()}
+            self._cancel_proposals(thread_id, "cancelled")
+            self._to_client(encode({"method": "turn/started", "params": {
+                "threadId": thread_id, "turn": {"id": turn_id, "status": "inProgress"}}}))
+            result = {"turn": {"id": turn_id, "status": "inProgress"}}
+        else:
+            reject_unknown(params, ("threadId", "turnId", "status"))
+            if params.get("status") not in ("completed", "failed"):
+                raise PolicyError(-32602, "status must be completed or failed")
+            self._require_thread(params, external=True)
+            if not self._end_external_turn(params["threadId"], params.get("turnId"), params["status"]):
+                raise PolicyError(-32001, "turnId is not the active turn of this thread")
+            result = {}
+        self._to_client(encode({"id": request_id, "result": result}))
+
+    def _external_tool_call(self, request_id, params):
+        """One model tool call from the external engine, entering the same handlers as a Codex item/tool/call."""
+        reject_unknown(params, ("threadId", "turnId", "callId", "tool", "arguments"))
+        thread_id, turn_id, call_id = params.get("threadId"), params.get("turnId"), params.get("callId")
+        tool, arguments = params.get("tool"), params.get("arguments")
+        if (not isinstance(thread_id, str) or not isinstance(turn_id, str) or not isinstance(call_id, str)
+                or not EXTERNAL_CALL_ID.match(call_id) or not isinstance(tool, str) or not 0 < len(tool) <= 128
+                or not isinstance(arguments, dict)):
+            raise PolicyError(-32602, "threadId, turnId, callId (1-128), tool and arguments (object) are required")
+        names = {spec["name"] for spec in self._declared_tools()}
+        refusal, key = None, None
+        with self.state_lock:
+            turn = self.external_turn
+            if thread_id not in self.threads or self._thread_engine(thread_id) != self.engine:
+                refusal = "threadId is not one of this session's external threads"
+            elif turn is None or turn["thread"] != thread_id or turn["turn"] != turn_id:
+                refusal = "turnId is not the active turn of this thread"
+            elif call_id in turn["calls"] or len(turn["calls"]) >= MAX_TRACKED_REQUESTS:
+                refusal = "callId was already used in this turn"
+            elif tool not in names:
+                refusal = "unknown tool"
+            elif len(self.external_calls) >= EXTERNAL_PENDING_CALLS:
+                refusal = "too many tool calls in progress; wait for them first"
+            else:
+                turn["calls"].add(call_id)
+                self.external_seq += 1
+                key = ExternalCall(EXTERNAL_ID_PREFIX + str(self.external_seq))
+                self.external_calls[key] = {"id": request_id, "thread": thread_id, "turn": turn_id}
+        if refusal is not None:
+            text = json.dumps({"tool": tool, "operation": None, "ok": False,
+                               "error": {"code": "invalid_arguments", "message": refusal}}, separators=(",", ":"))
+            self._to_client(encode({"id": request_id, "result": {
+                "success": False, "contentItems": [{"type": "inputText", "text": text}]}}))
+            return
+        self._start_tool({"id": key, "params": {"threadId": thread_id, "turnId": turn_id, "callId": call_id,
+                                                "tool": tool, "arguments": arguments}})
+
+    def _end_external_turn(self, thread_id, turn_id, status):
+        """Ends the active external turn: later calls are refused, its unanswered calls get an error and its pending
+        proposals are cancelled. Live jobs continue, as after a Codex turn (Stop also stops them). False: not active."""
+        with self.state_lock:
+            current = self.external_turn
+            if current is None or current["thread"] != thread_id or current["turn"] != turn_id:
+                return False
+            self.external_turn = None
+            pending = [key for key, call in self.external_calls.items() if call["turn"] == turn_id]
+            calls = [self.external_calls.pop(key) for key in pending]
+        self._cancel_proposals(thread_id, "cancelled")
+        for call in calls:
+            self._to_client(encode({"id": call["id"], "error": {"code": -32001, "message": "the external turn ended",
+                                                                 "data": {"reason": "turn_ended"}}}))
+        self._to_client(encode({"method": "turn/completed", "params": {
+            "threadId": thread_id, "turn": {"id": turn_id, "status": status}}}))
+        return True
+
+    def _external_local(self, request_id, method, params):
+        """In an external-engine session: Codex turns are refused, and Stop, archive and delete of an external
+        thread are answered here. True when handled; a Codex thread id keeps the usual rules."""
+        if method in EXTERNAL_REFUSED_CODEX:
+            raise PolicyError(-32601, "method not available in an external-engine session: " + method)
+        if method not in ("turn/interrupt",) + THREAD_LIFECYCLE_METHODS or not isinstance(params, dict):
+            return False
+        with self.state_lock:
+            external = self._thread_engine(params.get("threadId")) is not None
+        if not external:
+            return False
+        reject_unknown(params, ("threadId", "turnId") if method == "turn/interrupt" else ("threadId",))
+        self._require_thread(params, external=True)
+        thread_id = params["threadId"]
+        # As for a Codex thread: Stop, archive or delete ends pending proposals and stops the thread's live jobs.
+        self._cancel_proposals(thread_id, "cancelled")
+        self._stop_jobs(thread_id, "interrupted")
+        with self.state_lock:
+            current = self.external_turn
+        if current is not None and current["thread"] == thread_id and (
+                method != "turn/interrupt" or params.get("turnId") in (None, current["turn"])):
+            self._end_external_turn(thread_id, current["turn"], "interrupted")
+        if method == "thread/delete":
+            with self.state_lock:
+                try:
+                    self.threads.remove_external(thread_id)
+                except (OSError, Refusal):
+                    self.failure = self.failure or "state_untrusted"
+                    raise PolicyError(-32001, "the task's thread mapping could not be saved")
+        self._to_client(encode({"id": request_id, "result": {}}))
+        return True
+
+    def _declared_tools(self):
+        """The broker's own tool declarations for this session; never the client's."""
+        if self.client_kind == "game":
+            return []
+        return ([TOOL_SPEC] + ([MEMORY_SPEC] if self.memory else [])
+                + ([explore_spec(self._checkout(), self._services())] if EXPLORE_CAPABILITY in self.tools else [])
+                + ([EXEC_SPEC] if EXEC_CAPABILITY in self.tools else [])
+                + ([action_spec(self.actions)] if self.actions else [])
+                + ([run_tool_spec(self.live_run_auto, self.recovery, self.live_service)] if self.live_run else []))
+
     def _service_list(self):
         """(ok, payload) of ddistro service list; ok only for the expected shape."""
         try:
@@ -3475,11 +3738,18 @@ class Broker:
         """True when ddistro_explore offers services: service_control negotiated together with explore."""
         return ACTION_SERVICE_CAPABILITY in self.actions and EXPLORE_CAPABILITY in self.tools
 
-    def _require_thread(self, params):
+    def _require_thread(self, params, external=False):
+        """Codex methods accept only this task's Codex threads; external=True only this session engine's threads."""
+        thread_id = params.get("threadId")
         with self.state_lock:
-            known = params.get("threadId") in self.threads
-        if not known:
+            engine = self._thread_engine(thread_id)
+            known = thread_id in self.threads and (engine == self.engine if external else engine is None)
+        if not known or external and self.engine is None:
             raise PolicyError(-32602, "threadId does not belong to this task")
+
+    def _thread_engine(self, thread_id):
+        engine = getattr(self.threads, "engine", None)
+        return engine(thread_id) if engine is not None else None
 
     def _list_threads(self, request_id, params):
         """thread/list from this task's own index, never Codex's account-wide list; newest first by default.
@@ -3733,7 +4003,10 @@ class Broker:
                 budget[2] = interrupt = True
         if interrupt:
             # The model ignored TOOL_TURN_CALLS refusals; end the turn as the client's turn/interrupt would.
-            self._internal_request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+            if self._thread_engine(thread_id) is not None:
+                self._end_external_turn(thread_id, turn_id, "interrupted")
+            else:
+                self._internal_request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
         return None, {"code": "turn_tool_limit", "message": (
             "ddistro_read, ddistro_memory, ddistro_explore and ddistro_exec are limited to %d calls and %d KiB of "
             "output per turn together; stop calling them, answer from the evidence already gathered, and let the user ask again in a new turn"
@@ -3752,6 +4025,11 @@ class Broker:
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         if self.client_kind == "game":
             self._tool_reply(message["id"], params, False, {"code": "permission_denied", "message": "in-game tools are not enabled"})
+            return
+        if not isinstance(message["id"], ExternalCall) and self._thread_engine(params.get("threadId")) is not None:
+            # A Codex item/tool/call naming an external engine's thread: ids never cross engines.
+            self._tool_reply(message["id"], params, False, {"code": "permission_denied",
+                                                            "message": "threadId does not belong to this engine"})
             return
         if params.get("tool") == RUN_TOOL and self.live_run and params.get("namespace") is None:
             self._start_run_call(message["id"], params)
@@ -3995,8 +4273,8 @@ class Broker:
                 budget = self.turn_budgets.get(key)
                 if budget is not None:
                     budget[1] += len(text)
-        self._to_server({"id": request_id, "result": {"success": success,
-                                                      "contentItems": [{"type": "inputText", "text": text}]}})
+        self._send_tool_result(request_id, {"success": success,
+                                            "contentItems": [{"type": "inputText", "text": text}]})
 
     def _run_model_action(self, request_id, arguments, thread_id, turn_id, key):
         """propose_model_change and propose_model_rollback. The broker, not the model, runs the root preview (which
@@ -4729,7 +5007,7 @@ class Broker:
             if not self.recovery:
                 raise PolicyError(-32601, "method not available in DwemerDistro assistant: " + method)
             reject_unknown(params, ("threadId",))
-            self._require_thread(params)
+            self._require_thread(params, external=self.engine is not None)
             self._to_client(encode({"id": request_id, "result": self._recovery_read(params["threadId"])}))
             return
         if method == "ddistro/run/revoke":
@@ -4741,7 +5019,7 @@ class Broker:
                 self._run_grant_notice("revoked")
             return
         reject_unknown(params, ("threadId", "jobId"))
-        self._require_thread(params)
+        self._require_thread(params, external=self.engine is not None)
         job = self._run_job(params.get("jobId"), params.get("threadId"))
         self._stop_job(job, "user_cancel")
         with job.lock:
@@ -5072,8 +5350,8 @@ class Broker:
         line = bounded_line({"result": document}, TOOL_TEXT_BUDGET)
         text = json.dumps(json.loads(line)["result"], separators=(",", ":")) if line else json.dumps(
             {"tool": RUN_TOOL, "state": document.get("state"), "error": {"code": "output_too_large"}})
-        self._to_server({"id": request_id, "result": {"success": bool(success),
-                                                      "contentItems": [{"type": "inputText", "text": text}]}})
+        self._send_tool_result(request_id, {"success": bool(success),
+                                            "contentItems": [{"type": "inputText", "text": text}]})
 
     def _tool_reply(self, request_id, params, ok, payload, key=None):
         arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
@@ -5121,8 +5399,19 @@ class Broker:
                 budget = self.turn_budgets.get(key)
                 if budget is not None:
                     budget[1] += len(text)
-        self._to_server({"id": request_id, "result": {"success": ok,
-                                                      "contentItems": [{"type": "inputText", "text": text}]}})
+        self._send_tool_result(request_id, {"success": ok,
+                                            "contentItems": [{"type": "inputText", "text": text}]})
+
+    def _send_tool_result(self, request_id, result):
+        """A tool handler's reply: to Codex for its item/tool/call (unchanged bytes), or for an external call to the
+        client's own request, once, while its turn is active. A reply after the turn ended goes nowhere."""
+        if not isinstance(request_id, ExternalCall):
+            self._to_server({"id": request_id, "result": result})
+            return
+        with self.state_lock:
+            call = self.external_calls.pop(request_id, None)
+        if call is not None:
+            self._to_client(self._fit({"id": call["id"], "result": result}))
 
     @staticmethod
     def _fit_log_lines(payload):
@@ -5404,7 +5693,7 @@ def cmd_recovery(task_id):
         if not TASK_ID_PATTERN.match(task_id):
             raise Refusal("task_id_invalid")
         threads = ThreadStore(task_id)
-        view = recovery_view(TaskJournal(task_id).read(), set(threads.ids))
+        view = recovery_view(TaskJournal(task_id).read(), set(threads.ids) | set(threads.external))
         view["available"] = True
     except Refusal as exc:
         view = {"recovery_version": RECOVERY_VERSION, "available": False, "reason": exc.reason}

@@ -21,6 +21,13 @@ all clients and a FIFO queue of eight reservations. Detached live runs keep the
 reservation until their final broker event. Idle workers expire after 15 minutes;
 an idle worker can also be evicted to admit a new conversation.
 
+An external-engine turn (`ddistro/external/turn/start`, see ASSISTANT_RUNTIME.md
+"External engine") takes the same reservation and queue as a Launcher
+`turn/start`, and a queued one is cancelled by `turn/interrupt` the same way.
+A Claude turn ends only when the Launcher ends it. A detach first interrupts it, and so does an
+attached relay that stops polling events for 60 seconds. That releases the
+reservation and stops its proposals and live jobs. No public endpoint changes.
+
 Closing the Launcher detaches its relay, not the API. Active requests remain
 supervised. Reattaching an active Launcher task refuses until it completes;
 it never initializes the same running worker twice. There is no durable-job or
