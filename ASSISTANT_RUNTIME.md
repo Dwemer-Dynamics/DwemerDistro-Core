@@ -786,17 +786,16 @@ a static fact that adds no command and opens no database.
 ### External engine
 
 A trusted Launcher can run the model loop itself (`claude`: the user's own signed-in Claude Code on Windows) and send
-each tool call to the broker. The calls end in the same handlers as a Codex `item/tool/call`, so argument
+each tool call to the broker, or let the broker run it (`openrouter`, see "OpenRouter engine"). The calls end in the same handlers as a Codex `item/tool/call`, so argument
 validation, budgets, proposals and digests, grants, the destructive backstop, journals, redaction, job supervision
 and thread ownership are unchanged. Core holds no Claude code, account or key. Attestation is unchanged too: the
 session still needs a passing probe and still starts the pinned App Server, which stays idle for the whole session
 (no model call). One idle App Server process per session is the cost of leaving the worker lifecycle unchanged; it
 is not measured here.
 
-Negotiation: `initialize` with `experimentalApi: true` and `capabilities.ddistroEngine` `"claude"`, launcher clients
-only. The broker removes the field before Codex sees it. `"openrouter"` is reserved and refused as not available yet
-(`-32602`). Any other value is refused, as is the field without `experimentalApi`, and a repeated `initialize` may not
-change `ddistroEngine` (`-32602`). An older client never sends it and sees no
+Negotiation: `initialize` with `experimentalApi: true` and `capabilities.ddistroEngine` `"claude"` or `"openrouter"`,
+launcher clients only. The broker removes the field before Codex sees it. Any other value is refused, as is the
+field without `experimentalApi`. An older client never sends it and sees no
 change. In such a session, `thread/start`, `thread/resume` and `turn/start` are refused (`-32601`), so one session
 never mixes engines. History reads, `thread/list` and lifecycle methods for Codex threads keep their usual rules.
 
@@ -830,9 +829,53 @@ limit ends the external turn as `interrupted`, as it interrupts a Codex turn. `d
 `ddistro/task/recovery` take this session's external threads. `ddistro_agent recovery` lists jobs of both kinds.
 
 `ddistro capabilities` reports `features.assistant_external_engine` and `assistant_external_engine {available,
-reason, revision, engines, reserved_engines, methods}`. It is true only with the foundations, and when the trusted
-installed `ddistro_agent` and `ddistro_api` both declare `EXTERNAL_ENGINE_REVISION = 1` (engines `claude`, reserved
-`openrouter`). The files are read, never run. It describes the installed contract, never a provider run.
+reason, revision, engines, reserved_engines, methods, openrouter}`. It is true only with the foundations, and when the
+trusted installed `ddistro_agent` and `ddistro_api` both declare `EXTERNAL_ENGINE_REVISION = 2` (revision 1, Claude
+only, was never released). The files are read, never run. It describes the installed contract, never a provider run.
+
+#### OpenRouter engine
+
+The broker runs the whole loop: the model requests, the tool calls (through the same `_start_tool` handlers, with
+broker-minted routing keys whose replies return to the broker, never through the client) and the turn end. So
+`ddistro/external/tool/call` and `ddistro/external/turn/end` are refused (`-32601`): no client tool result or early
+success is accepted. `thread/start`/`resume` results add `models`, the three fixed presets
+(`z-ai/glm-5.3`, `openai/gpt-6.1-sol`, `anthropic/claude-sonnet-5.5`) with `catalog {tools, images}` from the
+public catalog and `runtimeTested: false`. GLM 5.3 is text-only (`images: false`); a turn with image input for it is
+refused (`-32602`) before any key or provider call. The retired `google/gemma-4-31b-it` preset is no longer offered or
+accepted for new turns, but stored transcripts that used it stay readable.
+
+`ddistro/external/turn/start` takes `threadId, model` (a preset), `keyId` (a global key UUID), `input` (`text` items
+and up to four `image` items with an inline `data:image/png|jpeg|webp|gif;base64` URL of at most 4 MiB; no paths or
+remote URLs) and optional `instructions` (at most 32 KiB, appended to Core's own system prompt). It answers
+`{turn, model, keyId}` after `turn/started`, then streams `item/started`/`item/completed` for `userMessage`,
+`agentMessage` and `dynamicToolCall` items and coalesced `item/agentMessage/delta`, and ends with
+`turn/completed {threadId, turn: {id, status, error?: {code, message}}}` (`completed`, `interrupted` or `failed`).
+That notification is sent only after the provider socket is closed, so the API reservation covers all provider work.
+
+The key is resolved for each turn, privately: `ddistro_keys global-status`, then `global-reveal {key_id, revision}`
+on stdin. It must exist, be configured, and have provider `openrouter` and origin `https://openrouter.ai:443`;
+otherwise the turn fails with `key_missing`, `key_wrong_provider`, `key_changed` or `key_unavailable` before any
+request. The value never leaves the broker process: not in argv, env, logs, history, notifications or errors
+(provider error text is scrubbed of it, then redacted). No other key, provider or model is ever substituted.
+
+Each model request is one streamed `POST https://openrouter.ai/api/v1/chat/completions` (stdlib TLS with system CAs),
+with `provider.require_parameters` and no model list. Redirects are errors, nothing is retried, and a stream that
+breaks mid-answer fails as an unknown outcome. An answer cut off at the model's output limit (`finish_reason: length`)
+fails with `provider_finish`: its text is kept and shown, its tool calls never run, and nothing is continued. Stop,
+archive, delete, detach, the API's 60 s silence watchdog, session end, and ignoring the per-turn tool limit until twice
+that limit all cancel the turn: the key helper's process group is killed, and the socket is closed. The connection is
+opened before the request, so a cancel that lands while it opens sends no request (one that lands during DNS
+resolution takes effect when resolution returns); after cancel no further deltas are sent. The key lookup has one
+150 s deadline for both helper calls. A turn has at most 36 model requests and the tool calls run one at a time; each
+waits at most 660 s. A repeated `initialize` may not change `ddistroEngine` (`-32602`).
+
+Transcripts are root-private `threads/<task>.<thread>.openrouter.json` files (same mode, link and symlink rules),
+written atomically at turn start and end only (never per token). At most 100 turns and 2 MiB are kept: whole oldest
+turns are dropped and counted in `compacted`, which the model is told about. Image bytes are never stored. A turn left
+`inProgress` by a closed session reads as `interrupted`. `ddistro/external/thread/turns/list {threadId, cursor?,
+limit? (1-10, default 5), sortDirection?}` pages them, newest first, as `{data: [{id, status, model, error, startedAt,
+completedAt, items}], nextCursor, backwardsCursor: null, compacted}`. Deleting a thread, or its eviction past 64,
+removes its transcript. A Claude or Codex thread never reads or feeds an OpenRouter transcript.
 
 ## Known limitations
 

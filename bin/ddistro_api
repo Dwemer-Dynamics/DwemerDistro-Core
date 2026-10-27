@@ -44,9 +44,9 @@ ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 UUID = re.compile(r"^[0-9a-f-]{36}$")
 TERMINAL = ("completed", "failed", "cancelled", "outcome_unknown")
 # External engine turns (ASSISTANT_RUNTIME.md "External engine") take the same single reservation as turn/start. A
-# Claude turn ends only when the Launcher says so; a detach, or an attached Launcher that stops polling events for
-# EXTERNAL_SILENCE seconds, interrupts it. ddistro capabilities reads this revision; raise it only together with ddistro_agent's.
-EXTERNAL_ENGINE_REVISION = 1
+# Claude turn ends only when the Launcher says so and an OpenRouter turn when Core's own loop finishes; either way a
+# detach, or an attached Launcher that stops polling events for EXTERNAL_SILENCE seconds, interrupts it. ddistro capabilities reads this revision; raise it only together with ddistro_agent's.
+EXTERNAL_ENGINE_REVISION = 2
 EXTERNAL_TURN_START = "ddistro/external/turn/start"
 EXTERNAL_SILENCE = 60
 

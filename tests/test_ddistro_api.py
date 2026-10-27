@@ -7,6 +7,7 @@ import json
 import os
 import re
 from pathlib import Path
+import socket
 import tempfile
 import threading
 import types
@@ -335,6 +336,467 @@ class ExternalEngine(unittest.TestCase):
         line = self.server.getvalue().splitlines()[-1]
         self.assertTrue(line.startswith(b'{"id":7,"result":{"success":true,"contentItems":[{"type":"inputText"'))
         self.assertNotIn(b'"id":7', self.client.getvalue())
+
+
+SECRET = "sk-or-v1-fixture-NOT-A-REAL-KEY-0123456789"
+KEY_ID = "3074ec1c-0000-4000-8000-000000000001"
+OTHER_KEY = "773ff307-0000-4000-8000-000000000002"
+
+
+def text_chunks(text):
+    return [{"choices": [{"delta": {"content": text[:4]}}]}, {"choices": [{"delta": {"content": text[4:]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]}]
+
+
+def tool_chunks(name="ddistro_read", arguments='{"operation":"status"}', call_id="call_a"):
+    return [{"choices": [{"delta": {"tool_calls": [{"index": 0, "id": call_id, "type": "function",
+                                                    "function": {"name": name, "arguments": arguments[:5]}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": arguments[5:]}}]},
+                          "finish_reason": "tool_calls"}]}]
+
+
+class OpenRouterEngine(unittest.TestCase):
+    """Core's own OpenRouter loop with a mocked key resolver and transport: no key read and no network."""
+    send, messages, wait_for, reply = ExternalEngine.send, ExternalEngine.messages, ExternalEngine.wait_for, \
+        ExternalEngine.reply
+
+    def setUp(self):
+        self.handled, self.scripts, self.bodies, self.secrets, self.resolved = [], [], [], [], []
+
+        def run_tool(argv):
+            self.handled.append(argv)
+            return True, {"probe": "fixture"}
+
+        def resolve(key_id, turn):
+            self.resolved.append(key_id)
+            if key_id != KEY_ID:
+                raise agent.ProviderError("key_missing", "The selected OpenRouter key no longer exists.")
+            return SECRET, {"keyId": key_id, "revision": 1, "label": "fixture"}
+
+        def stream(body, secret, turn):
+            self.bodies.append(json.loads(body))
+            self.secrets.append(secret)
+            script = self.scripts.pop(0) if self.scripts else tool_chunks()
+            if isinstance(script, Exception):
+                raise script
+            yield from (script(turn) if callable(script) else script)
+
+        self.threads = agent.ThreadStore(None)
+        self.threads.ids = ["codex-thread"]
+        self.server, self.client = io.BytesIO(), io.BytesIO()
+        self.broker = agent.Broker(types.SimpleNamespace(stdin=self.server), None, self.client, self.threads,
+                                   run_tool=run_tool, openrouter_io=(resolve, stream))
+        self.seq = 0
+
+    def open_chat(self, actions=()):
+        capabilities = {"experimentalApi": True, "ddistroEngine": "openrouter"}
+        if actions:
+            capabilities["ddistroActions"] = list(actions)
+        self.send("initialize", {"capabilities": capabilities})
+        started = self.reply(self.send("ddistro/external/thread/start", {"engine": "openrouter"}))["result"]
+        self.assertEqual([m["id"] for m in started["models"]],
+                         ["z-ai/glm-5.3", "openai/gpt-6.1-sol", "anthropic/claude-sonnet-5.5"])
+        self.assertTrue(all(m["catalog"]["tools"] and m["runtimeTested"] is False for m in started["models"]))
+        self.assertEqual([m["catalog"]["images"] for m in started["models"]], [False, True, True])
+        return started["threadId"]
+
+    def turn(self, thread, text="Check my distro", **changes):
+        params = {"threadId": thread, "model": "openai/gpt-6.1-sol", "keyId": KEY_ID,
+                  "input": [{"type": "text", "text": text}]}
+        params.update(changes)
+        return self.send("ddistro/external/turn/start", params)
+
+    def completed(self, turn_id):
+        return self.wait_for(lambda m: m.get("method") == "turn/completed"
+                             and m["params"]["turn"]["id"] == turn_id)["params"]["turn"]
+
+    def run_turn(self, thread, **changes):
+        turn_id = self.reply(self.turn(thread, **changes))["result"]["turn"]["id"]
+        return turn_id, self.completed(turn_id)
+
+    def test_text_and_tool_round_trip_history_and_credential_isolation(self):
+        thread = self.open_chat()
+        self.scripts = [tool_chunks(), text_chunks("All services passed.")]
+        turn_id, done = self.run_turn(thread)
+        self.assertEqual(done, {"id": turn_id, "status": "completed"})
+        tool = self.wait_for(lambda m: m.get("method") == "item/completed"
+                             and m["params"]["item"]["type"] == "dynamicToolCall")["params"]["item"]
+        self.assertEqual((tool["id"], tool["tool"], tool["success"], tool["status"]),
+                         ("call_a", "ddistro_read", True, "completed"))
+        self.assertEqual(len(self.handled), 1)
+        # The model receives exactly the handler's result, as Codex would.
+        self.assertEqual(self.bodies[1]["messages"][-1], {"role": "tool", "tool_call_id": "call_a",
+                                                         "content": tool["contentItems"][0]["text"]})
+        self.assertEqual(json.loads(tool["contentItems"][0]["text"])["tool"], "ddistro_read")
+        deltas = "".join(m["params"]["delta"] for m in self.messages()
+                         if m.get("method") == "item/agentMessage/delta")
+        self.assertEqual(deltas, "All services passed.")
+        first = self.bodies[0]
+        self.assertEqual((first["model"], first["messages"][0]["role"]), ("openai/gpt-6.1-sol", "system"))
+        self.assertEqual([t["function"]["name"] for t in first["tools"]], ["ddistro_read"])
+        self.assertEqual(first["tools"][0]["function"]["parameters"], agent.TOOL_SPEC["inputSchema"])
+        self.assertNotIn("models", first)  # never a fallback list
+        self.assertEqual(self.secrets, [SECRET, SECRET])
+        stored = json.dumps(self.threads.memory_histories)
+        for blob in (self.client.getvalue().decode(), self.server.getvalue().decode(), stored,
+                     json.dumps(self.bodies)):
+            self.assertNotIn(SECRET, blob)
+        self.assertNotIn(b'"turn/', self.server.getvalue())  # Codex never ran a turn
+        page = self.reply(self.send("ddistro/external/thread/turns/list", {"threadId": thread}))["result"]
+        self.assertEqual([item["type"] for item in page["data"][0]["items"]],
+                         ["userMessage", "dynamicToolCall", "agentMessage"])
+        self.assertEqual((page["nextCursor"], page["compacted"], page["data"][0]["status"]), (None, 0, "completed"))
+        self.scripts = [tool_chunks(), text_chunks("Still fine.")]
+        second = self.run_turn(thread, text="And now?")[0]
+        self.assertEqual([m["role"] for m in self.bodies[2]["messages"]],
+                         ["system", "user", "assistant", "tool", "assistant", "user"])
+        # call_a is already in the replayed history, so this turn's call gets an id no other turn can mint.
+        replayed = [m["tool_call_id"] for m in self.bodies[3]["messages"] if m["role"] == "tool"]
+        self.assertEqual(replayed[0], "call_a")
+        self.assertTrue(agent.EXTERNAL_CALL_ID.match(replayed[1]) and replayed[1].startswith("call_" + second))
+        self.assertEqual(len(self.reply(self.send("ddistro/external/thread/turns/list",
+                                                  {"threadId": thread, "limit": 1}))["result"]["data"]), 1)
+
+    def test_approved_action_result_reaches_the_model_through_the_same_handler(self):
+        restarts = []
+        self.broker.run_tool = lambda argv: (restarts.append(argv), (True, {"executed": True, "verified": True,
+                                                                           "state": "verified"}))[1]
+        thread = self.open_chat(actions=["restart_service"])
+        service = next(iter(agent.ACTION_SERVICES))
+        arguments = json.dumps({"operation": "propose_restart", "service": service, "reason": "fixture"})
+        self.scripts = [tool_chunks(name="ddistro_action", arguments=arguments), text_chunks("Restarted.")]
+        turn_id = self.reply(self.turn(thread))["result"]["turn"]["id"]
+        proposal = self.wait_for(lambda m: m.get("method") == "ddistro/action/proposed")["params"]
+        self.assertEqual(len(self.bodies), 1)  # the loop waits for the card
+        self.reply(self.send("ddistro/action/decide", {"proposalId": proposal["proposalId"], "threadId": thread,
+                                                       "decision": "approve"}))
+        self.assertEqual(self.completed(turn_id)["status"], "completed")
+        self.assertEqual([argv[:2] for argv in restarts if argv[:2] == ["service", "restart"]],
+                         [["service", "restart"]])
+        result = json.loads(self.bodies[1]["messages"][-1]["content"])
+        self.assertEqual(result["tool"], "ddistro_action")
+        self.assertNotIn(SECRET, self.client.getvalue().decode())
+
+    def test_client_results_bad_requests_and_other_engines_are_refused(self):
+        thread = self.open_chat()
+        for engine in ("claude", None):
+            capabilities = {"experimentalApi": True, "ddistroEngine": engine}
+            self.assertEqual(self.reply(self.send("initialize", {"capabilities": capabilities}))["error"]["code"],
+                             -32602)
+        self.assertEqual(self.broker.engine, "openrouter")
+        self.send("initialize", {"capabilities": {"experimentalApi": True, "ddistroEngine": "openrouter"}})
+        self.assertTrue(self.broker.experimental)
+        for method, params in (("ddistro/external/tool/call", {"threadId": thread, "turnId": "t", "callId": "c",
+                                                               "tool": "ddistro_read", "arguments": {}}),
+                               ("ddistro/external/turn/end", {"threadId": thread, "turnId": "t",
+                                                              "status": "completed"})):
+            self.assertEqual(self.reply(self.send(method, params))["error"]["code"], -32601)
+        image = [{"type": "text", "text": "What is this?"},
+                 {"type": "image", "url": "data:image/png;base64,iVBORw0KGgo="}]
+        for change in ({"model": "openai/gpt-4o"}, {"model": "google/gemma-4-31b-it"},
+                       {"model": "z-ai/glm-5.3", "input": image}, {"keyId": "not-a-uuid"},
+                       {"endpoint": "https://example.com"},
+                       {"input": [{"type": "localImage", "path": "/etc/shadow"}]},
+                       {"input": [{"type": "image", "url": "https://example.com/x.png"}]},
+                       {"input": [{"type": "text", "text": ""}]}):
+            self.assertEqual(self.reply(self.turn(thread, **change))["error"]["code"], -32602)
+        claude = "00000000-0000-4000-8000-00000000c1a0"
+        self.threads.external[claude] = "claude"
+        for other in (claude, "codex-thread"):
+            self.assertIn("error", self.reply(self.turn(other)))
+            self.assertIn("error", self.reply(self.send("ddistro/external/thread/turns/list", {"threadId": other})))
+        self.assertEqual((self.resolved, self.bodies), ([], []))
+        # Undeclared tools and non-object arguments are answered in Core and reach no handler.
+        self.scripts = [tool_chunks(name="shell", arguments='{"operation": "status"}'),
+                        tool_chunks(arguments="[1,2]", call_id="call_b"),
+                        tool_chunks(arguments='{"op', call_id="call_c"), tool_chunks(arguments="null", call_id="call_d"),
+                        text_chunks("Done.")]
+        self.assertEqual(self.run_turn(thread)[1]["status"], "completed")
+        failed = [m["params"]["item"] for m in self.messages() if m.get("method") == "item/completed"
+                  and m["params"]["item"]["type"] == "dynamicToolCall"]
+        self.assertEqual([json.loads(i["contentItems"][0]["text"])["error"]["code"] for i in failed],
+                         ["invalid_arguments"] * 4)
+        self.assertEqual((self.handled, self.broker.session_calls), ([], 0))
+        # Only JSON objects are sent back as tool-call arguments, later in the turn and in the next turn's history.
+        self.scripts = [text_chunks("Ok.")]
+        self.assertEqual(self.run_turn(thread)[1]["status"], "completed")
+        for body in (self.bodies[4], self.bodies[5]):
+            sent = [call["function"]["arguments"] for m in body["messages"] for call in m.get("tool_calls", ())]
+            self.assertEqual(sent, ['{"operation":"status"}', "{}", "{}", "{}"])
+
+    def test_key_http_and_stream_failures_are_clear_and_never_retried(self):
+        thread = self.open_chat()
+        done = self.run_turn(thread, keyId=OTHER_KEY)[1]
+        self.assertEqual((done["status"], done["error"]["code"], self.bodies), ("failed", "key_missing", []))
+        cases = ((agent.provider_message(401, json.dumps({"error": {"message": "bad key " + SECRET}}).encode(),
+                                         SECRET), "provider_auth"),
+                 ([{"error": {"message": "upstream failed"}}], "provider_error"),
+                 ([{"choices": [{"delta": {"content": "partial"}}]}], "incomplete_response"),
+                 ([{"choices": [{"delta": {"content": "cut off"}, "finish_reason": "length"}]}], "provider_finish"),
+                 ([{"choices": [{"delta": {"tool_calls": [{"index": 99}]}}]}], "malformed_response"))
+        for script, code in cases:
+            before = len(self.bodies)
+            self.scripts = [script]
+            done = self.run_turn(thread)[1]
+            self.assertEqual((done["status"], done["error"]["code"]), ("failed", code))
+            self.assertEqual(len(self.bodies), before + 1)
+        self.assertNotIn(SECRET, self.client.getvalue().decode())
+        self.assertIn("[redacted]", self.client.getvalue().decode())
+        self.assertTrue(self.wait_for(lambda m: m.get("method") == "item/completed"
+                                      and m["params"]["item"].get("text") == "cut off"))
+        page = self.reply(self.send("ddistro/external/thread/turns/list", {"threadId": thread}))["result"]
+        self.assertEqual(page["data"][0]["error"]["code"], "malformed_response")
+
+    def test_stop_closes_blocked_provider_io_before_releasing_the_turn(self):
+        thread = self.open_chat()
+        reader, writer = socket.socketpair()
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        reading = threading.Event()
+
+        def blocked(turn):
+            turn.attach(types.SimpleNamespace(sock=reader))
+            reading.set()
+            reader.recv(1)  # returns only once Stop shuts the socket down
+            turn.detach()
+            raise agent.ProviderError("network_error", "closed")
+            yield
+
+        self.scripts = [blocked]
+        turn_id = self.reply(self.turn(thread))["result"]["turn"]["id"]
+        self.assertTrue(reading.wait(5))
+        self.assertEqual(self.reply(self.turn(thread))["error"]["code"], -32001)  # one active turn
+        self.assertFalse([m for m in self.messages() if m.get("method") == "turn/completed"])
+        self.assertEqual(self.reply(self.send("turn/interrupt", {"threadId": thread, "turnId": turn_id}))["result"], {})
+        self.assertEqual(self.completed(turn_id), {"id": turn_id, "status": "interrupted"})
+        self.assertEqual(len(self.bodies), 1)  # an unknown outcome is never replayed
+        self.assertIsNone(self.broker.external_turn)
+        page = self.reply(self.send("ddistro/external/thread/turns/list", {"threadId": thread}))["result"]
+        self.assertEqual(page["data"][0]["status"], "interrupted")
+
+    def test_ignoring_the_turn_limit_until_doubled_interrupts_the_loop(self):
+        thread = self.open_chat()
+        done = self.run_turn(thread)[1]  # every model round asks for another ddistro_read
+        self.assertEqual(done["status"], "interrupted")
+        self.assertEqual((self.broker.session_calls, len(self.handled)),
+                         (2 * agent.TOOL_TURN_CALLS, agent.TOOL_TURN_CALLS))
+        self.assertEqual(len(self.bodies), 2 * agent.TOOL_TURN_CALLS)
+        self.assertIsNone(self.broker.external_turn)
+        self.assertFalse(self.broker.external_calls)
+
+    def test_key_resolution_uses_only_the_selected_openrouter_key(self):
+        status = {"ok": True, "data": {"keys": [
+            {"key_id": KEY_ID, "provider": "openrouter", "origin": "https://openrouter.ai:443", "revision": 3,
+             "configured": True, "label": "Main"},
+            {"key_id": OTHER_KEY, "provider": "openai", "origin": "https://api.openai.com:443", "revision": 1,
+             "configured": True}]}}
+        reveal, calls = {"ok": True, "outcome": "revealed", "data": {"secret": SECRET}}, []
+
+        def fake(verb, payload, turn, deadline):
+            calls.append((verb, payload))
+            return status if verb == "global-status" else reveal
+
+        with patch.object(agent, "trusted_chain"), patch.object(agent, "keys_call", side_effect=fake):
+            secret, meta = agent.openrouter_key(KEY_ID, None)
+            self.assertEqual((secret, calls[-1]), (SECRET, ("global-reveal", {"key_id": KEY_ID, "revision": 3})))
+            self.assertNotIn(SECRET, json.dumps(meta))
+            for key_id, code in ((OTHER_KEY, "key_wrong_provider"), ("00000000-0000-4000-8000-000000000000",
+                                                                     "key_missing")):
+                with self.assertRaises(agent.ProviderError) as error:
+                    agent.openrouter_key(key_id, None)
+                self.assertEqual(error.exception.code, code)
+            reveal = {"ok": False, "outcome": "conflict", "data": None}
+            with self.assertRaises(agent.ProviderError) as error:
+                agent.openrouter_key(KEY_ID, None)
+            self.assertEqual(error.exception.code, "key_changed")
+
+    def test_key_helper_group_stops_with_the_turn_and_at_the_deadline(self):
+        # A slow fixture helper with a grandchild stands in for ddistro_keys; no real key or installer is used.
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = temporary.name
+        helper = Path(root, "keys")
+        helper.write_text("#!/bin/sh\necho \"$@\" > %s/argv\ncat > %s/stdin\nsleep 60 &\necho $! > %s/pids\n"
+                          "echo $$ >> %s/pids\nwait\n" % ((root,) * 4))
+        helper.chmod(0o755)
+
+        def driver():
+            return agent.OpenRouterTurn(None, "t", "u", "m", KEY_ID, {"type": "userMessage", "id": "u:0",
+                                                                      "content": []}, None, {"turns": [], "compacted": 0})
+
+        with patch.object(agent, "KEYS_HELPER", str(helper)),                 patch.object(agent.subprocess, "Popen", wraps=agent.subprocess.Popen) as popen:
+            for stop_by_cancel in (True, False):
+                Path(root, "pids").unlink(missing_ok=True)
+                turn, errors = driver(), []
+
+                def run():
+                    try:
+                        agent.keys_call("global-reveal", {"key_id": KEY_ID, "revision": 3}, turn,
+                                        agent.time.monotonic() + (30 if stop_by_cancel else 1))
+                    except agent.ProviderError as exc:
+                        errors.append(exc.code)
+                worker = threading.Thread(target=run)
+                started = agent.time.monotonic()
+                worker.start()
+                for _ in range(500):
+                    if len(Path(root, "pids").read_text().split() if Path(root, "pids").exists() else ()) == 2:
+                        break
+                    threading.Event().wait(0.01)
+                if stop_by_cancel:
+                    turn.cancel("interrupted")
+                worker.join(10)
+                self.assertFalse(worker.is_alive())
+                self.assertLess(agent.time.monotonic() - started, 5)
+                self.assertEqual(errors, ["cancelled" if stop_by_cancel else "key_unavailable"])
+                self.assertIsNone(turn.child)
+                for pid in map(int, Path(root, "pids").read_text().split()):
+                    for _ in range(200):  # the orphaned grandchild is reaped by init
+                        try:
+                            os.kill(pid, 0)
+                        except ProcessLookupError:
+                            break
+                        threading.Event().wait(0.01)
+                    else:
+                        self.fail("a key helper process outlived the lookup")
+        self.assertEqual(Path(root, "argv").read_text().split(), ["global-reveal"])
+        self.assertIn(KEY_ID, Path(root, "stdin").read_text())
+        options = popen.call_args[1]
+        self.assertTrue(options["start_new_session"])
+        self.assertEqual(set(options["env"]), {"PATH", "LANG"})
+
+    def test_stop_while_connecting_sends_no_request(self):
+        thread, requests, broker = self.open_chat(), [], self.broker
+
+        class Connection:
+            def __init__(self, *args, **kwargs):
+                self.sock = None
+
+            def connect(self):
+                broker.external_turn["driver"].cancel("interrupted")  # Stop lands while the socket opens
+                self.sock = types.SimpleNamespace(settimeout=lambda value: None)
+
+            def request(self, *args):
+                requests.append(args)
+
+            def close(self):
+                pass
+
+        self.scripts = [lambda turn: agent.openrouter_stream(b"{}", SECRET, turn)]
+        with patch.object(agent.http.client, "HTTPSConnection", Connection):
+            turn_id, done = self.run_turn(thread)
+        self.assertEqual((done, requests), ({"id": turn_id, "status": "interrupted"}, []))
+
+    def test_transport_is_fixed_never_redirects_and_rejects_malformed_streams(self):
+        connections = []
+
+        class Response:
+            def __init__(self, status, ctype, lines):
+                self.status, self.ctype, self.lines = status, ctype, list(lines)
+
+            def read(self, limit):
+                return b'{"error":{"message":"moved"}}'
+
+            def getheader(self, name):
+                return self.ctype
+
+            def readline(self, limit):
+                return self.lines.pop(0) if self.lines else b""
+
+        class Connection:
+            def __init__(self, host, port, timeout=None, context=None):
+                self.host, self.port, self.sock = host, port, types.SimpleNamespace(settimeout=lambda value: None)
+                connections.append(self)
+
+            def connect(self):
+                pass
+
+            def request(self, method, path, body, headers):
+                self.sent = (method, path, headers)
+
+            def getresponse(self):
+                return self.response_value
+
+            def close(self):
+                pass
+
+        turn = types.SimpleNamespace(attach=lambda conn: True, detach=lambda: None, lock=threading.Lock(),
+                                     cancelled=None)
+
+        def collect(response):
+            with patch.object(agent.http.client, "HTTPSConnection",
+                              side_effect=lambda *a, **k: setattr(Connection(*a, **k), "response_value", response)
+                              or connections[-1]):
+                return list(agent.openrouter_stream(b"{}", SECRET, turn))
+
+        chunks = collect(Response(200, "text/event-stream", [b": OPENROUTER PROCESSING\n", b"\n",
+                                                              b'data: {"choices":[]}\n', b"data: [DONE]\n"]))
+        self.assertEqual(chunks, [{"choices": []}])
+        conn = connections[-1]
+        self.assertEqual((conn.host, conn.port, conn.sent[0], conn.sent[1]),
+                         ("openrouter.ai", 443, "POST", "/api/v1/chat/completions"))
+        self.assertEqual(conn.sent[2]["Authorization"], "Bearer " + SECRET)
+        for response, code in ((Response(302, "text/html", []), "provider_redirect"),
+                               (Response(200, "application/json", []), "malformed_response"),
+                               (Response(200, "text/event-stream", [b"data: {not json\n"]), "malformed_response")):
+            count = len(connections)
+            with self.assertRaises(agent.ProviderError) as error:
+                collect(response)
+            self.assertEqual((error.exception.code, len(connections)), (code, count + 1))
+            self.assertNotIn(SECRET, error.exception.message)
+
+    def test_history_file_is_root_private_atomic_bounded_and_removed(self):
+        real_fstat = os.fstat
+
+        def as_root(fd):
+            st = real_fstat(fd)
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, st.st_gid, st.st_size,
+                                   int(st.st_atime), int(st.st_mtime), int(st.st_ctime)))
+
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(agent, "open_root_dir", side_effect=lambda *a, **k: os.open(root, os.O_RDONLY)), \
+                patch.object(agent.os, "fstat", side_effect=as_root):
+            store = agent.ThreadStore("task-fixture")
+            thread, other, claude = (str(agent.uuid.uuid4()) for _ in range(3))
+            for thread_id, engine in ((thread, "openrouter"), (other, "openrouter"), (claude, "claude")):
+                store.add_external(thread_id, engine)
+            history = store.load_history(thread)
+            item = {"type": "agentMessage", "id": "x", "text": "y" * 1000}
+            history["turns"] = [{"id": str(agent.uuid.uuid4()), "status": "completed", "model": "google/gemma-4-31b-it",
+                                 "error": None, "startedAt": 1, "completedAt": 2, "items": [item]}
+                                for _ in range(agent.OPENROUTER_HISTORY_TURNS + 5)]
+            store.save_history(thread, history)
+            path = Path(root, "task-fixture." + thread + agent.OPENROUTER_HISTORY_SUFFIX)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            loaded = store.load_history(thread)
+            self.assertEqual((len(loaded["turns"]), loaded["compacted"]), (agent.OPENROUTER_HISTORY_TURNS, 5))
+            with patch.object(agent, "OPENROUTER_HISTORY_LIMIT", 20000):
+                store.save_history(thread, loaded)
+            self.assertLessEqual(path.stat().st_size, 20000)
+            self.assertGreater(store.load_history(thread)["compacted"], 5)
+            self.assertFalse([p for p in Path(root).iterdir() if p.name.endswith(".tmp")])
+            os.chmod(path, 0o644)
+            with self.assertRaises(agent.Refusal):
+                store.load_history(thread)
+            os.chmod(path, 0o600)
+            os.link(path, Path(root, "second-link"))
+            with self.assertRaises(agent.Refusal):
+                store.load_history(thread)
+            os.unlink(Path(root, "second-link"))
+            target = Path(root, "target")
+            path.rename(target)
+            path.symlink_to(target)
+            with self.assertRaises(agent.Refusal):
+                store.load_history(thread)
+            path.unlink()
+            target.rename(path)
+            foreign = Path(root, "task-fixture." + other + agent.OPENROUTER_HISTORY_SUFFIX)
+            foreign.write_bytes(path.read_bytes())
+            os.chmod(foreign, 0o600)
+            for thread_id in (other, claude):  # another thread's transcript, or an engine with none in Core
+                with self.assertRaises(agent.Refusal):
+                    store.load_history(thread_id)
+            store.remove_external(thread)
+            self.assertFalse(path.exists())
 
 
 class ExternalReservation(unittest.TestCase):
