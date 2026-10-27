@@ -543,18 +543,26 @@ def cmd_capabilities(opts, ctx):
                      "live_run": live_run,
                      # ddistro_run operation service (capability live_service, with live_run_auto); see live_run.service.
                      "live_service": live_run,
-                     # A trusted Launcher runs the model loop (Claude Code) and relays tool calls; the installed agent
-                     # and API both carry this revision. See assistant_external_engine.
+                     # A trusted Launcher runs the model loop (Claude Code) and relays tool calls, or Core runs it (OpenRouter); the
+                     # installed agent and API both carry this revision. See assistant_external_engine.
                      "assistant_external_engine": external_engine},
         "assistant_external_engine": {"available": external_engine, "reason": external_engine_reason,
-                                      "revision": EXTERNAL_ENGINE_REVISION, "engines": ["claude"],
-                                      "reserved_engines": ["openrouter"],
+                                      "revision": EXTERNAL_ENGINE_REVISION, "engines": ["claude", "openrouter"],
+                                      "reserved_engines": [],
                                       "requires": ["features.assistant_foundations", "ddistro_agent revision",
                                                    "ddistro_api revision"],
                                       "negotiate": "initialize capabilities.ddistroEngine",
                                       "methods": ["ddistro/external/thread/start", "ddistro/external/thread/resume",
                                                   "ddistro/external/turn/start", "ddistro/external/tool/call",
-                                                  "ddistro/external/turn/end"]},
+                                                  "ddistro/external/turn/end", "ddistro/external/thread/turns/list"],
+                                      # Core runs this engine's model and tool loop itself with the selected global
+                                      # OpenRouter key. Installed contract only: no provider call is made or implied.
+                                      "openrouter": {"endpoint": "https://openrouter.ai/api/v1/chat/completions",
+                                                     "key": "global key, provider openrouter, chosen per turn by keyId",
+                                                     # Must match ddistro_agent OPENROUTER_MODELS.
+                                                     "models": ["z-ai/glm-5.3", "openai/gpt-6.1-sol",
+                                                                "anthropic/claude-sonnet-5.5"],
+                                                     "runtime_tested": False}},
         "assistant_foundations": {"available": foundations, "reason": foundations_reason,
                                   "requires": ["ddistro_agent", "ddistro_access", "ddistro_exec", "ddistro_changes",
                                                "agent status installed", "agent status probe_passed"]},
@@ -1249,7 +1257,7 @@ def managed_exec_attested():
 
 # The external engine contract both the installed broker and the API supervisor must declare (see
 # ASSISTANT_RUNTIME.md "External engine"). Read from the trusted files, never by running them.
-EXTERNAL_ENGINE_REVISION = 1
+EXTERNAL_ENGINE_REVISION = 2
 EXTERNAL_ENGINE_LINE = re.compile(rb"^EXTERNAL_ENGINE_REVISION = ([0-9]{1,4})$", re.M)
 API_HELPER = "/usr/local/bin/ddistro_api"
 
