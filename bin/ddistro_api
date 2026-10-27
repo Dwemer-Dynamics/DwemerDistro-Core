@@ -43,6 +43,12 @@ MAX_QUEUE = 8
 ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 UUID = re.compile(r"^[0-9a-f-]{36}$")
 TERMINAL = ("completed", "failed", "cancelled", "outcome_unknown")
+# External engine turns (ASSISTANT_RUNTIME.md "External engine") take the same single reservation as turn/start. A
+# Claude turn ends only when the Launcher says so; a detach, or an attached Launcher that stops polling events for
+# EXTERNAL_SILENCE seconds, interrupts it. ddistro capabilities reads this revision; raise it only together with ddistro_agent's.
+EXTERNAL_ENGINE_REVISION = 1
+EXTERNAL_TURN_START = "ddistro/external/turn/start"
+EXTERNAL_SILENCE = 60
 
 
 class ApiError(Exception):
@@ -124,6 +130,9 @@ class Session:
         self.answer = ""
         self.thread = conversation.get("thread")
         self.turn = None
+        # The reserved turn is an external-engine turn, and the thread its turn/started named.
+        self.external = False
+        self.turn_thread = None
         self.cancel_requested = False
         self.attached = False
         self.queued = False
@@ -193,9 +202,11 @@ class Session:
                         self.responses[message["id"]] = message
                     if method == "turn/started":
                         self.turn = params.get("turn", {}).get("id")
-                        if self.cancel_requested and self.thread and self.turn:
+                        self.turn_thread = params.get("threadId")
+                        thread = self.thread or (self.turn_thread if self.external else None)
+                        if self.cancel_requested and thread and self.turn:
                             self.send({"id": "cancel:" + str(uuid.uuid4()), "method": "turn/interrupt",
-                                "params": {"threadId": self.thread, "turnId": self.turn}})
+                                "params": {"threadId": thread, "turnId": self.turn}})
                     if method == "item/agentMessage/delta" and self.request_id:
                         self.answer = (self.answer + params.get("delta", ""))[:65536]
                     if method == "ddistro/run/started":
@@ -226,6 +237,19 @@ class Session:
             # Broker EOF means cleanup is complete; never release a dead worker's jobs based on a guessed success.
             self.proc.wait()
             self.app.release(self)
+
+    def interrupt_external(self):
+        """Stops the reserved external turn (its proposals and live jobs too); nothing else would end it. Before its
+        turn/started arrives, the interrupt is sent as soon as it does."""
+        with self.lock:
+            if not (self.active and self.external) or self.turn_done:
+                return
+            self.cancel_requested = True
+            thread, turn = self.turn_thread, self.turn
+        if thread and turn:
+            with contextlib.suppress(ApiError, OSError, ValueError):
+                self.send({"id": "cancel:" + str(uuid.uuid4()), "method": "turn/interrupt",
+                           "params": {"threadId": thread, "turnId": turn}})
 
     def close(self):
         with self.app.lock:
@@ -267,6 +291,11 @@ class App:
                 idle = [session for session in self.sessions.values()
                         if not session.active and not session.jobs and not session.queued and not session.attached
                         and time.monotonic() - session.last > 900]
+                silent = [session for session in self.sessions.values()
+                          if session.active and getattr(session, "external", False)
+                          and time.monotonic() - session.last > EXTERNAL_SILENCE]
+            for session in silent:
+                session.interrupt_external()
             for session in idle:
                 with contextlib.suppress(ApiError, OSError):
                     session.close()
@@ -605,11 +634,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if set(body) != {"message"} or not isinstance(body["message"], dict):
                     raise ApiError(400, "invalid_request")
                 message = body["message"]
-                if message.get("method") == "turn/start":
+                if message.get("method") in ("turn/start", EXTERNAL_TURN_START):
                     with app.lock:
                         if session.active or session.queued:
                             raise ApiError(409, "request_running")
                         session.queued, session.queue_cancel = True, False
+                        session.external = message.get("method") == EXTERNAL_TURN_START
                         threading.Thread(target=app.launcher_turn, args=(session, message), daemon=True).start()
                     return {"accepted": True, "state": "queued"}
                 if message.get("method") == "turn/interrupt" and session.queued and not session.active:
@@ -626,6 +656,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "detach" and method == "POST":
                 session.attached = False
                 session.queue_cancel = True
+                session.interrupt_external()
                 session.close()
                 return {"detached": True}
         if len(parts) >= 3 and parts[:2] == ["v1", "requests"]:

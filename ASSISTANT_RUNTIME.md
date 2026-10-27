@@ -312,6 +312,7 @@ The broker relays JSONL both ways and forwards only these client methods:
 | `thread/archive`, `thread/unarchive`, `thread/delete` | `threadId` (this task) only; see "Thread archive and delete" |
 | `ddistro/action/decide` | `proposalId`, `threadId`, `decision` (`approve`/`cancel`, and for a `live_run` proposal that offers it `approve_session`), `digest` (required to approve a `live_run` proposal, refused on any other); answered by the broker, never forwarded; see "ddistro_action" and "ddistro_run" |
 | `ddistro/run/revoke`, `ddistro/run/cancel` | only after `live_run` was negotiated; see "ddistro_run" |
+| `ddistro/external/*` | only after `capabilities.ddistroEngine` was negotiated; answered by the broker, never forwarded; see "External engine" |
 
 For thread and turn requests, `approvalPolicy` may only be `never`, and `cwd` only
 `/work`; the broker sets both. `permissions` may only be `dwemer-scratch`.
@@ -781,6 +782,57 @@ notes captured in it: that is a separate, optional user action, `ddistro memory 
 --thread ID` (or `--task TASK`), which the launcher may offer next to the delete confirmation,
 unchecked by default. `ddistro capabilities` reports this as `features.thread_lifecycle: true`,
 a static fact that adds no command and opens no database.
+
+### External engine
+
+A trusted Launcher can run the model loop itself (`claude`: the user's own signed-in Claude Code on Windows) and send
+each tool call to the broker. The calls end in the same handlers as a Codex `item/tool/call`, so argument
+validation, budgets, proposals and digests, grants, the destructive backstop, journals, redaction, job supervision
+and thread ownership are unchanged. Core holds no Claude code, account or key. Attestation is unchanged too: the
+session still needs a passing probe and still starts the pinned App Server, which stays idle for the whole session
+(no model call). One idle App Server process per session is the cost of leaving the worker lifecycle unchanged; it
+is not measured here.
+
+Negotiation: `initialize` with `experimentalApi: true` and `capabilities.ddistroEngine` `"claude"`, launcher clients
+only. The broker removes the field before Codex sees it. `"openrouter"` is reserved and refused as not available yet
+(`-32602`). Any other value is refused, as is the field without `experimentalApi`, and a repeated `initialize` may not
+change `ddistroEngine` (`-32602`). An older client never sends it and sees no
+change. In such a session, `thread/start`, `thread/resume` and `turn/start` are refused (`-32601`), so one session
+never mixes engines. History reads, `thread/list` and lifecycle methods for Codex threads keep their usual rules.
+
+External threads are broker-minted v4 UUIDs, which `ddistro memory add --thread` accepts. They are kept in
+`threads/<task>.external.json` (root 0600, one link, no symlink, at most 64 entries, oldest forgotten first):
+`{"schema_version": 1, "task_id", "threads": [{"id", "engine"}]}`. The file holds metadata only, never a
+transcript. A malformed entry, a looser mode, a hard link or a symlink refuses the session (`state_untrusted`); the
+Codex mapping now refuses a hard link the same way. Codex methods accept only Codex ids, and external methods only
+ids of this session's engine. A Codex `item/tool/call` that names an external thread is refused.
+
+| Method | Params (strict) | Result |
+|---|---|---|
+| `ddistro/external/thread/start` | `engine` (the session's) | `{threadId, engine, tools: [{name, description, inputSchema}]}`: the broker's own declarations, as `dynamicTools` would carry them |
+| `ddistro/external/thread/resume` | `threadId` | the same; refused for another engine's or task's id |
+| `ddistro/external/turn/start` | `threadId` | emits `turn/started {threadId, turn: {id, status: "inProgress"}}`, then `{turn: {id, status}}`; one active turn per session |
+| `ddistro/external/tool/call` | `threadId, turnId, callId` (1-128 of `A-Za-z0-9_.:-`, unique in the turn), `tool`, `arguments` (object) | `{success, contentItems: [{type: "inputText", text}]}`, the native shape |
+| `ddistro/external/turn/end` | `threadId, turnId, status` (`completed` or `failed`) | `{}`; emits `turn/completed` |
+
+Thread start and resume are refused while a turn is active and cancel pending proposals. Turn start cancels that
+thread's pending proposals. A malformed call is a `-32602` error. A call for another thread, another or ended turn,
+a reused `callId`, an undeclared tool, or over 32 unanswered calls gets `success: false` with code
+`invalid_arguments` and reaches no handler. Each accepted call gets a broker-minted routing key, so the handler's
+reply goes back once, to the client's own request id. When the turn ends, its unanswered calls get error `-32001`
+with `data.reason: "turn_ended"`, its pending proposals are cancelled, and any later reply is dropped. Live jobs
+continue as after a Codex turn.
+
+`turn/interrupt` with an external thread (`turnId` optional) cancels its proposals, stops its jobs, ends the active
+turn as `interrupted` and answers `{}` without reaching Codex. `thread/archive` and `thread/unarchive` do the same
+and answer `{}`. `thread/delete` also removes the mapping entry. Ignoring the per-turn tool limit until twice the
+limit ends the external turn as `interrupted`, as it interrupts a Codex turn. `ddistro/run/cancel` and
+`ddistro/task/recovery` take this session's external threads. `ddistro_agent recovery` lists jobs of both kinds.
+
+`ddistro capabilities` reports `features.assistant_external_engine` and `assistant_external_engine {available,
+reason, revision, engines, reserved_engines, methods}`. It is true only with the foundations, and when the trusted
+installed `ddistro_agent` and `ddistro_api` both declare `EXTERNAL_ENGINE_REVISION = 1` (engines `claude`, reserved
+`openrouter`). The files are read, never run. It describes the installed contract, never a provider run.
 
 ## Known limitations
 

@@ -407,6 +407,7 @@ def cmd_capabilities(opts, ctx):
     exec_ok = exec_available(access_available)
     foundations, foundations_reason = foundations_ready(access_available)
     live_run, live_run_reason = live_run_ready(foundations)
+    external_engine, external_engine_reason = external_engine_ready(foundations)
     tools = [{"name": "ddistro_read", "mutates": False,
               "operations": ["inventory", "status", "models", "logs", "health", "performance", "model_options",
                              "update_check"],
@@ -541,7 +542,19 @@ def cmd_capabilities(opts, ctx):
                      # installed now; the reason is in live_run.
                      "live_run": live_run,
                      # ddistro_run operation service (capability live_service, with live_run_auto); see live_run.service.
-                     "live_service": live_run},
+                     "live_service": live_run,
+                     # A trusted Launcher runs the model loop (Claude Code) and relays tool calls; the installed agent
+                     # and API both carry this revision. See assistant_external_engine.
+                     "assistant_external_engine": external_engine},
+        "assistant_external_engine": {"available": external_engine, "reason": external_engine_reason,
+                                      "revision": EXTERNAL_ENGINE_REVISION, "engines": ["claude"],
+                                      "reserved_engines": ["openrouter"],
+                                      "requires": ["features.assistant_foundations", "ddistro_agent revision",
+                                                   "ddistro_api revision"],
+                                      "negotiate": "initialize capabilities.ddistroEngine",
+                                      "methods": ["ddistro/external/thread/start", "ddistro/external/thread/resume",
+                                                  "ddistro/external/turn/start", "ddistro/external/tool/call",
+                                                  "ddistro/external/turn/end"]},
         "assistant_foundations": {"available": foundations, "reason": foundations_reason,
                                   "requires": ["ddistro_agent", "ddistro_access", "ddistro_exec", "ddistro_changes",
                                                "agent status installed", "agent status probe_passed"]},
@@ -1231,6 +1244,29 @@ def managed_exec_attested():
             return False, name + "_helper_untrusted"
         if not hmac.compare_digest(current, digest):
             return False, name + "_digest_stale"
+    return True, None
+
+
+# The external engine contract both the installed broker and the API supervisor must declare (see
+# ASSISTANT_RUNTIME.md "External engine"). Read from the trusted files, never by running them.
+EXTERNAL_ENGINE_REVISION = 1
+EXTERNAL_ENGINE_LINE = re.compile(rb"^EXTERNAL_ENGINE_REVISION = ([0-9]{1,4})$", re.M)
+API_HELPER = "/usr/local/bin/ddistro_api"
+
+
+def external_engine_ready(foundations):
+    """(features.assistant_external_engine, reason): the foundations are on and the trusted root-owned ddistro_agent
+    and ddistro_api both declare exactly this EXTERNAL_ENGINE_REVISION."""
+    if not foundations:
+        return False, "foundations_unavailable"
+    for name, path in (("agent", AGENT_HELPER), ("api", API_HELPER)):
+        try:
+            raw = read_root_file(path, ATTESTED_HELPER_LIMIT)
+        except CliError as error:
+            return False, name + "_helper_" + error.details.get("reason", "untrusted")
+        match = EXTERNAL_ENGINE_LINE.search(raw)
+        if match is None or int(match.group(1)) != EXTERNAL_ENGINE_REVISION:
+            return False, name + "_external_engine_unsupported"
     return True, None
 
 
