@@ -1,0 +1,860 @@
+#!/usr/bin/env bash
+# Verify that the shared PHP 8.2 runtime has the Debian 12 security fix for
+# CVE-2026-109618 and CVE-2026-109619, and apply only that update when it is missing.
+#
+# Usage: ensure_php_security [--check] [--json]
+#
+# Default (root): when the installed official PHP 8.2 packages are older than the fixed
+# version, upgrade exactly those packages to one bookworm-security version. Extension
+# packages built separately (for example php8.2-mcrypt) are kept, nothing is removed or
+# newly installed, and PHP/Apache configuration is kept byte-for-byte. Maintainer scripts
+# may not start or stop services. Afterwards, only services that were already running and
+# still use replaced PHP code are restarted (Apache, PHP-FPM, LORKHAN worker, and running
+# CHIM4 components); stopped services stay stopped.
+# When the packages are already fixed there is no APT or network use.
+#
+# --check  Read-only verification (as root; other users cannot inspect every process).
+# --json   Also print one evidence line to stdout: DDISTRO_PHP_SECURITY {...}
+#
+# Exit codes: 0 fixed and no process runs the old PHP code; 1 failed or unsupported runtime;
+# 3 update required (--check); 4 restart required: a process still runs the old PHP code;
+# 5 incomplete: not every process could be inspected; 64 usage.
+
+set -u
+
+PHP_SOURCE=php8.2
+PHP_BINARY=/usr/bin/php8.2
+PHP_CONFIG_ROOT=/etc/php/8.2
+MOD_PHP_PACKAGE=libapache2-mod-php8.2
+MOD_PHP_LIBRARY=/usr/lib/apache2/modules/libphp8.2.so
+FPM_PACKAGE=php8.2-fpm
+FPM_BINARY=/usr/sbin/php-fpm8.2
+FIXED_VERSION='8.2.35-1~deb12u1'
+FIXED_RUNTIME='8.2.35'
+SECURITY_SUITE=bookworm-security
+LOCK_FILE=/run/lock/dwemerdistro-php-security.lock
+# The lock is held on FD 9. Commands that may start daemons (service, CHIM4, APT maintainer
+# scripts) run with 9>&- so a restarted daemon cannot keep the lock after this helper exits.
+POLICY_RC=/usr/sbin/policy-rc.d
+POLICY_MARKER='# ensure_php_security: maintainer scripts must not start or stop services'
+# An existing policy is renamed here (same directory, so it keeps its inode and metadata) and
+# renamed back afterwards.
+POLICY_BACKUP="$POLICY_RC.ensure-php-security-saved"
+CONFIG_ROOTS=("$PHP_CONFIG_ROOT" /etc/apache2)
+APACHE_SERVER_ROOT=/etc/apache2
+# Restarted only when already running; the LORKHAN worker is optional.
+MANAGED_SERVICES=(apache2 "$FPM_PACKAGE" lorkhanserver-worker)
+APACHE_PID_FILE=/run/apache2/apache2.pid
+FPM_PID_FILE=/run/php/php8.2-fpm.pid
+# Optional CHIM4: each component runs under a supervisor that leads its own process group and
+# records "pid start-time" in /run/chim4/<component>.pid. Its isolated Apache is not apache2.
+CHIM4_INIT=/etc/init.d/chim4
+CHIM4_RUN=/run/chim4
+# An upgrade of an installed package: "Inst name [old] (new origin [arch])".
+PLAN_UPGRADE_PATTERN='^Inst ([^ ]+) \[[^]]+\] \(([^ ]+) '
+STALE_PATTERN=' (/usr/lib/apache2/modules/libphp8\.2\.so|/usr/bin/php8\.2|/usr/sbin/php-fpm8\.2|/usr/lib/php/[0-9]+/[^ ]+\.so) \(deleted\)$'
+
+MODE=ensure
+JSON_OUTPUT=0
+WORK_DIR=""
+KEEP_WORK_DIR=0
+POLICY_STATE=none
+OFFICIAL=()
+declare -A OFFICIAL_VERSION=()
+OUTDATED=()
+INCOHERENT=0
+CLI_VERSION=""
+MOD_PACKAGE_VERSION=""
+MOD_RUNTIME_VERSION=""
+FPM_RUNTIME_VERSION=""
+STALE_MANAGED=()
+STALE_OTHER=()
+UNSCANNED=()
+PROCESS_SCAN=complete
+APACHE_PHP_MODULE=""
+declare -A CHIM4_SUPERVISOR=()
+APACHE_MAIN_PID=""
+FPM_MAIN_PID=""
+PROC_STATE=""
+PROC_PARENT=""
+PROC_GROUP=""
+PROC_START=""
+
+fail() {
+    printf '[FAIL] %s\n' "$1" >&2
+    exit 1
+}
+
+info() {
+    printf '[INFO] %s\n' "$1" >&2
+}
+
+ok() {
+    printf '[OK] %s\n' "$1" >&2
+}
+
+usage() {
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+cleanup() {
+    local status=$?
+    restore_service_policy || [ "$status" -ne 0 ] || status=1
+    if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
+        if [ "$KEEP_WORK_DIR" -eq 1 ]; then
+            printf '[INFO] Original PHP and Apache configuration retained in %s\n' "$WORK_DIR" >&2
+        else
+            rm -rf -- "$WORK_DIR"
+        fi
+    fi
+    exit "$status"
+}
+
+version_ge() {
+    dpkg --compare-versions "$1" ge "$2"
+}
+
+# The fixed upstream release on the supported branch; any other branch is not assumed safe.
+runtime_fixed() {
+    case "$1" in
+        8.2.*) version_ge "$1" "$FIXED_RUNTIME" ;;
+        *) return 1 ;;
+    esac
+}
+
+# PHP_VERSION is compiled into each SAPI's X-Powered-By header string.
+embedded_version() {
+    LC_ALL=C grep -a -o -m 1 'X-Powered-By: PHP/[0-9][0-9.]*' "$1" 2>/dev/null | head -n 1 | sed 's#.*PHP/##'
+}
+
+check_base() {
+    local base
+    base="$(. /etc/os-release 2>/dev/null && printf '%s %s' "${ID:-}" "${VERSION_ID:-}")"
+    [ "$base" = "debian 12" ] || fail "Unsupported base system '${base:-unknown}'; this update supports Debian 12 PHP 8.2 only."
+    for command_name in apt-cache apt-get dpkg dpkg-query flock grep sha256sum; do
+        command -v "$command_name" >/dev/null 2>&1 || fail "Required command is missing: $command_name"
+    done
+}
+
+inspect_packages() {
+    local status name version source first_version="" unsupported=""
+    OFFICIAL=()
+    OFFICIAL_VERSION=()
+    OUTDATED=()
+    INCOHERENT=0
+
+    while IFS=$'\t' read -r status name version source; do
+        status="${status// /}"
+        name="${name%%:*}"
+        source="${source:-$name}"
+        if [ "$source" = "$PHP_SOURCE" ]; then
+            case "$status" in
+                ii) ;;
+                un|pn|rc) continue ;;
+                *) fail "PHP package $name is in an incomplete dpkg state ($status). Repair it before updating." ;;
+            esac
+            OFFICIAL+=("$name")
+            OFFICIAL_VERSION[$name]="$version"
+            if ! version_ge "$version" "$FIXED_VERSION"; then
+                OUTDATED+=("$name")
+            fi
+            if [ -z "$first_version" ]; then
+                first_version="$version"
+            elif [ "$version" != "$first_version" ]; then
+                INCOHERENT=1
+            fi
+        elif [ "$status" = ii ] && [[ "$source" =~ ^php[0-9]+\.[0-9]+$ ]]; then
+            unsupported="${unsupported:+$unsupported, }$name"
+        fi
+    done < <(dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\t${Version}\t${source:Package}\n' 2>/dev/null)
+
+    [ -z "$unsupported" ] || fail "Unsupported PHP branch packages are installed ($unsupported). Only PHP 8.2 is verified."
+    [ -n "${OFFICIAL_VERSION[php8.2-cli]+set}" ] && [ -n "${OFFICIAL_VERSION[php8.2-common]+set}" ] \
+        || fail "The official PHP 8.2 CLI packages are not installed."
+}
+
+inspect_runtime() {
+    local php_path
+    CLI_VERSION=""
+    MOD_PACKAGE_VERSION=""
+    MOD_RUNTIME_VERSION=""
+    FPM_RUNTIME_VERSION=""
+
+    php_path="$(command -v php 2>/dev/null || true)"
+    [ -n "$php_path" ] && [ "$(readlink -f "$php_path")" = "$PHP_BINARY" ] \
+        || fail "The php command does not run $PHP_BINARY; only PHP 8.2 is verified."
+    CLI_VERSION="$("$PHP_BINARY" -n -r 'echo PHP_VERSION;' 2>/dev/null)" || fail "PHP 8.2 CLI could not run."
+    if [ -n "${OFFICIAL_VERSION[$MOD_PHP_PACKAGE]+set}" ]; then
+        MOD_PACKAGE_VERSION="${OFFICIAL_VERSION[$MOD_PHP_PACKAGE]}"
+        MOD_RUNTIME_VERSION="$(embedded_version "$MOD_PHP_LIBRARY")"
+        [ -n "$MOD_RUNTIME_VERSION" ] || fail "Could not read the Apache PHP module version from $MOD_PHP_LIBRARY."
+    fi
+    if [ -n "${OFFICIAL_VERSION[$FPM_PACKAGE]+set}" ]; then
+        FPM_RUNTIME_VERSION="$(embedded_version "$FPM_BINARY")"
+        [ -n "$FPM_RUNTIME_VERSION" ] || fail "Could not read the PHP-FPM version from $FPM_BINARY."
+    fi
+}
+
+# Every PHP LoadModule that the main Apache configuration actually includes must load the
+# packaged module verified here; any other PHP handler is unverified and is left untouched.
+verify_apache_handler() {
+    local includes file directive module path resolved
+    APACHE_PHP_MODULE=""
+    command -v apache2ctl >/dev/null 2>&1 || return 0
+    includes="$(apache2ctl -t -D DUMP_INCLUDES 2>/dev/null)" \
+        || fail "Could not read the Apache configuration to verify which PHP module it loads."
+    while IFS= read -r file; do
+        [ -f "$file" ] || fail "Could not read Apache configuration file $file."
+        while read -r directive module path _; do
+            path="${path//\"/}"
+            case "$module $path" in
+                *[Pp][Hh][Pp]*) ;;
+                *) continue ;;
+            esac
+            case "$path" in
+                /*) resolved="$(readlink -f -- "$path" 2>/dev/null || true)" ;;
+                *'$'*|'') resolved="" ;;
+                *) resolved="$(readlink -f -- "$APACHE_SERVER_ROOT/$path" 2>/dev/null || true)" ;;
+            esac
+            [ -n "$MOD_PACKAGE_VERSION" ] && [ "$resolved" = "$MOD_PHP_LIBRARY" ] \
+                || fail "Apache loads an unverified PHP handler ($module from $path in $file). Only $MOD_PHP_LIBRARY from $MOD_PHP_PACKAGE is verified; the Apache configuration was not changed."
+            APACHE_PHP_MODULE="$resolved"
+        done < <(grep -Ei '^[[:space:]]*LoadModule[[:space:]]' "$file")
+    done < <(printf '%s\n' "$includes" | sed -n 's/^[[:space:]]*([^)]*) //p')
+}
+
+# Installed programs and libraries must be the packaged ones. Configuration files and
+# documentation (which images may exclude) are not part of this proof.
+verify_package_files() {
+    local problems
+    problems="$(LC_ALL=C dpkg --verify "${OFFICIAL[@]}" 2>&1 | awk '$2 != "c" && $NF ~ /^\/usr\/(s?bin|lib)\//')"
+    [ -z "$problems" ] || fail "Installed PHP files do not match their packages: $(printf '%s' "$problems" | head -n 3 | tr '\n' ';')"
+}
+
+packages_fixed() {
+    [ "${#OUTDATED[@]}" -eq 0 ] && [ "$INCOHERENT" -eq 0 ]
+}
+
+runtime_versions_fixed() {
+    runtime_fixed "$CLI_VERSION" || return 1
+    [ -z "$MOD_PACKAGE_VERSION" ] || runtime_fixed "$MOD_RUNTIME_VERSION" || return 1
+    [ -z "$FPM_RUNTIME_VERSION" ] || runtime_fixed "$FPM_RUNTIME_VERSION" || return 1
+}
+
+# Fills PROC_STATE, PROC_PARENT, PROC_GROUP and PROC_START (clock ticks since boot) from /proc.
+proc_stat() {
+    local line
+    local -a fields
+    read -r line 2>/dev/null < "/proc/$1/stat" || return 1
+    line="${line##*) }"
+    read -r -a fields <<< "$line"
+    PROC_STATE="${fields[0]}"
+    PROC_PARENT="${fields[1]}"
+    PROC_GROUP="${fields[2]}"
+    PROC_START="${fields[19]}"
+}
+
+# A process that exited or is a zombie holds no code and needs no restart.
+proc_gone() {
+    proc_stat "$1" || return 0
+    [ "$PROC_STATE" = Z ] || [ "$PROC_STATE" = X ]
+}
+
+trusted_path() {
+    local path="$1" owner mode
+    while :; do
+        [ -e "$path" ] && [ ! -L "$path" ] || return 1
+        read -r owner mode < <(stat -c '%u %a' -- "$path") || return 1
+        [ "$owner" = 0 ] && (( (8#$mode & 8#022) == 0 )) || return 1
+        [ "$path" = / ] && return 0
+        path="$(dirname -- "$path")"
+    done
+}
+
+# The CHIM4 script and its run directory count only when nobody but root can change them.
+chim4_trusted() {
+    [ -f "$CHIM4_INIT" ] && [ -x "$CHIM4_INIT" ] && trusted_path "$CHIM4_INIT" && trusted_path "$CHIM4_RUN"
+}
+
+# Records the CHIM4 supervisors whose PID, start time, process group and command line match.
+load_chim4_supervisors() {
+    local record component pid start command_line
+    CHIM4_SUPERVISOR=()
+    chim4_trusted || return 0
+    for record in "$CHIM4_RUN"/*.pid; do
+        [ -f "$record" ] && [ ! -L "$record" ] && [ "$(stat -c '%u' -- "$record")" = 0 ] || continue
+        component="${record##*/}"
+        component="${component%.pid}"
+        [[ "$component" =~ ^[a-z][a-z0-9-]*$ ]] || continue
+        read -r pid start 2>/dev/null < "$record" || continue
+        [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] && proc_stat "$pid" || continue
+        [ "$PROC_START" = "$start" ] && [ "$PROC_GROUP" = "$pid" ] || continue
+        command_line="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" || continue
+        [ "$command_line" = "/bin/bash $CHIM4_INIT _supervise $component " ] || continue
+        CHIM4_SUPERVISOR[$pid]="$component"
+    done
+}
+
+main_pid() {
+    local pid=""
+    read -r pid 2>/dev/null < "$1" || true
+    [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] && printf '%s\n' "$pid"
+}
+
+# Names the service that owns a process from its ancestry: a verified CHIM4 supervisor, the
+# main Apache or PHP-FPM master from their PID files, or the LORKHAN worker's account.
+service_for_pid() {
+    local pid="$1" ancestor="$1" group depth=0 owner
+    proc_stat "$pid" || { printf 'gone\n'; return 0; }
+    group="$PROC_GROUP"
+    while [ "$ancestor" -gt 1 ] && [ "$depth" -lt 64 ]; do
+        if [ -n "${CHIM4_SUPERVISOR[$ancestor]+set}" ]; then
+            printf 'chim4:%s\n' "${CHIM4_SUPERVISOR[$ancestor]}"
+            return 0
+        fi
+        [ "$ancestor" != "$APACHE_MAIN_PID" ] || { printf 'apache2\n'; return 0; }
+        [ "$ancestor" != "$FPM_MAIN_PID" ] || { printf '%s\n' "$FPM_PACKAGE"; return 0; }
+        proc_stat "$ancestor" || break
+        ancestor="$PROC_PARENT"
+        depth=$((depth + 1))
+    done
+    # Leftovers in a supervisor's process group end when that component restarts.
+    if [ -n "${CHIM4_SUPERVISOR[$group]+set}" ]; then
+        printf 'chim4:%s\n' "${CHIM4_SUPERVISOR[$group]}"
+        return 0
+    fi
+    owner="$(stat -c '%U' "/proc/$pid" 2>/dev/null || true)"
+    if [ "$owner" = lorkhan ]; then
+        printf 'lorkhanserver-worker\n'
+    else
+        printf 'unmanaged\n'
+    fi
+}
+
+# Processes that still map PHP code replaced on disk keep running the old version. A process
+# whose memory map cannot be read (other than one that just exited) leaves the scan incomplete.
+scan_stale_processes() {
+    local dir pid result attempt service_name
+    STALE_MANAGED=()
+    STALE_OTHER=()
+    UNSCANNED=()
+    PROCESS_SCAN=complete
+    load_chim4_supervisors
+    APACHE_MAIN_PID="$(main_pid "$APACHE_PID_FILE")"
+    FPM_MAIN_PID="$(main_pid "$FPM_PID_FILE")"
+    for dir in /proc/[0-9]*; do
+        pid="${dir#/proc/}"
+        [ "$pid" != "$$" ] || continue
+        for attempt in 1 2; do
+            grep -Eq "$STALE_PATTERN" "$dir/maps" 2>/dev/null
+            result=$?
+            [ "$result" -gt 1 ] || break
+            ! proc_gone "$pid" || break
+        done
+        if [ "$result" -eq 0 ]; then
+            service_name="$(service_for_pid "$pid")"
+            case "$service_name" in
+                gone) ;;
+                unmanaged) STALE_OTHER+=("$pid") ;;
+                *) STALE_MANAGED+=("$pid:$service_name") ;;
+            esac
+        elif [ "$result" -gt 1 ] && ! proc_gone "$pid"; then
+            UNSCANNED+=("$pid")
+            PROCESS_SCAN=partial
+        fi
+    done
+}
+
+service_running() {
+    [ -x "/etc/init.d/$1" ] || return 1
+    service "$1" status < /dev/null >/dev/null 2>&1 9>&-
+}
+
+chim4_running() {
+    chim4_trusted && "$CHIM4_INIT" status "$1" < /dev/null >/dev/null 2>&1 9>&-
+}
+
+stale_service() {
+    local entry
+    for entry in "${STALE_MANAGED[@]}"; do
+        [ "${entry#*:}" != "$1" ] || return 0
+    done
+    return 1
+}
+
+restart_services() {
+    local service_name
+    for service_name in "$@"; do
+        info "Restarting $service_name so it uses the fixed PHP runtime."
+        service "$service_name" restart < /dev/null >/dev/null 2>&1 9>&- || fail "$service_name could not be restarted after the PHP security update."
+        # Init scripts may background the daemon; confirm it survived startup.
+        sleep 1
+        service_running "$service_name" || fail "$service_name is not running after the PHP security update restart."
+    done
+}
+
+restart_chim4_components() {
+    local component attempt
+    for component in "$@"; do
+        info "Restarting CHIM4 $component so it uses the fixed PHP runtime."
+        chim4_trusted && "$CHIM4_INIT" restart "$component" < /dev/null >&2 9>&- \
+            || fail "CHIM4 $component could not be restarted after the PHP security update."
+        for attempt in $(seq 15); do
+            chim4_running "$component" && break
+            sleep 1
+        done
+        chim4_running "$component" || fail "CHIM4 $component is not running after the PHP security update restart."
+    done
+}
+
+# Restart only services and CHIM4 components that are running and still use replaced PHP code.
+# A component in backoff or not verifiably running is left alone and stays reported as stale.
+restart_stale_services() {
+    local service_name entry component
+    local -a services=() components=()
+    for service_name in "${MANAGED_SERVICES[@]}"; do
+        if stale_service "$service_name" && service_running "$service_name"; then
+            services+=("$service_name")
+        fi
+    done
+    for entry in "${STALE_MANAGED[@]}"; do
+        component="${entry#*:}"
+        [ "${component#chim4:}" != "$component" ] || continue
+        component="${component#chim4:}"
+        [[ " ${components[*]} " != *" $component "* ]] || continue
+        if chim4_running "$component"; then
+            components+=("$component")
+        fi
+    done
+    [ "${#services[@]}" -eq 0 ] || restart_services "${services[@]}"
+    [ "${#components[@]}" -eq 0 ] || restart_chim4_components "${components[@]}"
+}
+
+# Identifies processes by PID and process name only; command lines may contain secrets.
+process_name() {
+    local name=""
+    read -r name 2>/dev/null < "/proc/$1/comm" || true
+    name="${name//[^[:alnum:]._:\/@+-]/?}"
+    printf '%s\n' "${name:-exited}"
+}
+
+report_stale() {
+    local entry pid
+    for entry in "${STALE_MANAGED[@]}"; do
+        pid="${entry%%:*}"
+        printf '[WARN] Process %s (%s, %s) still uses the previous PHP code.\n' \
+            "$pid" "$(process_name "$pid")" "${entry#*:}" >&2
+    done
+    for pid in "${STALE_OTHER[@]}"; do
+        printf '[WARN] Process %s (%s) still uses the previous PHP code and is not managed here.\n' \
+            "$pid" "$(process_name "$pid")" >&2
+    done
+    for pid in "${UNSCANNED[@]}"; do
+        printf '[WARN] Process %s (%s) could not be inspected.\n' "$pid" "$(process_name "$pid")" >&2
+    done
+}
+
+# The fix is certified only when no process runs the old PHP code and every process was inspected.
+finish() {
+    report_stale
+    if [ "${#STALE_MANAGED[@]}" -gt 0 ] || [ "${#STALE_OTHER[@]}" -gt 0 ]; then
+        emit_json restart-required
+        printf '[FAIL] PHP packages are fixed, but running processes still use the previous PHP code. Restart DwemerDistro to finish the PHP security update.\n' >&2
+        exit 4
+    fi
+    if [ "$PROCESS_SCAN" != complete ]; then
+        emit_json incomplete
+        printf '[FAIL] PHP packages are fixed, but not every process could be inspected, so the running PHP code is not verified.\n' >&2
+        exit 5
+    fi
+    emit_json fixed
+    ok "PHP $CLI_VERSION includes the security fix."
+    exit 0
+}
+
+config_manifest() {
+    (
+        cd "$1" || exit 1
+        find . -printf '%y %m %u:%g %p -> %l\n' | LC_ALL=C sort
+        find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+    )
+}
+
+# Put back changed or removed entries, then remove entries that the upgrade added.
+restore_config() {
+    local root="$1" backup="$2" relative
+    cp -a "$backup/." "$root/" || return 1
+    while IFS= read -r relative; do
+        if [ -d "$root/$relative" ] && [ ! -L "$root/$relative" ]; then
+            rmdir -- "$root/$relative" || return 1
+        else
+            rm -f -- "$root/$relative" || return 1
+        fi
+    done < <(LC_ALL=C comm -13 <(cd "$backup" && find . | LC_ALL=C sort) <(cd "$root" && find . | LC_ALL=C sort) | LC_ALL=C sort -r)
+}
+
+dpkg_snapshot() {
+    dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\t${Version}\n' | LC_ALL=C sort
+}
+
+php_module_lists() {
+    "$PHP_BINARY" -m 2>&1
+    if [ -f "$PHP_CONFIG_ROOT/apache2/php.ini" ]; then
+        printf -- '--- apache2\n'
+        PHP_INI_SCAN_DIR="$PHP_CONFIG_ROOT/apache2/conf.d" "$PHP_BINARY" -c "$PHP_CONFIG_ROOT/apache2/php.ini" -m 2>&1
+    fi
+}
+
+# One-line sources: keep only "deb"/"deb-src" lines whose suite is the security suite, with
+# their [options] (signed-by, arch, ...) unchanged.
+select_one_line_sources() {
+    awk -v suite="$SECURITY_SUITE" '
+        {
+            line = $0
+            sub(/#.*/, "", line)
+            sub(/^[ \t]+/, "", line)
+            if (line !~ /^deb(-src)?[ \t]/) next
+            rest = line
+            sub(/^deb(-src)?[ \t]+/, "", rest)
+            if (substr(rest, 1, 1) == "[") {
+                end = index(rest, "]")
+                if (end == 0) next
+                rest = substr(rest, end + 1)
+                sub(/^[ \t]+/, "", rest)
+            }
+            split(rest, field, /[ \t]+/)
+            if (field[2] == suite) print line
+        }' "$1"
+}
+
+# deb822 sources: keep only enabled stanzas that list the security suite, with every other
+# field (Signed-By, Components, ...) unchanged and Suites narrowed to the security suite.
+select_deb822_sources() {
+    awk -v suite="$SECURITY_SUITE" '
+        function check(value,    count, i, item) {
+            count = split(value, item, /[ \t]+/)
+            for (i = 1; i <= count; i++) if (item[i] == suite) selected = 1
+        }
+        function flush(    i) {
+            if (n && selected && enabled) {
+                for (i = 1; i <= n; i++) print stanza[i]
+                print ""
+            }
+            n = 0; selected = 0; enabled = 1; in_suites = 0
+        }
+        BEGIN { enabled = 1 }
+        /^[ \t]*$/ { flush(); next }
+        /^#/ { next }
+        /^[ \t]/ {
+            if (in_suites) { check($0); next }
+            stanza[++n] = $0
+            next
+        }
+        {
+            in_suites = 0
+            value = $0
+            sub(/^[^:]*:/, "", value)
+            if (tolower($0) ~ /^suites:/) {
+                in_suites = 1
+                check(value)
+                stanza[++n] = "Suites: " suite
+                next
+            }
+            if (tolower($0) ~ /^enabled:/) {
+                gsub(/[ \t]/, "", value)
+                if (tolower(value) == "no") enabled = 0
+            }
+            stanza[++n] = $0
+        }
+        END { flush() }' "$1"
+}
+
+# Refresh only the configured bookworm-security entries; other suites and repositories are
+# neither contacted nor allowed to fail this update. Their lists and the existing package
+# caches are kept as they are.
+refresh_security_lists() {
+    local parts="$WORK_DIR/sources" file count=0 selection
+    mkdir -p "$parts" || fail "Could not prepare the APT source selection."
+    for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        [ -f "$file" ] || continue
+        count=$((count + 1))
+        case "$file" in
+            *.sources)
+                selection="$parts/$count-security.sources"
+                select_deb822_sources "$file" > "$selection"
+                ;;
+            *)
+                selection="$parts/$count-security.list"
+                select_one_line_sources "$file" > "$selection"
+                ;;
+        esac || fail "Could not read APT source $file."
+        [ -s "$selection" ] || rm -f -- "$selection"
+    done
+    [ -n "$(find "$parts" -type f -print -quit)" ] \
+        || fail "No $SECURITY_SUITE APT source is configured; the PHP security update cannot be installed."
+
+    info "Refreshing the Debian security package lists."
+    apt-get update --error-on=any -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 \
+        -o Dir::Etc::SourceList=/dev/null -o Dir::Etc::SourceParts="$parts" \
+        -o APT::Get::List-Cleanup=false -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= \
+        < /dev/null >&2 9>&- \
+        || fail "Could not refresh the $SECURITY_SUITE package lists. Check the network and retry."
+}
+
+security_versions() {
+    apt-cache madison "$1" 2>/dev/null \
+        | awk -F'|' -v suite=" $SECURITY_SUITE/" 'index($3, suite) { gsub(/[[:space:]]/, "", $2); print $2 }'
+}
+
+select_target_version() {
+    local candidate target="" name
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        if [ -z "$target" ] || version_ge "$candidate" "$target"; then
+            target="$candidate"
+        fi
+    done < <(security_versions php8.2-common)
+    [ -n "$target" ] && version_ge "$target" "$FIXED_VERSION" && [[ "$target" == 8.2.* ]] \
+        || fail "The fixed PHP version $FIXED_VERSION is not available from $SECURITY_SUITE."
+    for name in "${OFFICIAL[@]}"; do
+        security_versions "$name" | grep -Fxq "$target" \
+            || fail "$name $target is not available from $SECURITY_SUITE; no packages were changed."
+    done
+    printf '%s\n' "$target"
+}
+
+# Accept only upgrades of installed official PHP 8.2 packages to the selected version.
+validate_plan() {
+    local target="$1" plan="$2" line name count=0
+    while IFS= read -r line; do
+        case "$line" in
+            Inst\ *)
+                if [[ "$line" =~ $PLAN_UPGRADE_PATTERN ]]; then
+                    name="${BASH_REMATCH[1]%%:*}"
+                    if [ -n "${OFFICIAL_VERSION[$name]+set}" ] && [ "${BASH_REMATCH[2]}" = "$target" ]; then
+                        count=$((count + 1))
+                        continue
+                    fi
+                fi
+                fail "APT planned an unrelated or new package change; nothing was installed: $line"
+                ;;
+            Remv\ *|Purg\ *)
+                fail "APT planned a package removal; nothing was installed: $line"
+                ;;
+        esac
+    done <<< "$plan"
+    [ "$count" -gt 0 ] || fail "APT did not plan the PHP security upgrade; nothing was installed."
+}
+
+verify_package_changes() {
+    local target="$1" before="$2" after="$3" name status version
+    declare -A old=() new=()
+    while IFS=$'\t' read -r status name version; do old[$name]="${status// /} $version"; done < "$before"
+    while IFS=$'\t' read -r status name version; do new[$name]="${status// /} $version"; done < "$after"
+    for name in "${!old[@]}" "${!new[@]}"; do
+        [ "${old[$name]-}" != "${new[$name]-}" ] || continue
+        if [ -n "${OFFICIAL_VERSION[${name%%:*}]+set}" ] && [ "${new[$name]-}" = "ii $target" ]; then
+            continue
+        fi
+        fail "Unexpected package change for $name: '${old[$name]-absent}' -> '${new[$name]-absent}'."
+    done
+}
+
+# Maintainer scripts must neither start a stopped service nor restart a running one during
+# this update. An existing policy is set aside by rename and put back afterwards, including
+# after a failure; if it cannot be preserved, nothing is installed.
+install_service_policy() {
+    local temporary
+    [ ! -e "$POLICY_BACKUP" ] && [ ! -L "$POLICY_BACKUP" ] \
+        || fail "$POLICY_BACKUP is left from an interrupted update. Move it back to $POLICY_RC (or remove it), then retry; nothing was installed."
+    if [ -e "$POLICY_RC" ] && [ ! -L "$POLICY_RC" ] && [ ! -f "$POLICY_RC" ]; then
+        fail "$POLICY_RC is not a file or link and cannot be preserved; nothing was installed."
+    fi
+    temporary="$(mktemp "$POLICY_RC.XXXXXX")" || fail "Could not prepare the temporary service policy."
+    if ! printf '#!/bin/sh\n%s\nexit 101\n' "$POLICY_MARKER" > "$temporary" || ! chmod 755 "$temporary"; then
+        rm -f -- "$temporary"
+        fail "Could not prepare the temporary service policy."
+    fi
+    if [ -e "$POLICY_RC" ] || [ -L "$POLICY_RC" ]; then
+        if ! mv -n -T -- "$POLICY_RC" "$POLICY_BACKUP" || [ -e "$POLICY_RC" ] || [ -L "$POLICY_RC" ]; then
+            rm -f -- "$temporary"
+            fail "Could not set aside the existing $POLICY_RC; nothing was installed."
+        fi
+        POLICY_STATE=replaced
+    else
+        POLICY_STATE=added
+    fi
+    if ! mv -n -T -- "$temporary" "$POLICY_RC" || ! grep -Fxq "$POLICY_MARKER" "$POLICY_RC"; then
+        rm -f -- "$temporary"
+        restore_service_policy
+        fail "Could not install the temporary service policy; nothing was installed."
+    fi
+}
+
+restore_service_policy() {
+    [ "$POLICY_STATE" != none ] || return 0
+    if [ -L "$POLICY_RC" ] || { [ -e "$POLICY_RC" ] && ! grep -Fxq "$POLICY_MARKER" "$POLICY_RC" 2>/dev/null; }; then
+        # Something else replaced the temporary policy; keep both rather than guess.
+        if [ "$POLICY_STATE" = replaced ]; then
+            printf '[FAIL] %s changed during the update; the original policy is kept in %s.\n' "$POLICY_RC" "$POLICY_BACKUP" >&2
+            POLICY_STATE=none
+            return 1
+        fi
+        POLICY_STATE=none
+        return 0
+    fi
+    if [ "$POLICY_STATE" = replaced ]; then
+        if ! mv -T -- "$POLICY_BACKUP" "$POLICY_RC"; then
+            printf '[FAIL] Could not restore %s; the original policy is kept in %s.\n' "$POLICY_RC" "$POLICY_BACKUP" >&2
+            POLICY_STATE=none
+            return 1
+        fi
+    else
+        rm -f -- "$POLICY_RC"
+    fi
+    POLICY_STATE=none
+}
+
+# Put back every configuration tree that differs from its snapshot. Returns non-zero, with the
+# snapshot location, for any tree that could not be restored.
+restore_configs() {
+    local index root status=0 changed=0
+    for index in "${!CONFIG_ROOTS[@]}"; do
+        root="${CONFIG_ROOTS[$index]}"
+        [ -f "$WORK_DIR/config-$index.manifest" ] || continue
+        cmp -s "$WORK_DIR/config-$index.manifest" <(config_manifest "$root") && continue
+        changed=1
+        info "Restoring the previous configuration in $root."
+        if ! restore_config "$root" "$WORK_DIR/config-$index" \
+            || ! cmp -s "$WORK_DIR/config-$index.manifest" <(config_manifest "$root"); then
+            printf '[FAIL] Could not restore %s; its original copy is in %s.\n' "$root" "$WORK_DIR/config-$index" >&2
+            status=1
+        fi
+    done
+    [ "$changed" -eq 0 ] || [ "$status" -ne 0 ] || ok "PHP and Apache configuration were kept unchanged."
+    return "$status"
+}
+
+report_package_state() {
+    local name state
+    for name in "${OFFICIAL[@]}"; do
+        state="$(dpkg-query -W -f='${db:Status-Abbrev} ${Version}' "$name" 2>/dev/null || printf 'unknown')"
+        printf '[INFO] %s: %s\n' "$name" "$state" >&2
+    done
+}
+
+apply_update() {
+    local target name plan index root
+    local -a specs=()
+
+    WORK_DIR="$(mktemp -d /var/tmp/ddistro-php-security.XXXXXX)" || fail "Could not create a work directory."
+    chmod 700 "$WORK_DIR"
+    refresh_security_lists
+    target="$(select_target_version)" || exit 1
+    for name in "${OFFICIAL[@]}"; do
+        specs+=("$name=$target")
+    done
+
+    plan="$(LC_ALL=C apt-get -s -o Debug::NoLocking=1 install --only-upgrade --no-install-recommends \
+        --no-remove "${specs[@]}" 2>&1 < /dev/null)" \
+        || fail "APT cannot apply the PHP security upgrade without other changes; nothing was installed. $(printf '%s' "$plan" | tail -n 3 | tr '\n' ' ')"
+    validate_plan "$target" "$plan"
+
+    dpkg_snapshot > "$WORK_DIR/packages.before" || fail "Could not record installed packages."
+    php_module_lists > "$WORK_DIR/modules.before"
+    for index in "${!CONFIG_ROOTS[@]}"; do
+        root="${CONFIG_ROOTS[$index]}"
+        [ -d "$root" ] || continue
+        cp -a "$root" "$WORK_DIR/config-$index" && config_manifest "$root" > "$WORK_DIR/config-$index.manifest" \
+            || fail "Could not back up $root."
+    done
+
+    install_service_policy
+    # From here on the configuration snapshots are kept until the update is verified.
+    KEEP_WORK_DIR=1
+    info "Installing PHP $target from $SECURITY_SUITE for: ${OFFICIAL[*]}"
+    if ! DEBIAN_FRONTEND=noninteractive UCF_FORCE_CONFFOLD=1 NEEDRESTART_SUSPEND=1 \
+        apt-get install -y --only-upgrade --no-install-recommends --no-remove \
+        -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=300 "${specs[@]}" < /dev/null >&2 9>&-; then
+        restore_service_policy
+        restore_configs
+        printf '[FAIL] The PHP security upgrade did not complete; PHP packages may be partly updated:\n' >&2
+        report_package_state
+        fail "Run 'sudo dpkg --configure -a', then run ensure_php_security again. Running services were not restarted."
+    fi
+    restore_service_policy || fail "Could not restore the previous $POLICY_RC."
+    restore_configs || fail "Could not keep the PHP and Apache configuration unchanged during the PHP security update."
+
+    dpkg_snapshot > "$WORK_DIR/packages.after" || fail "Could not record installed packages."
+    verify_package_changes "$target" "$WORK_DIR/packages.before" "$WORK_DIR/packages.after"
+    if ! cmp -s "$WORK_DIR/modules.before" <(php_module_lists); then
+        diff "$WORK_DIR/modules.before" <(php_module_lists) >&2 || true
+        fail "PHP extensions loaded differently after the security update."
+    fi
+    KEEP_WORK_DIR=0
+}
+
+emit_json() {
+    local status="$1" packages="" name stale_count
+    [ "$JSON_OUTPUT" -eq 1 ] || return 0
+    for name in "${OFFICIAL[@]}"; do
+        packages="${packages:+$packages,}{\"name\":\"$name\",\"version\":\"${OFFICIAL_VERSION[$name]}\"}"
+    done
+    stale_count=$(( ${#STALE_MANAGED[@]} + ${#STALE_OTHER[@]} ))
+    printf 'DDISTRO_PHP_SECURITY {"schema_version":1,"status":"%s","fixed_package_version":"%s","fixed_runtime_version":"%s","security_suite":"%s","php_cli_version":"%s","mod_php_package_version":"%s","mod_php_runtime_version":"%s","fpm_runtime_version":"%s","apache_php_module":"%s","packages":[%s],"stale_processes":%d,"unscanned_processes":%d,"process_scan":"%s","checked_at_utc":"%s"}\n' \
+        "$status" "$FIXED_VERSION" "$FIXED_RUNTIME" "$SECURITY_SUITE" "$CLI_VERSION" \
+        "$MOD_PACKAGE_VERSION" "$MOD_RUNTIME_VERSION" "$FPM_RUNTIME_VERSION" "$APACHE_PHP_MODULE" "$packages" \
+        "$stale_count" "${#UNSCANNED[@]}" "$PROCESS_SCAN" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+}
+
+inspect() {
+    inspect_packages
+    inspect_runtime
+    verify_apache_handler
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check) MODE=check ;;
+        --json) JSON_OUTPUT=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 64 ;;
+    esac
+    shift
+done
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+check_base
+
+if [ "$MODE" = check ]; then
+    inspect
+    scan_stale_processes
+    if ! packages_fixed || ! runtime_versions_fixed; then
+        emit_json update-required
+        info "PHP $CLI_VERSION needs the security update (fixed in $FIXED_VERSION): ${OUTDATED[*]:-mixed package versions}"
+        exit 3
+    fi
+    verify_package_files
+    finish
+fi
+
+[ "$(id -u)" -eq 0 ] || fail "This command must run as root. Use --check for read-only verification."
+mkdir -p "$(dirname "$LOCK_FILE")" && exec 9>"$LOCK_FILE" || fail "Could not open $LOCK_FILE."
+flock -w 900 9 || fail "Another PHP security update is still running."
+
+inspect
+if ! packages_fixed; then
+    apply_update
+    inspect
+    packages_fixed || fail "PHP packages are still not at the fixed version after the update."
+fi
+
+runtime_versions_fixed || fail "PHP runtime versions are not fixed (CLI ${CLI_VERSION:-unknown}, Apache module ${MOD_RUNTIME_VERSION:-none}, FPM ${FPM_RUNTIME_VERSION:-none})."
+verify_package_files
+scan_stale_processes
+restart_stale_services
+scan_stale_processes
+finish

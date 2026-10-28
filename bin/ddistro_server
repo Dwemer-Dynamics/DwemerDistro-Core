@@ -1,0 +1,1569 @@
+#!/usr/bin/env bash
+
+set -u
+
+WEB_ROOT="/var/www/html"
+STATE_ROOT="/var/lib/dwemerdistro/servers"
+LOCK_PATH="/run/lock/dwemerdistro-server-manager.d"
+MAINTENANCE_HELD=0
+APP_USER="dwemer"
+WEB_GROUP="www-data"
+DATABASE_ROLE="dwemer"
+POSTGRES_PORT="${DDISTRO_POSTGRES_PORT:-5432}"
+JSON_OUTPUT=0
+PRODUCT=""
+PRODUCT_ROOT=""
+PRODUCT_DATABASE=""
+PRODUCT_REPOSITORY=""
+PRODUCT_PRODUCTION_BRANCH=""
+PRODUCT_DEV_BRANCH="dev"
+PRODUCT_VHOST=""
+PRODUCT_PORT=""
+PRODUCT_BACKUP=""
+INSTALL_CLEANUP_ACTIVE=0
+INSTALL_DATABASE_CREATED=0
+INSTALL_ROOT_CREATED=0
+LOCK_HELD=0
+FORCE_UPDATE=0
+# Update-only exit codes for a checkout blocked by local files. Each is preceded by one stdout line:
+# DDISTRO_UPDATE_BLOCKED {"schema_version":1,"reason":...,"product":...,"branch":...,"total":N,"files":[...]}
+# The files list is capped; total counts every blocking path found.
+UPDATE_BLOCKED_TRACKED_EXIT=79
+UPDATE_BLOCKED_UNTRACKED_EXIT=80
+UPDATE_BLOCKED_FILE_LIMIT=20
+
+# Record provenance before changing origin, so an interrupted migration can be retried.
+mark_herika_migration_pending() {
+    local migration="$STATE_ROOT/herika-org-migration"
+    [ ! -L "$STATE_ROOT" ] && [ ! -L "$migration" ] || fail "Refusing redirected migration state."
+    if [ ! -d "$migration" ]; then
+        (umask 077; mkdir -p "$migration") || fail "Could not create migration state."
+    fi
+    if [ ! -f "$migration/pending" ] && [ ! -f "$migration/complete" ]; then
+        git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" rev-parse HEAD > "$migration/pending.tmp" \
+            && mv "$migration/pending.tmp" "$migration/pending" || fail "Could not record migration provenance."
+    fi
+}
+
+# Recognize older attempts that already changed origin but left the unrelated legacy checkout.
+detect_partial_herika_migration() {
+    local branch="$1"
+    local migration="$STATE_ROOT/herika-org-migration"
+    local ref
+    [ "$PRODUCT" = herika ] || return 0
+    case "$(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" remote get-url origin)" in
+        https://github.com/Dwemer-Dynamics/HerikaServer.git|https://github.com/Dwemer-Dynamics/HerikaServer|git@github.com:Dwemer-Dynamics/HerikaServer.git) ;;
+        *) return 0 ;;
+    esac
+    [ ! -e "$migration/pending" ] && [ ! -e "$migration/complete" ] || return 0
+    if git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" merge-base HEAD "origin/$branch" >/dev/null 2>&1; then
+        return 0
+    fi
+    # Channels may have independently imported histories. Refresh all canonical refs before
+    # deciding this is a legacy checkout; old remote-tracking refs are not trustworthy here.
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" fetch --no-tags --atomic origin \
+        '+refs/heads/aiagent:refs/remotes/origin/aiagent' \
+        '+refs/heads/dev:refs/remotes/origin/dev' \
+        '+refs/heads/unstable:refs/remotes/origin/unstable' \
+        || fail "Could not verify canonical HerikaServer history; no files were replaced."
+    for ref in aiagent dev unstable; do
+        if git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" merge-base HEAD "origin/$ref" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    # An unrelated history alone is not permission to replace it: prove legacy ancestry.
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" fetch --no-tags --atomic \
+        https://github.com/abeiro/HerikaServer.git \
+        '+refs/heads/aiagent:refs/dwemerdistro/legacy-herika/aiagent' \
+        '+refs/heads/dev:refs/dwemerdistro/legacy-herika/dev' \
+        '+refs/heads/unstable:refs/dwemerdistro/legacy-herika/unstable' \
+        || fail "Could not verify the old HerikaServer history; no files were replaced."
+    for ref in aiagent dev unstable; do
+        if git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" merge-base HEAD "refs/dwemerdistro/legacy-herika/$ref" >/dev/null 2>&1; then
+            mark_herika_migration_pending
+            return 0
+        fi
+    done
+    info "Unrecognized HerikaServer history; automatic migration recovery was skipped."
+}
+
+# Keep the original checkout and runtime files before the one-time source replacement.
+recover_herika_checkout() {
+    local branch="$1"
+    local migration="$STATE_ROOT/herika-org-migration"
+    local relative
+    [ ! -L "$migration" ] && [ -f "$migration/pending" ] || fail "Invalid migration state."
+    case "$(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" remote get-url origin)" in
+        https://github.com/Dwemer-Dynamics/HerikaServer.git|https://github.com/Dwemer-Dynamics/HerikaServer|git@github.com:Dwemer-Dynamics/HerikaServer.git) ;;
+        *) fail "Migration is pending, but origin is now custom. No source files were replaced." ;;
+    esac
+    if [ -f "$migration/backup-ready" ] && [ "$(cat "$migration/branch")" != "$branch" ]; then
+        fail "Finish the pending migration on $(cat "$migration/branch") before switching branches."
+    fi
+    if [ ! -f "$migration/backup-ready" ]; then
+        info "Backing up HerikaServer before repository migration. This can take a few minutes."
+        (umask 077; tar -C "$PRODUCT_ROOT" -cpf "$migration/checkout.tar.tmp" .) \
+            && mv "$migration/checkout.tar.tmp" "$migration/checkout.tar" \
+            || fail "Could not back up HerikaServer; no source files were replaced."
+        # Preserve untracked/ignored files unless the new release owns that source path.
+        git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" ls-files --others -z > "$migration/candidates" \
+            || fail "Could not enumerate HerikaServer runtime files."
+        git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" ls-files -z \
+            'conf/conf.php' 'conf/character_map.json' 'conf/conf_*.php' 'uploads/*' 'data/voices/*' 'soundcache/*' 'log/*' \
+            >> "$migration/candidates" || fail "Could not enumerate tracked runtime files."
+        : > "$migration/runtime-files"
+        while IFS= read -r -d '' relative; do
+            [ -e "$PRODUCT_ROOT/$relative" ] || [ -L "$PRODUCT_ROOT/$relative" ] || continue
+            case "$relative" in
+                conf/conf_loader.php|conf/conf_schema.php) continue ;;
+                conf/conf.php|conf/character_map.json|conf/conf_*.php|uploads/*|data/voices/*|soundcache/*|log/*)
+                    printf '%s\0' "$relative" >> "$migration/runtime-files" ;;
+                *)
+                    if ! git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" cat-file -e "origin/$branch:$relative" 2>/dev/null; then
+                        printf '%s\0' "$relative" >> "$migration/runtime-files"
+                    else
+                        info "A local file conflicts with the new release; its original is retained in the migration backup."
+                    fi ;;
+            esac
+        done < "$migration/candidates"
+        (umask 077; tar -C "$PRODUCT_ROOT" --null -T "$migration/runtime-files" -cpf "$migration/runtime.tar.tmp") \
+            && mv "$migration/runtime.tar.tmp" "$migration/runtime.tar" \
+            || fail "Could not preserve HerikaServer runtime files."
+        printf '%s\n' "$branch" > "$migration/branch" \
+            && touch "$migration/backup-ready" || fail "Could not finalize migration backup."
+    fi
+    info "Switching HerikaServer to Dwemer Dynamics. Original files remain in $migration/checkout.tar."
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" checkout --force -B "$branch" "origin/$branch" \
+        || fail "Migration checkout failed. The original checkout is retained in $migration/checkout.tar."
+    # Tar refuses traversal through symlink parents; do not weaken that protection.
+    tar -C "$PRODUCT_ROOT" -xpf "$migration/runtime.tar" \
+        || fail "Could not restore runtime files; retain $migration and retry migration."
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" rev-parse HEAD > "$migration/checkout-ready.tmp" \
+        && mv "$migration/checkout-ready.tmp" "$migration/checkout-ready" \
+        || fail "Could not record migration checkout completion."
+}
+
+# Only commit the migration after the caller has finished database setup and installation state.
+complete_herika_migration() {
+    local migration="$STATE_ROOT/herika-org-migration"
+    [ "$PRODUCT" = herika ] && [ -f "$migration/pending" ] && [ -f "$migration/checkout-ready" ] || return 0
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" rev-parse HEAD > "$migration/complete.tmp" \
+        && mv "$migration/complete.tmp" "$migration/complete" \
+        || fail "Could not record migration completion."
+    rm -f "$migration/pending"
+    ok "HerikaServer migration completed. Original checkout retained at $migration/checkout.tar."
+}
+
+usage() {
+    cat <<'EOF'
+Usage: ddistro_server <command> [product] [options]
+
+Manage optional DwemerDistro application servers.
+
+Commands:
+  status [all|herika|lorkhan|stobe|dialectic|reign] [--json]
+  migrate-remotes [all|herika|lorkhan|stobe|dialectic|reign]
+  install <herika|lorkhan|stobe|dialectic|reign> [--branch main|dev|lorkhan|reign|unstable]
+  update <herika|lorkhan|stobe|dialectic|reign> [--branch main|dev|lorkhan|reign|unstable] [--force]
+  repair <herika|lorkhan|stobe|dialectic|reign> [--branch main|dev|lorkhan|reign|unstable]
+  uninstall <herika|lorkhan|stobe|dialectic|reign> --confirm PURGE-<PRODUCT>
+  startup [herika|lorkhan|stobe|dialectic|reign]
+
+Reign production is reign; it also exposes dev and unstable. Other products keep main/dev choices.
+Reign uninstall retains its database and data; repair reinstalls it.
+
+Install is allowed only when both the canonical server root and application
+database are absent. Repair handles legacy and partial installations. Update
+never installs a missing product. --force discards local edits to tracked
+server files before an update. Git may also replace untracked or ignored files
+that conflict with the update, so back up custom files first.
+
+Update exit codes: 79 means edits to tracked files block the update (retry with
+--force to discard them); 80 means untracked files are in the way and must be moved.
+EOF
+}
+
+fail() {
+    printf '[FAIL] %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+info() {
+    printf '[INFO] %s\n' "$1" >&2
+}
+
+ok() {
+    printf '[OK] %s\n' "$1" >&2
+}
+
+require_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        return 0
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        if sudo -n true >/dev/null 2>&1; then
+            exec sudo "$0" "$@"
+        fi
+
+        if [ -t 0 ]; then
+            exec sudo "$0" "$@"
+        fi
+    fi
+
+    fail "This command must run as root."
+}
+
+select_product() {
+    PRODUCT="$1"
+    PRODUCT_DEV_BRANCH="dev"
+
+    case "$PRODUCT" in
+        herika)
+            PRODUCT_ROOT="$WEB_ROOT/HerikaServer"
+            PRODUCT_DATABASE="dwemer"
+            PRODUCT_REPOSITORY="https://github.com/Dwemer-Dynamics/HerikaServer.git"
+            PRODUCT_PRODUCTION_BRANCH="aiagent"
+            PRODUCT_VHOST=""
+            PRODUCT_PORT="8081"
+            ;;
+        lorkhan)
+            # Keep source separate: Lorkhan's allowlisted runtime deploy must not delete its checkout.
+            PRODUCT_ROOT="/opt/dwemerdistro/sources/LorkhanServer"
+            PRODUCT_DATABASE="lorkhan"
+            PRODUCT_REPOSITORY="https://github.com/Dwemer-Dynamics/LorkhanServer.git"
+            PRODUCT_PRODUCTION_BRANCH="lorkhan"
+            PRODUCT_VHOST="lorkhanserver.conf"
+            PRODUCT_PORT="8090"
+            ;;
+        reign)
+            PRODUCT_ROOT="$WEB_ROOT/ReignServer"
+            PRODUCT_DATABASE="reign"
+            PRODUCT_REPOSITORY="https://github.com/Dwemer-Dynamics/ReignServer.git"
+            PRODUCT_PRODUCTION_BRANCH="reign"
+            PRODUCT_VHOST="reign.conf"
+            PRODUCT_PORT="8089"
+            ;;
+        stobe)
+            PRODUCT_ROOT="$WEB_ROOT/StobeServer"
+            PRODUCT_DATABASE="stobe"
+            PRODUCT_REPOSITORY="https://github.com/Dwemer-Dynamics/StobeServer.git"
+            PRODUCT_PRODUCTION_BRANCH="stobe"
+            PRODUCT_VHOST="stobe.conf"
+            PRODUCT_PORT="8083"
+            ;;
+        dialectic)
+            PRODUCT_ROOT="$WEB_ROOT/DialecticServer"
+            PRODUCT_DATABASE="dialectic"
+            PRODUCT_REPOSITORY="https://github.com/Dwemer-Dynamics/DialecticServer.git"
+            PRODUCT_PRODUCTION_BRANCH="dialectic"
+            PRODUCT_VHOST="dialectic.conf"
+            PRODUCT_PORT="8088"
+            ;;
+        *)
+            fail "Unknown product '$PRODUCT'. Expected herika, lorkhan, stobe, dialectic, or reign." 64
+            ;;
+    esac
+}
+
+# Retarget only recognized legacy HerikaServer origins after proving the new
+# canonical repository and all supported branches are reachable.
+migrate_product_repository_origin() {
+    local origin_url
+    local remote_refs
+    local required_branch
+    local state_path="$STATE_ROOT/herika.state"
+
+    [ "$PRODUCT" = "herika" ] || return 0
+    [ -d "$PRODUCT_ROOT/.git" ] || return 0
+
+    origin_url="$(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" remote get-url origin 2>/dev/null || true)"
+    if [ -z "$origin_url" ]; then
+        info "HerikaServer has no origin remote; repository migration was skipped."
+        return 0
+    fi
+
+    case "$origin_url" in
+        https://github.com/Dwemer-Dynamics/HerikaServer.git|\
+        https://github.com/Dwemer-Dynamics/HerikaServer|\
+        git@github.com:Dwemer-Dynamics/HerikaServer.git)
+            ;;
+        https://github.com/abeiro/HerikaServer.git|\
+        https://github.com/abeiro/HerikaServer|\
+        git@github.com:abeiro/HerikaServer.git)
+            remote_refs="$(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" \
+                ls-remote --heads "$PRODUCT_REPOSITORY" \
+                refs/heads/aiagent refs/heads/dev refs/heads/unstable 2>/dev/null)" \
+                || fail "Could not verify the canonical HerikaServer repository; the legacy origin was retained."
+            for required_branch in aiagent dev unstable; do
+                printf '%s\n' "$remote_refs" | grep -Eq "[[:space:]]refs/heads/$required_branch$" \
+                    || fail "Canonical HerikaServer branch $required_branch is unavailable; the legacy origin was retained."
+            done
+
+            mark_herika_migration_pending
+            git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" remote set-url origin "$PRODUCT_REPOSITORY" \
+                || fail "Could not set the canonical HerikaServer origin; the legacy origin was retained."
+            if ! git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" fetch --no-tags --atomic origin \
+                "+refs/heads/aiagent:refs/remotes/origin/aiagent" \
+                "+refs/heads/dev:refs/remotes/origin/dev" \
+                "+refs/heads/unstable:refs/remotes/origin/unstable"; then
+                git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" remote set-url origin "$origin_url" \
+                    || fail "HerikaServer migration failed and the legacy origin could not be restored."
+                fail "Could not fetch the canonical HerikaServer branches; the legacy origin was restored."
+            fi
+            ok "HerikaServer repository migrated to Dwemer Dynamics."
+            ;;
+        *)
+            info "Custom HerikaServer origin detected; leaving it unchanged."
+            return 0
+            ;;
+    esac
+
+    if [ -f "$state_path" ]; then
+        sed -i \
+            -e "s|^repository=https://github.com/abeiro/HerikaServer.git$|repository=$PRODUCT_REPOSITORY|" \
+            -e "s|^repository=https://github.com/abeiro/HerikaServer$|repository=$PRODUCT_REPOSITORY|" \
+            -e "s|^repository=git@github.com:abeiro/HerikaServer.git$|repository=$PRODUCT_REPOSITORY|" \
+            "$state_path"
+    fi
+}
+
+resolve_branch() {
+    case "$1" in
+        main|"") printf '%s\n' "$PRODUCT_PRODUCTION_BRANCH" ;;
+        unstable) [[ "$PRODUCT" = reign || "$PRODUCT" = lorkhan ]] || fail "Unstable is only exposed for Reign and LORKHAN." 64; printf '%s\n' unstable ;;
+        dev) printf '%s\n' "$PRODUCT_DEV_BRANCH" ;;
+        "$PRODUCT_PRODUCTION_BRANCH"|"$PRODUCT_DEV_BRANCH") printf '%s\n' "$1" ;;
+        *) fail "Invalid branch '$1' for $PRODUCT. Expected main or dev." 64 ;;
+    esac
+}
+
+MAINTENANCE_LOCK="/run/lock/dwemerdistro-maintenance.lock"
+
+# Hold the common maintenance lock shared on fd 7. ddistro changes apply/rollback take it
+# exclusively, so they never interleave with maintenance; shared holders (including nested
+# helpers) still serialize through their own locks. Root creates the fixed root-owned file
+# once; it is never replaced. Release with flock -u, which also covers services that
+# inherited fd 7.
+acquire_maintenance_lock() {
+    local info=""
+    if [ "$(id -u)" -eq 0 ] && [ ! -e "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ]; then
+        (umask 022; set -C; : > "$MAINTENANCE_LOCK") 2>/dev/null || true
+    fi
+    if [ -f "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ] && exec 7<"$MAINTENANCE_LOCK"; then
+        info="$(stat -L -c '%u %h %a' /proc/self/fd/7 2>/dev/null)"
+    fi
+    case "$info" in
+        "0 1 644") ;;
+        "0 1 "*) [ "$(id -u)" -eq 0 ] && chmod 0644 /proc/self/fd/7 || info="" ;;
+        *) info="" ;;
+    esac
+    if [ -z "$info" ]; then
+        exec 7<&-
+        fail "$MAINTENANCE_LOCK is missing or not a root-owned plain file; it was not replaced."
+    fi
+    if ! flock -s -w 30 7; then
+        exec 7<&-
+        fail "Another DwemerDistro maintenance or ddistro changes operation is running." 75
+    fi
+}
+
+acquire_operation_lock() {
+    local owner_pid=""
+
+    acquire_maintenance_lock
+    MAINTENANCE_HELD=1
+    mkdir -p "$(dirname "$LOCK_PATH")"
+    if ! mkdir "$LOCK_PATH" 2>/dev/null; then
+        if [ -f "$LOCK_PATH/pid" ]; then
+            owner_pid="$(sed -n '1p' "$LOCK_PATH/pid" 2>/dev/null || true)"
+        fi
+        case "$owner_pid" in
+            ''|*[!0-9]*) ;;
+            *)
+                if kill -0 "$owner_pid" >/dev/null 2>&1; then
+                    fail "Another server install, update, repair, or uninstall operation is running." 75
+                fi
+                ;;
+        esac
+
+        rm -f "$LOCK_PATH/pid" 2>/dev/null || true
+        rmdir "$LOCK_PATH" 2>/dev/null || true
+        if ! mkdir "$LOCK_PATH" 2>/dev/null; then
+            fail "Another server install, update, repair, or uninstall operation is running." 75
+        fi
+    fi
+
+    printf '%s\n' "$$" > "$LOCK_PATH/pid"
+    LOCK_HELD=1
+    trap on_exit EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+postgres_ready() {
+    pg_isready -p "$POSTGRES_PORT" -d template1 -q >/dev/null 2>&1
+}
+
+start_postgres() {
+    local attempt
+
+    if postgres_ready; then
+        return 0
+    fi
+
+    if [ -x /etc/init.d/postgresql ]; then
+        /etc/init.d/postgresql start >/dev/null 2>&1 7<&- || true
+    elif command -v service >/dev/null 2>&1; then
+        service postgresql start >/dev/null 2>&1 7<&- || true
+    fi
+
+    for attempt in $(seq 1 20); do
+        if postgres_ready; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    fail "PostgreSQL did not become ready."
+}
+
+database_exists() {
+    local database="$1"
+    if [ "$(id -u)" -eq 0 ]; then
+        sudo -u postgres psql -p "$POSTGRES_PORT" -d template1 -X -tAc \
+            "SELECT 1 FROM pg_database WHERE datname = '$database' LIMIT 1" 2>/dev/null \
+            | tr -d '[:space:]'
+    else
+        PGPASSWORD=dwemer psql -h localhost -p "$POSTGRES_PORT" -U "$DATABASE_ROLE" \
+            -d template1 -X -tAc \
+            "SELECT 1 FROM pg_database WHERE datname = '$database' LIMIT 1" 2>/dev/null \
+            | tr -d '[:space:]'
+    fi
+}
+
+database_state() {
+    if ! postgres_ready; then
+        printf 'unknown\n'
+        return 0
+    fi
+
+    if [ "$(database_exists "$PRODUCT_DATABASE")" = "1" ]; then
+        printf 'present\n'
+    else
+        printf 'absent\n'
+    fi
+}
+
+repository_state() {
+    if [ "$PRODUCT" = lorkhan ] && [ ! -e "$PRODUCT_ROOT" ] && [ -e "$WEB_ROOT/LorkhanServer" ]; then
+        printf 'legacy\n'
+        return
+    fi
+    if [ -d "$PRODUCT_ROOT/.git" ]; then
+        printf 'managed\n'
+    elif [ -e "$PRODUCT_ROOT" ]; then
+        printf 'legacy\n'
+    else
+        printf 'absent\n'
+    fi
+}
+
+install_state() {
+    local repo_state
+    local db_state
+
+    repo_state="$(repository_state)"
+    db_state="$(database_state)"
+
+    if [ "$PRODUCT" = lorkhan ] && [ "$repo_state" = managed ] && { [ ! -f "$WEB_ROOT/LorkhanServer/index.php" ] || [ ! -e /etc/apache2/sites-enabled/lorkhanserver.conf ]; }; then
+        printf 'needs-repair\n'
+    elif [ "$PRODUCT" = reign ] && [ "$repo_state" = managed ] && [ ! -x /var/www/html/ReignServer/runtime/current/ReignServer ] && [ ! -x /var/www/html/ReignServer/runtime/current/ReignBetaServer ]; then
+        printf 'needs-repair\n'
+    elif [ "$repo_state" = "managed" ] && [ "$db_state" != "absent" ]; then
+        printf 'installed\n'
+    elif [ "$repo_state" = "absent" ] && [ "$db_state" != "present" ]; then
+        printf 'not-installed\n'
+    else
+        printf 'needs-repair\n'
+    fi
+}
+
+current_branch() {
+    if [ ! -d "$PRODUCT_ROOT/.git" ]; then
+        return 0
+    fi
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" branch --show-current 2>/dev/null || true
+}
+
+current_version() {
+    if [ "$PRODUCT" = reign ] && [ -f /var/www/html/ReignServer/runtime/current/reign-linux-artifact.json ]; then
+        python3 -c 'import json; print(json.load(open("/var/www/html/ReignServer/runtime/current/reign-linux-artifact.json"))["version"])'
+        return
+    fi
+    local candidate
+    for candidate in .version_number.txt versionnumber.txt .version.txt version.txt; do
+        if [ -s "$PRODUCT_ROOT/$candidate" ]; then
+            sed -n '1p' "$PRODUCT_ROOT/$candidate" | tr -d '\r'
+            return 0
+        fi
+    done
+}
+
+json_escape() {
+    sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+}
+
+status_json() {
+    local state
+    local repo_state
+    local db_state
+    local branch
+    local version
+    local db_json
+
+    state="$(install_state)"
+    repo_state="$(repository_state)"
+    db_state="$(database_state)"
+    branch="$(current_branch | json_escape)"
+    version="$(current_version | json_escape)"
+
+    case "$db_state" in
+        present) db_json=true ;;
+        absent) db_json=false ;;
+        *) db_json=null ;;
+    esac
+
+    printf '{"schema_version":1,"product":"%s","state":"%s","repository_state":"%s","database_present":%s,"root":"%s","database":"%s","branch":"%s","version":"%s","production_branch":"%s","development_branch":"%s","port":%s}' \
+        "$PRODUCT" "$state" "$repo_state" "$db_json" "$PRODUCT_ROOT" "$PRODUCT_DATABASE" \
+        "$branch" "$version" "$PRODUCT_PRODUCTION_BRANCH" "$PRODUCT_DEV_BRANCH" "$PRODUCT_PORT"
+}
+
+status_human() {
+    printf '%-10s %-15s branch=%-10s version=%s database=%s\n' \
+        "$PRODUCT" "$(install_state)" "$(current_branch)" "$(current_version)" "$(database_state)"
+}
+
+show_status() {
+    local requested="$1"
+    local first=1
+    local key
+
+    if [ "$requested" != "all" ]; then
+        select_product "$requested"
+        if [ "$JSON_OUTPUT" -eq 1 ]; then
+            status_json
+            printf '\n'
+        else
+            status_human
+        fi
+        return 0
+    fi
+
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        printf '{"schema_version":1,"servers":['
+    fi
+
+    for key in herika lorkhan stobe dialectic reign; do
+        select_product "$key"
+        if [ "$JSON_OUTPUT" -eq 1 ]; then
+            if [ "$first" -eq 0 ]; then
+                printf ','
+            fi
+            status_json
+            first=0
+        else
+            status_human
+        fi
+    done
+
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        printf ']}\n'
+    fi
+}
+
+ensure_pgvector() {
+    local helper="/usr/local/bin/ensure_portable_pgvector"
+    if [ ! -x "$helper" ]; then
+        helper="/home/dwemer/dwemerdistro/bin/ensure_portable_pgvector"
+    fi
+    [ -x "$helper" ] || fail "Portable pgvector helper is unavailable."
+    "$helper" >/dev/null || fail "Portable pgvector setup failed."
+}
+
+# Install, repair and update deploy and migrate PHP code, so they require the fixed shared
+# PHP runtime first. The helper does no APT or network work when PHP is already fixed.
+require_php_security() {
+    local helper="/usr/local/bin/ensure_php_security"
+    if [ ! -x "$helper" ]; then
+        helper="/home/dwemer/dwemerdistro/bin/ensure_php_security"
+    fi
+    [ -x "$helper" ] || fail "PHP security helper is unavailable. Update DwemerDistro first."
+    "$helper" || fail "The PHP security update is incomplete; $PRODUCT was not changed."
+}
+
+ensure_database_role() {
+    local role_exists
+
+    role_exists="$(sudo -u postgres psql -p "$POSTGRES_PORT" -d template1 -X -tAc \
+        "SELECT 1 FROM pg_roles WHERE rolname = '$DATABASE_ROLE' LIMIT 1" 2>/dev/null | tr -d '[:space:]')"
+    if [ "$role_exists" = "1" ]; then
+        return 0
+    fi
+
+    info "Creating the shared DwemerDistro PostgreSQL role."
+    sudo -u postgres psql -p "$POSTGRES_PORT" -d template1 -v ON_ERROR_STOP=1 \
+        -c "CREATE ROLE $DATABASE_ROLE LOGIN PASSWORD 'dwemer';" >/dev/null \
+        || fail "Could not create the shared PostgreSQL role."
+}
+
+create_database_if_missing() {
+    if [ "$(database_exists "$PRODUCT_DATABASE")" = "1" ]; then
+        return 0
+    fi
+
+    info "Creating database $PRODUCT_DATABASE."
+    sudo -u postgres createdb -p "$POSTGRES_PORT" --maintenance-db=template1 --owner="$DATABASE_ROLE" \
+        --encoding=UTF8 --locale=C --template=template0 "$PRODUCT_DATABASE" \
+        || fail "Could not create database $PRODUCT_DATABASE."
+    if [ "$INSTALL_CLEANUP_ACTIVE" -eq 1 ]; then
+        INSTALL_DATABASE_CREATED=1
+    fi
+}
+
+run_psql_file() {
+    local file="$1"
+    [ -f "$file" ] || fail "Required database file is missing: $file"
+    PGPASSWORD=dwemer psql -h localhost -p "$POSTGRES_PORT" -U "$DATABASE_ROLE" -d "$PRODUCT_DATABASE" \
+        -v ON_ERROR_STOP=1 -f "$file"
+}
+
+table_exists() {
+    local table="$1"
+    PGPASSWORD=dwemer psql -h localhost -p "$POSTGRES_PORT" -U "$DATABASE_ROLE" -d "$PRODUCT_DATABASE" \
+        -X -tAc "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='$table' LIMIT 1" \
+        2>/dev/null | tr -d '[:space:]'
+}
+
+# Run a server's PHP migration entry point and reject errors that it reports
+# without reflecting in its process exit code.
+run_php_updates() {
+    local label="$1"
+    local update_runner="$2"
+    local update_log
+    local update_status
+    local unexpected_errors
+    local herika_payload_ready
+
+    update_log="$(mktemp)" || fail "Could not create a temporary migration log."
+    php "$update_runner" 2>&1 | tee "$update_log"
+    update_status=${PIPESTATUS[0]}
+
+    if [ "$update_status" -ne 0 ]; then
+        rm -f "$update_log"
+        fail "$label database updates failed."
+    fi
+
+    unexpected_errors="$(grep -Ei '\[error\]|Failed to apply patch' "$update_log" 2>/dev/null || true)"
+    if [ -n "$unexpected_errors" ] && [ "$PRODUCT" = "herika" ] \
+        && grep -Fq 'Failed to apply patch eventlog_session_payload 20260807001' "$update_log"; then
+        herika_payload_ready="$(PGPASSWORD=dwemer psql -h localhost -p "$POSTGRES_PORT" \
+            -U "$DATABASE_ROLE" -d "$PRODUCT_DATABASE" -X -tAc \
+            "SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='eventlog'
+                  AND column_name='sess' AND data_type='text'
+            ) AND to_regclass('public.eventlog_view') IS NOT NULL THEN 1 ELSE 0 END" \
+            2>/dev/null | tr -d '[:space:]')"
+
+        if [ "$herika_payload_ready" != "1" ]; then
+            rm -f "$update_log"
+            fail "$label eventlog session migration is incomplete."
+        fi
+
+        unexpected_errors="$(printf '%s\n' "$unexpected_errors" \
+            | grep -Fv 'ALTER TABLE public.eventlog ALTER COLUMN sess TYPE text ERROR:' \
+            | grep -Fv 'Failed to apply patch eventlog_session_payload 20260807001' || true)"
+
+        if [ "$herika_payload_ready" = "1" ] && [ -z "$unexpected_errors" ]; then
+            info "Recording the completed Herika eventlog session migration."
+            PGPASSWORD=dwemer psql -h localhost -p "$POSTGRES_PORT" \
+                -U "$DATABASE_ROLE" -d "$PRODUCT_DATABASE" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+INSERT INTO public.database_versioning (tablename, version)
+VALUES ('eventlog_session_payload', 20260807001)
+ON CONFLICT (tablename) DO UPDATE SET version = EXCLUDED.version;
+SQL
+        fi
+    fi
+
+    if [ -n "$unexpected_errors" ]; then
+        rm -f "$update_log"
+        fail "$label database updates reported an error."
+    fi
+
+    rm -f "$update_log"
+}
+
+bootstrap_herika() {
+    local baseline="$PRODUCT_ROOT/data/database_default.sql"
+    local seed="$PRODUCT_ROOT/data/core_action_seed.sql"
+    local update_runner="$PRODUCT_ROOT/debug/apply_db_updates.php"
+
+    sudo -u postgres psql -p "$POSTGRES_PORT" -d "$PRODUCT_DATABASE" -v ON_ERROR_STOP=1 \
+        -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm; ALTER DATABASE $PRODUCT_DATABASE OWNER TO $DATABASE_ROLE;" >/dev/null
+
+    if [ "$(table_exists eventlog)" != "1" ]; then
+        info "Importing the HerikaServer database baseline."
+        run_psql_file "$baseline" >/dev/null
+        if [ -s "$seed" ]; then
+            run_psql_file "$seed" >/dev/null
+        fi
+    fi
+
+    [ -f "$update_runner" ] || fail "HerikaServer database update runner is missing."
+    run_php_updates "HerikaServer" "$update_runner"
+
+    if [ ! -f "$PRODUCT_ROOT/conf/conf.php" ] && [ -f "$PRODUCT_ROOT/conf/conf.sample.php" ]; then
+        cp "$PRODUCT_ROOT/conf/conf.sample.php" "$PRODUCT_ROOT/conf/conf.php"
+    fi
+}
+
+bootstrap_stobe() {
+    local baseline="$PRODUCT_ROOT/data/schema.sql"
+    local update_runner="$PRODUCT_ROOT/debug/run_db_updates.php"
+
+    sudo -u postgres psql -p "$POSTGRES_PORT" -d "$PRODUCT_DATABASE" -v ON_ERROR_STOP=1 \
+        -c "CREATE EXTENSION IF NOT EXISTS vector; ALTER DATABASE $PRODUCT_DATABASE OWNER TO $DATABASE_ROLE;" >/dev/null
+
+    if [ "$(table_exists general_settings)" != "1" ]; then
+        info "Importing the StobeServer database baseline."
+        run_psql_file "$baseline" >/dev/null
+    fi
+
+    [ -f "$update_runner" ] || fail "StobeServer database update runner is missing."
+    run_php_updates "StobeServer" "$update_runner"
+}
+
+bootstrap_dialectic() {
+    local baseline="$PRODUCT_ROOT/data/database_default.sql"
+    local update_runner="$PRODUCT_ROOT/tools/bootstrap-database.php"
+    local utf8_migration="$PRODUCT_ROOT/tools/migrate-dialectic-db-utf8-wsl.sh"
+    local encoding
+
+    encoding="$(sudo -u postgres psql -p "$POSTGRES_PORT" -d template1 -X -tAc "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = '$PRODUCT_DATABASE'" | tr -d '[:space:]')"
+    if [ "$encoding" = "SQL_ASCII" ]; then
+        [ -f "$utf8_migration" ] || fail "Dialectic UTF-8 migration tool is missing: $utf8_migration"
+        # The existing migration uses the distro's default cluster through sudo.
+        [ "$POSTGRES_PORT" -eq 5432 ] || fail "Run the Dialectic UTF-8 migration manually for a non-default PostgreSQL port."
+        # Preserve the legacy updater's backup-and-verify migration before bootstrapping.
+        info "Migrating the existing Dialectic database from SQL_ASCII to UTF8."
+        if ! DIALECTIC_DB_NAME="$PRODUCT_DATABASE" \
+            DIALECTIC_DB_USER="$DATABASE_ROLE" bash "$utf8_migration"; then
+            fail "Dialectic UTF-8 migration failed. Check the retained migration backup before retrying."
+        fi
+        encoding="$(sudo -u postgres psql -p "$POSTGRES_PORT" -d template1 -X -tAc "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = '$PRODUCT_DATABASE'" | tr -d '[:space:]')"
+    fi
+    if [ "$encoding" != "UTF8" ]; then
+        fail "Dialectic database must use UTF8; found ${encoding:-unknown}."
+    fi
+
+    sudo -u postgres psql -p "$POSTGRES_PORT" -d "$PRODUCT_DATABASE" -v ON_ERROR_STOP=1 \
+        -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS vector; ALTER DATABASE $PRODUCT_DATABASE OWNER TO $DATABASE_ROLE;" >/dev/null
+
+    if [ "$(table_exists eventlog)" != "1" ]; then
+        info "Importing the DialecticServer database baseline."
+        run_psql_file "$baseline" >/dev/null
+    fi
+
+    [ -f "$update_runner" ] || fail "DialecticServer database update runner is missing."
+    run_php_updates "DialecticServer" "$update_runner"
+}
+
+bootstrap_database() {
+    start_postgres
+    if [ "$PRODUCT" = lorkhan ]; then
+        [ "$POSTGRES_PORT" = 5432 ] || fail 'LORKHAN bootstrap currently requires PostgreSQL port 5432.'
+        LORKHAN_HTTP_PORT=8090 bash "$PRODUCT_ROOT/scripts/deploy-wsl.sh" "$PRODUCT_ROOT" \
+            || fail 'LORKHAN bootstrap/deployment failed; configuration and player data were retained. Use Repair.'
+        return
+    fi
+    local utf8_helper="/usr/local/bin/ensure_postgres_utf8"
+    [ -x "$utf8_helper" ] || utf8_helper="$(dirname "$0")/ensure_postgres_utf8"
+    "$utf8_helper" || fail "PostgreSQL UTF-8 default setup needs attention."
+    ensure_pgvector
+    ensure_database_role
+    create_database_if_missing
+
+    case "$PRODUCT" in
+        herika) bootstrap_herika ;;
+        stobe) bootstrap_stobe ;;
+        dialectic) bootstrap_dialectic ;;
+        reign) : ;;
+    esac
+}
+
+write_vhost() {
+    [ "$PRODUCT" != lorkhan ] || return 0 # The server deploy owns its authenticated Apache configuration.
+    local ports_conf="/etc/apache2/ports.conf"
+    local vhost_path
+
+    case "$PRODUCT" in
+        reign)
+            /usr/local/bin/ddistro_reign configure-web
+            return 0
+            ;;
+        stobe)
+            vhost_path="/etc/apache2/sites-available/stobe.conf"
+            if ! grep -Eq '^[[:space:]]*Listen[[:space:]]+([^:[:space:]]+:)?8083([[:space:]]|$)' "$ports_conf"; then
+                printf 'Listen 0.0.0.0:8083\n' >> "$ports_conf"
+            fi
+            cat > "$vhost_path" <<'EOF'
+<VirtualHost *:8083>
+	DocumentRoot /var/www/html
+	Alias /StobeServer /var/www/html/StobeServer
+	<Directory /var/www/html>
+		Options -Indexes +FollowSymLinks
+		AllowOverride All
+		Require all granted
+	</Directory>
+	<Directory /var/www/html/StobeServer>
+		Options -Indexes +FollowSymLinks
+		AllowOverride All
+		Require all granted
+	</Directory>
+	<Directory /var/www/html/StobeServer/soundcache>
+		Options +Indexes +FollowSymLinks
+		AllowOverride None
+		Require all granted
+	</Directory>
+	ErrorLog ${APACHE_LOG_DIR}/stobe_error.log
+	CustomLog ${APACHE_LOG_DIR}/stobe_access.log combined
+	LimitRequestLine 65535
+</VirtualHost>
+EOF
+            ;;
+        dialectic)
+            vhost_path="/etc/apache2/sites-available/dialectic.conf"
+            if ! grep -Eq '^[[:space:]]*Listen[[:space:]]+([^:[:space:]]+:)?8088([[:space:]]|$)' "$ports_conf"; then
+                printf 'Listen 0.0.0.0:8088\n' >> "$ports_conf"
+            fi
+            cat > "$vhost_path" <<'EOF'
+<VirtualHost *:8088>
+	DocumentRoot /var/www/html
+	Alias /DialecticServer /var/www/html/DialecticServer
+	<Directory /var/www/html>
+		Options -Indexes +FollowSymLinks
+		AllowOverride All
+		Require all granted
+	</Directory>
+	<Directory /var/www/html/DialecticServer>
+		Options -Indexes +FollowSymLinks
+		AllowOverride All
+		Require all granted
+	</Directory>
+	<Directory /var/www/html/DialecticServer/soundcache>
+		Options +Indexes +FollowSymLinks
+		AllowOverride None
+		Require all granted
+	</Directory>
+	ErrorLog ${APACHE_LOG_DIR}/dialectic_error.log
+	CustomLog ${APACHE_LOG_DIR}/dialectic_access.log combined
+	LimitRequestLine 65535
+</VirtualHost>
+EOF
+            ;;
+        *) return 0 ;;
+    esac
+
+    a2ensite "$PRODUCT_VHOST" >/dev/null 2>&1 || true
+}
+
+remove_vhost() {
+    local ports_conf="/etc/apache2/ports.conf"
+    if [ -z "$PRODUCT_VHOST" ]; then
+        return 0
+    fi
+
+    a2dissite "$PRODUCT_VHOST" >/dev/null 2>&1 || true
+    rm -f "/etc/apache2/sites-enabled/$PRODUCT_VHOST" "/etc/apache2/sites-available/$PRODUCT_VHOST"
+    rm -f "/var/log/apache2/${PRODUCT}_error.log" "/var/log/apache2/${PRODUCT}_access.log"
+    if [ -f "$ports_conf" ]; then
+        sed -i "/^[[:space:]]*Listen[[:space:]].*:${PRODUCT_PORT}[[:space:]]*$/d; /^[[:space:]]*Listen[[:space:]]*${PRODUCT_PORT}[[:space:]]*$/d" "$ports_conf"
+    fi
+}
+
+apply_permissions() {
+    [ "$PRODUCT" != lorkhan ] || return 0 # Preserve the server's separate runtime/config/media permissions.
+    if [ "$PRODUCT" = reign ]; then
+        # Source updates must not broaden access to private data or retained executables.
+        find -P "$PRODUCT_ROOT" \( -path "$PRODUCT_ROOT/data" -o -path "$PRODUCT_ROOT/runtime" \) -prune -o \
+            -exec chown -h "$APP_USER:$WEB_GROUP" {} +
+        find -P "$PRODUCT_ROOT" \( -path "$PRODUCT_ROOT/data" -o -path "$PRODUCT_ROOT/runtime" \) -prune -o \
+            -type d -exec chmod ug+rwx,g+s,o-rwx {} + -o -type f -exec chmod ug+rw,o-rwx {} +
+        return
+    fi
+    mkdir -p "$PRODUCT_ROOT/log"
+    chown -R "$APP_USER:$WEB_GROUP" "$PRODUCT_ROOT"
+    chmod -R ug+rwX,o-rwx "$PRODUCT_ROOT"
+    find "$PRODUCT_ROOT" -type d -exec chmod g+s {} + >/dev/null 2>&1 || true
+
+    if [ "$PRODUCT" = "dialectic" ]; then
+        local helper="/usr/local/bin/ensure_dialectic_runtime_permissions"
+        if [ ! -x "$helper" ]; then
+            helper="/home/dwemer/dwemerdistro/bin/ensure_dialectic_runtime_permissions"
+        fi
+        [ ! -x "$helper" ] || "$helper" "$PRODUCT_ROOT" >/dev/null || true
+    fi
+}
+
+record_install() {
+    local update_include_path="/home/dwemer/.update_include_$PRODUCT"
+
+    mkdir -p "$STATE_ROOT"
+    cat > "$STATE_ROOT/$PRODUCT.state" <<EOF
+schema_version=1
+product=$PRODUCT
+root=$PRODUCT_ROOT
+database=$PRODUCT_DATABASE
+repository=$PRODUCT_REPOSITORY
+installed_branch=$(current_branch)
+managed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+EOF
+    if [ -n "$PRODUCT_BACKUP" ]; then
+        printf 'backup=%s\n' "$PRODUCT_BACKUP" >> "$STATE_ROOT/$PRODUCT.state"
+    fi
+    chmod 600 "$STATE_ROOT/$PRODUCT.state"
+    # Installation defaults to included, but repair/update must preserve the user's saved choice.
+    if [ ! -e "$update_include_path" ]; then
+        printf '1\n' > "$update_include_path"
+    fi
+}
+
+safe_remove_temp() {
+    local path="$1"
+    case "$path" in
+        "$WEB_ROOT/.ddistro-$PRODUCT-"*) rm -rf -- "$path" ;;
+        *) fail "Refusing to remove unexpected temporary path: $path" ;;
+    esac
+}
+
+safe_remove_product_root() {
+    [ "$PRODUCT_ROOT" = "$WEB_ROOT/ReignServer" ] \
+        || [ "$PRODUCT_ROOT" = /opt/dwemerdistro/sources/LorkhanServer ] \
+        || [ "$PRODUCT_ROOT" = "$WEB_ROOT/HerikaServer" ] \
+        || [ "$PRODUCT_ROOT" = "$WEB_ROOT/StobeServer" ] \
+        || [ "$PRODUCT_ROOT" = "$WEB_ROOT/DialecticServer" ] \
+        || fail "Refusing to remove unexpected product root: $PRODUCT_ROOT"
+    rm -rf -- "$PRODUCT_ROOT"
+}
+
+clone_repository() {
+    local branch="$1"
+    local temp_root="$WEB_ROOT/.ddistro-$PRODUCT-$$"
+    if [ "$PRODUCT" = lorkhan ]; then
+        mkdir -p /opt/dwemerdistro/sources || return 1
+        [ "$(realpath /opt/dwemerdistro/sources)" = /opt/dwemerdistro/sources ] || return 1
+    fi
+
+    [ ! -e "$temp_root" ] || safe_remove_temp "$temp_root"
+    info "Cloning $PRODUCT from $branch."
+    if ! git clone --branch "$branch" --single-branch "$PRODUCT_REPOSITORY" "$temp_root"; then
+        safe_remove_temp "$temp_root"
+        printf '[FAIL] Could not clone %s.\n' "$PRODUCT" >&2
+        return 1
+    fi
+
+    if [ ! -d "$temp_root/.git" ]; then
+        safe_remove_temp "$temp_root"
+        printf '[FAIL] The cloned %s repository is invalid.\n' "$PRODUCT" >&2
+        return 1
+    fi
+
+    if ! mv "$temp_root" "$PRODUCT_ROOT"; then
+        safe_remove_temp "$temp_root"
+        printf '[FAIL] Could not activate the cloned %s repository.\n' "$PRODUCT" >&2
+        return 1
+    fi
+    if [ "$INSTALL_CLEANUP_ACTIVE" -eq 1 ]; then
+        INSTALL_ROOT_CREATED=1
+    fi
+}
+
+# Escape one value for the blocker line; other bytes pass through unchanged.
+json_string() {
+    local value="$1" escaped="" char code index
+    for ((index = 0; index < ${#value}; index++)); do
+        char="${value:index:1}"
+        case "$char" in
+            '"') escaped+='\"' ;;
+            '\') escaped+='\\' ;;
+            *)
+                printf -v code '%d' "'$char"
+                if [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; then
+                    printf -v char '\\u%04x' "$code"
+                fi
+                escaped+="$char"
+                ;;
+        esac
+    done
+    printf '"%s"' "$escaped"
+}
+
+fail_update_blocked() {
+    local reason="$1" status="$2" branch="$3" message="$4"
+    shift 4
+    local files="" path count=0
+
+    for path in "$@"; do
+        [ "$count" -lt "$UPDATE_BLOCKED_FILE_LIMIT" ] || break
+        files+="${files:+,}$(json_string "$path")"
+        count=$((count + 1))
+    done
+    printf 'DDISTRO_UPDATE_BLOCKED {"schema_version":1,"reason":"%s","product":"%s","branch":%s,"total":%d,"files":[%s]}\n' \
+        "$reason" "$PRODUCT" "$(json_string "$branch")" "$#" "$files"
+    fail "$message" "$status"
+}
+
+# Classify a failed update checkout from Git's own refusal, using NUL-separated plumbing for paths.
+# Untracked collisions win because discarding tracked edits would not let the update continue.
+classify_update_blocker() {
+    local branch="$1" checkout_output="$2" path
+    local -a candidates=() blocked=()
+    local -a repo_git=(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" --literal-pathspecs)
+
+    case "$checkout_output" in
+        *"untracked working tree files would be"*|*"would lose untracked files"*)
+            while IFS= read -r -d '' path; do
+                if [ -e "$PRODUCT_ROOT/$path" ] || [ -L "$PRODUCT_ROOT/$path" ]; then
+                    candidates+=("$path")
+                fi
+            done < <("${repo_git[@]}" diff -z --no-renames --name-only --diff-filter=A HEAD "origin/$branch" --)
+            if [ "${#candidates[@]}" -gt 0 ]; then
+                while IFS= read -r -d '' path; do
+                    blocked+=("$path")
+                done < <(printf '%s\0' "${candidates[@]}" \
+                    | xargs -0 "${repo_git[@]}" ls-files -z --others --exclude-standard --)
+            fi
+            fail_update_blocked untracked-files "$UPDATE_BLOCKED_UNTRACKED_EXIT" "$branch" \
+                "Untracked $PRODUCT files are in the way of this update. Move them, then update again." \
+                "${blocked[@]}"
+            ;;
+    esac
+
+    case "$checkout_output" in
+        *"Your local changes to the following files would be overwritten"*)
+            # Staged, unstaged, deleted and mode-changed tracked paths that the target also changes.
+            # Index and work tree are read separately: a staged change the work tree undoes still blocks.
+            local -A seen=()
+            while IFS= read -r -d '' path; do
+                [ -n "${seen[$path]+set}" ] && continue
+                seen[$path]=1
+                candidates+=("$path")
+            done < <("${repo_git[@]}" diff -z --no-renames --name-only --cached HEAD --
+                     "${repo_git[@]}" diff -z --no-renames --name-only --)
+            if [ "${#candidates[@]}" -gt 0 ]; then
+                while IFS= read -r -d '' path; do
+                    blocked+=("$path")
+                done < <(printf '%s\0' "${candidates[@]}" \
+                    | xargs -0 "${repo_git[@]}" diff -z --no-renames --name-only HEAD "origin/$branch" --)
+            fi
+            if [ "${#blocked[@]}" -gt 0 ]; then
+                fail_update_blocked tracked-changes "$UPDATE_BLOCKED_TRACKED_EXIT" "$branch" \
+                    "Local edits to tracked $PRODUCT files block this update." "${blocked[@]}"
+            fi
+            ;;
+    esac
+}
+
+update_repository() {
+    local branch="$1"
+    [ -d "$PRODUCT_ROOT/.git" ] || fail "$PRODUCT is not installed."
+
+    migrate_product_repository_origin
+    info "Updating $PRODUCT on branch $branch."
+    # Installs use --single-branch, so fetch the requested channel into an explicit remote-tracking
+    # ref before switching between Main and Dev.
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" fetch origin \
+        "+refs/heads/$branch:refs/remotes/origin/$branch" \
+        || fail "Could not fetch $PRODUCT branch $branch."
+    detect_partial_herika_migration "$branch"
+    if [ "$PRODUCT" = herika ] && [ -f "$STATE_ROOT/herika-org-migration/pending" ]; then
+        case "$(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" remote get-url origin)" in
+            https://github.com/Dwemer-Dynamics/HerikaServer.git|https://github.com/Dwemer-Dynamics/HerikaServer|git@github.com:Dwemer-Dynamics/HerikaServer.git) ;;
+            *) fail "Migration is pending, but origin is now custom. No source files were replaced." ;;
+        esac
+        if [ ! -f "$STATE_ROOT/herika-org-migration/checkout-ready" ]; then
+            recover_herika_checkout "$branch"
+            return 0
+        fi
+        # A database failure must not cause the next attempt to discard source edits again.
+        if [ "$(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" rev-parse HEAD)" = \
+             "$(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" rev-parse "origin/$branch")" ]; then
+            return 0
+        fi
+    fi
+    if [ "$FORCE_UPDATE" -eq 1 ]; then
+        info "Force update enabled; discarding tracked changes in $PRODUCT_ROOT."
+        git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" reset --hard HEAD \
+            || fail "Could not discard tracked changes for $PRODUCT."
+    fi
+    # Keep Git's refusal in English so a blocked update can be classified; it is still shown.
+    local checkout_output checkout_status
+    checkout_output="$(LC_ALL=C git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" \
+        checkout -B "$branch" "origin/$branch" 2>&1)"
+    checkout_status=$?
+    [ -z "$checkout_output" ] || printf '%s\n' "$checkout_output" >&2
+    if [ "$checkout_status" -ne 0 ]; then
+        [ "$COMMAND" != update ] || classify_update_blocker "$branch" "$checkout_output"
+        fail "Could not select $PRODUCT branch $branch."
+    fi
+    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" reset --hard "origin/$branch" \
+        || fail "Could not update $PRODUCT to origin/$branch."
+}
+
+copy_legacy_runtime() {
+    local backup_root="$1"
+    local relative
+
+    for relative in conf/conf.php conf/character_map.json; do
+        if [ -e "$backup_root/$relative" ]; then
+            mkdir -p "$PRODUCT_ROOT/$(dirname "$relative")"
+            cp -a "$backup_root/$relative" "$PRODUCT_ROOT/$relative"
+        fi
+    done
+
+    for relative in uploads data/voices soundcache log ext; do
+        if [ -d "$backup_root/$relative" ]; then
+            mkdir -p "$PRODUCT_ROOT/$relative"
+            cp -a "$backup_root/$relative/." "$PRODUCT_ROOT/$relative/"
+        fi
+    done
+
+    if [ -d "$backup_root/conf" ]; then
+        find "$backup_root/conf" -maxdepth 1 -type f -name 'conf_*.php' -exec cp -a {} "$PRODUCT_ROOT/conf/" \;
+    fi
+}
+
+adopt_legacy_repository() {
+    local branch="$1"
+    local backup_root="${PRODUCT_ROOT}.pre-managed-$(date -u '+%Y%m%d%H%M%S')"
+
+    [ -e "$PRODUCT_ROOT" ] || return 0
+    [ ! -d "$PRODUCT_ROOT/.git" ] || return 0
+
+    info "Preserving the legacy $PRODUCT deployment at $backup_root."
+    mv "$PRODUCT_ROOT" "$backup_root" || fail "Could not preserve the legacy $PRODUCT deployment."
+    if ! clone_repository "$branch"; then
+        mv "$backup_root" "$PRODUCT_ROOT" || true
+        fail "Could not adopt the legacy $PRODUCT deployment."
+    fi
+    copy_legacy_runtime "$backup_root"
+    PRODUCT_BACKUP="$backup_root"
+}
+
+on_exit() {
+    local status=$?
+
+    if [ "$INSTALL_CLEANUP_ACTIVE" -eq 1 ] && [ "$status" -ne 0 ]; then
+        printf '[INFO] Removing partial %s installation.\n' "$PRODUCT" >&2
+        if [ "$INSTALL_DATABASE_CREATED" -eq 1 ] \
+            && postgres_ready \
+            && [ "$(database_exists "$PRODUCT_DATABASE")" = "1" ]; then
+            sudo -u postgres psql -p "$POSTGRES_PORT" -d template1 -c \
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$PRODUCT_DATABASE' AND pid <> pg_backend_pid();" \
+                >/dev/null 2>&1 || true
+            sudo -u postgres dropdb -p "$POSTGRES_PORT" --if-exists "$PRODUCT_DATABASE" >/dev/null 2>&1 || true
+        fi
+        if [ "$INSTALL_ROOT_CREATED" -eq 1 ] && [ -e "$PRODUCT_ROOT" ]; then
+            safe_remove_product_root
+        fi
+        rm -f "$STATE_ROOT/$PRODUCT.state"
+    fi
+
+    if [ "$LOCK_HELD" -eq 1 ]; then
+        rm -f "$LOCK_PATH/pid" 2>/dev/null || true
+        rmdir "$LOCK_PATH" 2>/dev/null || true
+        LOCK_HELD=0
+    fi
+    if [ "$MAINTENANCE_HELD" -eq 1 ]; then
+        flock -u 7 2>/dev/null || true
+        MAINTENANCE_HELD=0
+    fi
+
+    trap - EXIT INT TERM
+    exit "$status"
+}
+
+install_product() {
+    local branch="$1"
+    local repo_state
+    local db_state
+
+    repo_state="$(repository_state)"
+    db_state="$(database_state)"
+    if [ "$repo_state" != "absent" ] || [ "$db_state" = "present" ]; then
+        fail "$PRODUCT is not completely absent. Use repair or uninstall first."
+    fi
+
+    INSTALL_CLEANUP_ACTIVE=1
+    clone_repository "$branch" || fail "Could not install $PRODUCT."
+    bootstrap_database
+
+    write_vhost
+    apply_permissions
+    if [ "$PRODUCT" = reign ]; then
+        /usr/local/bin/ddistro_reign prepare || fail "Reign runtime preparation failed."
+        /usr/local/bin/ddistro_reign build || fail "Reign build or activation failed."
+    fi
+    record_install
+    INSTALL_CLEANUP_ACTIVE=0
+    ok "$PRODUCT installed."
+}
+
+repair_product() {
+    local branch="$1"
+    local repo_state
+    local state
+
+    state="$(install_state)"
+    [ "$state" != "not-installed" ] || fail "$PRODUCT is not installed. Use install instead of repair."
+    repo_state="$(repository_state)"
+    case "$repo_state" in
+        absent) clone_repository "$branch" || fail "Could not restore the $PRODUCT repository." ;;
+        legacy)
+            if [ "$PRODUCT" = lorkhan ] && [ ! -e "$PRODUCT_ROOT" ]; then
+                clone_repository "$branch" || fail 'Could not prepare LORKHAN source; existing runtime retained.'
+            else
+                adopt_legacy_repository "$branch"
+            fi ;;
+        managed) update_repository "$branch" ;;
+    esac
+
+    bootstrap_database
+    write_vhost
+    apply_permissions
+    if [ "$PRODUCT" = reign ]; then
+        /usr/local/bin/ddistro_reign prepare || fail "Reign runtime preparation failed."
+        /usr/local/bin/ddistro_reign build || fail "Reign build or activation failed; previous runtime retained."
+    fi
+    record_install
+    complete_herika_migration
+    ok "$PRODUCT repaired."
+}
+
+update_product() {
+    local branch="$1"
+    [ "$(install_state)" = "installed" ] || fail "$PRODUCT is not installed. Update never installs missing products."
+    update_repository "$branch"
+    bootstrap_database
+    write_vhost
+    apply_permissions
+    if [ "$PRODUCT" = reign ]; then
+        /usr/local/bin/ddistro_reign prepare || fail "Reign runtime preparation failed."
+        /usr/local/bin/ddistro_reign build || fail "Reign build or activation failed; previous runtime retained."
+    fi
+    record_install
+    complete_herika_migration
+    ok "$PRODUCT updated."
+}
+
+stop_product_processes() {
+    case "$PRODUCT" in
+        lorkhan) service lorkhanserver-worker stop || fail 'Could not stop LORKHAN worker.' ;;
+        reign) /usr/local/bin/ddistro_reign stop ;;
+        herika)
+            pkill -f "$PRODUCT_ROOT/service/start.sh" >/dev/null 2>&1 || true
+            pkill -f "$PRODUCT_ROOT/service/manager.php" >/dev/null 2>&1 || true
+            ;;
+        dialectic)
+            pkill -f "$PRODUCT_ROOT/service/start.sh" >/dev/null 2>&1 || true
+            pkill -f "$PRODUCT_ROOT/service/manager.php" >/dev/null 2>&1 || true
+            rm -f /tmp/dialectic_background_processor.lock
+            ;;
+    esac
+}
+
+drop_product_database() {
+    start_postgres
+    if [ "$(database_exists "$PRODUCT_DATABASE")" != "1" ]; then
+        return 0
+    fi
+
+    sudo -u postgres psql -p "$POSTGRES_PORT" -d template1 -v ON_ERROR_STOP=1 \
+        -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$PRODUCT_DATABASE' AND pid <> pg_backend_pid();" >/dev/null
+    sudo -u postgres dropdb -p "$POSTGRES_PORT" --if-exists "$PRODUCT_DATABASE" || fail "Could not drop database $PRODUCT_DATABASE."
+}
+
+# The migration helper writes only to the default cluster and this fixed backup
+# directory. Check it before uninstall mutates anything, then recheck on removal.
+purge_dialectic_migration_backups() {
+    [ "$PRODUCT" = "dialectic" ] || return 0
+    [ "$POSTGRES_PORT" = "5432" ] || return 0
+
+    local backup_dir="/var/backups/dialectic"
+    local databases candidate name
+
+    [ ! -L "$backup_dir" ] || fail "Refusing redirected Dialectic migration backup directory."
+    if [ -e "$backup_dir" ]; then
+        [ -d "$backup_dir" ] && [ "$(readlink -e -- "$backup_dir")" = "$backup_dir" ] \
+            || fail "Refusing an unexpected Dialectic migration backup path."
+    fi
+
+    start_postgres
+    databases="$(sudo -u postgres psql -p "$POSTGRES_PORT" -d template1 -X -At -v ON_ERROR_STOP=1 -c \
+        "SELECT d.datname FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba
+         WHERE d.datname ~ '^dialectic_sql_ascii_[0-9]{14}$'
+           AND r.rolname = '$DATABASE_ROLE' AND NOT d.datistemplate
+           AND pg_encoding_to_char(d.encoding) = 'SQL_ASCII' AND NOT d.datallowconn
+           AND EXISTS (SELECT 1 FROM pg_db_role_setting s
+                       WHERE s.setdatabase = d.oid AND s.setrole = 0
+                         AND 'default_transaction_read_only=on' = ANY(s.setconfig))
+         ORDER BY d.datname;")" || fail "Could not inspect Dialectic migration recovery databases."
+
+    [ "${1:-}" != "--check" ] || return 0
+
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        [[ "$candidate" =~ ^dialectic_sql_ascii_[0-9]{14}$ ]] \
+            || fail "Refusing an unexpected Dialectic migration database name."
+        sudo -u postgres dropdb -p "$POSTGRES_PORT" --maintenance-db=template1 --if-exists "$candidate" \
+            || fail "Could not remove Dialectic migration recovery database $candidate."
+    done <<< "$databases"
+
+    [ -d "$backup_dir" ] || return 0
+    for candidate in "$backup_dir"/dialectic-*-sql-ascii.dump; do
+        name="${candidate##*/}"
+        [[ "$name" =~ ^dialectic-[0-9]{14}-sql-ascii\.dump$ ]] || continue
+        # The helper creates regular postgres-owned dumps. Never follow links or
+        # remove unrelated files/directories merely because their names match.
+        [ ! -L "$candidate" ] && [ -f "$candidate" ] || continue
+        [ "$(readlink -e -- "$candidate")" = "$candidate" ] \
+            && [ "$(stat -c '%U' -- "$candidate")" = "postgres" ] || continue
+        rm -f -- "$candidate" || fail "Could not remove Dialectic migration recovery dump $name."
+    done
+}
+
+remove_managed_backups() {
+    local candidate
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        case "$candidate" in
+            "$PRODUCT_ROOT.pre-git-"[0-9]*|"$PRODUCT_ROOT.pre-managed-"[0-9]*)
+                rm -rf -- "$candidate"
+                ;;
+            *)
+                info "Leaving unrecognized backup path untouched: $candidate"
+                ;;
+        esac
+    done < <(find "$WEB_ROOT" -maxdepth 1 -mindepth 1 -type d \
+        \( -name "$(basename "$PRODUCT_ROOT").pre-git-[0-9]*" -o -name "$(basename "$PRODUCT_ROOT").pre-managed-[0-9]*" \) \
+        -print 2>/dev/null)
+
+    if [ "$PRODUCT" = "herika" ] && [ -d /home/dwemer/DwemerDistro-Backups/Doctor ]; then
+        find /home/dwemer/DwemerDistro-Backups/Doctor -maxdepth 1 -type f \
+            -name 'dwemer-before-schema-recovery-[0-9]*.dump' -delete
+    fi
+}
+
+uninstall_product() {
+    local confirmation="$1"
+    local expected
+
+    expected="PURGE-$(printf '%s' "$PRODUCT" | tr '[:lower:]' '[:upper:]')"
+    [ "$confirmation" = "$expected" ] || fail "Uninstall confirmation did not match $expected." 64
+
+    purge_dialectic_migration_backups --check
+    stop_product_processes
+    remove_vhost
+    if [ "$PRODUCT" = lorkhan ]; then
+        info 'LORKHAN was disabled. Source, runtime, database, credentials, voices and playthroughs were retained. Use Repair to reactivate.'
+    elif [ "$PRODUCT" = reign ]; then
+        rm -f /var/www/html/ReignServer/runtime/current
+        info "Reign checkout, database, campaigns, credentials, portraits and previous runtimes were retained. Use Repair to reactivate."
+    else
+        drop_product_database
+        safe_remove_product_root
+        remove_managed_backups
+    fi
+    purge_dialectic_migration_backups
+    rm -f "$STATE_ROOT/$PRODUCT.state"
+    printf '1\n' > "/home/dwemer/.update_include_$PRODUCT"
+
+    if command -v service >/dev/null 2>&1 && service apache2 status >/dev/null 2>&1; then
+        service apache2 reload >/dev/null 2>&1 || true
+    fi
+
+    ok "$PRODUCT uninstalled."
+}
+
+startup_product() {
+    local key="$1"
+    local state
+
+    select_product "$key"
+    if [ "$PRODUCT" = lorkhan ]; then
+        if [ -f "$WEB_ROOT/LorkhanServer/index.php" ] && [ -e /etc/apache2/sites-enabled/lorkhanserver.conf ] && [ -x /etc/init.d/lorkhanserver-worker ]; then
+            service lorkhanserver-worker start 7<&- || fail 'LORKHAN worker failed to start.'
+            # The init script backgrounds the worker; verify it survives startup.
+            sleep 1
+            service lorkhanserver-worker status >/dev/null 2>&1 || fail 'LORKHAN worker exited during startup.'
+        else
+            info 'LORKHAN is absent or disabled; startup skipped.'
+        fi
+        return
+    fi
+    state="$(repository_state)"
+    if [ "$state" = "absent" ]; then
+        if [ "$(database_state)" = "present" ]; then
+            info "$key has an orphaned database and needs repair; startup skipped."
+        else
+            info "$key is not installed; startup skipped."
+        fi
+        remove_vhost
+        return 0
+    fi
+    if [ "$state" = "legacy" ]; then
+        info "$key uses a legacy deployment; database startup will continue without Git adoption."
+    fi
+    bootstrap_database
+    write_vhost
+    apply_permissions
+}
+
+startup_installed_products() {
+    local key
+    local failed=0
+
+    # Keep products independent: a broken migration in one server must not prevent healthy
+    # installed servers from preparing their databases, vhosts, and runtime permissions.
+    for key in herika lorkhan stobe dialectic reign; do
+        if ! (startup_product "$key"); then
+            info "$key startup preparation failed; continuing with the remaining products."
+            failed=1
+        fi
+    done
+
+    return "$failed"
+}
+
+case "$POSTGRES_PORT" in
+    ''|*[!0-9]*) fail "Invalid PostgreSQL port override." 64 ;;
+esac
+if [ "$POSTGRES_PORT" -lt 1 ] || [ "$POSTGRES_PORT" -gt 65535 ]; then
+    fail "PostgreSQL port override must be between 1 and 65535." 64
+fi
+
+COMMAND="${1:-}"
+[ -n "$COMMAND" ] || {
+    usage
+    exit 64
+}
+shift
+
+case "$COMMAND" in
+    status)
+        REQUESTED="all"
+        if [ "$#" -gt 0 ] && [ "${1#--}" = "$1" ]; then
+            REQUESTED="$1"
+            shift
+        fi
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --json) JSON_OUTPUT=1 ;;
+                *) fail "Unknown status option '$1'." 64 ;;
+            esac
+            shift
+        done
+        show_status "$REQUESTED"
+        ;;
+    migrate-remotes)
+        REQUESTED="${1:-all}"
+        [ "$#" -le 1 ] || fail "migrate-remotes accepts at most one product." 64
+        if [ "$REQUESTED" != "all" ]; then
+            select_product "$REQUESTED"
+        fi
+        require_root migrate-remotes "$REQUESTED"
+        acquire_operation_lock
+        case "$REQUESTED" in
+            all|herika)
+                select_product herika
+                migrate_product_repository_origin
+                ;;
+            stobe|dialectic|reign)
+                ;;
+        esac
+        ;;
+    install|update|repair)
+        [ "$#" -gt 0 ] || fail "$COMMAND requires a product." 64
+        select_product "$1"
+        shift
+        BRANCH_CHOICE="main"
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --branch)
+                    [ "$#" -ge 2 ] || fail "--branch requires main or dev." 64
+                    BRANCH_CHOICE="$2"
+                    shift
+                    ;;
+                --force)
+                    [ "$COMMAND" = "update" ] || fail "--force is supported only for update." 64
+                    FORCE_UPDATE=1
+                    ;;
+                *) fail "Unknown $COMMAND option '$1'." 64 ;;
+            esac
+            shift
+        done
+        require_root "$COMMAND" "$PRODUCT" --branch "$BRANCH_CHOICE"
+        acquire_operation_lock
+        BRANCH=$(resolve_branch "$BRANCH_CHOICE") || exit $?
+        require_php_security
+        start_postgres
+        case "$COMMAND" in
+            install) install_product "$BRANCH" ;;
+            update) update_product "$BRANCH" ;;
+            repair) repair_product "$BRANCH" ;;
+        esac
+        # Shared references resolve at request time; legacy credentials remain untouched.
+        ;;
+    uninstall)
+        [ "$#" -gt 0 ] || fail "uninstall requires a product." 64
+        select_product "$1"
+        shift
+        CONFIRMATION=""
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --confirm)
+                    [ "$#" -ge 2 ] || fail "--confirm requires a value." 64
+                    CONFIRMATION="$2"
+                    shift
+                    ;;
+                *) fail "Unknown uninstall option '$1'." 64 ;;
+            esac
+            shift
+        done
+        require_root uninstall "$PRODUCT" --confirm "$CONFIRMATION"
+        acquire_operation_lock
+        uninstall_product "$CONFIRMATION"
+        ;;
+    startup)
+        REQUESTED="${1:-all}"
+        [ "$#" -le 1 ] || fail "startup accepts at most one product." 64
+        if [ "$REQUESTED" != "all" ]; then
+            select_product "$REQUESTED"
+        fi
+        require_root startup "$REQUESTED"
+        acquire_operation_lock
+        start_postgres
+        if [ "$REQUESTED" = "all" ]; then
+            startup_installed_products
+        else
+            startup_product "$REQUESTED"
+        fi
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        fail "Unknown command '$COMMAND'." 64
+        ;;
+esac

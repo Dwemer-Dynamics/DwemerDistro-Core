@@ -1,0 +1,100 @@
+# DwemerDistro Core
+
+DwemerDistro provides the shared WSL runtime used by the Dwemer Dynamics game servers and optional voice, speech, and utility components.
+
+Fresh distribution payloads do not include HerikaServer, StobeServer, DialecticServer, or ReignServer. Users choose the servers they want in the launcher Quickstart or install them later from Mods.
+
+## Reign and UTF-8
+
+The launcher's **Rollback ReignServer** action uses `ddistro_reign rollback-list` and `ddistro_reign rollback <retained-version-id>`. Only retained builds whose manifest, lowercase database name, and schema compatibility were verified while running are offered. `rollback-metadata` lives beside the retained runtime directories. Every activation records the previous/current compatible builds; older builds without database-name/schema reporting are excluded. Rollback validates the artifact inventory and checks the current database schema again, preserves campaigns/settings/databases, and restores the prior runtime if startup fails. The source checkout and update channel stay unchanged.
+
+Reign 0.1.0 uses `ddistro_server install|update|repair reign --branch reign|dev|unstable`. Its production/default branch is `reign`, with promotion through `unstable -> dev -> reign`. `ddistro_reign` owns compiled runtime activation, health checks, and process-group startup/shutdown. Apache port 8089 proxies to Reign on loopback 5101; its vector worker uses 5102. PostgreSQL database `reign` and `/var/www/html/ReignServer/data` survive application replacement and uninstall. Previous code and lock-specific dependency/model directories are retained; code rollback does not undo database migrations.
+
+The distro's default locale is `C.UTF-8`. `ensure_postgres_utf8` makes new PostgreSQL databases UTF-8 through template1 when the template is uncustomized. It retains the original empty template. Customized templates are preserved with a successful skip so system updates and managed database bootstrap can continue. Active template sessions and maintenance failures still return an error. Existing application databases are not converted by this operation. Managed database creation continues to specify UTF-8/template0 explicitly.
+
+## Optional server manager
+
+`bin/ddistro_server` is the supported lifecycle interface:
+
+```bash
+ddistro_server status all --json
+ddistro_server install herika --branch main
+ddistro_server update stobe --branch dev
+ddistro_server update herika --branch dev --force
+ddistro_server repair dialectic --branch main
+ddistro_server uninstall herika --confirm PURGE-HERIKA
+```
+
+`update --force` discards manual changes to tracked server files before switching
+branches. It does not run `git clean`, so untracked files and runtime data remain
+untouched.
+
+CHIM installs from `abeiro/HerikaServer` receive a one-time migration to
+`Dwemer-Dynamics/HerikaServer`. Recovery also recognizes legacy Git history when
+an earlier attempt already changed the remote URL. It backs up the checkout before
+replacing source files and preserves configuration and untracked runtime files.
+Conflicting local source files remain in the backup rather than overriding the release.
+Custom repository origins do not receive this automatic recovery.
+
+The private backup is retained at
+`/var/lib/dwemerdistro/servers/herika-org-migration/checkout.tar`; it includes the
+original source edits and runtime files, so migration needs enough free space for
+a full checkout backup plus the preserved runtime files. The completion marker is
+written only after database setup succeeds. A retry after database failure does
+not force the code checkout again. Databases are updated through the existing
+bootstrap process, not replaced by the repository migration.
+
+Supported products are `herika`, `stobe`, and `dialectic`. Supported branch channels are `main` and `dev`; the manager maps them to each repository's actual production and development branch.
+
+Uninstall permanently removes only the selected server's canonical files, retained manager backups, Apache site, runtime processes, and PostgreSQL database. It does not remove shared components or another server's data.
+
+`update_gws` updates only servers that are already installed. A missing server is skipped and is never installed as an update side effect. `start_env` similarly starts and reports only installed servers.
+
+## Custom mods
+
+`bin/ddistro_custom_mod` installs user-added PHP/PostgreSQL mod servers from public HTTPS repositories that ship a version 1 `dwemer-mod.json`. See [CUSTOM_MODS.md](CUSTOM_MODS.md) for the manifest contract and safety rules.
+
+## Shared PHP security updates
+
+`bin/ensure_php_security` keeps the shared Debian 12 PHP 8.2 runtime at or above `8.2.35-1~deb12u1` (CVE-2026-109618, CVE-2026-109619):
+
+```bash
+sudo ensure_php_security --check --json   # read-only; exit 0 fixed, 3 update required, 4 restart required, 5 incomplete
+sudo ensure_php_security             # apply the fix only if it is missing
+```
+
+When an update is needed it refreshes only the configured `bookworm-security` source entries (other suites are not contacted and existing lists and caches are kept), then upgrades every installed official PHP 8.2 package to the same security version. It refuses any plan that removes, newly installs, or changes another package, so separately built extensions such as `php8.2-mcrypt` and the rest of the system stay as they were. Configuration under `/etc/php/8.2` and `/etc/apache2` is kept byte-for-byte; if APT fails, the configuration is restored, its snapshot is kept, and the partly updated package state is reported. Apache must load PHP only from the packaged `libphp8.2.so`; another handler stops the update without changing the configuration. A temporary `policy-rc.d` stops maintainer scripts from starting or stopping services; an existing policy is set aside and restored afterwards. Afterwards only running services that still use the old code are restarted: Apache, PHP-FPM, the LORKHAN worker, and running CHIM4 components (identified by their verified supervisors); stopped services and components stay stopped. Other PHP processes still using the old code are reported by PID and name and are not killed; the helper then exits with restart required instead of reporting the fix as complete. The fix is certified only when every process could be inspected. Another PHP branch is reported as unsupported rather than assumed safe. When PHP is already fixed, the helper makes no APT or network requests.
+
+`update.sh` runs it before any server or migration step. `ddistro_server install|update|repair`, `update_gws` (servers and Dwemer Dashboard), and `ddistro_custom_mod install|update|switch` also require it first; status, check, and uninstall make no PHP changes.
+
+`update.sh` no longer overwrites `/etc/php/8.2/apache2/php.ini`; it installs the distro default only when the file is missing. The LM Studio catalog and `/etc/cuda_config` are replaced only while they still match the last version an update installed (recorded under `/var/lib/dwemerdistro/shipped-config`), so user-edited copies are kept. `/etc/dwemerdistro_services.conf` is still created only when missing.
+
+## System release version
+
+`system-release.json` is the release signal for DwemerDistro core and shared components. Increment its semantic version whenever users need to run **Update System** for a core or shared-component release.
+
+The launcher compares this published version with `/var/lib/dwemerdistro/system-release.json`. It replaces the installed marker only after the core update and shared-component update both succeed, so an interrupted or failed update remains visible to the user.
+
+The legacy `.version.txt` file remains unchanged for older launchers and is not the authoritative system-release version.
+
+## Distribution payload rule
+
+Release payloads must report all three products as `not-installed` with no application databases. Build and validate them with the installer repository's `scripts/Prepare-EmptyDistroPayload.ps1`; do not distribute a tar exported directly from a development distro.
+
+## Component storage
+
+Report the allocated filesystem usage of component environments and installer caches:
+
+```bash
+sudo ddistro_storage report
+```
+
+Remove only reproducible APT/Pip downloads and abandoned audio.cpp installer
+directories after all component installers have finished:
+
+```bash
+sudo ddistro_storage safe-cleanup
+```
+
+The cleanup does not remove models, voices, databases, configuration, logs, or
+installed component environments.

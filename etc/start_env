@@ -1,10 +1,27 @@
 #!/bin/bash
 
+# Also covers imported images on WSL versions without boot.command support.
+/usr/local/bin/initialize_fresh_distro || exit 1
+
 /usr/local/bin/print_logo
+
+# Optional Assistant API stays available to paired mods when the Launcher is closed.
+if [ -x /usr/local/bin/ddistro_api ] && [ -f /var/lib/dwemerdistro/assistant/agent/attestation.json ]; then
+    /usr/local/bin/ddistro_api ensure >/dev/null || echo "Assistant API unavailable; other services will continue."
+fi
 
 # Load CUDA configuration if it exists (will not be overwritten by updates)
 if [ -f "/home/dwemer/.cuda_config" ]; then
     source /home/dwemer/.cuda_config
+fi
+
+# Snapshot the dashboard preference for this startup. Only an explicit 0 disables the legacy behavior.
+DASHBOARD_AUTOOPEN=1
+if [ -r "/home/dwemer/.dashboard_autoopen" ]; then
+	dashboard_autoopen_value=$(head -n 1 /home/dwemer/.dashboard_autoopen 2>/dev/null | tr -d '[:space:]')
+	if [ "$dashboard_autoopen_value" = "0" ]; then
+		DASHBOARD_AUTOOPEN=0
+	fi
 fi
 
 if [ -f "/etc/dwemerdistro_services.conf" ]; then
@@ -37,6 +54,20 @@ read_tts_service_port() {
 
 CHATTERBOX_ACTIVE_PORT="$(read_tts_service_port /home/dwemer/chatterbox/.dwemerdistro-port "$CHATTERBOX_LEGACY_PORT")"
 POCKETTTS_ACTIVE_PORT="$(read_tts_service_port /home/dwemer/pocket-tts/.dwemerdistro-port "$POCKETTTS_LEGACY_PORT")"
+
+# audio.cpp listens on the port in its server.json, the same file sync_pockettts_connectors reads.
+read_audiocpp_port() {
+    local value=""
+
+    value="$(python3 -c 'import json, sys; port = int(str(json.load(open(sys.argv[1]))["port"]).strip()); print(port if 1 <= port <= 65535 else "")' \
+        /home/dwemer/audio.cpp/server.json 2>/dev/null)"
+    case "$value" in
+        ''|*[!0-9]*) value="$1" ;;
+    esac
+    printf '%s\n' "$value"
+}
+
+POCKETTTS_AUDIOCPP_PORT="$(read_audiocpp_port "$POCKETTTS_AUDIOCPP_PORT")"
 
 # Clean tmp
 find /tmp -type f -mtime +7 -delete 
@@ -166,6 +197,60 @@ EOF
     a2ensite dialectic.conf >/dev/null 2>&1 || true
 }
 
+ensure_portable_pgvector() {
+    local helper="/usr/local/bin/ensure_portable_pgvector"
+
+    if [ ! -x "$helper" ]; then
+        helper="/home/dwemer/dwemerdistro/bin/ensure_portable_pgvector"
+    fi
+
+    if [ ! -x "$helper" ]; then
+        echo "WARNING: Portable pgvector repair helper is unavailable."
+        return 1
+    fi
+
+    if ! "$helper"; then
+        echo "WARNING: Portable pgvector repair failed."
+        return 1
+    fi
+
+    return 0
+}
+
+# Run HerikaServer migrations during service startup so browser loading is not a prerequisite.
+ensure_herika_database_updates() {
+    local server_root="/var/www/html/HerikaServer"
+    local update_runner="$server_root/debug/apply_db_updates.php"
+    local update_output="/tmp/herika_startup_database_updates.out"
+    local update_log="$server_root/log/db_update_runner.log"
+
+    if [ ! -d "$server_root" ]; then
+        echo "Skipping HerikaServer DB updates (HerikaServer not installed)."
+        return 0
+    fi
+
+    mkdir -p "$server_root/log" >/dev/null 2>&1 || true
+
+    if [ ! -f "$update_runner" ]; then
+        echo "WARNING: HerikaServer DB update runner is missing at $update_runner"
+        return 1
+    fi
+
+    if ! php "$update_runner" >"$update_output" 2>&1; then
+        {
+            printf "\n[%s] start_env: apply_db_updates.php failed\n" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            cat "$update_output"
+        } >> "$update_log"
+        echo "WARNING: HerikaServer DB update trigger failed. See $update_log"
+        rm -f "$update_output"
+        return 1
+    fi
+
+    rm -f "$update_output"
+    echo "HerikaServer database updates complete."
+    return 0
+}
+
 ensure_stobe_database() {
     local server_root="/var/www/html/StobeServer"
     local schema_path="$server_root/data/schema.sql"
@@ -180,6 +265,11 @@ ensure_stobe_database() {
     fi
 
     mkdir -p "$server_root/log" >/dev/null 2>&1 || true
+
+    if ! ensure_portable_pgvector; then
+        echo "WARNING: Stobe database provisioning stopped before loading pgvector."
+        return 1
+    fi
 
     if ! pg_isready -d template1 -q; then
         echo "PostgreSQL is not ready; starting it before StobeServer database setup..."
@@ -290,6 +380,11 @@ ensure_dialectic_database() {
     if [ ! -d "$server_root" ]; then
         echo "Skipping DialecticServer DB bootstrap (DialecticServer not installed)."
         return 0
+    fi
+
+    if ! ensure_portable_pgvector; then
+        echo "WARNING: Dialectic database provisioning stopped before loading pgvector."
+        return 1
     fi
 
     export PGPASSWORD=dwemer
@@ -493,35 +588,50 @@ ensure_herika_log_permissions() {
     done
 }
 
-ensure_stobe_apache_vhost
-ensure_dialectic_apache_vhost
-ensure_herika_log_permissions
+SERVER_MANAGER="/usr/local/bin/ddistro_server"
+if [ ! -x "$SERVER_MANAGER" ]; then
+    SERVER_MANAGER="/home/dwemer/dwemerdistro/bin/ddistro_server"
+fi
+
+DIALECTIC_DATABASE_READY=0
+if [ -x "$SERVER_MANAGER" ]; then
+    for managed_product in herika stobe dialectic reign; do
+        if "$SERVER_MANAGER" startup "$managed_product"; then
+            if [ "$managed_product" = "dialectic" ]; then
+                DIALECTIC_DATABASE_READY=1
+            fi
+        else
+            echo "WARNING: $managed_product needs attention; continuing with the remaining application servers."
+        fi
+    done
+else
+    echo "WARNING: Optional-server manager is unavailable. Run Update Mods before starting application servers."
+fi
 
 # Start Apache/PHP server
 echo "Starting Apache/PHP/PGSQL Server"
+# Shared loopback listener for custom mods on CUSTOM_MODS_PORT; official sites are not touched.
+/usr/local/bin/ddistro_custom_mod setup-web || echo "WARNING: The custom mod listener needs attention; official servers are unaffected."
 /etc/init.d/apache2 restart &>/dev/null
 /etc/init.d/postgresql restart
 
-if ! ensure_stobe_database; then
-    echo "WARNING: StobeServer may not be fully initialized."
+# Start the queue worker after the database restart so it can claim dialogue jobs.
+if [ -x "$SERVER_MANAGER" ]; then
+    "$SERVER_MANAGER" startup lorkhan || echo "WARNING: LORKHAN worker failed to start; check its log."
 fi
 
-ensure_dialectic_runtime_permissions || true
-
-DIALECTIC_DATABASE_READY=1
-if ! ensure_dialectic_database; then
-    DIALECTIC_DATABASE_READY=0
-    echo "WARNING: DialecticServer may not be fully initialized."
+if [ -x /var/www/html/ReignServer/runtime/current/ReignBetaServer ]; then
+    /usr/local/bin/ddistro_reign start || echo "WARNING: Reign failed to start; check its log."
 fi
 
-if [ "$DIALECTIC_DATABASE_READY" -eq 1 ]; then
+if [ "$DIALECTIC_DATABASE_READY" -eq 1 ] && [ -d "/var/www/html/DialecticServer" ]; then
     ensure_dialectic_runtime
-else
+elif [ -d "/var/www/html/DialecticServer" ]; then
     echo "WARNING: DialecticServer background runtime was not started because its database is not ready."
 fi
 
 # Create symbolic link for Apache error log if it doesn't exist
-if [ ! -e "/var/www/html/HerikaServer/log/apache_error.log" ]; then
+if [ -d "/var/www/html/HerikaServer" ] && [ ! -e "/var/www/html/HerikaServer/log/apache_error.log" ]; then
   mkdir -p /var/www/html/HerikaServer/log/
   ln -sf /var/log/apache2/error.log /var/www/html/HerikaServer/log/apache_error.log
 fi
@@ -563,7 +673,16 @@ fi
 if [ -f /home/dwemer/parakeet-api-server/start.sh ];then
 	echo -ne  "Starting Parakeet "
 	su dwemer -c /home/dwemer/parakeet-api-server/start.sh
-    check_port "$PARAKEET_PORT"
+	if ! check_port "$PARAKEET_PORT"; then
+		L_PARAKEET=1
+		echo "Parakeet did not become ready; speech-to-text is unavailable."
+		if [ -r /home/dwemer/parakeet-api-server/log.txt ]; then
+			echo "Last Parakeet log lines:"
+			tail -n 12 /home/dwemer/parakeet-api-server/log.txt | sed 's/^/  /'
+		else
+			echo "Parakeet log is unavailable at /home/dwemer/parakeet-api-server/log.txt"
+		fi
+	fi
 else
 	echo "Skipping Parakeet (not enabled)"
 	L_PARAKEET=1
@@ -599,6 +718,13 @@ else
 	L_POCKETTTS=1
 fi
 
+# Keep DwemerDistro-managed PocketTTS connectors on the backend that just started.
+# One bounded check; it never blocks the rest of startup.
+if [ -x /usr/local/bin/sync_pockettts_connectors ]; then
+	runuser -u dwemer -- /usr/local/bin/sync_pockettts_connectors --startup ||
+		echo "PocketTTS connector check is incomplete; see the details above. Continuing startup."
+fi
+
 if [ -f "/home/dwemer/piper/cuda-keyring_1.1-1_all.deb" ]; then 
 
     if [ -f  "/home/dwemer/piper/start.sh" ]; then
@@ -630,6 +756,19 @@ if [ -f  "/home/dwemer/xtts-api-server/start.sh" ]; then
 else
 	echo  "Skipping CHIM XTTS server (not enabled)"
 	L_XTTSV2=1
+fi
+
+# LM Studio starts only after the user enables it in its manager.
+if [ -e /usr/local/bin/ddistro_lmstudio ]; then
+    # Check access as the account that reads and executes the Python helper.
+    { runuser -u dwemer -- test -r /usr/local/bin/ddistro_lmstudio &&
+      runuser -u dwemer -- test -x /usr/local/bin/ddistro_lmstudio &&
+      runuser -u dwemer -- /usr/local/bin/ddistro_lmstudio autostart; } || echo 'LM Studio startup failed; open its manager for details.'
+fi
+
+# Higgs is opt-in and uses a dedicated runtime and port.
+if [ -f /home/dwemer/higgs-tts/.enabled ] && [ -x /home/dwemer/higgs-tts/service.sh ]; then
+    /home/dwemer/higgs-tts/service.sh start || echo 'Higgs startup failed; see /home/dwemer/higgs-tts/server.log'
 fi
 
 if [ -f "/home/dwemer/omnivoice-tts/start-gpu.sh" ]; then
@@ -667,15 +806,16 @@ else
 	L_MCPSERVER=1
 fi
 
-# Save IPs to PostgreSQL database after all services are started
+# Save IPs to the Herika database only when CHIM is installed. These values are
+# product configuration, not a dependency of the server-free distro core.
 export PGPASSWORD=dwemer
 
-# Wait for PostgreSQL to be fully ready
-sleep 2
-
-# Check if database connection works and create/update IP records
-psql_result=$(psql -h localhost -U dwemer -d dwemer -t -c "SELECT 1;" 2>/dev/null | tr -d ' \n')
-if [ "$psql_result" = "1" ]; then
+# Check if the Herika database connection works and create/update IP records.
+if [ -d "/var/www/html/HerikaServer" ]; then
+  # Wait for PostgreSQL to be fully ready before writing CHIM network settings.
+  sleep 2
+  psql_result=$(psql -h localhost -U dwemer -d dwemer -t -c "SELECT 1;" 2>/dev/null | tr -d ' \n')
+  if [ "$psql_result" = "1" ]; then
     # Create conf_opts table if it doesn't exist
     psql -h localhost -U dwemer -d dwemer -c "
     CREATE TABLE IF NOT EXISTS conf_opts (
@@ -697,7 +837,8 @@ if [ "$psql_result" = "1" ]; then
     ON CONFLICT (id) 
     DO UPDATE SET value = EXCLUDED.value;" &>/dev/null
     
-    echo "Network IPs saved to database successfully."
+      echo "Network IPs saved to HerikaServer database successfully."
+  fi
 fi
 
 unset PGPASSWORD
@@ -708,12 +849,20 @@ cat << EOF
 AIAgent.ini Network Settings:
 Windows Host IP: $host_ip 
 WSL2 Internal IP: $wsl_ip 
-HerikaServer: http://$ipaddress:8081/HerikaServer
-StobeServer: http://$ipaddress:8083/StobeServer
-DialecticServer: http://$ipaddress:8088/DialecticServer
-
-Running Components:
 EOF
+
+if [ -d "/var/www/html/HerikaServer" ]; then
+    echo "HerikaServer: http://$ipaddress:8081/HerikaServer"
+fi
+if [ -d "/var/www/html/StobeServer" ]; then
+    echo "StobeServer: http://$ipaddress:8083/StobeServer"
+fi
+if [ -d "/var/www/html/DialecticServer" ]; then
+    echo "DialecticServer: http://$ipaddress:8088/DialecticServer"
+fi
+
+echo
+echo "Running Components:"
 
 if [ -z "$L_MINIME" ]; then
 	echo Minime-T5/TXT2VEC API: http://$ipaddress:8082
@@ -759,11 +908,23 @@ if [ -z "$L_MCPSERVER" ]; then
 	echo CHIM MCP Server: http://$ipaddress:3100
 fi
 
-explorer.exe http://$ipaddress:8081/Dwemer-Dashboard/index.php &>/dev/null&
+if [ "$DASHBOARD_AUTOOPEN" = "0" ]; then
+	echo "Skipping Dwemer Dashboard browser launch (disabled in launcher Settings)."
+else
+	echo "Opening Dwemer Dashboard in the default browser."
+	explorer.exe http://$ipaddress:8081/Dwemer-Dashboard/index.php &>/dev/null&
+fi
 
 echo "Press Enter to shutdown DwemerDistro"
 read
 
+if runuser -u dwemer -- test -r /usr/local/bin/ddistro_lmstudio &&
+   runuser -u dwemer -- test -x /usr/local/bin/ddistro_lmstudio; then
+    runuser -u dwemer -- /usr/local/bin/ddistro_lmstudio shutdown
+fi
+if [ -x /usr/local/bin/ddistro_reign ]; then /usr/local/bin/ddistro_reign stop; fi
+if [ -x /etc/init.d/lorkhanserver-worker ]; then service lorkhanserver-worker stop; fi
+if [ -x /home/dwemer/higgs-tts/service.sh ]; then /home/dwemer/higgs-tts/service.sh stop; fi
 killall -15 -u dwemer
 
 /etc/init.d/apache2 stop

@@ -1,0 +1,103 @@
+#!/usr/bin/python3
+"""Repair configured GitHub CLI APT keyrings without changing repository trust settings."""
+
+import glob
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+import time
+
+
+FINGERPRINT = "7F38BBB59D064DBCB3D84D725612B36462313325"
+KEY_URL = "https://cli.github.com/packages/githubcli-archive-keyring.gpg"
+
+
+def configured_keyrings():
+    """Read active GitHub entries in both APT source formats; preserve Signed-By paths."""
+    paths = set()
+    for filename in ["/etc/apt/sources.list", *glob.glob("/etc/apt/sources.list.d/*.list"),
+                     *glob.glob("/etc/apt/sources.list.d/*.sources")]:
+        source = Path(filename)
+        if not source.exists():
+            continue
+        text = "\n".join(line for line in source.read_text().splitlines()
+                         if not line.lstrip().startswith("#"))
+        entries = re.split(r"\n\s*\n", text) if source.suffix == ".sources" else text.splitlines()
+        for entry in entries:
+            if source.suffix == ".sources":
+                if re.search(r"^Enabled:\s*no\s*$", entry, re.I | re.M):
+                    continue
+                urls = re.search(r"^URIs:\s*(.+)$", entry, re.I | re.M)
+                signed = re.search(r"^Signed-By:[ \t]*(.+)$", entry, re.I | re.M)
+            else:
+                if not re.match(r"^\s*deb(?:-src)?\s", entry):
+                    continue
+                urls = re.search(r"https?://cli\.github\.com/packages/?(?:\s|$)", entry)
+                signed = re.search(r"\bsigned-by=([^\s\]]+)", entry)
+            if not urls or not re.search(r"https?://cli\.github\.com/packages/?(?:\s|$)", urls.group(0)):
+                continue
+            values = signed.group(1).strip().split() if signed else []
+            if not values or any(not value.startswith("/") for value in values):
+                raise RuntimeError(f"Unsupported GitHub CLI Signed-By setting in {filename}")
+            paths.update(Path(value) for value in values)
+    return sorted(paths)
+
+
+def has_current_key(path, homedir):
+    """Accept only the expected, unexpired primary key; never import into a user keyring."""
+    result = subprocess.run(
+        ["gpg", "--batch", "--homedir", homedir, "--with-colons", "--show-keys", str(path)],
+        capture_output=True, text=True)
+    if result.returncode:
+        return False
+    primary_valid = False
+    for line in result.stdout.splitlines():
+        fields = line.split(":")
+        if fields[0] == "pub":
+            primary_valid = (fields[1] not in ("r", "e", "d") and
+                             (not fields[6] or int(fields[6]) > time.time()))
+        elif fields[0] == "sub":
+            primary_valid = False
+        elif fields[0] == "fpr" and primary_valid and fields[9] == FINGERPRINT:
+            return True
+    return False
+
+
+def main():
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", "--", os.path.abspath(__file__)])
+    paths = configured_keyrings()
+    if not paths:
+        return
+    with tempfile.TemporaryDirectory(prefix="github-cli-keyring-") as work:
+        pending = [path for path in paths if not has_current_key(path, work)]
+        if not pending:
+            return
+        download = Path(work) / "download.gpg"
+        subprocess.run(["curl", "--fail", "--silent", "--show-error", "--location",
+                        "--proto", "=https", "--proto-redir", "=https",
+                        "--connect-timeout", "15", "--max-time", "60",
+                        "--output", str(download), KEY_URL], check=True)
+        if not has_current_key(download, work):
+            raise RuntimeError("Downloaded GitHub CLI keyring does not contain the expected current key")
+        for path in pending:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".github-cli-", delete=False) as output:
+                    temporary = Path(output.name)
+                    output.write(download.read_bytes())
+                    os.fchmod(output.fileno(), 0o644)
+                os.replace(temporary, path)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        raise SystemExit(f"GitHub CLI keyring repair failed: {error}")
