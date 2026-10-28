@@ -146,12 +146,13 @@ service postgresql start >/dev/null 7<&- || exit 1
 /usr/local/bin/ensure_postgres_utf8 || exit 1
 
 # Replace a shipped configuration file only while it still matches what an update installed.
-# A file the user changed is kept; a missing file gets the shipped default.
+# A file the user changed is kept; a missing file gets the shipped default. Updates from before
+# the recorded baseline existed pass the SHA-256 of each earlier shipped copy, which counts as unchanged.
 SHIPPED_CONFIG_STATE=/var/lib/dwemerdistro/shipped-config
 install_shipped_config() {
     local source="$1" target="$2" mode="$3"
     local baseline="$SHIPPED_CONFIG_STATE/$(basename "$target").sha256"
-    local shipped current recorded=""
+    local shipped current recorded="" previous
 
     shipped="$(sha256sum < "$source" | cut -d ' ' -f 1)" || return 1
     if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
@@ -160,7 +161,13 @@ install_shipped_config() {
     fi
     if [ -f "$target" ]; then
         current="$(sha256sum < "$target" | cut -d ' ' -f 1)" || return 1
-        [ ! -f "$baseline" ] || recorded="$(head -n 1 "$baseline")"
+        if [ -f "$baseline" ]; then
+            recorded="$(head -n 1 "$baseline")"
+        else
+            for previous in "${@:4}"; do
+                [ "$current" != "$previous" ] || recorded="$previous"
+            done
+        fi
         if [ "$current" != "$shipped" ] && [ "$current" != "$recorded" ]; then
             printf ">> Keeping customized %s\n" "$target"
             return 0
@@ -175,8 +182,10 @@ printf ">> Copying configuration files to /etc...\n"
 find /home/dwemer/dwemerdistro/etc/ -type f ! -name "php.ini" ! -name "dwemerdistro_services.conf" \
     ! -name "dwemerdistro-lmstudio.json" ! -name "cuda_config" -exec cp {} /etc/ \; 2>/dev/null
 if [ $? -eq 0 ]; then
-    # The LM Studio helper runs as dwemer and must read the public model catalog.
-    install_shipped_config /home/dwemer/dwemerdistro/etc/dwemerdistro-lmstudio.json /etc/dwemerdistro-lmstudio.json 644 || exit 1
+    # The LM Studio helper runs as dwemer and must read the public model catalog. The hash is the
+    # catalog shipped before the recorded baseline (v1.0.7 and v1.0.8).
+    install_shipped_config /home/dwemer/dwemerdistro/etc/dwemerdistro-lmstudio.json /etc/dwemerdistro-lmstudio.json 644 \
+        77e1415be85be014231aa5eea3d29bfd08cbfa949b7d23fd55bfccff8b098dd9 || exit 1
     install_shipped_config /home/dwemer/dwemerdistro/etc/cuda_config /etc/cuda_config 644 || exit 1
     install -d -o root -g root -m 755 /etc/dwemer || exit 1
     install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/shared-key-runtime.json /etc/dwemer/shared-key-runtime.json || exit 1

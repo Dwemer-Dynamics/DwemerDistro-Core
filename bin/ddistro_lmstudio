@@ -13,11 +13,14 @@ import re
 import secrets
 import selectors
 import shutil
+import signal
 import stat
 import struct
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 HOME = Path('/home/dwemer')
@@ -25,11 +28,19 @@ STATE = HOME / '.config/dwemerdistro/lmstudio'
 LMS = HOME / '.lmstudio/bin/lms'
 API = 'http://127.0.0.1:1234'
 CATALOG = Path('/etc/dwemerdistro-lmstudio.json')
+# Engine processes are this user's processes running an executable from LM Studio's install folders (the llmster
+# versions, the lms CLI and backend runtimes), and their descendants; user files elsewhere in ~/.lmstudio never match.
+ENGINE = HOME / '.lmstudio'
+ENGINE_DIRS = ('llmster', 'bin', 'extensions/backends')
+HELPER = Path(__file__).resolve()
 MUTATIONS = {'start', 'stop', 'restart', 'settings', 'download', 'import', 'load', 'unload', 'test', 'model-defaults', 'test-preset'}
 IMPORTS = STATE / 'imports'
 IMPORT_TARGET = STATE / 'import-target.json'
 # Distinct language models that may stay loaded together, such as a dialogue model and a smaller decision model.
 MAX_LOADED = 2
+# Numbered slots (1..MAX_LOADED) map to exact loaded model keys and persist across polls and page reloads. They only
+# organise loading here; inference clients still choose a model by its id.
+SLOTS = STATE / 'slots.json'
 # Byte sizes of fixed-width GGUF metadata value types (enum gguf_type in ggml's gguf.h).
 GGUF_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 GGUF_UINT16, GGUF_STRING, GGUF_ARRAY = 2, 8, 9
@@ -45,6 +56,25 @@ CACHE_TYPES = {'f32', 'f16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1'}
 TEST_NUMBERS = {'temperature': (0, 1, float), 'max_output_tokens': (1, 4096, int),
                 'top_p': (0, 1, float), 'top_k': (1, 1000, int), 'min_p': (0, 1, float),
                 'repeat_penalty': (0.1, 2, float)}
+# Hugging Face discovery: fixed public API, validated names, short cache and a request budget shared by all sessions.
+HF = 'https://huggingface.co'
+HF_REPO = re.compile(r'[A-Za-z0-9][\w.-]{0,95}/[\w.-]{1,96}', re.A)
+HF_FILE = re.compile(r'[\w.+-]{1,200}\.gguf', re.I | re.A)
+HF_SPLIT = re.compile(r'-\d{5}-of-\d{5}\.gguf$', re.I)
+# Calibration data (an imatrix name without a quant) and multi-token prediction companions (mtp- prefix) share
+# repositories with models.
+HF_IMATRIX = re.compile(r'(?<![A-Za-z0-9])imatrix(?![A-Za-z0-9])', re.I)
+HF_MTP = re.compile(r'mtp[-_.]', re.I)
+HF_QUANT = re.compile(r'(?<![A-Za-z0-9])(I?Q\d_[A-Z0-9_]+?|TQ\d_\d|MXFP4|BF16|F16|F32)(?=[.-]|$)', re.I)
+HF_CACHE, HF_CACHE_SECONDS, HF_BUDGET = STATE / 'hf-cache.json', 600, 30
+# Browse filters map to fixed Hugging Face API values; HF parameter ranges include both ends.
+HF_SIZES = {'': None, '0-4': 'max:4B', '4-9': 'min:4B,max:9B', '9-15': 'min:9B,max:15B', '15-35': 'min:15B,max:35B',
+            '35-': 'min:35B'}
+HF_TASKS = {'': None, 'text-generation': 'text-generation', 'image-text-to-text': 'image-text-to-text'}
+HF_SORTS = {'trending': 'trendingScore', 'downloads': 'downloads', 'likes': 'likes', 'updated': 'lastModified',
+            'newest': 'createdAt'}
+HF_CURSOR = re.compile(r'[A-Za-z0-9+/=_-]{1,1500}', re.A)
+HF_PAGE = 20
 os.umask(0o077)
 
 
@@ -140,6 +170,23 @@ def model_changed():
     write_json(STATE / 'model-state.json', {'changedAt': max(time.time(), previous + .001)})
 
 
+def slot_map(models):
+    # Saved slots keep loaded models; a loaded model without one (an older helper, lms or the desktop app) takes the
+    # lowest free slot. A model that is no longer loaded frees its slot.
+    loaded = [m.get('key') for m in models if m.get('loaded_instances') and m.get('type') == 'llm']
+    saved, slots = read_json(SLOTS, {}), {}
+    saved = saved if isinstance(saved, dict) else {}
+    for number in range(1, MAX_LOADED + 1):
+        key = saved.get(str(number))
+        if key in loaded and key not in slots.values():
+            slots[str(number)] = key
+    for key in loaded:
+        free = next((str(n) for n in range(1, MAX_LOADED + 1) if str(n) not in slots), None)
+        if key not in slots.values() and free:
+            slots[free] = key
+    return slots
+
+
 def memlock_limit():
     # The engine's soft RLIMIT_MEMLOCK in bytes; None when unlimited or the engine is not running.
     for proc in Path('/proc').iterdir():
@@ -193,8 +240,8 @@ def status():
             job = read_json(STATE / 'job.json', {})
             if job.get('state') == 'running':
                 message = 'Operation interrupted. Check the model state and retry.'
-                if job.get('preset'):
-                    message = 'Operation interrupted. Retry to resume a preset download.'
+                if job.get('preset') or job.get('file'):
+                    message = 'Operation interrupted. Retry to resume the download.'
                 if job.get('action') == 'import':
                     retained = clear_imports()
                     message = ('Import interrupted. Private staging was cleared and your original file is '
@@ -209,6 +256,10 @@ def status():
             gone = (tested is not None and tested not in instances) or (loaded is not None and loaded not in keys)
             if running and gone and changed == read_json(STATE / 'model-state.json', {}).get('changedAt'):
                 model_changed()
+            # Same guard: a job that loaded or unloaded after the list above was read keeps its own slot record.
+            if running and changed == read_json(STATE / 'model-state.json', {}).get('changedAt'):
+                if slot_map(models) != read_json(SLOTS, {}):
+                    write_json(SLOTS, slot_map(models))
         except BlockingIOError:
             job = read_json(STATE / 'job.json', {})
     last_test, last_load = read_json(STATE / 'last-test.json', {}), read_json(STATE / 'last-load.json', {})
@@ -220,6 +271,7 @@ def status():
               'modelDefaults': read_json(STATE / 'model-defaults.json', {}),
               'testPresets': read_json(STATE / 'test-presets.json', {}),
               'advancedAvailable': Path(SDK_PYTHON).is_file(), 'maxLoaded': MAX_LOADED,
+              'slots': slot_map(models) if running else {},
               'lastTest': last_test if last_test.get('model') in instances else {},
               'lastLoad': last_load if last_load.get('model') in keys else {},
               'memoryLockLimit': memlock_limit(), 'resources': resources()}
@@ -286,10 +338,13 @@ def validate(data):
         number(data, 'ttl', 60, 86400, 600)
         number(data, 'gpu', 0, 100, 100)
         configuration(data.get('advanced', {}), 'load')
+    if action == 'load' and 'slot' in data:
+        number(data, 'slot', 1, MAX_LOADED, 1)
     if action == 'settings':
-        startup = data.get('startupModel', '')
-        if not isinstance(startup, str) or len(startup) > 512 or startup.startswith('-') or '\x00' in startup:
-            raise ValueError('Invalid startup model.')
+        for key in ('startupModel', 'startupDecisionModel'):
+            startup = data.get(key, '')
+            if not isinstance(startup, str) or len(startup) > 512 or startup.startswith('-') or '\x00' in startup:
+                raise ValueError('Invalid startup model.')
     if action == 'test-preset':
         if not isinstance(data.get('name'), str) or not re.fullmatch(r'[\w .-]{1,60}', data['name']):
             raise ValueError('Preset name must be 1–60 letters, numbers, spaces, dots or hyphens.')
@@ -298,8 +353,12 @@ def validate(data):
         configuration(data.get('generation', {}), 'test')
     if action == 'download':
         if data.get('preset'):
-            if data['preset'] not in {m['id'] for m in read_json(CATALOG, {})['models']}:
+            if data['preset'] not in {m['id'] for m in catalog_models()}:
                 raise ValueError('Unknown preset.')
+        elif 'repo' in data:
+            hf_repo(data['repo'])
+            if not isinstance(data.get('file'), str) or not HF_FILE.fullmatch(data['file']) or '..' in data['file']:
+                raise ValueError('Choose a standalone .gguf file from the repository.')
         else:
             source = data.get('source', '')
             # lms accepts HF URLs or a catalog identifier; flags, local paths and other hosts do not pass.
@@ -314,6 +373,198 @@ def validate(data):
             raise ValueError('Invalid reasoning setting.')
         if not isinstance(data.get('prompt'), str) or not 1 <= len(data['prompt']) <= 4000:
             raise ValueError('Enter a prompt up to 4000 characters.')
+
+
+# Keys LM Studio lists now, or listed at its last check while it is stopped.
+def known_models():
+    try:
+        with request('/api/v1/models') as response:
+            models = json.load(response)['models']
+    except (OSError, ValueError, KeyError):
+        try:
+            models = read_json(STATE / 'model-inventory.json', {}).get('models', [])
+        except (OSError, ValueError, AttributeError):
+            models = []
+    return {m.get('key') for m in models if isinstance(m, dict) and m.get('type') == 'llm'} if isinstance(models, list) else set()
+
+
+def proc_stat(pid):
+    # (state, parent, session, start time in clock ticks, real uid), or None once the process is gone.
+    try:
+        text = Path(f'/proc/{pid}/stat').read_text()
+        uid = int(re.search(r'^Uid:\s+(\d+)', Path(f'/proc/{pid}/status').read_text(), re.M).group(1))
+    except (OSError, AttributeError, ValueError):
+        return None
+    fields = text[text.rindex(')') + 2:].split()
+    return fields[0], int(fields[1]), int(fields[3]), int(fields[19]), uid
+
+
+def own_processes():
+    table = {}
+    for proc in Path('/proc').iterdir():
+        info = proc_stat(proc.name) if proc.name.isdigit() else None
+        if info and info[4] == os.getuid() and info[0] not in 'ZX':
+            table[int(proc.name)] = info
+    return table
+
+
+def helper_process(pid, commands):
+    try:
+        args = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')[:-1]
+        return (len(args) == 3 and b'python' in os.path.basename(args[0]) and args[2].decode() in commands and
+                Path(os.fsdecode(args[1])).resolve() == HELPER)
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def engine_process(pid):
+    try:
+        exe = Path(os.readlink(f'/proc/{pid}/exe').removesuffix(' (deleted)'))
+    except OSError:
+        return False
+    return any(exe.is_relative_to((ENGINE / folder).resolve()) for folder in ENGINE_DIRS)
+
+
+# New jobs and startup drivers hold this shared barrier only while they are admitted (until a worker records its pid),
+# so a running force stop refuses them without ever waiting behind a running or hung job.
+def admit():
+    gate = (STATE / 'admit.lock').open('a')
+    try:
+        fcntl.flock(gate, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        gate.close()
+        raise ValueError('A force stop is running. Try again in a moment.')
+    return gate
+
+
+# A pidfd pins the process, and its unchanged start time proves the pid was not reused since it was identified.
+def send(pid, start, sig):
+    try:
+        handle = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return False
+    try:
+        info = proc_stat(pid)
+        if not info or info[3] != start or info[0] in 'ZX':
+            return False
+        signal.pidfd_send_signal(handle, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    finally:
+        os.close(handle)
+
+
+def survivors(targets, seconds):
+    deadline = time.monotonic() + seconds
+    while True:
+        alive = {pid: start for pid, start in targets.items()
+                 if (info := proc_stat(pid)) and info[3] == start and info[0] not in 'ZX'}
+        if not alive or time.monotonic() > deadline:
+            return alive
+        time.sleep(.1)
+
+
+# Emergency recovery that never queues behind the job lock. It freezes the recorded job worker, a running autostart or
+# start-saved helper and their descendants so none can restart the engine, ends this user's LM Studio engine processes,
+# then ends the frozen ones and reconciles the job record under the lock. Settings, defaults and models are kept.
+def force_stop():
+    with (STATE / 'force.lock').open('a') as guard:
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('A force stop is already running.')
+        gate, deadline = (STATE / 'admit.lock').open('a'), time.monotonic() + 3
+        while True:
+            try:
+                fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    gate.close()
+                    raise ValueError('An operation is starting. Try Force stop again in a moment.')
+                time.sleep(.05)
+        job, deadline = read_json(STATE / 'job.json', {}), time.monotonic() + 3
+        # A worker records itself right after it starts.
+        while job.get('state') == 'running' and 'pid' not in job and time.monotonic() < deadline:
+            time.sleep(.1)
+            job = read_json(STATE / 'job.json', {})
+        table, ancestors, pid = own_processes(), set(), os.getpid()
+        while pid > 1 and pid not in ancestors:
+            ancestors.add(pid)
+            pid = (proc_stat(pid) or (0, 0))[1]
+        roots = {pid: info[3] for pid, info in table.items()
+                 if pid not in ancestors and helper_process(pid, {'autostart', 'start-saved'})}
+        worker = job.get('pid')
+        if (job.get('state') == 'running' and isinstance(worker, int) and worker in table and worker not in ancestors and
+                table[worker][3] == job.get('pidStart') and helper_process(worker, {'submit'})):
+            roots[worker] = table[worker][3]
+        frozen, tried = {}, set()
+        for _ in range(5):
+            # The worker leads its own session, so processes it started stay found after their parent exits.
+            table = own_processes()
+            sessions = {pid for pid in roots if pid in table and table[pid][2] == pid}
+            tree, grown = {pid: start for pid, start in roots.items() if pid in table}, True
+            while grown:
+                grown = False
+                for pid, info in table.items():
+                    if pid not in tree and pid not in ancestors and (info[1] in tree or info[2] in sessions):
+                        tree[pid], grown = info[3], True
+            new = {pid: start for pid, start in tree.items() if pid not in tried}
+            if not new:
+                break
+            for pid, start in new.items():
+                tried.add(pid)
+                if send(pid, start, signal.SIGSTOP):
+                    frozen[pid] = start
+        table = own_processes()
+        engine, grown = {pid: info[3] for pid, info in table.items()
+                         if pid not in ancestors and pid not in frozen and engine_process(pid)}, True
+        while grown:
+            grown = False
+            for pid, info in table.items():
+                if pid not in engine and pid not in ancestors and pid not in frozen and info[1] in engine:
+                    engine[pid], grown = info[3], True
+        for pid, start in engine.items():
+            send(pid, start, signal.SIGTERM)
+        for pid, start in {**survivors(engine, 5), **frozen}.items():
+            send(pid, start, signal.SIGKILL)
+        left = survivors({**engine, **frozen}, 5)
+        with (STATE / 'job.lock').open('a') as lock:
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() > deadline:
+                        raise ValueError('LM Studio processes were stopped, but another operation still holds the job '
+                                         'lock. Check again in a moment, or restart Dwemer Distro.')
+                    time.sleep(.2)
+            # Only the job that was running when the force stop began is closed; a newer record is left as it is.
+            latest = read_json(STATE / 'job.json', {})
+            if latest.get('id') == job.get('id') and latest.get('state') == 'running':
+                message = 'Force stopped. The operation was interrupted; check the model state and retry.'
+                if latest.get('action') == 'import':
+                    retained = clear_imports()
+                    message = 'Force stopped. Import staging was cleared and your original file is unchanged.' + (
+                        f' A registration file was preserved at {retained}. Check it before retrying.' if retained else '')
+                progress(latest, message, state='failed')
+            try:
+                request('/api/v1/models', timeout=1).close()
+                reachable = True
+            except OSError:
+                reachable = False
+                SLOTS.unlink(missing_ok=True)
+            model_changed()
+        gate.close()
+    if reachable:
+        raise ValueError(f'LM Studio still answers at {API} after Force stop. It may run outside Dwemer Distro; close it '
+                         'there, or restart Dwemer Distro.')
+    if left:
+        raise ValueError(f'{len(left)} LM Studio process(es) did not stop. Restart Dwemer Distro to recover.')
+    return {'ok': True, 'stopped': len(engine) + len(frozen),
+            'interrupted': job.get('action') if job.get('state') == 'running' else None}
 
 
 def start():
@@ -337,35 +588,286 @@ def sha256(path, job, size):
     return digest.hexdigest()
 
 
-def preset_installed(model):
+def installed_entry(model):
     installed = json.loads(command('ls', '--json'))
-    return any(m.get('path') == model['repo'] + '/' + model['file'] and m.get('sizeBytes') == model['bytes'] for m in installed)
+    return next((m for m in installed if m.get('path') == model['repo'] + '/' + model['file'] and
+                 m.get('sizeBytes') == model['bytes']), None)
+
+
+# The manager selects a finished download only by the key lms lists for that exact file. A key grouping several
+# variants may load a different file, so it is not reported and the user chooses the model in the list instead.
+def model_identity(entry):
+    key = (entry or {}).get('modelKey')
+    if entry and entry.get('type', 'llm') == 'llm' and isinstance(key, str) and key and len(entry.get('variants') or []) <= 1:
+        return {'modelKey': key}
+    return {}
+
+
+# Presets keep their original list for Quickstart; recommended dialogue and decision candidates live beside it.
+def catalog_models():
+    catalog = read_json(CATALOG, {})
+    return catalog.get('models', []) + catalog.get('recommended', []) + catalog.get('decisionRecommended', [])
+
+
+# Exact identity only: the file lms import creates for this repository and name, with the pinned byte count.
+def installed_file(repo, file, size):
+    try:
+        info = (models_folder() / repo / file).lstat()
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_size == size
+
+
+# API lookups follow only canonical-name redirects; downloads may also continue to the Hugging Face CDN.
+class HFRedirects(urllib.request.HTTPRedirectHandler):
+    def __init__(self, cdn):
+        self.cdn = cdn
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        url = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
+        host = (url.hostname or '').lower()
+        if not (url.scheme == 'https' and url.port in {None, 443} and (
+                (host == 'huggingface.co' and url.path.startswith('/api/models/')) or (self.cdn and (
+                    host == 'huggingface.co' or host.endswith('.huggingface.co') or host.endswith('.hf.co'))))):
+            raise urllib.error.HTTPError(req.full_url, code, 'Redirect refused', headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def hf_opener(cdn=False):
+    return urllib.request.build_opener(HFRedirects(cdn))
+
+
+# With pages=True, also return the next-page cursor from a Link header that points back at the same endpoint.
+def hf_get(path, query, limit, pages=False):
+    req = urllib.request.Request(HF + path + '?' + urllib.parse.urlencode(query),
+                                 headers={'Accept': 'application/json', 'User-Agent': 'DwemerDistro-LMStudio'})
+    body, deadline = b'', time.monotonic() + 20
+    try:
+        with hf_opener().open(req, timeout=10) as response:
+            link = response.headers.get('Link', '') if pages else ''
+            while chunk := response.read(65536):
+                body += chunk
+                if len(body) > limit:
+                    raise ValueError('Hugging Face returned more data than DwemerDistro accepts.')
+                if time.monotonic() > deadline:
+                    raise ValueError('Hugging Face took too long to respond. Retry later.')
+    except urllib.error.HTTPError as error:
+        if error.code == 400 and pages:
+            raise ValueError('Hugging Face rejected these results. Search again.')
+        if error.code in {401, 403, 404}:
+            raise ValueError('Repository not found, private, or not available without signing in.')
+        if error.code == 429:
+            raise ValueError('Hugging Face is limiting requests. Wait a minute and retry.')
+        if 300 <= error.code < 400:
+            raise ValueError('Hugging Face redirected to an unexpected location, so the request was stopped.')
+        raise ValueError(f'Hugging Face returned HTTP {error.code}. Retry later.')
+    except OSError:
+        raise ValueError('Could not reach Hugging Face. Check the internet connection and retry.')
+    try:
+        value = json.loads(body)
+    except ValueError:
+        raise ValueError('Hugging Face returned an unreadable response.')
+    if not pages:
+        return value
+    cursor, found = None, re.search(r'<([^<>]{1,4096})>\s*;\s*rel="next"', link)
+    if found:
+        url = urllib.parse.urlsplit(found.group(1))
+        values = urllib.parse.parse_qs(url.query).get('cursor', [])
+        if url.scheme == 'https' and url.hostname == 'huggingface.co' and url.path == path and len(values) == 1 and \
+                HF_CURSOR.fullmatch(values[0]):
+            cursor = values[0]
+    return value, cursor
+
+
+# One shared cache and per-minute request budget for every browser session; errors are never cached.
+def hf_cached(key, fetch, fresh=False):
+    with (STATE / 'hf.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            cache = read_json(HF_CACHE, {})
+        except (OSError, ValueError):
+            cache = {}
+        now = time.time()
+        entries = cache.get('entries') if isinstance(cache, dict) and isinstance(cache.get('entries'), dict) else {}
+        entries = {k: v for k, v in entries.items() if isinstance(v, dict) and isinstance(v.get('at'), (int, float))
+                   and 0 <= now - v['at'] < HF_CACHE_SECONDS and 'value' in v}
+        if not fresh and key in entries:
+            return entries[key]['value']
+        recent = cache.get('requests') if isinstance(cache, dict) and isinstance(cache.get('requests'), list) else []
+        recent = [t for t in recent if isinstance(t, (int, float)) and 0 <= now - t < 60]
+        if len(recent) >= HF_BUDGET:
+            raise ValueError('Too many Hugging Face lookups in the last minute. Wait a moment and retry.')
+        recent.append(now)
+        write_json(HF_CACHE, {'entries': entries, 'requests': recent})
+        value = fetch()
+        entries[key] = {'at': time.time(), 'value': value}
+        entries = dict(sorted(entries.items(), key=lambda item: item[1]['at'])[-40:])
+        write_json(HF_CACHE, {'entries': entries, 'requests': recent})
+        return value
+
+
+def hf_repo(value):
+    if not isinstance(value, str) or len(value) > 300:
+        value = ''
+    value = value.strip()
+    url = re.fullmatch(r'https://huggingface\.co/([^/?#]+/[^/?#]+)(?:/(?:tree|blob|resolve)/[^?#]*)?/?(?:[?#].*)?', value)
+    repo = url.group(1) if url else value
+    if not HF_REPO.fullmatch(repo) or '..' in repo or repo.split('/')[0] in {'datasets', 'spaces', 'api'}:
+        raise ValueError('Enter a Hugging Face model repository as owner/name or its https://huggingface.co/ URL.')
+    return repo
+
+
+def hf_count(value):
+    return value if type(value) is int and value >= 0 else 0
+
+
+def hf_choice(data, key, choices, default=''):
+    value = data.get(key, default)
+    if not isinstance(value, str) or value not in choices:
+        raise ValueError('Invalid search filter. Reset filters and retry.')
+    return value
+
+
+# Metadata Hugging Face read from a repository's GGUF header, when it has one. The rest of that object, including
+# chat templates, is dropped here and never cached or returned.
+def hf_gguf(item):
+    info = item.get('gguf') if isinstance(item.get('gguf'), dict) else {}
+    params, arch, context = info.get('total'), info.get('architecture'), info.get('context_length')
+    return {'params': params if type(params) is int and 0 < params < 10**13 else None,
+            'architecture': arch if isinstance(arch, str) and re.fullmatch(r'[\w.-]{1,40}', arch, re.A) else None,
+            'context': context if type(context) is int and 0 < context <= 2**24 else None}
+
+
+# Browse or search public GGUF repositories, one bounded page at a time. The browser returns only the opaque cursor
+# from the previous page; the endpoint, host and every other parameter are rebuilt here from allowlists.
+def hf_search(data):
+    query, author, cursor = data.get('query', ''), data.get('author', ''), data.get('cursor')
+    if not isinstance(query, str) or (query.strip() and not re.fullmatch(r'[\w .+/-]{2,80}', query.strip(), re.A)):
+        raise ValueError('Search with 2–80 letters, numbers, spaces, dots, hyphens or slashes, or paste a '
+                         'https://huggingface.co/ repository URL.')
+    if not isinstance(author, str) or (author.strip() and
+                                       not re.fullmatch(r'[A-Za-z0-9][\w.-]{0,95}', author.strip(), re.A)):
+        raise ValueError('Creator must be a Hugging Face user or organisation name, such as bartowski.')
+    if cursor is not None and (not isinstance(cursor, str) or not HF_CURSOR.fullmatch(cursor)):
+        raise ValueError('Invalid results page. Search again.')
+    size, task = hf_choice(data, 'size', HF_SIZES), hf_choice(data, 'task', HF_TASKS)
+    sort = hf_choice(data, 'sort', HF_SORTS, 'trending')
+    query, author = ' '.join(query.split()), author.strip()
+    params = [('filter', 'gguf'), ('gated', 'false'), ('sort', HF_SORTS[sort]), ('direction', '-1'), ('limit', HF_PAGE)]
+    for key, value in (('search', query), ('author', author), ('num_parameters', HF_SIZES[size]),
+                       ('pipeline_tag', HF_TASKS[task]), ('cursor', cursor)):
+        if value:
+            params.append((key, value))
+    params += [('expand[]', key) for key in ('gated', 'downloads', 'likes', 'lastModified', 'private', 'pipeline_tag', 'gguf')]
+
+    def fetch():
+        # GGUF headers include chat templates that HF cannot leave out, so a page of 20 may reach a few hundred KB.
+        found, after = hf_get('/api/models', params, 4 * 1024**2, pages=True)
+        if not isinstance(found, list):
+            raise ValueError('Hugging Face returned an unreadable response.')
+        results = [{'id': item['id'], 'downloads': hf_count(item.get('downloads')), 'likes': hf_count(item.get('likes')),
+                    'gated': bool(item.get('gated')), 'updated': str(item.get('lastModified') or '')[:10],
+                    'task': item['pipeline_tag'] if isinstance(item.get('pipeline_tag'), str) and
+                    re.fullmatch(r'[a-z-]{1,40}', item['pipeline_tag']) else None, **hf_gguf(item)}
+                   for item in found[:HF_PAGE] if isinstance(item, dict) and isinstance(item.get('id'), str)
+                   and HF_REPO.fullmatch(item['id']) and not item.get('private')]
+        return {'query': query, 'author': author, 'size': size, 'task': task, 'sort': sort, 'results': results,
+                'cursor': after if len(found) >= HF_PAGE else None}
+    key = json.dumps(['search', query.lower(), author, size, task, sort, cursor])
+    return hf_cached(key, fetch)
+
+
+# List GGUF files with the reason any of them cannot be downloaded as one standalone language model.
+def hf_files(value, fresh=False):
+    repo = hf_repo(value)
+
+    def fetch():
+        info = hf_get(f'/api/models/{repo}', [('blobs', 'true')], 8 * 1024**2)
+        if not isinstance(info, dict) or not isinstance(info.get('id'), str) or not HF_REPO.fullmatch(info['id']) or \
+                not isinstance(info.get('sha'), str) or not re.fullmatch(r'[0-9a-f]{40}', info['sha']) or \
+                not isinstance(info.get('siblings'), list):
+            raise ValueError('Hugging Face returned incomplete repository metadata.')
+        locked = ('Gated on Hugging Face; downloads that need sign-in are not supported here.' if info.get('gated') else
+                  'This repository is private or disabled.' if info.get('private') or info.get('disabled') else '')
+        files = []
+        for sibling in info['siblings'][:10000]:
+            name = sibling.get('rfilename') if isinstance(sibling, dict) else None
+            if not isinstance(name, str) or not name.lower().endswith('.gguf'):
+                continue
+            lfs = sibling.get('lfs') if isinstance(sibling.get('lfs'), dict) else {}
+            size, digest, base = lfs.get('size'), lfs.get('sha256'), name.rsplit('/', 1)[-1]
+            reason = ('Part of a split set; split models are not supported.' if HF_SPLIT.search(name) else
+                      'Vision projector, not a language model.' if 'mmproj' in base.lower() else
+                      'Importance-matrix calibration data, not a language model.' if HF_IMATRIX.search(base) and not HF_QUANT.search(base) else
+                      'Multi-token prediction companion, not a standalone model.' if HF_MTP.match(base) else
+                      'Stored in a subfolder; not supported here.' if '/' in name else
+                      'Unsupported file name.' if not HF_FILE.fullmatch(name) or '..' in name else
+                      'Missing size or checksum metadata.' if type(size) is not int or size <= 0 or
+                      sibling.get('size', size) != size or not isinstance(digest, str) or
+                      not re.fullmatch(r'[0-9a-f]{64}', digest) else locked)
+            quant = HF_QUANT.search(base)
+            files.append({'name': name[:300], 'size': size if type(size) is int and size > 0 else None,
+                          'quant': quant.group(1).upper() if quant else '', 'selectable': not reason, 'reason': reason,
+                          'sha256': digest if not reason else None})
+            if len(files) >= 300:
+                break
+        return {'repo': info['id'], 'revision': info['sha'], 'gated': bool(info.get('gated')), 'files': files,
+                'truncated': len(files) >= 300}
+    result = hf_cached(f'files:{repo.lower()}', fetch, fresh)
+    # Installed state is local and changes after downloads, so it is checked on every request, not cached.
+    for file in result['files']:
+        file['installed'] = file['selectable'] and installed_file(result['repo'], file['name'], file['size'])
+    return result
 
 
 def download_preset(data, job):
-    model = next(m for m in read_json(CATALOG, {})['models'] if m['id'] == data['preset'])
+    download_verified(next(m for m in catalog_models() if m['id'] == data['preset']), job)
+
+
+# Re-resolve the chosen file from Hugging Face; the browser supplies only repository and file names.
+def download_hf(data, job):
+    progress(job, 'Checking the file on Hugging Face...')
+    info = hf_files(data['repo'], fresh=True)
+    file = next((f for f in info['files'] if f['name'] == data['file']), None)
+    if not file or not file['selectable']:
+        raise ValueError((file or {}).get('reason') or 'That file is not in the repository. Search again.')
+    download_verified({'name': file['name'], 'repo': info['repo'], 'revision': info['revision'], 'file': file['name'],
+                       'bytes': file['size'], 'sha256': file['sha256']}, job, check=True)
+
+
+def download_verified(model, job, check=False):
     command('daemon', 'up')
-    if preset_installed(model):
-        progress(job, 'This preset is already installed.')
+    entry = installed_entry(model)
+    if entry:
+        progress(job, f"{model['name']} is already installed.", **model_identity(entry))
         return
-    folder = STATE / 'downloads'
-    folder.mkdir(exist_ok=True)
+    # An imported file that lms does not list yet must not be downloaded again; its import would also be refused.
+    if installed_file(model['repo'], model['file'], model['bytes']):
+        raise ValueError(f"{model['name']} is downloaded, but LM Studio has not listed it yet. Retry in a moment.")
+    # Staging is keyed by the expected SHA-256, so equal file names from different repositories never share a partial.
+    folder = STATE / 'downloads' / model['sha256']
+    folder.mkdir(parents=True, exist_ok=True)
     target = folder / model['file']
     partial = target.with_suffix('.part')
+    legacy = STATE / 'downloads' / model['file']
+    if 'id' in model:
+        for old, new in ((legacy, target), (legacy.with_suffix('.part'), partial)):
+            if old.is_file() and not old.is_symlink() and not new.exists():
+                old.replace(new)
     # A file verified by an earlier attempt that failed to import is reused after re-verification.
     if target.exists():
         if target.stat().st_size == model['bytes'] and sha256(target, job, model['bytes']) == model['sha256']:
             partial.unlink(missing_ok=True)
-            import_preset(model, target, job)
+            import_preset(model, target, job, check)
             return
         target.unlink()
     offset = partial.stat().st_size if partial.exists() else 0
     if shutil.disk_usage(folder).free < model['bytes'] - offset + 1024**3:
         raise ValueError('Not enough disk space for this model plus 1 GB working space.')
-    url = f"https://huggingface.co/{model['repo']}/resolve/{model['revision']}/{model['file']}"
+    url = f"{HF}/{model['repo']}/resolve/{model['revision']}/{urllib.parse.quote(model['file'])}"
     if offset < model['bytes']:
         req = urllib.request.Request(url, headers={'Range': f'bytes={offset}-'} if offset else {})
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with hf_opener(cdn=True).open(req, timeout=60) as response:
             if offset and (response.status != 206 or not response.headers.get('Content-Range', '').startswith(f'bytes {offset}-')):
                 offset = 0
             with partial.open('ab' if offset else 'wb') as output:
@@ -384,10 +886,18 @@ def download_preset(data, job):
         partial.unlink(missing_ok=True)
         raise ValueError('Model checksum failed. Retry to download a clean copy.')
     partial.replace(target)
-    import_preset(model, target, job)
+    import_preset(model, target, job, check)
 
 
-def import_preset(model, target, job):
+def import_preset(model, target, job, check=False):
+    if check:
+        # A searched file passed its checksum; its metadata must still describe one whole language model.
+        try:
+            with target.open('rb', buffering=1024**2) as stream:
+                check_gguf(stream, model['bytes'], language=True)
+        except ValueError:
+            target.unlink(missing_ok=True)
+            raise
     job.pop('downloaded', None)
     job.pop('total', None)
     progress(job, 'Step 3 of 3: Importing verified model into LM Studio...', phase='import')
@@ -400,8 +910,19 @@ def import_preset(model, target, job):
     if target.stat().st_nlink < 2:
         raise ValueError('Import reported success but no model link was created. The verified download is kept; retry to import it.')
     target.unlink()
-    if preset_installed(model):
-        progress(job, f"{model['name']} is installed.")
+    # LM Studio indexes imports asynchronously, so give it a short, bounded time to list the exact file.
+    entry = installed_entry(model)
+    deadline = time.monotonic() + 10
+    if not entry:
+        progress(job, 'Waiting for LM Studio to list the model...')
+    while not entry and time.monotonic() < deadline:
+        time.sleep(0.5)
+        try:
+            entry = installed_entry(model)
+        except ValueError:
+            pass
+    if entry:
+        progress(job, f"{model['name']} is installed.", **model_identity(entry))
     else:
         # LM Studio indexes imports asynchronously; the hard link above already proves the import.
         progress(job, f"{model['name']} was imported. LM Studio may take a moment to list it.")
@@ -477,7 +998,7 @@ def open_import_source(letter, parts):
 
 # Read the GGUF header and metadata without loading tensors. Rejects other formats, malformed headers and
 # split sets, so the extension alone is never trusted.
-def check_gguf(stream, size):
+def check_gguf(stream, size, language=False):
     deadline, items = time.monotonic() + GGUF_SECONDS, 0
 
     def invalid(reason):
@@ -531,6 +1052,7 @@ def check_gguf(stream, size):
         raise ValueError('This GGUF version is not supported. Use a current GGUF (version 2 or 3) file.')
     # Each entry needs at least a key length, one key byte and a type.
     jump(count * 13)
+    found = {b'general.architecture': None, b'general.type': None}
     for _ in range(count):
         tick()
         length = struct.unpack('<Q', take(8))[0]
@@ -538,7 +1060,13 @@ def check_gguf(stream, size):
             raise invalid('a metadata key is too long')
         key = take(length)
         kind = struct.unpack('<I', take(4))[0]
-        if key != b'split.count':
+        if language and key in found and kind == GGUF_STRING:
+            length = struct.unpack('<Q', take(8))[0]
+            # Overlong values are skipped and recorded as unrecognised.
+            found[key] = take(length) if length <= 64 else b''
+            if length > 64:
+                stream.seek(jump(length))
+        elif key != b'split.count':
             skip(kind)
         elif kind != GGUF_UINT16:
             raise invalid('its split.count metadata has the wrong type')
@@ -546,6 +1074,16 @@ def check_gguf(stream, size):
         elif struct.unpack('<H', take(2))[0] > 1:
             raise ValueError('This file is one part of a split GGUF model. Split models are not supported; '
                              'merge them into one .gguf file first.')
+    if language:
+        # Vision projectors use the clip architecture; imatrix data and adapters declare a non-model general.type.
+        # A file with no architecture at all cannot be loaded as a language model.
+        architecture, kind = found[b'general.architecture'], found[b'general.type']
+        if architecture == b'clip' or kind == b'mmproj':
+            raise ValueError('This file is a vision projector, not a language model.')
+        if kind == b'imatrix':
+            raise ValueError('This file is importance-matrix calibration data, not a language model.')
+        if kind not in {None, b'model'} or not architecture:
+            raise ValueError('This file is not a standalone language model.')
 
 
 # LM Studio's model folder, resolved as lms import does: the home named by ~/.lmstudio-home-pointer (lms writes it
@@ -683,8 +1221,13 @@ def import_local(data, job):
         if not registered:
             raise ValueError('LM Studio did not register the model. Your original file is unchanged; retry the import.')
         IMPORT_TARGET.unlink()
+        # The model is registered; a failed listing only leaves the user to choose it in the list.
+        try:
+            identity = model_identity(installed_entry({'repo': repo, 'file': name, 'bytes': size}))
+        except (OSError, ValueError):
+            identity = {}
         progress(job, f'{name} was imported as {repo}. Start the server and load it from Installed; '
-                      'LM Studio may take a moment to list it.')
+                      'LM Studio may take a moment to list it.', **identity)
     except Exception as error:
         retained = clear_imports()
         if retained:
@@ -700,14 +1243,22 @@ def execute(data, job):
     action = data['action']
     if action in {'stop', 'restart'}:
         command('daemon', 'down')
+        SLOTS.unlink(missing_ok=True)
         model_changed()
     if action in {'start', 'restart'}:
         start()
     elif action == 'settings':
         settings = read_json(STATE / 'settings.json', {})
         settings.update(autostart=data['autostart'])
-        if 'startupModel' in data:
-            settings['startupModel'] = data['startupModel']
+        # Each startup model changes only when sent, so a save naming only the dialogue model keeps the decision model.
+        # Saving never loads or unloads a model.
+        for key in ('startupModel', 'startupDecisionModel'):
+            if key in data:
+                if data[key] and data[key] != settings.get(key) and data[key] not in known_models():
+                    raise ValueError('Choose an installed language model. Start LM Studio once if the list is empty.')
+                settings[key] = data[key]
+        if settings.get('startupDecisionModel') and settings.get('startupDecisionModel') == settings.get('startupModel'):
+            raise ValueError('Choose a different decision model, or None.')
         write_json(STATE / 'settings.json', settings)
     elif action == 'model-defaults':
         defaults = read_json(STATE / 'model-defaults.json', {})
@@ -728,6 +1279,8 @@ def execute(data, job):
     elif action == 'download':
         if data.get('preset'):
             download_preset(data, job)
+        elif 'repo' in data:
+            download_hf(data, job)
         else:
             command('daemon', 'up')
             progress(job, 'Downloading custom model. LM Studio is selecting the requested file/quantization.')
@@ -744,6 +1297,15 @@ def execute(data, job):
             raise ValueError('This model is already loaded. Unload it before loading it again.')
         if sum(len(m.get('loaded_instances') or []) for m in models) >= MAX_LOADED:
             raise ValueError(f'At most {MAX_LOADED} models can be loaded at once. Unload one before loading another.')
+        # An explicit slot must be free; nothing is ever replaced. Without one (startup, older callers) the lowest
+        # free slot is used.
+        slots = slot_map(models)
+        slot = str(data['slot']) if 'slot' in data else next((str(n) for n in range(1, MAX_LOADED + 1) if str(n) not in slots), None)
+        if slot is None or slot in slots:
+            holder = next((m.get('display_name') or m['key'] for m in models if m['key'] == slots.get(slot)), 'another model')
+            raise ValueError(f'Slot {slot} holds {holder}. Unload it first; loading never replaces a model.' if slot
+                             else 'No slot is free. Unload a model first.')
+        job['slot'] = int(slot)
         available = resources()
         # Free memory already excludes loaded models. Leave space for the desktop and KV cache; LM Studio also
         # applies its own load guardrails.
@@ -780,6 +1342,7 @@ with lmstudio.Client("127.0.0.1:1234") as client:
             # The engine default keeps models in memory.
             applied, locking = {}, True
         model_changed()
+        write_json(SLOTS, {**slots, slot: data['model']})
         limit = memlock_limit()
         # llama.cpp only warns when mlock fails, so the reported setting alone would overstate it.
         if locking and limit is not None and limit < model['size_bytes']:
@@ -792,6 +1355,12 @@ with lmstudio.Client("127.0.0.1:1234") as client:
     elif action == 'unload':
         command('unload', data['model'])
         model_changed()
+        # The unload already succeeded; if the list is unavailable, status frees the slot on its next check.
+        try:
+            with request('/api/v1/models') as response:
+                write_json(SLOTS, slot_map(json.load(response)['models']))
+        except (OSError, ValueError, KeyError):
+            pass
     elif action == 'test':
         with request('/api/v1/models') as response:
             models = json.load(response)['models']
@@ -847,13 +1416,44 @@ with lmstudio.Client("127.0.0.1:1234") as client:
         progress(job, message, **{key: value for key, value in result.items() if key != 'updated'})
 
 
+# Returns once the job has ended and released the job lock. A failed, interrupted or replaced job raises.
+def wait_for_job(job_id):
+    # A load runs lms or the SDK for at most 300 seconds; the rest covers memory checks and bookkeeping.
+    deadline = time.monotonic() + 360
+    with (STATE / 'job.lock').open('a') as lock:
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise ValueError('The startup model load did not finish within 360 seconds.')
+                time.sleep(1)
+        job = read_json(STATE / 'job.json', {})
+    if job.get('id') != job_id:
+        raise ValueError('Another operation replaced the startup model load.')
+    if job.get('state') == 'failed':
+        raise ValueError(job.get('message') or 'The startup model load failed.')
+    if job.get('state') != 'completed':
+        raise ValueError('The startup model load was interrupted.')
+
+
 def main():
     initialize()
     action = sys.argv[1] if len(sys.argv) == 2 else ''
     if action == 'init':
         return {'ok': True}
     if action == 'catalog':
-        return read_json(CATALOG, {'models': []})
+        catalog = read_json(CATALOG, {'models': []})
+        for model in catalog.get('models', []) + catalog.get('recommended', []) + catalog.get('decisionRecommended', []):
+            model['installed'] = installed_file(model['repo'], model['file'], model['bytes'])
+        return catalog
+    if action in {'search', 'files'}:
+        # Read-only lookups: no job lock, engine start or download.
+        data = json.loads(sys.stdin.read(4096) or '{}')
+        if not isinstance(data, dict):
+            raise ValueError('Invalid request.')
+        return hf_search(data) if action == 'search' else hf_files(data.get('repo'))
     if action == 'status':
         return status()
     if action == 'access':
@@ -863,32 +1463,46 @@ def main():
     if action == 'authorize':
         data = json.loads(sys.stdin.read(16384))
         return {'authorized': hmac.compare_digest(str(data.get('token', '')), (STATE / 'access').read_text())}
-    if action == 'autostart':
+    if action == 'force-stop':
+        return force_stop()
+    if action in {'autostart', 'start-saved'}:
         settings = read_json(STATE / 'settings.json', {})
-        if settings.get('autostart') and LMS.is_file():
+        # Autostart follows the saved toggle; start-saved is an explicit Start that loads the same saved models.
+        if action == 'start-saved' or (settings.get('autostart') and LMS.is_file()):
+            admit().close()
             start()
-            if settings.get('startupModel'):
-                model = settings['startupModel']
+            # The dialogue model first, then the optional decision model. Each exact key loads once, and a key that is
+            # already loaded is skipped, so running startup again changes nothing.
+            keys = [settings.get(key) for key in ('startupModel', 'startupDecisionModel')]
+            with request('/api/v1/models', timeout=10) as response:
+                loaded = {m.get('key') for m in json.load(response)['models'] if m.get('loaded_instances')}
+            keys = [model for model in dict.fromkeys(keys) if isinstance(model, str) and model and model not in loaded]
+            for model in keys:
                 defaults = read_json(STATE / 'model-defaults.json', {}).get(model, {})
                 # Use the same job lock and validation as manual loads.
                 result = subprocess.run([sys.executable, __file__, 'submit'], input=json.dumps(
                     {**defaults, 'action': 'load', 'model': model}), capture_output=True, text=True, timeout=10)
                 if result.returncode:
                     raise ValueError(result.stdout)
+                # Every load, the last too, must end before startup reports success: the next load needs the job lock and
+                # is checked against the memory this one leaves, and a failed load must not look like a ready startup.
+                wait_for_job(json.loads(result.stdout)['id'])
         return {'ok': True}
     if action == 'shutdown':
         if LMS.is_file():
             command('daemon', 'down')
+            SLOTS.unlink(missing_ok=True)
             model_changed()
         return {'ok': True}
     if action != 'submit':
         raise ValueError('Unknown command.')
     data = json.loads(sys.stdin.read(16384))
     validate(data)
-    lock = (STATE / 'job.lock').open('a')
+    gate, lock = admit(), (STATE / 'job.lock').open('a')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        gate.close()
         raise ValueError('Another operation is running. Wait for it to finish.')
     job = {'id': secrets.token_hex(8), 'action': data['action'], 'state': 'running', 'message': 'Starting...', 'updated': time.time()}
     # With two models loaded, a running job names its target so another model's view never shows its output.
@@ -896,18 +1510,25 @@ def main():
         job['model'] = data['model']
     if data['action'] == 'download' and data.get('preset'):
         job['preset'] = data['preset']
+    elif data['action'] == 'download' and 'repo' in data:
+        job.update(repo=data['repo'], file=data['file'])
     write_json(STATE / 'job.json', job)
     if os.fork():
         lock.close()
+        gate.close()
         return job
     # Keep the inherited lock for the complete job; close the web/launcher pipes before returning.
     os.setsid()
+    # Force stop identifies this worker by its pid and start time.
+    job.update(pid=os.getpid(), pidStart=proc_stat(os.getpid())[3])
+    write_json(STATE / 'job.json', job)
+    gate.close()
     with open(os.devnull, 'r+') as null:
         for fd in (0, 1, 2):
             os.dup2(null.fileno(), fd)
     try:
         execute(data, job)
-        keep = data['action'] in {'test', 'import'} or (data['action'] == 'download' and data.get('preset'))
+        keep = data['action'] in {'test', 'import'} or (data['action'] == 'download' and (data.get('preset') or 'repo' in data))
         progress(job, job.get('message', 'Done') if keep else 'Done.', state='completed')
     except Exception as error:
         progress(job, str(error), state='failed')
