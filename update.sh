@@ -95,6 +95,8 @@ if [ $? -eq 0 ]; then
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_lmstudio /usr/local/bin/ddistro_lmstudio || exit 1
     # The launcher reads custom mod status as dwemer, so the manager must stay world-readable.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_custom_mod /usr/local/bin/ddistro_custom_mod || exit 1
+    # Startup runs the PocketTTS connector helper as dwemer, so it must not stay root-only.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/sync_pockettts_connectors /usr/local/bin/sync_pockettts_connectors || exit 1
     # Every user runs the ddistro CLI for status and logs; only root may change it.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro /usr/local/bin/ddistro || exit 1
     # Root-only file changes helper; ddistro checks it is root-owned before running it.
