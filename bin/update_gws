@@ -29,6 +29,39 @@ if [ "${DWEMER_COMPONENT_UPDATE_LOCKED:-0}" != 1 ]; then
     exit "$result"
 fi
 
+MAINTENANCE_LOCK="/run/lock/dwemerdistro-maintenance.lock"
+
+# Hold the common maintenance lock shared on fd 7. ddistro changes apply/rollback take it
+# exclusively, so they never interleave with maintenance; shared holders (including nested
+# helpers) still serialize through their own locks. Root creates the fixed root-owned file
+# once; it is never replaced. Release with flock -u, which also covers services that
+# inherited fd 7.
+acquire_maintenance_lock() {
+    local info=""
+    if [ "$(id -u)" -eq 0 ] && [ ! -e "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ]; then
+        (umask 022; set -C; : > "$MAINTENANCE_LOCK") 2>/dev/null || true
+    fi
+    if [ -f "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ] && exec 7<"$MAINTENANCE_LOCK"; then
+        info="$(stat -L -c '%u %h %a' /proc/self/fd/7 2>/dev/null)"
+    fi
+    case "$info" in
+        "0 1 644") ;;
+        "0 1 "*) [ "$(id -u)" -eq 0 ] && chmod 0644 /proc/self/fd/7 || info="" ;;
+        *) info="" ;;
+    esac
+    if [ -z "$info" ]; then
+        exec 7<&-
+        printf '%s is missing or unsafe. Start DwemerDistro or run the core update as root once, then retry.\n' "$MAINTENANCE_LOCK" >&2; exit 1
+    fi
+    if ! flock -s -w 30 7; then
+        exec 7<&-
+        printf 'Another DwemerDistro maintenance or ddistro changes operation is running.\n' >&2; exit 75
+    fi
+}
+
+acquire_maintenance_lock
+trap 'flock -u 7 2>/dev/null || true' EXIT
+
 UPDATE_HERIKA=1
 UPDATE_STOBE=1
 UPDATE_DIALECTIC=1
@@ -665,16 +698,36 @@ update_installed_server() {
     return 1
 }
 
-update_installed_server herika "$UPDATE_HERIKA" /var/www/html/HerikaServer || COMPONENT_UPDATE_FAILED=1
-update_installed_server lorkhan "$UPDATE_LORKHAN" /opt/dwemerdistro/sources/LorkhanServer || COMPONENT_UPDATE_FAILED=1
-update_installed_server stobe "$UPDATE_STOBE" /var/www/html/StobeServer || COMPONENT_UPDATE_FAILED=1
-update_installed_server reign "$UPDATE_REIGN" /var/www/html/ReignServer || COMPONENT_UPDATE_FAILED=1
-if ! update_installed_server dialectic "$UPDATE_DIALECTIC" /var/www/html/DialecticServer; then
-    DIALECTIC_UPDATE_FAILED=1
+# Server and Dashboard updates deploy PHP code, so the shared PHP runtime must be fixed first.
+# After update.sh this is a quick check without APT or network use.
+PHP_SECURITY_READY=0
+PHP_SECURITY_HELPER="/usr/local/bin/ensure_php_security"
+if [ ! -x "$PHP_SECURITY_HELPER" ]; then
+    PHP_SECURITY_HELPER="/home/dwemer/dwemerdistro/bin/ensure_php_security"
+fi
+print_header "VERIFYING PHP SECURITY UPDATE"
+if [ -x "$PHP_SECURITY_HELPER" ] && echo "$PASSWORD" | sudo -S -p '' "$PHP_SECURITY_HELPER"; then
+    PHP_SECURITY_READY=1
+    print_success "PHP security update verified"
+else
+    COMPONENT_UPDATE_FAILED=1
+    print_warning "The PHP security update is incomplete; server and Dwemer Dashboard updates were skipped."
+fi
+
+if [ "$PHP_SECURITY_READY" -eq 1 ]; then
+    update_installed_server herika "$UPDATE_HERIKA" /var/www/html/HerikaServer || COMPONENT_UPDATE_FAILED=1
+    update_installed_server lorkhan "$UPDATE_LORKHAN" /opt/dwemerdistro/sources/LorkhanServer || COMPONENT_UPDATE_FAILED=1
+    update_installed_server stobe "$UPDATE_STOBE" /var/www/html/StobeServer || COMPONENT_UPDATE_FAILED=1
+    update_installed_server reign "$UPDATE_REIGN" /var/www/html/ReignServer || COMPONENT_UPDATE_FAILED=1
+    if ! update_installed_server dialectic "$UPDATE_DIALECTIC" /var/www/html/DialecticServer; then
+        DIALECTIC_UPDATE_FAILED=1
+    fi
 fi
 
 # Dwemer Dashboard update/install. Propagate failures without discarding local files.
-if (
+if [ "$PHP_SECURITY_READY" -ne 1 ]; then
+    print_warning "Dwemer Dashboard update skipped until the PHP security update succeeds."
+elif (
     if [ ! -d /var/www/html/Dwemer-Dashboard/.git ]; then
         print_header "INSTALLING DWEMER DASHBOARD"
         printf ">> Cloning Dwemer Dashboard repository...\n"
