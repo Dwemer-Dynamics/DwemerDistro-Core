@@ -10,7 +10,7 @@ The launcher's **Rollback ReignServer** action uses `ddistro_reign rollback-list
 
 Reign 0.1.0 uses `ddistro_server install|update|repair reign --branch reign|dev|unstable`. Its production/default branch is `reign`, with promotion through `unstable -> dev -> reign`. `ddistro_reign` owns compiled runtime activation, health checks, and process-group startup/shutdown. Apache port 8089 proxies to Reign on loopback 5101; its vector worker uses 5102. PostgreSQL database `reign` and `/var/www/html/ReignServer/data` survive application replacement and uninstall. Previous code and lock-specific dependency/model directories are retained; code rollback does not undo database migrations.
 
-The distro's default locale is `C.UTF-8`. `ensure_postgres_utf8` makes new PostgreSQL databases UTF-8 through template1. It retains the original empty template and refuses customized templates or active template sessions. Existing application databases are not converted by this operation. Managed database creation continues to specify UTF-8/template0 explicitly.
+The distro's default locale is `C.UTF-8`. `ensure_postgres_utf8` makes new PostgreSQL databases UTF-8 through template1 when the template is uncustomized. It retains the original empty template. Customized templates are preserved with a successful skip so system updates and managed database bootstrap can continue. Active template sessions and maintenance failures still return an error. Existing application databases are not converted by this operation. Managed database creation continues to specify UTF-8/template0 explicitly.
 
 ## Optional server manager
 
@@ -49,6 +49,25 @@ Supported products are `herika`, `stobe`, and `dialectic`. Supported branch chan
 Uninstall permanently removes only the selected server's canonical files, retained manager backups, Apache site, runtime processes, and PostgreSQL database. It does not remove shared components or another server's data.
 
 `update_gws` updates only servers that are already installed. A missing server is skipped and is never installed as an update side effect. `start_env` similarly starts and reports only installed servers.
+
+## Custom mods
+
+`bin/ddistro_custom_mod` installs user-added PHP/PostgreSQL mod servers from public HTTPS repositories that ship a version 1 `dwemer-mod.json`. See [CUSTOM_MODS.md](CUSTOM_MODS.md) for the manifest contract and safety rules.
+
+## Shared PHP security updates
+
+`bin/ensure_php_security` keeps the shared Debian 12 PHP 8.2 runtime at or above `8.2.35-1~deb12u1` (CVE-2026-109618, CVE-2026-109619):
+
+```bash
+sudo ensure_php_security --check --json   # read-only; exit 0 fixed, 3 update required, 4 restart required, 5 incomplete
+sudo ensure_php_security             # apply the fix only if it is missing
+```
+
+When an update is needed it refreshes only the configured `bookworm-security` source entries (other suites are not contacted and existing lists and caches are kept), then upgrades every installed official PHP 8.2 package to the same security version. It refuses any plan that removes, newly installs, or changes another package, so separately built extensions such as `php8.2-mcrypt` and the rest of the system stay as they were. Configuration under `/etc/php/8.2` and `/etc/apache2` is kept byte-for-byte; if APT fails, the configuration is restored, its snapshot is kept, and the partly updated package state is reported. Apache must load PHP only from the packaged `libphp8.2.so`; another handler stops the update without changing the configuration. A temporary `policy-rc.d` stops maintainer scripts from starting or stopping services; an existing policy is set aside and restored afterwards. Afterwards only running services that still use the old code are restarted: Apache, PHP-FPM, the LORKHAN worker, and running CHIM4 components (identified by their verified supervisors); stopped services and components stay stopped. Other PHP processes still using the old code are reported by PID and name and are not killed; the helper then exits with restart required instead of reporting the fix as complete. The fix is certified only when every process could be inspected. Another PHP branch is reported as unsupported rather than assumed safe. When PHP is already fixed, the helper makes no APT or network requests.
+
+`update.sh` runs it before any server or migration step. `ddistro_server install|update|repair`, `update_gws` (servers and Dwemer Dashboard), and `ddistro_custom_mod install|update|switch` also require it first; status, check, and uninstall make no PHP changes.
+
+`update.sh` no longer overwrites `/etc/php/8.2/apache2/php.ini`; it installs the distro default only when the file is missing. The LM Studio catalog and `/etc/cuda_config` are replaced only while they still match the last version an update installed (recorded under `/var/lib/dwemerdistro/shipped-config`), so user-edited copies are kept. `/etc/dwemerdistro_services.conf` is still created only when missing.
 
 ## System release version
 

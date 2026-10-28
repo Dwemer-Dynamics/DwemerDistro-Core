@@ -34,9 +34,11 @@ SELECT (SELECT count(*) FROM pg_namespace WHERE nspname NOT IN ('public','pg_cat
  + (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public')
  + (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public')
  + (SELECT count(*) FROM pg_extension WHERE extname <> 'plpgsql')")
-[ "$custom" = 0 ] || { echo 'template1 contains custom objects; retained unchanged. New managed databases explicitly use UTF8/template0.' >&2; exit 1; }
+# Retaining a customized template is a safe skip, not an update/bootstrap failure.
+# Managed database creation explicitly requests UTF8/template0 independently.
+[ "$custom" = 0 ] || { echo 'template1 contains custom objects; retained unchanged. New managed databases explicitly use UTF8/template0.' >&2; exit 0; }
 settings=$(psql_admin -c "SELECT (SELECT count(*) FROM pg_db_role_setting WHERE setdatabase=(SELECT oid FROM pg_database WHERE datname='template1')) + (SELECT count(*) FROM pg_database WHERE datname='template1' AND ((datacl IS NOT NULL AND datacl::text NOT IN ('{=c/postgres,postgres=CTc/postgres}','{postgres=CTc/postgres,=c/postgres}')) OR datdba<>(SELECT oid FROM pg_roles WHERE rolname='postgres')))")
-[ "$settings" = 0 ] || { echo 'template1 has custom settings, ownership, or grants; retained unchanged.' >&2; exit 1; }
+[ "$settings" = 0 ] || { echo 'template1 has custom settings, ownership, or grants; retained unchanged.' >&2; exit 0; }
 original_acl=$(psql_admin -c "SELECT COALESCE(datacl::text, '') FROM pg_database WHERE datname='template1'")
 backup="ddistro_template1_before_utf8_$(date -u +%Y%m%d%H%M%S)"
 install -d -m 755 /var/lib/dwemerdistro

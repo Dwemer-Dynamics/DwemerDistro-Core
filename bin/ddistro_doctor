@@ -86,6 +86,42 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+MAINTENANCE_LOCK="/run/lock/dwemerdistro-maintenance.lock"
+
+# Hold the common maintenance lock shared on fd 7. ddistro changes apply/rollback take it
+# exclusively, so they never interleave with maintenance; shared holders (including nested
+# helpers) still serialize through their own locks. Root creates the fixed root-owned file
+# once; it is never replaced. Release with flock -u, which also covers services that
+# inherited fd 7.
+acquire_maintenance_lock() {
+    local info=""
+    if [ "$(id -u)" -eq 0 ] && [ ! -e "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ]; then
+        (umask 022; set -C; : > "$MAINTENANCE_LOCK") 2>/dev/null || true
+    fi
+    if [ -f "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ] && exec 7<"$MAINTENANCE_LOCK"; then
+        info="$(stat -L -c '%u %h %a' /proc/self/fd/7 2>/dev/null)"
+    fi
+    case "$info" in
+        "0 1 644") ;;
+        "0 1 "*) [ "$(id -u)" -eq 0 ] && chmod 0644 /proc/self/fd/7 || info="" ;;
+        *) info="" ;;
+    esac
+    if [ -z "$info" ]; then
+        exec 7<&-
+        printf '[FAIL] %s is not a root-owned plain file; it was not replaced.\n' "$MAINTENANCE_LOCK" >&2; exit 1
+    fi
+    if ! flock -s -w 30 7; then
+        exec 7<&-
+        printf '[FAIL] Another DwemerDistro maintenance or ddistro changes operation is running.\n' >&2; exit 75
+    fi
+}
+
+# Only repair writes; an ordinary check stays unlocked.
+if [ "$MODE" = "repair" ]; then
+    acquire_maintenance_lock
+    trap 'flock -u 7 2>/dev/null || true' EXIT
+fi
+
 info() {
     printf '[INFO] %s\n' "$*"
 }

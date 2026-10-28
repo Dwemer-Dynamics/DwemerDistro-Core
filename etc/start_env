@@ -5,6 +5,11 @@
 
 /usr/local/bin/print_logo
 
+# Optional Assistant API stays available to paired mods when the Launcher is closed.
+if [ -x /usr/local/bin/ddistro_api ] && [ -f /var/lib/dwemerdistro/assistant/agent/attestation.json ]; then
+    /usr/local/bin/ddistro_api ensure >/dev/null || echo "Assistant API unavailable; other services will continue."
+fi
+
 # Load CUDA configuration if it exists (will not be overwritten by updates)
 if [ -f "/home/dwemer/.cuda_config" ]; then
     source /home/dwemer/.cuda_config
@@ -49,6 +54,20 @@ read_tts_service_port() {
 
 CHATTERBOX_ACTIVE_PORT="$(read_tts_service_port /home/dwemer/chatterbox/.dwemerdistro-port "$CHATTERBOX_LEGACY_PORT")"
 POCKETTTS_ACTIVE_PORT="$(read_tts_service_port /home/dwemer/pocket-tts/.dwemerdistro-port "$POCKETTTS_LEGACY_PORT")"
+
+# audio.cpp listens on the port in its server.json, the same file sync_pockettts_connectors reads.
+read_audiocpp_port() {
+    local value=""
+
+    value="$(python3 -c 'import json, sys; port = int(str(json.load(open(sys.argv[1]))["port"]).strip()); print(port if 1 <= port <= 65535 else "")' \
+        /home/dwemer/audio.cpp/server.json 2>/dev/null)"
+    case "$value" in
+        ''|*[!0-9]*) value="$1" ;;
+    esac
+    printf '%s\n' "$value"
+}
+
+POCKETTTS_AUDIOCPP_PORT="$(read_audiocpp_port "$POCKETTTS_AUDIOCPP_PORT")"
 
 # Clean tmp
 find /tmp -type f -mtime +7 -delete 
@@ -591,8 +610,15 @@ fi
 
 # Start Apache/PHP server
 echo "Starting Apache/PHP/PGSQL Server"
+# Shared loopback listener for custom mods on CUSTOM_MODS_PORT; official sites are not touched.
+/usr/local/bin/ddistro_custom_mod setup-web || echo "WARNING: The custom mod listener needs attention; official servers are unaffected."
 /etc/init.d/apache2 restart &>/dev/null
 /etc/init.d/postgresql restart
+
+# Start the queue worker after the database restart so it can claim dialogue jobs.
+if [ -x "$SERVER_MANAGER" ]; then
+    "$SERVER_MANAGER" startup lorkhan || echo "WARNING: LORKHAN worker failed to start; check its log."
+fi
 
 if [ -x /var/www/html/ReignServer/runtime/current/ReignBetaServer ]; then
     /usr/local/bin/ddistro_reign start || echo "WARNING: Reign failed to start; check its log."
@@ -692,6 +718,13 @@ else
 	L_POCKETTTS=1
 fi
 
+# Keep DwemerDistro-managed PocketTTS connectors on the backend that just started.
+# One bounded check; it never blocks the rest of startup.
+if [ -x /usr/local/bin/sync_pockettts_connectors ]; then
+	runuser -u dwemer -- /usr/local/bin/sync_pockettts_connectors --startup ||
+		echo "PocketTTS connector check is incomplete; see the details above. Continuing startup."
+fi
+
 if [ -f "/home/dwemer/piper/cuda-keyring_1.1-1_all.deb" ]; then 
 
     if [ -f  "/home/dwemer/piper/start.sh" ]; then
@@ -723,6 +756,14 @@ if [ -f  "/home/dwemer/xtts-api-server/start.sh" ]; then
 else
 	echo  "Skipping CHIM XTTS server (not enabled)"
 	L_XTTSV2=1
+fi
+
+# LM Studio starts only after the user enables it in its manager.
+if [ -e /usr/local/bin/ddistro_lmstudio ]; then
+    # Check access as the account that reads and executes the Python helper.
+    { runuser -u dwemer -- test -r /usr/local/bin/ddistro_lmstudio &&
+      runuser -u dwemer -- test -x /usr/local/bin/ddistro_lmstudio &&
+      runuser -u dwemer -- /usr/local/bin/ddistro_lmstudio autostart; } || echo 'LM Studio startup failed; open its manager for details.'
 fi
 
 # Higgs is opt-in and uses a dedicated runtime and port.
@@ -877,7 +918,12 @@ fi
 echo "Press Enter to shutdown DwemerDistro"
 read
 
+if runuser -u dwemer -- test -r /usr/local/bin/ddistro_lmstudio &&
+   runuser -u dwemer -- test -x /usr/local/bin/ddistro_lmstudio; then
+    runuser -u dwemer -- /usr/local/bin/ddistro_lmstudio shutdown
+fi
 if [ -x /usr/local/bin/ddistro_reign ]; then /usr/local/bin/ddistro_reign stop; fi
+if [ -x /etc/init.d/lorkhanserver-worker ]; then service lorkhanserver-worker stop; fi
 if [ -x /home/dwemer/higgs-tts/service.sh ]; then /home/dwemer/higgs-tts/service.sh stop; fi
 killall -15 -u dwemer
 
