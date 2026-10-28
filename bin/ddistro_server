@@ -5,6 +5,7 @@ set -u
 WEB_ROOT="/var/www/html"
 STATE_ROOT="/var/lib/dwemerdistro/servers"
 LOCK_PATH="/run/lock/dwemerdistro-server-manager.d"
+MAINTENANCE_HELD=0
 APP_USER="dwemer"
 WEB_GROUP="www-data"
 DATABASE_ROLE="dwemer"
@@ -24,6 +25,12 @@ INSTALL_DATABASE_CREATED=0
 INSTALL_ROOT_CREATED=0
 LOCK_HELD=0
 FORCE_UPDATE=0
+# Update-only exit codes for a checkout blocked by local files. Each is preceded by one stdout line:
+# DDISTRO_UPDATE_BLOCKED {"schema_version":1,"reason":...,"product":...,"branch":...,"total":N,"files":[...]}
+# The files list is capped; total counts every blocking path found.
+UPDATE_BLOCKED_TRACKED_EXIT=79
+UPDATE_BLOCKED_UNTRACKED_EXIT=80
+UPDATE_BLOCKED_FILE_LIMIT=20
 
 # Record provenance before changing origin, so an interrupted migration can be retried.
 mark_herika_migration_pending() {
@@ -167,8 +174,12 @@ Reign uninstall retains its database and data; repair reinstalls it.
 
 Install is allowed only when both the canonical server root and application
 database are absent. Repair handles legacy and partial installations. Update
-never installs a missing product. --force discards tracked server-file changes
-before an update, but leaves untracked files and runtime data untouched.
+never installs a missing product. --force discards local edits to tracked
+server files before an update. Git may also replace untracked or ignored files
+that conflict with the update, so back up custom files first.
+
+Update exit codes: 79 means edits to tracked files block the update (retry with
+--force to discard them); 80 means untracked files are in the way and must be moved.
 EOF
 }
 
@@ -327,9 +338,41 @@ resolve_branch() {
     esac
 }
 
+MAINTENANCE_LOCK="/run/lock/dwemerdistro-maintenance.lock"
+
+# Hold the common maintenance lock shared on fd 7. ddistro changes apply/rollback take it
+# exclusively, so they never interleave with maintenance; shared holders (including nested
+# helpers) still serialize through their own locks. Root creates the fixed root-owned file
+# once; it is never replaced. Release with flock -u, which also covers services that
+# inherited fd 7.
+acquire_maintenance_lock() {
+    local info=""
+    if [ "$(id -u)" -eq 0 ] && [ ! -e "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ]; then
+        (umask 022; set -C; : > "$MAINTENANCE_LOCK") 2>/dev/null || true
+    fi
+    if [ -f "$MAINTENANCE_LOCK" ] && [ ! -L "$MAINTENANCE_LOCK" ] && exec 7<"$MAINTENANCE_LOCK"; then
+        info="$(stat -L -c '%u %h %a' /proc/self/fd/7 2>/dev/null)"
+    fi
+    case "$info" in
+        "0 1 644") ;;
+        "0 1 "*) [ "$(id -u)" -eq 0 ] && chmod 0644 /proc/self/fd/7 || info="" ;;
+        *) info="" ;;
+    esac
+    if [ -z "$info" ]; then
+        exec 7<&-
+        fail "$MAINTENANCE_LOCK is missing or not a root-owned plain file; it was not replaced."
+    fi
+    if ! flock -s -w 30 7; then
+        exec 7<&-
+        fail "Another DwemerDistro maintenance or ddistro changes operation is running." 75
+    fi
+}
+
 acquire_operation_lock() {
     local owner_pid=""
 
+    acquire_maintenance_lock
+    MAINTENANCE_HELD=1
     mkdir -p "$(dirname "$LOCK_PATH")"
     if ! mkdir "$LOCK_PATH" 2>/dev/null; then
         if [ -f "$LOCK_PATH/pid" ]; then
@@ -370,9 +413,9 @@ start_postgres() {
     fi
 
     if [ -x /etc/init.d/postgresql ]; then
-        /etc/init.d/postgresql start >/dev/null 2>&1 || true
+        /etc/init.d/postgresql start >/dev/null 2>&1 7<&- || true
     elif command -v service >/dev/null 2>&1; then
-        service postgresql start >/dev/null 2>&1 || true
+        service postgresql start >/dev/null 2>&1 7<&- || true
     fi
 
     for attempt in $(seq 1 20); do
@@ -546,6 +589,17 @@ ensure_pgvector() {
     fi
     [ -x "$helper" ] || fail "Portable pgvector helper is unavailable."
     "$helper" >/dev/null || fail "Portable pgvector setup failed."
+}
+
+# Install, repair and update deploy and migrate PHP code, so they require the fixed shared
+# PHP runtime first. The helper does no APT or network work when PHP is already fixed.
+require_php_security() {
+    local helper="/usr/local/bin/ensure_php_security"
+    if [ ! -x "$helper" ]; then
+        helper="/home/dwemer/dwemerdistro/bin/ensure_php_security"
+    fi
+    [ -x "$helper" ] || fail "PHP security helper is unavailable. Update DwemerDistro first."
+    "$helper" || fail "The PHP security update is incomplete; $PRODUCT was not changed."
 }
 
 ensure_database_role() {
@@ -935,6 +989,92 @@ clone_repository() {
     fi
 }
 
+# Escape one value for the blocker line; other bytes pass through unchanged.
+json_string() {
+    local value="$1" escaped="" char code index
+    for ((index = 0; index < ${#value}; index++)); do
+        char="${value:index:1}"
+        case "$char" in
+            '"') escaped+='\"' ;;
+            '\') escaped+='\\' ;;
+            *)
+                printf -v code '%d' "'$char"
+                if [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; then
+                    printf -v char '\\u%04x' "$code"
+                fi
+                escaped+="$char"
+                ;;
+        esac
+    done
+    printf '"%s"' "$escaped"
+}
+
+fail_update_blocked() {
+    local reason="$1" status="$2" branch="$3" message="$4"
+    shift 4
+    local files="" path count=0
+
+    for path in "$@"; do
+        [ "$count" -lt "$UPDATE_BLOCKED_FILE_LIMIT" ] || break
+        files+="${files:+,}$(json_string "$path")"
+        count=$((count + 1))
+    done
+    printf 'DDISTRO_UPDATE_BLOCKED {"schema_version":1,"reason":"%s","product":"%s","branch":%s,"total":%d,"files":[%s]}\n' \
+        "$reason" "$PRODUCT" "$(json_string "$branch")" "$#" "$files"
+    fail "$message" "$status"
+}
+
+# Classify a failed update checkout from Git's own refusal, using NUL-separated plumbing for paths.
+# Untracked collisions win because discarding tracked edits would not let the update continue.
+classify_update_blocker() {
+    local branch="$1" checkout_output="$2" path
+    local -a candidates=() blocked=()
+    local -a repo_git=(git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" --literal-pathspecs)
+
+    case "$checkout_output" in
+        *"untracked working tree files would be"*|*"would lose untracked files"*)
+            while IFS= read -r -d '' path; do
+                if [ -e "$PRODUCT_ROOT/$path" ] || [ -L "$PRODUCT_ROOT/$path" ]; then
+                    candidates+=("$path")
+                fi
+            done < <("${repo_git[@]}" diff -z --no-renames --name-only --diff-filter=A HEAD "origin/$branch" --)
+            if [ "${#candidates[@]}" -gt 0 ]; then
+                while IFS= read -r -d '' path; do
+                    blocked+=("$path")
+                done < <(printf '%s\0' "${candidates[@]}" \
+                    | xargs -0 "${repo_git[@]}" ls-files -z --others --exclude-standard --)
+            fi
+            fail_update_blocked untracked-files "$UPDATE_BLOCKED_UNTRACKED_EXIT" "$branch" \
+                "Untracked $PRODUCT files are in the way of this update. Move them, then update again." \
+                "${blocked[@]}"
+            ;;
+    esac
+
+    case "$checkout_output" in
+        *"Your local changes to the following files would be overwritten"*)
+            # Staged, unstaged, deleted and mode-changed tracked paths that the target also changes.
+            # Index and work tree are read separately: a staged change the work tree undoes still blocks.
+            local -A seen=()
+            while IFS= read -r -d '' path; do
+                [ -n "${seen[$path]+set}" ] && continue
+                seen[$path]=1
+                candidates+=("$path")
+            done < <("${repo_git[@]}" diff -z --no-renames --name-only --cached HEAD --
+                     "${repo_git[@]}" diff -z --no-renames --name-only --)
+            if [ "${#candidates[@]}" -gt 0 ]; then
+                while IFS= read -r -d '' path; do
+                    blocked+=("$path")
+                done < <(printf '%s\0' "${candidates[@]}" \
+                    | xargs -0 "${repo_git[@]}" diff -z --no-renames --name-only HEAD "origin/$branch" --)
+            fi
+            if [ "${#blocked[@]}" -gt 0 ]; then
+                fail_update_blocked tracked-changes "$UPDATE_BLOCKED_TRACKED_EXIT" "$branch" \
+                    "Local edits to tracked $PRODUCT files block this update." "${blocked[@]}"
+            fi
+            ;;
+    esac
+}
+
 update_repository() {
     local branch="$1"
     [ -d "$PRODUCT_ROOT/.git" ] || fail "$PRODUCT is not installed."
@@ -967,8 +1107,16 @@ update_repository() {
         git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" reset --hard HEAD \
             || fail "Could not discard tracked changes for $PRODUCT."
     fi
-    git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" checkout -B "$branch" "origin/$branch" \
-        || fail "Could not select $PRODUCT branch $branch."
+    # Keep Git's refusal in English so a blocked update can be classified; it is still shown.
+    local checkout_output checkout_status
+    checkout_output="$(LC_ALL=C git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" \
+        checkout -B "$branch" "origin/$branch" 2>&1)"
+    checkout_status=$?
+    [ -z "$checkout_output" ] || printf '%s\n' "$checkout_output" >&2
+    if [ "$checkout_status" -ne 0 ]; then
+        [ "$COMMAND" != update ] || classify_update_blocker "$branch" "$checkout_output"
+        fail "Could not select $PRODUCT branch $branch."
+    fi
     git -c safe.directory="$PRODUCT_ROOT" -C "$PRODUCT_ROOT" reset --hard "origin/$branch" \
         || fail "Could not update $PRODUCT to origin/$branch."
 }
@@ -1036,6 +1184,10 @@ on_exit() {
         rm -f "$LOCK_PATH/pid" 2>/dev/null || true
         rmdir "$LOCK_PATH" 2>/dev/null || true
         LOCK_HELD=0
+    fi
+    if [ "$MAINTENANCE_HELD" -eq 1 ]; then
+        flock -u 7 2>/dev/null || true
+        MAINTENANCE_HELD=0
     fi
 
     trap - EXIT INT TERM
@@ -1251,7 +1403,7 @@ startup_product() {
     select_product "$key"
     if [ "$PRODUCT" = lorkhan ]; then
         if [ -f "$WEB_ROOT/LorkhanServer/index.php" ] && [ -e /etc/apache2/sites-enabled/lorkhanserver.conf ] && [ -x /etc/init.d/lorkhanserver-worker ]; then
-            service lorkhanserver-worker start || fail 'LORKHAN worker failed to start.'
+            service lorkhanserver-worker start 7<&- || fail 'LORKHAN worker failed to start.'
             # The init script backgrounds the worker; verify it survives startup.
             sleep 1
             service lorkhanserver-worker status >/dev/null 2>&1 || fail 'LORKHAN worker exited during startup.'
@@ -1363,13 +1515,15 @@ case "$COMMAND" in
         done
         require_root "$COMMAND" "$PRODUCT" --branch "$BRANCH_CHOICE"
         acquire_operation_lock
-        start_postgres
         BRANCH=$(resolve_branch "$BRANCH_CHOICE") || exit $?
+        require_php_security
+        start_postgres
         case "$COMMAND" in
             install) install_product "$BRANCH" ;;
             update) update_product "$BRANCH" ;;
             repair) repair_product "$BRANCH" ;;
         esac
+        # Shared references resolve at request time; legacy credentials remain untouched.
         ;;
     uninstall)
         [ "$#" -gt 0 ] || fail "uninstall requires a product." 64
