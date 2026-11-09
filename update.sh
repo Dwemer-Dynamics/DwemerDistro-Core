@@ -14,36 +14,55 @@ RED='\033[1;31m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
-# Print a header
+CURRENT_STEP="starting the core update"
+CORE_ERROR_REPORTED=0
+
+# Print a compact section header; it also names the step reported if a command fails silently.
 print_header() {
-    printf "\n${BOLD}-------------------------------------------------------${NC}\n"
-    printf "${BOLD} %s ${NC}\n" "$1"
-    printf "${BOLD}-------------------------------------------------------${NC}\n"
+    CURRENT_STEP="$1"
+    printf "${BOLD}== %s ==${NC}\n" "$1"
+}
+
+# Print one progress step.
+print_step() {
+    CURRENT_STEP="$1"
+    printf ">> %s...\n" "$1"
+}
+
+print_error() {
+    CORE_ERROR_REPORTED=1
+    printf "${RED}[ERROR] %s${NC}\n" "$1"
+}
+
+# Any non-zero exit that did not already print an error names the step, so no failure is silent.
+report_unexplained_failure() {
+    local status="$1"
+    if [ "$status" -ne 0 ] && [ "$CORE_ERROR_REPORTED" -ne 1 ]; then
+        printf "${RED}[ERROR] Core update failed at step: %s (exit %s).${NC}\n" "$CURRENT_STEP" "$status"
+    fi
 }
 
 # Main title
-printf "\n${BOLD}=======================================================${NC}\n"
-printf "${BOLD}             CORE SYSTEM UPDATER                  ${NC}\n"
-printf "${BOLD}=======================================================${NC}\n\n"
+printf "${BOLD}Core system update${NC}\n"
 
 print_header "CHECKING SYSTEM"
 
-printf ">> Checking source directories...\n"
+print_step "Checking source directories"
 if [ ! -d "/home/dwemer/dwemerdistro/bin" ]; then
-    printf "${RED}[ERROR] Source directory /home/dwemer/dwemerdistro/bin not found!${NC}\n"
+    print_error "Source directory /home/dwemer/dwemerdistro/bin not found!"
     exit 1
 fi
 if [ ! -d "/home/dwemer/dwemerdistro/etc" ]; then
-    printf "${RED}[ERROR] Source directory /home/dwemer/dwemerdistro/etc not found!${NC}\n"
+    print_error "Source directory /home/dwemer/dwemerdistro/etc not found!"
     exit 1
 fi
 
-printf ">> Checking Git credential helper configuration...\n"
+print_step "Checking Git credential helper configuration"
 DWEMER_GIT_CONFIG="/home/dwemer/.gitconfig"
 if [ -f "$DWEMER_GIT_CONFIG" ] && ! command -v git-credential-manager >/dev/null 2>&1; then
     if git config --file "$DWEMER_GIT_CONFIG" --get-all credential.helper 2>/dev/null | grep -Fxq "manager"; then
         if ! git config --file "$DWEMER_GIT_CONFIG" --unset-all credential.helper '^manager$'; then
-            printf "${RED}[ERROR] Could not remove the unavailable Git credential helper.${NC}\n"
+            print_error "Could not remove the unavailable Git credential helper."
             exit 1
         fi
         chown dwemer:dwemer "$DWEMER_GIT_CONFIG" || exit 1
@@ -73,20 +92,20 @@ acquire_maintenance_lock() {
     esac
     if [ -z "$info" ]; then
         exec 7<&-
-        printf "${RED}[ERROR] $MAINTENANCE_LOCK is not a root-owned plain file; it was not replaced.${NC}\n"; exit 1
+        print_error "$MAINTENANCE_LOCK is not a root-owned plain file; it was not replaced."; exit 1
     fi
     if ! flock -s -w 30 7; then
         exec 7<&-
-        printf "${RED}[ERROR] Another DwemerDistro maintenance or ddistro changes operation is running.${NC}\n"; exit 75
+        print_error "Another DwemerDistro maintenance or ddistro changes operation is running."; exit 75
     fi
 }
 
 acquire_maintenance_lock
-trap 'flock -u 7 2>/dev/null || true' EXIT
+trap 'core_status=$?; flock -u 7 2>/dev/null || true; report_unexplained_failure "$core_status"' EXIT
 
 print_header "UPDATING SYSTEM FILES"
 
-printf ">> Copying scripts to /usr/local/bin...\n"
+print_step "Copying scripts to /usr/local/bin"
 cp /home/dwemer/dwemerdistro/bin/* /usr/local/bin/ 2>/dev/null
 if [ $? -eq 0 ]; then
     # Set executable permissions for all scripts
@@ -117,6 +136,7 @@ if [ $? -eq 0 ]; then
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_dashboard_keys /usr/local/bin/ddistro_dashboard_keys || exit 1
     dashboard_keys_rule=$(mktemp) || exit 1
     printf '%s\n' 'www-data ALL=(root) NOPASSWD: /usr/local/bin/ddistro_dashboard_keys status, /usr/local/bin/ddistro_dashboard_keys edit, /usr/local/bin/ddistro_dashboard_keys create, /usr/local/bin/ddistro_dashboard_keys test' > "$dashboard_keys_rule"
+    CURRENT_STEP="validating and installing the dashboard keys sudoers rule"
     if ! visudo -cqf "$dashboard_keys_rule" || ! install -o root -g root -m 440 "$dashboard_keys_rule" /etc/sudoers.d/dwemerdistro-dashboard-keys; then
         rm -f "$dashboard_keys_rule"; exit 1
     fi
@@ -131,26 +151,29 @@ if [ $? -eq 0 ]; then
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_mod_release.py /usr/local/bin/ddistro_mod_release.py || exit 1
     printf "${GREEN}[SUCCESS] Scripts successfully copied to /usr/local/bin/${NC}\n"
 else
-    printf "${RED}[ERROR] Error copying scripts to /usr/local/bin/${NC}\n"
+    print_error "Error copying scripts to /usr/local/bin/"
     exit 1
 fi
 
 # Repair old image keyrings before any subsequent component installation uses APT.
+CURRENT_STEP="repairing the GitHub CLI keyring"
 /usr/local/bin/repair_github_cli_keyring || exit 1
 
 # Patch the shared PHP runtime before any server, migration, or configuration step runs PHP.
-printf ">> Verifying the PHP security update...\n"
+print_step "Verifying the PHP security update"
 if ! /usr/local/bin/ensure_php_security; then
-    printf "${RED}[ERROR] The PHP security update is incomplete. Server files were not updated.${NC}\n"
+    print_error "The PHP security update is incomplete. Server files were not updated."
     exit 1
 fi
 
-printf ">> Checking installed server repository origins...\n"
+print_step "Checking installed server repository origins"
 /usr/local/bin/ddistro_server migrate-remotes all || exit 1
 
-printf ">> Ensuring UTF-8 is the PostgreSQL default...\n"
+print_step "Ensuring UTF-8 is the PostgreSQL default"
 update-locale LANG=C.UTF-8 LC_ALL=C.UTF-8
+CURRENT_STEP="starting PostgreSQL"
 service postgresql start >/dev/null 7<&- || exit 1
+CURRENT_STEP="ensuring UTF-8 is the PostgreSQL default"
 /usr/local/bin/ensure_postgres_utf8 || exit 1
 
 # Replace a shipped configuration file only while it still matches what an update installed.
@@ -164,7 +187,7 @@ install_shipped_config() {
 
     shipped="$(sha256sum < "$source" | cut -d ' ' -f 1)" || return 1
     if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
-        printf "${RED}[ERROR] $target is not a plain file. It was not changed.${NC}\n"
+        print_error "$target is not a plain file. It was not changed."
         return 1
     fi
     if [ -f "$target" ]; then
@@ -186,7 +209,7 @@ install_shipped_config() {
         && printf '%s\n' "$shipped" > "$baseline"
 }
 
-printf ">> Copying configuration files to /etc...\n"
+print_step "Copying configuration files to /etc"
 find /home/dwemer/dwemerdistro/etc/ -type f ! -name "php.ini" ! -name "dwemerdistro_services.conf" \
     ! -name "dwemerdistro-lmstudio.json" ! -name "cuda_config" -exec cp {} /etc/ \; 2>/dev/null
 if [ $? -eq 0 ]; then
@@ -206,44 +229,47 @@ if [ $? -eq 0 ]; then
         install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/dwemerdistro_services.conf "$SERVICES_CONF" || exit 1
     elif [ -L "$SERVICES_CONF" ] || [ ! -f "$SERVICES_CONF" ] || [ "$(stat -c '%u' "$SERVICES_CONF")" != 0 ] \
         || [ $(( 0$(stat -c '%a' "$SERVICES_CONF") & 022 )) -ne 0 ]; then
-        printf "${RED}[ERROR] $SERVICES_CONF must be a plain root-owned file that only root can change. It was not changed.${NC}\n"
+        print_error "$SERVICES_CONF must be a plain root-owned file that only root can change. It was not changed."
         exit 1
     fi
     if ! runuser -u dwemer -- python3 -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1]))["models"], list))' /etc/dwemerdistro-lmstudio.json; then
-        printf "${RED}[ERROR] LM Studio model catalog is not readable by dwemer${NC}\n"
+        print_error "LM Studio model catalog is not readable by dwemer"
         exit 1
     fi
     if ! runuser -u dwemer -- python3 -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1]))["components"], list))' /etc/dwemerdistro-components.json; then
-        printf "${RED}[ERROR] Component catalog is not readable by dwemer${NC}\n"
+        print_error "Component catalog is not readable by dwemer"
         exit 1
     fi
     printf "${GREEN}[SUCCESS] Configuration files successfully copied to /etc/${NC}\n"
 else
-    printf "${RED}[ERROR] Error copying configuration files to /etc/${NC}\n"
+    print_error "Error copying configuration files to /etc/"
     exit 1
 fi
 
 print_header "UPDATING PHP CONFIGURATION"
 
 # Only a freshly prepared image has the marker that enables this initialization.
+CURRENT_STEP="initializing a fresh distro"
 /usr/local/bin/initialize_fresh_distro || exit 1
 
 # Existing PHP settings belong to the user; only a missing Apache php.ini gets the distro default.
-printf ">> Checking PHP Apache configuration...\n"
+print_step "Checking PHP Apache configuration"
 PHP_APACHE_INI=/etc/php/8.2/apache2/php.ini
 if [ -e "$PHP_APACHE_INI" ] || [ -L "$PHP_APACHE_INI" ]; then
-    printf "${GREEN}[SUCCESS] Existing PHP configuration kept unchanged${NC}\n"
+    : # The user's existing PHP configuration is kept; nothing to report.
 elif install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/php.ini "$PHP_APACHE_INI"; then
     printf "${GREEN}[SUCCESS] Default PHP configuration installed${NC}\n"
 else
-    printf "${RED}[ERROR] Error installing the default PHP configuration${NC}\n"
+    print_error "Error installing the default PHP configuration"
     exit 1
 fi
 
 # Existing and fresh users receive the same hash-verified runtime, without account sign-in.
 # An interrupted download can be retried; no user data or provider credentials are replaced.
+CURRENT_STEP="installing the Assistant runtime"
 /usr/local/bin/install_assistant_runtime --install-prerequisites 7<&- || exit 1
 # Install the immutable credential library without provisioning operator keys into redistributable images.
+CURRENT_STEP="installing the shared keys runtime"
 /usr/local/bin/install_shared_keys --install-runtime 7<&- || exit 1
 # Enable installed shared-key adapters only after their central deletion guard is ready; never import user keys here.
 if [ "${DDISTRO_KEYS_IMAGE_BUILD:-}" != 1 ] && ! /usr/local/bin/ddistro_keys prepare-legacy >/dev/null; then
@@ -256,13 +282,11 @@ import json, sys
 result = json.load(sys.stdin)
 sys.exit(0 if result.get("ok") is True and result.get("data", {}).get("passed") is True else 1)
 '; then
-    printf "${RED}[ERROR] Assistant isolation did not pass. Check connectivity and retry Update Distro.${NC}\n"
+    print_error "Assistant isolation did not pass. Check connectivity and retry Update Distro."
     exit 1
 fi
 
-printf "\n${BOLD}=======================================================${NC}\n"
-printf "${BOLD}${GREEN}        CORE SYSTEM UPDATED SUCCESSFULLY!          ${NC}\n"
-printf "${BOLD}=======================================================${NC}\n\n"
+printf "${GREEN}[SUCCESS] Core system updated.${NC}\n"
 
 #DO NOT REMOVE Begin CHIM Server Update as this triggers the update_gws step in the CHIM launcher.
 echo "Begin CHIM Server Update"
