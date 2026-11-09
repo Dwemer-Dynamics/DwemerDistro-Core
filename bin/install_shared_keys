@@ -22,6 +22,8 @@ RUNTIME = Path('/opt/dwemerdistro-keys')
 CONFIG = Path('/etc/dwemer/shared-keys.env')
 STATE = Path('/var/lib/dwemerdistro/shared-keys')
 LIMIT = 32 * 1024 * 1024
+# Present in schema.sql of every bundle that stores global keys as plain text; older code cannot read those rows.
+PLAINTEXT_SCHEMA = 'ADD COLUMN IF NOT EXISTS secret text'
 
 
 def trusted(path):
@@ -103,6 +105,10 @@ def install_runtime(bundle):
         for relative in ('Config/Autoloader.php', 'Core/ApiKeyManager/ApiKeyManager.php', 'schema.sql'):
             if not (temporary / relative).is_file():
                 raise RuntimeError('Shared-key runtime is incomplete')
+        installed_schema = RUNTIME / 'schema.sql'
+        if (installed_schema.is_file() and PLAINTEXT_SCHEMA in installed_schema.read_text()
+                and PLAINTEXT_SCHEMA not in (temporary / 'schema.sql').read_text()):
+            raise RuntimeError('Refusing to replace plain-text key storage with an older shared-key runtime; installed runtime was preserved')
         (temporary / '.bundle-sha256').write_text(digest + '\n')
         (temporary / '.permissions-ready').write_text('1\n')
         for entry in (temporary, *temporary.rglob('*')):
@@ -150,7 +156,8 @@ def ensure_store(port, environment):
             raise RuntimeError('Existing encryption key is not usable; it was not replaced')
     else:
         existing = sql(database, "SELECT to_regclass('public.api_keys');", port)
-        if existing and sql(database, 'SELECT count(*) FROM public.api_keys;', port) != '0':
+        # Only legacy sealed rows need the key; plain-text rows are readable without it.
+        if existing and sql(database, 'SELECT count(*) FROM public.api_keys WHERE ciphertext IS NOT NULL;', port) != '0':
             raise RuntimeError('Saved keys exist without their encryption key; preserve and recover the original key')
         key.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         subprocess.run(['/usr/sbin/groupadd', '-f', 'dwemer-keys'], check=True, capture_output=True)
@@ -162,6 +169,13 @@ def ensure_store(port, environment):
             output.write(secrets.token_bytes(32))
     sql(database, 'BEGIN; SET LOCAL lock_timeout=2000; SET LOCAL statement_timeout=10000;\n'
         + (RUNTIME / 'schema.sql').read_text() + '\nCOMMIT;', port)
+    runtime_role = environment.get('CHIM_SHARED_DB_USER', '')
+    if not runtime_role.replace('_', '').isalnum() or len(runtime_role) > 63:
+        raise RuntimeError('Invalid shared-key runtime role')
+    # Plain-text runtimes edit the secret column; older pinned bundles have no such column.
+    sql(database, "DO $$ BEGIN IF EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='public.api_keys'::regclass "
+        "AND attname='secret' AND NOT attisdropped) THEN EXECUTE 'GRANT UPDATE(secret) ON public.api_keys TO \""
+        + runtime_role + "\"'; END IF; END $$;", port)
     if not configured:
         sql(database, 'REVOKE ALL ON DATABASE dwemerdistro_keys FROM PUBLIC; GRANT CONNECT ON DATABASE dwemerdistro_keys TO ddistro_keys_runtime; '
             'GRANT USAGE ON SCHEMA public TO ddistro_keys_runtime; GRANT SELECT,INSERT ON public.api_keys TO ddistro_keys_runtime; '

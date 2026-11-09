@@ -1,0 +1,282 @@
+#!/usr/bin/python3 -I
+"""Dashboard bridge to global API keys: masked status, edits of existing keys, new keys for catalog providers and the
+read-only test of one saved key.
+
+www-data reaches this through one exact sudo rule. It reuses ddistro_keys' trusted environment, lock and
+www-data PHP adapter, so validation, limits, storage and SQL stay in ApiKeyManager/DBManager. It never
+initializes a store, reveals, deletes or binds keys; a test reuses the launcher's global-test check by UUID and
+revision. Secrets travel over bounded stdin only and are never echoed.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+KEYS = Path('/usr/local/bin/ddistro_keys')
+UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+SECRET = re.compile(r'[\x21-\x7e]{1,4096}')
+PROVIDER = re.compile(r'[a-z0-9_]{1,32}')
+EDIT_FIELDS = {'key_id', 'revision', 'label', 'secret'}
+CREATE_FIELDS = {'provider', 'label', 'origin', 'secret'}
+TEST_FIELDS = {'key_id', 'revision'}
+TEST_RESULTS = frozenset(('accepted', 'rejected', 'rate_limited', 'unavailable', 'unsupported', 'reachable'))
+MAX_REQUEST = 8192
+MAX_KEYS = 256
+MAX_PROVIDERS = 64
+
+
+def fail(outcome, **extra):
+    return dict({'ok': False, 'outcome': outcome}, **extra)
+
+
+def keys_module():
+    """Load the installed root-owned key helper as a library; its main() and runtime setup are not run."""
+    info = KEYS.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise PermissionError
+    loader = importlib.machinery.SourceFileLoader('ddistro_keys_library', str(KEYS))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def ready(keys):
+    """A configured store and installed runtime are required; missing setup is reported, never created."""
+    if not keys.environment().get('CHIM_SHARED_DB_NAME'):
+        return False
+    runtime = keys.GLOBAL_ROOT
+    if not (runtime / '.bundle-sha256').is_file() or not (runtime / 'Core/ApiKeyManager/ApiKeyManager.php').is_file():
+        return False
+    keys.trusted_file(keys.BRIDGE)
+    return True
+
+
+def view(key):
+    """Masked public fields only; anything unexpected drops the row rather than passing it through."""
+    if not isinstance(key, dict):
+        return None
+    row = {'key_id': key.get('key_id'), 'provider': key.get('provider'), 'label': key.get('label'),
+           'preview': key.get('preview', ''), 'revision': key.get('revision'), 'configured': key.get('configured') is True,
+           'test_supported': key.get('test_supported') is True}
+    if not isinstance(row['key_id'], str) or not UUID.fullmatch(row['key_id']) or not isinstance(row['provider'], str) \
+            or not PROVIDER.fullmatch(row['provider']) or not isinstance(row['label'], str) \
+            or len(row['label']) > 64 or type(row['revision']) is not int or row['revision'] < 1 \
+            or not isinstance(row['preview'], str) or len(row['preview']) > 32:
+        return None
+    return row
+
+
+def catalog(data):
+    """The installed provider catalog reduced to each id and whether a new key needs an entered origin, or None."""
+    providers = data.get('providers') if isinstance(data, dict) else None
+    if not isinstance(providers, dict) or not 1 <= len(providers) <= MAX_PROVIDERS:
+        return None
+    rows = []
+    for name, definition in providers.items():
+        origin = definition.get('origin', False) if isinstance(definition, dict) else False
+        if not PROVIDER.fullmatch(name) or not (origin is None or (isinstance(origin, str) and origin)):
+            return None
+        rows.append({'provider': name, 'needs_origin': origin is None})
+    return rows
+
+
+def listed(keys):
+    response = keys.invoke('global-status', {})
+    return response.get('data') if response.get('ok') and response.get('outcome') == 'listed' else None
+
+
+def status(keys):
+    data = listed(keys)
+    if not isinstance(data, dict) or not isinstance(data.get('keys'), list) or len(data['keys']) > MAX_KEYS:
+        return fail('unavailable')
+    rows = [view(key) for key in data['keys']]
+    providers = catalog(data)
+    if None in rows or providers is None:
+        return fail('unavailable')
+    return {'ok': True, 'outcome': 'listed', 'keys': rows, 'providers': providers}
+
+
+def label_valid(label):
+    return isinstance(label, str) and 1 <= len(label) <= 64 and label == label.strip() \
+        and not any(ord(c) < 32 or 127 <= ord(c) < 160 for c in label)
+
+
+def parse(raw, create):
+    if len(raw) > MAX_REQUEST:
+        return None
+    try:
+        request = json.loads(raw.decode('utf-8'))
+    except ValueError:
+        return None
+    if not isinstance(request, dict) or set(request) != (CREATE_FIELDS if create else EDIT_FIELDS) \
+            or not label_valid(request['label']) or not isinstance(request['secret'], str):
+        return None
+    if create:
+        # A provider id, display name, origin (null for fixed-origin providers) and a required secret; no key_id.
+        if not isinstance(request['provider'], str) or not PROVIDER.fullmatch(request['provider']) \
+                or not SECRET.fullmatch(request['secret']) or not (request['origin'] is None
+                or (isinstance(request['origin'], str) and 1 <= len(request['origin']) <= 256)):
+            return None
+        return request
+    # Exactly an existing UUID, its revision, a display name and an optional replacement; provider/origin are refused.
+    if not isinstance(request['key_id'], str) or not UUID.fullmatch(request['key_id']) \
+            or type(request['revision']) is not int or not 1 <= request['revision'] <= 2 ** 31 \
+            or (request['secret'] and not SECRET.fullmatch(request['secret'])):
+        return None
+    return request
+
+
+def parse_test(raw):
+    """Exactly an existing UUID and its revision; no secret, provider or origin."""
+    if len(raw) > MAX_REQUEST:
+        return None
+    try:
+        request = json.loads(raw.decode('utf-8'))
+    except ValueError:
+        return None
+    if not isinstance(request, dict) or set(request) != TEST_FIELDS:
+        return None
+    if not isinstance(request['key_id'], str) or not UUID.fullmatch(request['key_id']) \
+            or type(request['revision']) is not int or not 1 <= request['revision'] <= 2 ** 31:
+        return None
+    return request
+
+
+def test(keys, request):
+    """One read-only provider check of the saved key, under the key lock so it never races a replacement."""
+    lock = keys.migration_lock()
+    try:
+        lock.__enter__()
+    except keys.Refusal:
+        return fail('busy')
+    try:
+        try:
+            response = keys.invoke('global-test', request)
+        except Exception:
+            return fail('unavailable')
+    finally:
+        lock.__exit__(None, None, None)
+    outcome = response.get('outcome')
+    data = response.get('data')
+    if response.get('ok') and outcome == 'tested' and isinstance(data, dict) and data.get('result') in TEST_RESULTS:
+        # Only the fixed result code leaves; the adapter's message text stays behind.
+        return {'ok': True, 'outcome': 'tested', 'result': data['result']}
+    if outcome == 'conflict':
+        return fail('conflict')
+    if outcome in ('missing', 'revoked'):
+        return fail('missing')
+    return fail('unavailable')
+
+
+def parse_edit(raw):
+    return parse(raw, False)
+
+
+def parse_create(raw):
+    return parse(raw, True)
+
+
+def save(keys, request, create):
+    lock = keys.migration_lock()
+    try:
+        lock.__enter__()
+    except keys.Refusal:
+        # Lock contention or an untrusted lock: nothing was written.
+        request.clear()
+        return fail('busy')
+    try:
+        if create:
+            # The live catalog decides which providers exist and which need an entered origin; known origins stay fixed.
+            try:
+                providers = catalog(listed(keys))
+            except Exception:
+                providers = None
+            if providers is None:
+                return fail('unavailable')
+            entry = next((p for p in providers if p['provider'] == request['provider']), None)
+            if entry is None:
+                return fail('invalid', fields=['provider'])
+            if entry['needs_origin'] != (request['origin'] is not None):
+                return fail('invalid', fields=['origin'])
+            if request['origin'] is None:
+                del request['origin']
+        try:
+            response = keys.invoke('global-save', request)
+        except Exception:
+            # Timeout or malformed adapter reply after dispatch: the write may have completed.
+            return fail('unknown')
+    finally:
+        request.clear()
+        lock.__exit__(None, None, None)
+    return created(response) if create else edited(response)
+
+
+def invalid(response, allowed):
+    return fail('invalid', fields=sorted({e.get('key') for e in response.get('errors') or [] if isinstance(e, dict)} & allowed))
+
+
+def created(response):
+    outcome = response.get('outcome')
+    if response.get('ok') and outcome == 'created':
+        row = view(response.get('data'))
+        return {'ok': True, 'outcome': 'created', 'key': row} if row else fail('unknown')
+    if outcome == 'invalid':
+        return invalid(response, {'provider', 'label', 'origin', 'secret'})
+    # Refused before anything was written: the active-key limit, or a store whose encryption key is unavailable.
+    if outcome in ('limit', 'crypto_unavailable'):
+        return fail(outcome)
+    # The PHP adapter reports exceptions as "unavailable" because a write may have completed.
+    return fail('unknown')
+
+
+def edited(response):
+    outcome = response.get('outcome')
+    if response.get('ok') and outcome in ('updated', 'unchanged'):
+        row = view(response.get('data'))
+        return {'ok': True, 'outcome': outcome, 'key': row} if row else fail('unknown')
+    if outcome == 'conflict':
+        return fail('conflict')
+    if outcome in ('missing', 'revoked'):
+        return fail('missing')
+    if outcome == 'invalid':
+        return invalid(response, {'label', 'secret'})
+    # The PHP adapter reports exceptions as "unavailable" because a write may have completed.
+    return fail('unknown')
+
+
+def main(argv):
+    if os.geteuid() != 0 or len(argv) != 2 or argv[1] not in ('status', 'edit', 'create', 'test'):
+        return fail('refused')
+    request = None
+    if argv[1] != 'status':
+        # Each verb has its own exact request shape; status reads no input.
+        parser = {'edit': parse_edit, 'create': parse_create, 'test': parse_test}[argv[1]]
+        request = parser(sys.stdin.buffer.read(MAX_REQUEST + 1))
+        if request is None:
+            return fail('invalid', fields=[])
+    try:
+        keys = keys_module()
+        if not ready(keys):
+            return fail('not_configured')
+        if argv[1] == 'status':
+            return status(keys)
+        if argv[1] == 'test':
+            return test(keys, request)
+    except Exception:
+        # Never echo input, environment, SQL or subprocess diagnostics. Nothing has been written yet.
+        return fail('unavailable')
+    try:
+        return save(keys, request, argv[1] == 'create')
+    except Exception:
+        return fail('unknown')
+
+
+if __name__ == '__main__':
+    result = main(sys.argv)
+    print(json.dumps(result))
+    sys.exit(0 if result['ok'] else 1)

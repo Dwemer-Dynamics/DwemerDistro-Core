@@ -113,6 +113,14 @@ if [ $? -eq 0 ]; then
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_api /usr/local/bin/ddistro_api || exit 1
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/install_shared_keys /usr/local/bin/install_shared_keys || exit 1
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_keys /usr/local/bin/ddistro_keys || exit 1
+    # Dashboard API Keys rail: masked status, existing-key edits, new catalog keys and saved-key tests, through one exact four-verb root rule.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_dashboard_keys /usr/local/bin/ddistro_dashboard_keys || exit 1
+    dashboard_keys_rule=$(mktemp) || exit 1
+    printf '%s\n' 'www-data ALL=(root) NOPASSWD: /usr/local/bin/ddistro_dashboard_keys status, /usr/local/bin/ddistro_dashboard_keys edit, /usr/local/bin/ddistro_dashboard_keys create, /usr/local/bin/ddistro_dashboard_keys test' > "$dashboard_keys_rule"
+    if ! visudo -cqf "$dashboard_keys_rule" || ! install -o root -g root -m 440 "$dashboard_keys_rule" /etc/sudoers.d/dwemerdistro-dashboard-keys; then
+        rm -f "$dashboard_keys_rule"; exit 1
+    fi
+    rm -f "$dashboard_keys_rule"
     install -d -o root -g root -m 755 /usr/local/lib/dwemerdistro || exit 1
     install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_keys.php /usr/local/lib/dwemerdistro/keys.php || exit 1
     install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_native_keys.php /usr/local/lib/dwemerdistro/native_keys.php || exit 1
