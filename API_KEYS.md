@@ -1,6 +1,6 @@
 # DwemerDistro global API keys
 
-The top-level API Keys tab edits one encrypted shared `api_keys` table. It has no mod selector and never edits native mod badge rows or individual connection credentials. All saved keys are shown once by stable UUID, with their provider and editable display name. Empty provider rows are unsaved placeholders; they consume no key slots.
+The top-level API Keys tab edits one shared `api_keys` table; secrets are stored as plain text by explicit operator decision and are always censored in replies. It has no mod selector and never edits native mod badge rows or individual connection credentials. All saved keys are shown once by stable UUID, with their provider and editable display name. Empty provider rows are unsaved placeholders; they consume no key slots.
 
 Paste a replacement into a row and Save. Blank preserves its current secret. Existing global keys rotate in place, preserving the UUID and every current assignment. Creating a key does not automatically bind mods or replace their existing settings. Existing mod-specific keys, profiles and assignments are preserved. Consumers already assigned to a global UUID read its new value after rotation.
 
@@ -12,12 +12,16 @@ Saved values appear as first four + ******** + last four characters. Values of e
 
 - `global-status`: global key metadata, masked previews and provider catalog. No legacy or per-connection rows, no complete secrets.
 - `global-save {key_id,revision,label,secret}`: revision-checked in-place rotation/rename. Unchanged label plus blank secret is a no-op.
-- `global-save {provider,label,origin,secret}`: create a new encrypted global key.
+- `global-save {provider,label,origin,secret}`: create a new global key.
 - `global-reveal {key_id,revision}`: explicit readback, refusing stale revisions.
 
-Only the root-local fixed CLI exposes these operations. Secrets travel over bounded stdin/private captured stdout, never command arguments, environment or logging callbacks. Encryption and validation stay in ChimServer ApiKeyManager; all persistent SQL stays in DBManager. Provider/origin and UUID are authenticated encryption associated data. A metadata-only shared migration extends the allowed provider names without rewriting existing key rows. Existing ciphertexts, IDs and references are retained. Unknown write outcomes require reload, without automatic retries. Busy operations exclude distro maintenance and block launcher close.
+Only the root-local fixed CLI exposes these operations. Secrets travel over bounded stdin/private captured stdout, never command arguments, environment or logging callbacks. Storage and validation stay in ChimServer ApiKeyManager; all persistent SQL stays in DBManager. Rows sealed by older runtimes stay readable until the explicit ChimServer `bin/api-keys-plaintext-migrate.php` conversion, which keeps IDs, revisions and references and never runs implicitly. A metadata-only shared migration extends the allowed provider names without rewriting existing key rows. Existing IDs and references are retained. Unknown write outcomes require reload, without automatic retries. Busy operations exclude distro maintenance and block launcher close.
 
 The older native and advanced connection/import operations remain available for compatible callers, but are absent from this global editor. No automatic import, deduplication, merging, copying, rebinding or deletion occurs. Only explicit Test contacts a provider; loading and saving do not. The old private JSON file is preserved; sync remains a no-op.
+
+## Dashboard rail
+
+`/usr/local/bin/ddistro_dashboard_keys {status|edit|create|test}` is the only Dashboard path. `update.sh` installs it with `/etc/sudoers.d/dwemerdistro-dashboard-keys`, which lets `www-data` run exactly those four root verbs. `status` returns masked rows only (UUID, provider, display name, preview, revision, `test_supported`) plus the installed provider catalog reduced to each provider id and whether a new key needs an entered origin. `edit` accepts exactly `{key_id,revision,label,secret}` on stdin (8 KiB limit) and forwards it to `global-save` under the shared key lock. `create` accepts exactly `{provider,label,origin,secret}` with a required secret; under the same lock it re-reads the catalog, refuses unknown providers and requires `origin` to be null for fixed-origin providers and entered for regional/custom ones, then forwards to `global-save`, where ApiKeyManager still validates, stores and enforces the active-key limit (`limit` is reported as nothing written). `test` accepts exactly `{key_id,revision}` and, under the same lock, runs the launcher's `global-test` (one bounded read-only `ApiKeyCheck` request with the saved key, no generation); it replies only a fixed result (`accepted`, `rejected`, `rate_limited`, `unavailable`, `unsupported`, `reachable`) or `conflict`/`missing`/`busy`, never the provider reply or check message. Reveal, delete, bind, import and native operations are refused. The bridge never runs `install_shared_keys`: an unconfigured store reports `not_configured` until setup runs from the launcher API Keys tab or `sudo /usr/local/bin/install_shared_keys`. Replies carry fixed outcome codes, never adapter diagnostics; a dispatched write with no clear reply reports `unknown` and must be reloaded, not retried.
 
 ## Quick checks
 
