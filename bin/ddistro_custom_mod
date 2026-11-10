@@ -1099,19 +1099,30 @@ def run_setup_checks(folder, manifest):
         raise ModError("The mod's database migration failed.")
 
 
-def check_health(mod_id, manifest):
+# Seconds install and update let a just-reloaded Apache answer 503 before it counts as a failure.
+HEALTH_READY_TIMEOUT = 10
+
+
+def check_health(mod_id, manifest, ready_timeout=0):
+    """HTTP 200 from the health path. Only a 503 is retried, until ready_timeout seconds have passed."""
     _, url = mod_urls(mod_id, manifest)
     request = urllib.request.Request(url, method="GET", headers={"User-Agent": "ddistro_custom_mod"})
     opener = urllib.request.build_opener(NoRedirect)
-    try:
-        with opener.open(request, timeout=10) as response:
-            if response.status == 200:
-                return True, "Healthy."
-            return False, f"Health check returned HTTP {response.status}."
-    except urllib.error.HTTPError as error:
-        return False, f"Health check returned HTTP {error.code}."
-    except (urllib.error.URLError, OSError):
-        return False, "The web server is not reachable. Start the server, then choose Update to finish."
+    deadline = time.monotonic() + ready_timeout
+    while True:
+        try:
+            with opener.open(request, timeout=10) as response:
+                if response.status == 200:
+                    return True, "Healthy."
+                return False, f"Health check returned HTTP {response.status}."
+        except urllib.error.HTTPError as error:
+            error.close()
+            remaining = deadline - time.monotonic()
+            if error.code != 503 or remaining <= 0:
+                return False, f"Health check returned HTTP {error.code}."
+        except (urllib.error.URLError, OSError):
+            return False, "The web server is not reachable. Start the server, then choose Update to finish."
+        time.sleep(min(0.25, remaining))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1602,7 +1613,7 @@ def command_install(args):
         write_config_if_missing(folder, manifest, template, mod_id)
         run_setup_checks(folder, manifest)
         setup_web()
-        healthy, message = check_health(mod_id, manifest)
+        healthy, message = check_health(mod_id, manifest, HEALTH_READY_TIMEOUT)
         if not healthy:
             raise ModError(message)
     except ModError as error:
@@ -1858,7 +1869,8 @@ def update_checkout(entry, folder, source, local, branch, progress, expect_commi
     progress["migrated"] = True
     run_setup_checks(folder, manifest)
     setup_web()
-    healthy, message = check_health(entry["id"], dict(manifest, server_folder=entry.get("server_folder", "")))
+    healthy, message = check_health(entry["id"], dict(manifest, server_folder=entry.get("server_folder", "")),
+                                    HEALTH_READY_TIMEOUT)
     entry.update(name=manifest["name"], description=manifest["description"],
                  project_url=manifest["project_url"], dashboard_path=manifest["dashboard_path"],
                  health_path=manifest["health_path"], setup=manifest["setup"], assets=manifest["assets"])
