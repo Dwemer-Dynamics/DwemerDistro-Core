@@ -764,7 +764,7 @@ else
 	L_XTTSV2=1
 fi
 
-# LM Studio starts only after the user enables it in its manager.
+# LM Studio starts when a startup model is saved; the shared launcher/web setting can disable it.
 if [ -e /usr/local/bin/ddistro_lmstudio ]; then
     # Check access as the account that reads and executes the Python helper.
     { runuser -u dwemer -- test -r /usr/local/bin/ddistro_lmstudio &&

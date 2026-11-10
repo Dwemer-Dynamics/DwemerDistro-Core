@@ -33,7 +33,12 @@ CATALOG = Path('/etc/dwemerdistro-lmstudio.json')
 ENGINE = HOME / '.lmstudio'
 ENGINE_DIRS = ('llmster', 'bin', 'extensions/backends')
 HELPER = Path(__file__).resolve()
-MUTATIONS = {'start', 'stop', 'restart', 'settings', 'download', 'import', 'load', 'unload', 'test', 'model-defaults', 'test-preset'}
+MUTATIONS = {'start', 'stop', 'restart', 'settings', 'download', 'import', 'load', 'unload', 'test', 'model-defaults', 'test-preset',
+             'delete-model'}
+# Status advertises optional jobs, so an older launcher or helper pairing can disable what the other side lacks.
+CAPABILITIES = ['delete-model']
+# One folder or file name below LM Studio's model folder: no separators, control characters or dot-only names.
+MODEL_PART = re.compile(r'(?!\.{1,2}$)[^/\\\x00-\x1f\x7f]{1,255}')
 IMPORTS = STATE / 'imports'
 IMPORT_TARGET = STATE / 'import-target.json'
 # Distinct language models that may stay loaded together, such as a dialogue model and a smaller decision model.
@@ -267,14 +272,14 @@ def status():
               'inventory': inventory, 'inventoryUpdatedAt': inventory_updated,
               'inventoryCached': not running and bool(inventory),
               'endpoint': API + '/v1', 'chatUrl': API + '/v1/chat/completions',
-              'settings': read_json(STATE / 'settings.json', {'autostart': False}),
+              'settings': {'autostart': True, **read_json(STATE / 'settings.json', {})},
               'modelDefaults': read_json(STATE / 'model-defaults.json', {}),
               'testPresets': read_json(STATE / 'test-presets.json', {}),
               'advancedAvailable': Path(SDK_PYTHON).is_file(), 'maxLoaded': MAX_LOADED,
               'slots': slot_map(models) if running else {},
               'lastTest': last_test if last_test.get('model') in instances else {},
               'lastLoad': last_load if last_load.get('model') in keys else {},
-              'memoryLockLimit': memlock_limit(), 'resources': resources()}
+              'memoryLockLimit': memlock_limit(), 'resources': resources(), 'capabilities': CAPABILITIES}
     changed = read_json(STATE / 'model-state.json', {}).get('changedAt')
     if changed is not None:
         result['modelStateChangedAt'] = changed
@@ -329,7 +334,15 @@ def validate(data):
         raise ValueError('Unknown action.')
     if action == 'settings' and type(data.get('autostart')) is not bool:
         raise ValueError('autostart must be true or false.')
-    if action in {'load', 'unload', 'test', 'model-defaults'}:
+    if action == 'delete-model':
+        # Only the launcher offers deletion. The request names the exact key and the size the user confirmed, never a path.
+        if os.environ.get('SUDO_USER') == 'www-data':
+            raise ValueError('Delete models from the launcher.')
+        if set(data) - {'action', 'model', 'bytes'}:
+            raise ValueError('Unknown delete fields: ' + ', '.join(sorted(set(data) - {'action', 'model', 'bytes'})))
+        if type(data.get('bytes')) is not int or data['bytes'] <= 0:
+            raise ValueError('Refresh the library, then choose Delete again.')
+    if action in {'load', 'unload', 'test', 'model-defaults', 'delete-model'}:
         model = data.get('model', '')
         if not isinstance(model, str) or not 1 <= len(model) <= 512 or model.startswith('-') or '\x00' in model:
             raise ValueError('Choose a model first.')
@@ -1239,6 +1252,146 @@ def import_local(data, job):
         clear_imports()
 
 
+def listed_models():
+    try:
+        with request('/api/v1/models', timeout=10) as response:
+            models = json.load(response)['models']
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ValueError('Start LM Studio first, so it can confirm the model is not loaded, then delete it.')
+    if not isinstance(models, list):
+        raise ValueError('LM Studio returned an unreadable model list. Nothing was deleted.')
+    return models
+
+
+# A loaded or saved startup model is never deleted. Deleting never unloads a model or changes startup settings.
+def delete_guard(key, models):
+    entry = next((m for m in models if isinstance(m, dict) and m.get('key') == key), None)
+    name = str((entry or {}).get('display_name') or key)[:200]
+    if entry and entry.get('loaded_instances'):
+        raise ValueError(f'{name} is loaded. Unload it first; deleting never unloads a model.')
+    settings = read_json(STATE / 'settings.json', {})
+    roles = [role for field, role in (('startupModel', 'dialogue'), ('startupDecisionModel', 'decision'))
+             if isinstance(settings, dict) and settings.get(field) == key]
+    if roles:
+        raise ValueError(f'{name} is saved as the startup {" and ".join(roles)} model. Choose another startup model or '
+                         'None, save startup models, then delete it.')
+    return entry, name
+
+
+# Remove one downloaded language model: exactly one standalone GGUF file inside LM Studio's model folder, found again
+# under the job lock from LM Studio's own lists. The caller names only the exact key and the size it confirmed. Every
+# folder below the model folder, and the file, is opened without following links, so a linked import is refused and
+# its original never touched. The checked file is renamed to a private name in its own folder and removed only if that
+# name still holds the same inode. Other files, variants and folders are kept.
+def delete_model(data, job):
+    key, expected = data['model'], data['bytes']
+    entry, name = delete_guard(key, listed_models())
+    if not entry or entry.get('type') != 'llm':
+        raise ValueError('LM Studio no longer lists this language model. Refresh the library.')
+    progress(job, f'Checking {name}...')
+    listed = json.loads(command('ls', '--json', timeout=60))
+    listed = [m for m in listed if isinstance(m, dict)] if isinstance(listed, list) else []
+    matches = [m for m in listed if m.get('modelKey') == key]
+    if len(matches) != 1:
+        raise ValueError(f'LM Studio does not list exactly one downloaded file for {name}. Nothing was deleted.')
+    found, kept = matches[0], 'Nothing was deleted.'
+    variants, path = found.get('variants') or [], found.get('path')
+    if found.get('type') != 'llm' or found.get('format', 'gguf') != 'gguf':
+        raise ValueError(f'Only downloaded GGUF language models can be deleted here. {kept}')
+    if not isinstance(variants, list) or len(variants) > 1:
+        raise ValueError(f'{name} groups several files under one name, so the file to delete is unclear. {kept}')
+    if found.get('vision'):
+        raise ValueError(f'{name} uses a separate vision file, so it is not deleted here. {kept}')
+    if not found.get('sizeBytes') == entry.get('size_bytes') == expected:
+        raise ValueError(f'{name} changed since the library was shown. Refresh, then choose Delete again. {kept}')
+    # lms lists a downloaded file as <publisher>/<repository>/<file> below the model folder.
+    parts = path.split('/') if isinstance(path, str) else []
+    if (len(parts) != 3 or not all(MODEL_PART.fullmatch(part) for part in parts) or
+            not parts[-1].lower().endswith('.gguf') or HF_SPLIT.search(parts[-1]) or 'mmproj' in parts[-1].lower() or
+            sum(m.get('path') == path for m in listed) != 1):
+        raise ValueError(f'{name} is not one standalone model file in the usual folder layout. {kept}')
+    # The model folder itself may be a configured location elsewhere; nothing below it may be a link or another mount.
+    folders, file = [], None
+    try:
+        directory = os.open(models_folder(), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        folders.append(directory)
+        device = os.fstat(directory).st_dev
+        for part in parts[:-1]:
+            directory = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            folders.append(directory)
+            if os.fstat(directory).st_dev != device:
+                raise ValueError(f'{name} is stored on another drive inside the model folder. {kept}')
+        file = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+        info = os.fstat(file)
+        if not stat.S_ISREG(info.st_mode) or info.st_dev != device:
+            raise ValueError(f'{name} is not a regular file in the model folder. {kept}')
+        # Another name for the same data keeps it on disk; that name may be the user's own file.
+        if info.st_nlink != 1:
+            raise ValueError(f'{name} shares its data with another file (a hard link), so it is not deleted here. {kept}')
+        if info.st_size != expected:
+            raise ValueError(f'{name} changed since the library was shown. Refresh, then choose Delete again. {kept}')
+        with os.fdopen(os.dup(file), 'rb', buffering=1024**2) as stream:
+            try:
+                check_gguf(stream, info.st_size, language=True)
+            except ValueError as error:
+                raise ValueError(f'{error} {kept}')
+        # Checked again just before removal: a model loaded meanwhile, also from outside this manager, is kept.
+        if not delete_guard(key, listed_models())[0]:
+            raise ValueError(f'LM Studio stopped listing {name} during the check. Refresh the library. {kept}')
+        # The identity is the checked inode. A model folder on a Windows drive cannot stat a renamed file it holds open.
+        os.close(file)
+        file, hidden = None, f'.dwemer-delete-{secrets.token_hex(8)}'
+        os.rename(parts[-1], hidden, src_dir_fd=directory, dst_dir_fd=directory)
+        try:
+            moved = os.stat(hidden, dir_fd=directory, follow_symlinks=False)
+            same = ((moved.st_dev, moved.st_ino) == (info.st_dev, info.st_ino) and stat.S_ISREG(moved.st_mode) and
+                    moved.st_nlink == 1 and moved.st_size == expected)
+        except OSError:
+            same = False
+        if not same:
+            # The name was replaced after the check. Put back what was moved; a name that reappeared is never replaced.
+            try:
+                os.link(hidden, parts[-1], src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+                os.unlink(hidden, dir_fd=directory)
+            except OSError:
+                raise ValueError(f'{name} changed while it was being deleted. Nothing was deleted; what was found was '
+                                 f'kept as {"/".join(parts[:-1])}/{hidden} in the model folder. Check it.')
+            raise ValueError(f'{name} changed while it was being deleted. {kept} Refresh and retry.')
+        os.unlink(hidden, dir_fd=directory)
+    except FileNotFoundError:
+        raise ValueError(f'LM Studio lists {name}, but its file is not in the model folder. Refresh in a moment. {kept}')
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ValueError(f'{name} is a link to a file elsewhere, or goes through one, so it is not deleted here. {kept}')
+        raise
+    finally:
+        for descriptor in ([file] if file is not None else []) + folders:
+            os.close(descriptor)
+    # Disk removal already succeeded. Metadata failures must not misleadingly report that deletion failed.
+    metadata_warning = ''
+    try:
+        cache = read_json(STATE / 'model-inventory.json', {})
+        if isinstance(cache, dict) and isinstance(cache.get('models'), list):
+            cache['models'] = [m for m in cache['models'] if not (isinstance(m, dict) and m.get('key') == key)]
+            write_json(STATE / 'model-inventory.json', cache)
+        defaults = read_json(STATE / 'model-defaults.json', {})
+        if isinstance(defaults, dict) and defaults.pop(key, None) is not None:
+            write_json(STATE / 'model-defaults.json', defaults)
+    except (OSError, ValueError):
+        metadata_warning = ' Its cached listing or load settings could not be cleared; refresh the library.'
+    # LM Studio notices the removed file itself; give its list a short, bounded time to drop the key.
+    deadline, listed_now = time.monotonic() + 10, True
+    while listed_now and time.monotonic() < deadline:
+        try:
+            listed_now = any(isinstance(m, dict) and m.get('key') == key for m in listed_models())
+        except ValueError:
+            break
+        if listed_now:
+            time.sleep(.5)
+    progress(job, f'{name} was deleted from disk.' + (' LM Studio may take a moment to remove it from its list.'
+                                                      if listed_now else '') + metadata_warning, deleted=key, deletedBytes=expected)
+
+
 def execute(data, job):
     action = data['action']
     if action in {'stop', 'restart'}:
@@ -1287,6 +1440,8 @@ def execute(data, job):
             command('get', data['source'], '--gguf', '--yes', timeout=14400, job=job)
     elif action == 'import':
         import_local(data, job)
+    elif action == 'delete-model':
+        delete_model(data, job)
     elif action == 'load':
         with request('/api/v1/models') as response:
             models = json.load(response)['models']
@@ -1467,16 +1622,18 @@ def main():
         return force_stop()
     if action in {'autostart', 'start-saved'}:
         settings = read_json(STATE / 'settings.json', {})
-        # Autostart follows the saved toggle; start-saved is an explicit Start that loads the same saved models.
-        if action == 'start-saved' or (settings.get('autostart') and LMS.is_file()):
+        keys = [settings.get(key) for key in ('startupModel', 'startupDecisionModel')]
+        keys = list(dict.fromkeys(model for model in keys if isinstance(model, str) and model.strip()))
+        # Automatic startup needs a saved model; an explicit false remains the user's opt-out.
+        # Manual Start can run an empty engine so the user can choose and load models.
+        if action == 'start-saved' or (settings.get('autostart', True) and keys and LMS.is_file()):
             admit().close()
             start()
             # The dialogue model first, then the optional decision model. Each exact key loads once, and a key that is
             # already loaded is skipped, so running startup again changes nothing.
-            keys = [settings.get(key) for key in ('startupModel', 'startupDecisionModel')]
             with request('/api/v1/models', timeout=10) as response:
                 loaded = {m.get('key') for m in json.load(response)['models'] if m.get('loaded_instances')}
-            keys = [model for model in dict.fromkeys(keys) if isinstance(model, str) and model and model not in loaded]
+            keys = [model for model in keys if model not in loaded]
             for model in keys:
                 defaults = read_json(STATE / 'model-defaults.json', {}).get(model, {})
                 # Use the same job lock and validation as manual loads.
@@ -1506,7 +1663,7 @@ def main():
         raise ValueError('Another operation is running. Wait for it to finish.')
     job = {'id': secrets.token_hex(8), 'action': data['action'], 'state': 'running', 'message': 'Starting...', 'updated': time.time()}
     # With two models loaded, a running job names its target so another model's view never shows its output.
-    if data['action'] in {'load', 'unload', 'test'}:
+    if data['action'] in {'load', 'unload', 'test', 'delete-model'}:
         job['model'] = data['model']
     if data['action'] == 'download' and data.get('preset'):
         job['preset'] = data['preset']
@@ -1528,7 +1685,7 @@ def main():
             os.dup2(null.fileno(), fd)
     try:
         execute(data, job)
-        keep = data['action'] in {'test', 'import'} or (data['action'] == 'download' and (data.get('preset') or 'repo' in data))
+        keep = data['action'] in {'test', 'import', 'delete-model'} or (data['action'] == 'download' and (data.get('preset') or 'repo' in data))
         progress(job, job.get('message', 'Done') if keep else 'Done.', state='completed')
     except Exception as error:
         progress(job, str(error), state='failed')
