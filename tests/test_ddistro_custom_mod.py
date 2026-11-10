@@ -290,6 +290,48 @@ class ManifestTests(unittest.TestCase):
                 mod.parse_manifest(manifest(assets=bad))
 
 
+class HealthReadinessTests(unittest.TestCase):
+    # A fake opener and clock: no network and no real waiting.
+    def probe(self, codes, ready_timeout):
+        clock, attempts = [0.0], []
+
+        class Response:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, timeout):
+                attempts.append(timeout)
+                code = codes[min(len(attempts), len(codes)) - 1]
+                if code != 200:
+                    raise mod.urllib.error.HTTPError(request.full_url, code, "", {}, None)
+                return Response()
+
+        saved = mod.urllib.request.build_opener, mod.time.monotonic, mod.time.sleep
+        mod.urllib.request.build_opener = lambda *handlers: Opener()
+        mod.time.monotonic = lambda: clock[0]
+        mod.time.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+        try:
+            return mod.check_health("example-server", MANIFEST, ready_timeout), len(attempts), clock[0]
+        finally:
+            mod.urllib.request.build_opener, mod.time.monotonic, mod.time.sleep = saved
+
+    def test_transient_503_recovers(self):
+        self.assertEqual(self.probe([503, 503, 200], 10), ((True, "Healthy."), 3, 0.5))
+
+    def test_persistent_503_stops_at_the_deadline(self):
+        (healthy, message), attempts, elapsed = self.probe([503], 10)
+        self.assertEqual((healthy, message, attempts, elapsed), (False, "Health check returned HTTP 503.", 41, 10.0))
+
+    def test_other_errors_and_default_callers_do_not_retry(self):
+        for codes, timeout in [([404, 200], 10), ([500, 200], 10), ([302, 200], 10), ([503, 200], 0)]:
+            with self.subTest(codes=codes, timeout=timeout):
+                self.assertEqual(self.probe(codes, timeout)[1:], (1, 0.0))
+
+
 class TreeTests(unittest.TestCase):
     def setUp(self):
         self.manifest = mod.parse_manifest(manifest())
@@ -696,7 +738,7 @@ class RegistryLifecycleTests(unittest.TestCase):
                                                         "d" * 40)
         mod.database_exists = lambda name: True
         mod.database_owner = lambda name: mod.DATABASE_ROLE
-        mod.check_health = lambda mod_id, manifest_: (True, "")
+        mod.check_health = lambda mod_id, manifest_, ready_timeout=0: (True, "")
         mod.setup_web = lambda: None
         progress = {"changed": False}
         error = None
