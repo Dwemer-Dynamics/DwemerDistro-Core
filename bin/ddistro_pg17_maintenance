@@ -1,0 +1,1009 @@
+#!/usr/bin/env python3
+"""Cut over the standard Debian 15/main cluster to a verified UTF8 17/dwemer cluster."""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
+
+ROOT = Path("/var/lib/dwemerdistro/pg17-maintenance")
+STATE = ROOT / "state.json"
+CONF = Path("/etc/postgresql")
+DATA = Path("/var/lib/postgresql")
+OLD = CONF / "15/main"
+NEW = CONF / "17/dwemer"
+OLD_DATA = DATA / "15/main"
+NEW_DATA = DATA / "17/dwemer"
+PG = Path("/usr/lib/postgresql/17/bin")
+STAGER = "/usr/local/bin/ddistro_stage_pg17"
+# A failure that repeats is deterministic (for example invalid SQL_ASCII bytes). Each attempt stops
+# PG15 and retains its staging copy, so stop retrying unattended.
+AUTO_ATTEMPTS = 2
+
+
+class Busy(ValueError):
+    """Another operation holds a maintenance lock, so this one changed nothing."""
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, **kwargs)
+
+
+def atomic(path, value, mode):
+    temporary = path.with_name(path.name + ".pg17-" + uuid.uuid4().hex)
+    with temporary.open("x") as stream:
+        os.fchmod(stream.fileno(), mode)
+        stream.write(value)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    sync_dir(path.parent)
+
+
+def sync_dir(path):
+    fd = os.open(path, os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def phase(state, name):
+    state["phase"] = name
+    atomic(STATE, json.dumps(state), 0o600)
+
+
+def owns_config(state):
+    marker = NEW / "dwemer-maintenance-id"
+    return (
+        not NEW.is_symlink() and not marker.is_symlink() and marker.is_file()
+        and marker.read_text().strip() == Path(state["work"]).name
+    )
+
+
+def discard_temporaries():
+    """Remove files that an interrupted atomic() write left behind, once they are provably its own."""
+    # Only this tool writes these names, with a random 128-bit suffix, and it holds the maintenance
+    # lock, so no write of its own is in progress. A plain single-link file that root owns is such a
+    # leftover, since no other user can create one; the target it would have replaced stays intact.
+    # Unlinking removes only that entry of the real directory, which its writers could do anyway.
+    suffix = r"\.pg17-[0-9a-f]{32}"
+    places = [(ROOT, r"(state\.json|dwemer-stage-[0-9a-f]{32}-closed\.json)" + suffix),
+              (OLD, r"start\.conf" + suffix)]
+    if STATE.exists() and owns_config(json.loads(STATE.read_text())):
+        places.append((NEW, r"(start\.conf|dwemer-maintenance-id)" + suffix))
+    for directory, pattern in places:
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        found = [entry for entry in os.listdir(directory) if re.fullmatch(pattern, entry)]
+        for name in found:
+            path = directory / name
+            info = os.lstat(path)
+            if (
+                not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1
+                or info.st_size > 1024 * 1024
+            ):
+                raise ValueError(
+                    f"{path} looks like an interrupted maintenance write but is not a plain single-link "
+                    "root-owned file, so it was kept. Review it and remove it by hand"
+                )
+            path.unlink()
+        if found:
+            sync_dir(directory)
+
+
+def cluster(version, command):
+    name = "main" if version == 15 else "dwemer"
+    run(
+        "pg_ctlcluster", "--skip-systemctl-redirect", str(version), name, command, stdout=log, stderr=log
+    )
+
+
+def pg(*args, **kwargs):
+    return run("/usr/sbin/runuser", "-u", "postgres", "--", *args, **kwargs)
+
+
+def postgres_env(socket, db="postgres"):
+    return {
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C",
+        "PGHOST": str(socket),
+        "PGPORT": "5432",
+        "PGDATABASE": db,
+        "PGUSER": "postgres",
+    }
+
+
+def query(socket, statement):
+    client = PG / "psql" if (PG / "psql").exists() else Path("/usr/lib/postgresql/15/bin/psql")
+    return (
+        pg(
+            client,
+            "-XqAt",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            statement,
+            env=postgres_env(socket),
+            stdout=subprocess.PIPE,
+            stderr=log,
+        )
+        .stdout.decode()
+        .strip()
+    )
+
+
+def fingerprint(state):
+    # Run the stopped candidate on a peer-only private socket. This fences application writes
+    # throughout the comparison. Closed database data, sequences, globals and ACLs all count.
+    work = Path(state["work"])
+    pg_ctl = PG / "pg_ctl"
+    private = work / "s17"
+    options = (
+        f"-c config_file={NEW}/postgresql.conf -c listen_addresses='' "
+        f"-c unix_socket_directories={private} -c port=5432 -c hba_file={work}/hba "
+        "-c autovacuum=off -c max_logical_replication_workers=0"
+    )
+    pg(
+        pg_ctl,
+        "-D",
+        NEW_DATA,
+        "-o",
+        options,
+        "-l",
+        work / "fingerprint.log",
+        "-w",
+        "start",
+        stdout=log,
+        stderr=log,
+    )
+    try:
+        pending = ROOT / (work.name + "-closed.json")
+        if pending.exists():
+            if cluster_id(17, NEW_DATA) != state["candidate_id"]:
+                raise ValueError("Interrupted verification belongs to a different cluster")
+            quoted = '"' + json.loads(pending.read_text()).replace('"', '""') + '"'
+            query(private, "ALTER DATABASE " + quoted + " ALLOW_CONNECTIONS false")
+            pending.unlink()
+        names = json.loads(
+            query(
+                private,
+                """select json_agg(json_build_array(datname,datallowconn)
+                            order by datname collate "C") from pg_database""",
+            )
+        )
+        # Format 2 skips the version header comments; the legacy digest covers every byte, as
+        # baselines recorded before format 2 did.
+        digest, legacy = hashlib.sha256(), hashlib.sha256()
+
+        def update(data):
+            digest.update(data)
+            legacy.update(data)
+
+        update(json.dumps(names).encode())
+        for path in sorted([NEW_DATA / "postgresql.auto.conf", *NEW.rglob("*")]):
+            if path != NEW / "start.conf" and path.is_file():
+                update(json.dumps([str(path), hashlib.sha256(path.read_bytes()).hexdigest()]).encode())
+        command = ["/usr/sbin/runuser", "-u", "postgres", "--"]
+        for db, opened in [(None, True)] + names:
+            quoted = '"' + (db or "").replace('"', '""') + '"'
+            if not opened:
+                atomic(pending, json.dumps(db), 0o600)
+                query(private, "ALTER DATABASE " + quoted + " ALLOW_CONNECTIONS true")
+            try:
+                if db is not None:
+                    membership = pg(
+                        PG / "psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-c",
+                        "select count(*) from pg_depend d join pg_class c on c.oid=d.objid "
+                        "where d.classid='pg_class'::regclass and d.deptype='e' "
+                        "and c.relkind in ('r','p','m','S','f')",
+                        env=postgres_env(private, db), stdout=subprocess.PIPE, stderr=log,
+                    )
+                    if membership.stdout.strip() != b"0":
+                        raise ValueError("Extension-managed relations require a mapped migration")
+                tool = (
+                    [PG / "pg_dumpall", "--globals-only"] if db is None else [PG / "pg_dump", "--create"]
+                )
+                with subprocess.Popen(
+                    command + tool + ["--restrict-key=" + state["key"]],
+                    env=postgres_env(private, db or "postgres"),
+                    stdout=subprocess.PIPE,
+                    stderr=log,
+                ) as process:
+                    # Package minor updates change only these header comments, not the data. Read
+                    # the header with bounded lines, then hash fixed blocks so no row is held whole.
+                    for _ in range(12):
+                        line = process.stdout.readline(4096)
+                        legacy.update(line)
+                        if not (line.startswith(b"-- Dumped ") and line.endswith(b"\n")):
+                            digest.update(line)
+                        if not line.endswith(b"\n"):
+                            break
+                    for block in iter(lambda: process.stdout.read(1024 * 1024), b""):
+                        update(block)
+                    if process.wait():
+                        raise ValueError("Could not verify rollback data")
+            finally:
+                if not opened:
+                    query(private, "ALTER DATABASE " + quoted + " ALLOW_CONNECTIONS false")
+                    pending.unlink()
+        return digest.hexdigest(), legacy.hexdigest()
+    finally:
+        pg(pg_ctl, "-D", NEW_DATA, "-m", "fast", "-w", "stop", stdout=log, stderr=log)
+
+
+def controldata(version, directory):
+    control = run(
+        f"/usr/lib/postgresql/{version}/bin/pg_controldata",
+        directory,
+        env=dict(os.environ, LC_ALL="C"),
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout
+    return dict((part.strip() for part in line.split(":", 1)) for line in control.splitlines() if ":" in line)
+
+
+def cluster_id(version, directory):
+    return controldata(version, directory)["Database system identifier"]
+
+
+def seal():
+    # PostgreSQL records production state in pg_control before it accepts any connection, and every
+    # later shutdown writes a new checkpoint. An unchanged clean shutdown proves no client wrote to PG17.
+    control = controldata(17, NEW_DATA)
+    keys = ("Database system identifier", "Latest checkpoint location", "Latest checkpoint's REDO location",
+            "Time of latest checkpoint", "Database cluster state")
+    return [control[key] for key in keys]
+
+
+def running(version, directory):
+    # pg_ctl checks the postmaster process, so a pid file left by power loss reads as stopped.
+    status = subprocess.run(
+        ["/usr/sbin/runuser", "-u", "postgres", "--", f"/usr/lib/postgresql/{version}/bin/pg_ctl",
+         "-D", directory, "status"],
+        stdout=log, stderr=log,
+    )
+    if status.returncode not in (0, 3):
+        raise ValueError(f"Could not determine PG{version} cluster status")
+    return status.returncode == 0
+
+
+def restore_old(state, fallback=False):
+    # fallback: PG17 is the journaled candidate, stopped and proven unchanged, so it may serve again.
+    try:
+        if cluster_id(15, OLD_DATA) != state["donor_id"]:
+            raise ValueError("PG15 recovery cluster identity differs from the saved donor")
+        # Only fence a destination this run marked; another directory is not ours to change.
+        if NEW.exists() and owns_config(state):
+            atomic(NEW / "start.conf", "disabled\n", 0o644)
+        atomic(OLD / "start.conf", "manual\n", 0o644)
+        if not running(15, OLD_DATA):
+            cluster(15, "start")
+        verify_active(15, OLD_DATA)
+    except Exception as error:
+        if not fallback:
+            raise
+        return_pg17(state, error)
+    atomic(OLD / "start.conf", state["old_start"], 0o644)
+    phase(state, "rolled-back")
+
+
+def return_pg17(state, error):
+    # Fence the donor first so the two clusters never serve together. While either step is in
+    # doubt the journal keeps its unfinished phase, so the next update retries the rollback.
+    try:
+        atomic(OLD / "start.conf", "disabled\n", 0o644)
+        if running(15, OLD_DATA):
+            cluster(15, "stop")
+            if running(15, OLD_DATA):
+                raise ValueError("PG15 is still running")
+    except Exception:
+        raise ValueError(
+            "PostgreSQL 15 failed to start and could not be confirmed stopped, so PostgreSQL 17 stays "
+            "stopped. Review the log and stop PG15 before the next update retries the rollback"
+        ) from error
+    try:
+        atomic(NEW / "start.conf", "manual\n", 0o644)
+        cluster(17, "start")
+        verify_active(17, NEW_DATA)
+    except Exception:
+        raise ValueError(
+            "PostgreSQL 15 failed to start and PostgreSQL 17 could not be restarted, so both retained "
+            "clusters are stopped. Review the log; the next update retries the rollback"
+        ) from error
+    atomic(NEW / "start.conf", state["old_start"], 0o644)
+    state.pop("seal", None)
+    state.pop("retry_auto", None)
+    phase(state, "active")
+    raise ValueError(
+        "PostgreSQL 15 failed to start after the rollback check, so the unchanged PostgreSQL 17 cluster "
+        "serves again. Review the log before rolling back again"
+    ) from error
+
+
+def verify_active(major, path):
+    actual = query(
+        "/var/run/postgresql",
+        "select current_setting('server_version_num')::int / 10000 || '|' || current_setting('data_directory')",
+    )
+    if actual != f"{major}|{path}":
+        raise ValueError("Unexpected PostgreSQL version or data directory on the application socket")
+
+
+def ensure_packages():
+    needed = (PG / "pg_ctl", PG / "pg_dump", Path("/usr/share/postgresql/17/extension/vector.control"))
+    if all(p.is_file() for p in needed):
+        return
+    os_info = dict(
+        line.split("=", 1) for line in Path("/etc/os-release").read_text().splitlines() if "=" in line
+    )
+    suite = os_info.get("VERSION_CODENAME", "").strip('"')
+    if os_info.get("ID", "").strip('"') != "debian" or suite not in ("bookworm", "trixie"):
+        raise ValueError("Package provisioning supports Debian Bookworm and Trixie")
+    # Restrict this install to signed Debian sources and the upstream PostgreSQL repository on Bookworm.
+    # Isolated APT lists leave the customer's configured package sources and normal update policy intact.
+    with tempfile.TemporaryDirectory(prefix="ddistro-pg17-") as temp:
+        scratch = Path(temp)
+        scratch.chmod(0o755)
+        sources = [
+            f"deb https://deb.debian.org/debian {suite} main",
+            f"deb https://deb.debian.org/debian-security {suite}-security main",
+        ]
+        if suite == "bookworm":
+            key = scratch / "postgresql.asc"
+            run(
+                "curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--location",
+                "--proto",
+                "=https",
+                "https://www.postgresql.org/media/keys/ACCC4CF8.asc",
+                "-o",
+                key,
+                stderr=log,
+            )
+            info = run(
+                "gpg", "--batch", "--with-colons", "--show-keys", key, stdout=subprocess.PIPE, stderr=log
+            ).stdout
+            fingerprints = [
+                line.split(b":")[9] for line in info.splitlines() if line.startswith(b"fpr:")
+            ]
+            if (
+                not fingerprints
+                or fingerprints[0] != b"B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8"
+                or info.count(b"pub:") != 1
+            ):
+                raise ValueError("PostgreSQL repository key fingerprint mismatch")
+            key.chmod(0o644)
+            sources.append(
+                f"deb [signed-by={key}] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main"
+            )
+        source_list = scratch / "sources.list"
+        source_list.write_text("\n".join(sources) + "\n")
+        source_list.chmod(0o644)
+        lists = scratch / "lists"
+        lists.mkdir(mode=0o755)
+        apt = [
+            "apt-get",
+            "-o",
+            "Dir::Etc::sourcelist=" + str(source_list),
+            "-o",
+            "Dir::Etc::sourceparts=-",
+            "-o",
+            "Dir::State::lists=" + str(lists),
+            "-o",
+            "Dpkg::Options::=--force-confold",
+        ]
+        environment = dict(os.environ, DEBIAN_FRONTEND="noninteractive", NEEDRESTART_MODE="l")
+        print("Installing the PostgreSQL 17 server, client and pgvector.", flush=True)
+        run(*apt, "update", env=environment, stdout=log, stderr=log, umask=0o022)
+        run(
+            *apt,
+            "install",
+            "--no-remove",
+            "--no-install-recommends",
+            "-y",
+            "postgresql-17",
+            "postgresql-client-17",
+            "postgresql-17-pgvector",
+            env=environment,
+            stdout=log,
+            stderr=log,
+            umask=0o022,
+        )
+    if not all(p.is_file() for p in needed):
+        raise ValueError("PostgreSQL 17 prerequisites are incomplete")
+
+
+def allow_retry():
+    state = json.loads(STATE.read_text())
+    state["retry_auto"] = True
+    phase(state, "rolled-back")
+
+
+def upgrade(automatic=False):
+    attempts = 0
+    if STATE.exists():
+        previous = json.loads(STATE.read_text())
+        if previous.get("phase") == "active" and not previous.get("cleaned"):
+            # The verified PG17 already serves; an Upgrade retries only its staging cleanup.
+            cleanup_staging()
+            return
+        if previous["phase"] == "rolled-back":
+            if automatic:
+                attempts = previous.get("auto_attempts", 0)
+            verify_active(15, OLD_DATA)
+            tag = Path(previous["work"]).name
+            if not re.fullmatch(r"dwemer-stage-[0-9a-f]{32}", tag):
+                raise ValueError("Unrecognized previous maintenance identity")
+            if (NEW_DATA / "postmaster.pid").exists():
+                raise ValueError("The retained PG17 cluster is running")
+            if NEW_DATA.exists() and cluster_id(17, NEW_DATA) != previous.get("candidate_id"):
+                raise ValueError("Destination no longer matches the retained PG17 cluster")
+            if NEW.exists() and not owns_config(previous):
+                # Releases before atomic publication could stop between creating it and marking it.
+                raise ValueError(
+                    f"{NEW} lacks the retained PG17 cluster's maintenance marker, so it was neither adopted "
+                    "nor removed. If it is an empty directory left by an interrupted upgrade, remove it; "
+                    "otherwise move it aside after review, then retry"
+                )
+            # Preserve the previous run for recovery; never reuse or overwrite its files.
+            building = CONF / ("." + tag + "-config")
+            if building.is_dir() and not building.is_symlink():
+                building.rename(ROOT / (tag + "-config-partial"))
+            if NEW.exists():
+                NEW.rename(ROOT / (tag + "-config"))
+            if NEW_DATA.exists():
+                NEW_DATA.rename(DATA / (tag + "-retained17"))
+            STATE.rename(ROOT / (tag + ".json"))
+    if STATE.exists() or NEW.exists() or NEW_DATA.exists():
+        raise ValueError(
+            "Previous maintenance state or PG17 destination exists; retained copies were preserved"
+        )
+    if not Path(STAGER).is_file():
+        raise ValueError("The distro is missing its verified PG17 staging tool")
+    verify_active(15, OLD_DATA)
+    for setting, expected in (
+        ("config_file", OLD / "postgresql.conf"),
+        ("hba_file", OLD / "pg_hba.conf"),
+        ("ident_file", OLD / "pg_ident.conf"),
+    ):
+        if query("/var/run/postgresql", "show " + setting) != str(expected):
+            raise ValueError("Custom PostgreSQL configuration paths require a mapped migration")
+    if OLD.is_symlink() or OLD_DATA.is_symlink() or any(x.is_symlink() for tree in (OLD, OLD_DATA) for x in tree.rglob("*")) or any((OLD_DATA / "pg_tblspc").iterdir()):
+        raise ValueError("Linked configuration or external tablespaces require a mapped migration")
+    auto = OLD_DATA / "postgresql.auto.conf"
+    if auto.exists() and any(
+        line.strip() and not line.lstrip().startswith("#") for line in auto.read_text().splitlines()
+    ):
+        raise ValueError("Review ALTER SYSTEM settings before upgrading")
+    source_size = int(run("du", "-sb", OLD_DATA, stdout=subprocess.PIPE).stdout.split()[0])
+    if shutil.disk_usage(DATA).free < source_size * 4:
+        raise ValueError("Insufficient space for the staging copies")
+    work = DATA / ("dwemer-stage-" + uuid.uuid4().hex)
+    # The stopped donor and its disabled configuration stay in place as the recovery copy; no external
+    # backup is written. Journals without "backup" are also refused by older releases' donor removal.
+    state = {
+        "work": str(work),
+        "old_start": (OLD / "start.conf").read_text(),
+        "key": secrets.token_hex(32),
+        "donor_id": query("/var/run/postgresql", "select system_identifier from pg_control_system()"),
+        "auto_attempts": attempts + 1 if automatic else 0,
+    }
+    phase(state, "staging")
+    try:
+        atomic(OLD / "start.conf", "manual\n", 0o644)
+        cluster(15, "stop")
+        atomic(OLD / "start.conf", "disabled\n", 0o644)
+        ensure_packages()
+        # The stager reads the fenced donor only to copy it; it runs PG15 on that private copy.
+        print("Restoring and verifying all databases as UTF8.", flush=True)
+        pg("python3", STAGER, OLD_DATA, work, stdout=log, stderr=log)
+        if not (work / "verified.json").is_file():
+            raise ValueError("Missing verified candidate")
+        if not NEW_DATA.parent.exists():
+            NEW_DATA.parent.mkdir()
+            NEW_DATA.parent.chmod(0o755)
+        state["candidate_id"] = cluster_id(17, work / "pg17")
+        phase(state, "staging")
+        (work / "pg17").rename(NEW_DATA)
+        if not NEW.parent.exists():
+            NEW.parent.mkdir()
+            NEW.parent.chmod(0o755)
+        # Build the marked copy beside the version directories, where PostgreSQL never lists it as a
+        # cluster, then publish it with one rename, so the destination never exists unmarked.
+        building = CONF / ("." + work.name + "-config")
+        building.mkdir(mode=0o700)
+        atomic(building / "dwemer-maintenance-id", work.name, 0o600)
+        shutil.copytree(OLD, building, dirs_exist_ok=True)
+        for item in (building, *building.rglob("*")):
+            if item.name == "dwemer-maintenance-id":
+                continue
+            original = (OLD / item.relative_to(building)).stat()
+            os.chown(item, original.st_uid, original.st_gid)
+        # rename() would silently replace an empty directory that appeared meanwhile.
+        if os.path.lexists(NEW):
+            raise ValueError(f"{NEW} appeared during staging; it was not replaced")
+        building.rename(NEW)
+        sync_dir(NEW.parent)
+        for key, value in (
+            ("data_directory", str(NEW_DATA)),
+            ("hba_file", str(NEW / "pg_hba.conf")),
+            ("ident_file", str(NEW / "pg_ident.conf")),
+            ("external_pid_file", "/var/run/postgresql/17-dwemer.pid"),
+            ("port", "5432"),
+        ):
+            run("pg_conftool", "17", "dwemer", "set", key, value, stdout=log, stderr=log)
+        state["baseline"], _ = fingerprint(state)
+        state["baseline_format"] = 2
+        state["seal"] = seal()
+        if state["seal"][-1] != "shut down":
+            raise ValueError("PG17 candidate did not shut down cleanly after verification")
+        phase(state, "publishing")
+        atomic(NEW / "start.conf", "manual\n", 0o644)
+        cluster(17, "start")
+        verify_active(17, NEW_DATA)
+        atomic(NEW / "start.conf", state["old_start"], 0o644)
+        state.pop("seal")
+        phase(state, "active")
+        print("PostgreSQL 17 is serving on port 5432. The original PostgreSQL 15 cluster was retained.", flush=True)
+    except BaseException:
+        if state["phase"] == "staging":
+            state["retry_auto"] = True
+            restore_old(state)
+        elif state["phase"] == "publishing":
+            # PG15 is fenced and PG17 failed to come up; do not leave both clusters down. Journal the
+            # retry first so an interrupted rollback still resumes as a failed automatic attempt.
+            state["retry_auto"] = True
+            phase(state, "publishing")
+            rollback()
+        raise
+    # Outside the rollback handler: PG17 now serves, so a cleanup failure must never roll it back.
+    clean_staging(state)
+
+
+def rollback():
+    state = json.loads(STATE.read_text())
+    if state["phase"] == "rolled-back":
+        verify_active(15, OLD_DATA)
+        return
+    # Refuse before fencing PG17: without the donor, rollback would leave both clusters down.
+    record = removal(state)
+    if record is not None:
+        kept = record["quarantine"]
+        if not os.path.lexists(kept):
+            kept = ""
+        elif record["stage"] == "quarantine":
+            kept = f"; the complete renamed data directory remains at {kept}"
+        else:
+            kept = f"; the partly deleted copy at {kept} was kept"
+        raise ValueError(
+            "An earlier release removed the PG15 data directory after its Windows backup was verified, so "
+            f"PostgreSQL 17 keeps serving. Restore PG15 by hand from {state.get('backup', 'that backup')} "
+            "and its recovery JSON if needed" + kept
+        )
+    if not (OLD_DATA / "PG_VERSION").is_file():
+        # Only migrations by earlier releases wrote an external backup.
+        source = f" from {state['backup']} and its recovery JSON" if "backup" in state else ""
+        raise ValueError(
+            f"The PG15 data directory is missing, so rollback changed nothing. Restore it{source} before rolling back"
+        )
+    # Check the donor before fencing PG17, so a replaced PG15 cluster or missing PG15 binaries cannot
+    # leave both clusters stopped after the comparison.
+    if cluster_id(15, OLD_DATA) != state["donor_id"]:
+        raise ValueError("PG15 recovery cluster identity differs from the saved donor; rollback changed nothing")
+    if state["phase"] in ("active", "publishing", "checking"):
+        if cluster_id(17, NEW_DATA) != state["candidate_id"] or not owns_config(state):
+            raise ValueError("The PG17 cluster differs from the maintenance journal")
+        is_running = running(17, NEW_DATA)
+        if state["phase"] != "active" and "seal" in state and not is_running and seal() == state["seal"]:
+            # Never started since the verified shutdown, so it accepted no writes. Starting it to
+            # compare could itself fail and strand PG15, so retain it untouched.
+            atomic(NEW / "start.conf", "disabled\n", 0o644)
+            restore_old(state, fallback=True)
+            print("PostgreSQL 15 is serving on port 5432. The unpublished PG17 candidate was retained.")
+            return
+        # Journal the rollback before PG17 is stopped or disabled. An abrupt stop from here on leaves an
+        # unfinished phase, so the next update compares PG17 and keeps it serving if it accepted writes.
+        phase(state, "checking")
+        if is_running:
+            private = Path(state["work"]) / "s17"
+            if (private / ".s.PGSQL.5432").is_socket():
+                if query(private, "select system_identifier from pg_control_system()") != state["candidate_id"]:
+                    raise ValueError("Unexpected cluster on private verification socket")
+                pg(PG / "pg_ctl", "-D", NEW_DATA, "-m", "fast", "-w", "stop", stdout=log, stderr=log)
+            else:
+                verify_active(17, NEW_DATA)
+                cluster(17, "stop")
+        atomic(NEW / "start.conf", "disabled\n", 0o644)
+        try:
+            current, legacy = fingerprint(state)
+            if (current if state.get("baseline_format") == 2 else legacy) != state["baseline"]:
+                raise ValueError(
+                    "PG17 data or permissions changed. Rollback refused to preserve those writes."
+                )
+        except BaseException:
+            if (ROOT / (Path(state["work"]).name + "-closed.json")).exists():
+                raise ValueError(
+                    "Verification interrupted; recover the recorded database restriction before restart"
+                )
+            try:
+                atomic(NEW / "start.conf", "manual\n", 0o644)
+                cluster(17, "start")
+                verify_active(17, NEW_DATA)
+            except Exception:
+                raise ValueError(
+                    "PG17 may hold accepted writes but could not be verified or restarted, so PostgreSQL 15 "
+                    "stays stopped. Review the log and the retained clusters before restoring PG15 by hand"
+                ) from None
+            atomic(NEW / "start.conf", state["old_start"], 0o644)
+            state.pop("seal", None)
+            state.pop("retry_auto", None)
+            phase(state, "active")
+            raise
+    elif state["phase"] != "staging":
+        raise ValueError("Unknown migration state")
+    # A staging candidate was never published, so only a compared one may serve again.
+    restore_old(state, fallback=state["phase"] != "staging")
+    print("PostgreSQL 15 is serving on port 5432. PG17 was retained.")
+
+
+def settled():
+    return not STATE.exists() or json.loads(STATE.read_text())["phase"] in ("active", "rolled-back")
+
+
+def recover():
+    # An abrupt stop mid-maintenance can leave both clusters fenced, so update.sh runs this before
+    # it starts PostgreSQL or needs SQL. Settled journals are left alone without any cluster access.
+    if settled():
+        return False
+    state = json.loads(STATE.read_text())
+    work = Path(state["work"])
+    if work.parent != DATA or not re.fullmatch(r"dwemer-stage-[0-9a-f]{32}", work.name):
+        raise ValueError("Unrecognized interrupted maintenance identity")
+    # An interrupted upgrade counts as a failed automatic attempt; an interrupted explicit rollback stays held.
+    retry = state["phase"] in ("staging", "publishing") or state.get("retry_auto")
+    if retry and not state.get("retry_auto"):
+        # Journal it first: the rollback below moves past staging or publishing, and a recovery that is
+        # itself interrupted must still resume as a failed automatic attempt, not as a held rollback.
+        state["retry_auto"] = True
+        phase(state, state["phase"])
+    try:
+        rollback()
+    except Exception:
+        # A candidate that changed after publication keeps serving; its writes are the newer data.
+        if json.loads(STATE.read_text())["phase"] == "active":
+            verify_active(17, NEW_DATA)
+            print("Recovered interrupted maintenance. PostgreSQL 17 accepted writes and keeps serving.")
+            return True
+        raise
+    if retry:
+        allow_retry()
+    return True
+
+
+def automatic_status():
+    if STATE.exists():
+        state = json.loads(STATE.read_text())
+        if state.get("phase") == "active":
+            verify_active(17, NEW_DATA)
+            if state.get("cleaned"):
+                return "current"
+            # The verified PG17 already serves; only its staging copies remain, so never stage again.
+            cleanup_target(state)
+            return "cleanup-needed"
+        if state.get("phase") not in ("staging", "publishing", "checking", "rolled-back"):
+            raise ValueError("Unknown migration state; nothing was changed")
+        if state["phase"] == "rolled-back":
+            verify_active(15, OLD_DATA)
+            # Held means an operator chose PG15. Exhausted retries stay a failure until one decides.
+            if not state.get("retry_auto"):
+                return "held"
+            if state.get("auto_attempts", 0) >= AUTO_ATTEMPTS:
+                raise ValueError(
+                    f"The automatic PostgreSQL 17 upgrade failed {AUTO_ATTEMPTS} times and PostgreSQL 15 "
+                    "is serving. Review the log, then in Settings > Database Maintenance choose Upgrade "
+                    "to try again or Roll back to stay on PostgreSQL 15"
+                )
+        return "needed"
+    if not (OLD_DATA / "PG_VERSION").is_file():
+        return "unsupported"
+    verify_active(15, OLD_DATA)
+    return "needed"
+
+
+def mounts_within(path):
+    target = str(path)
+    with open("/proc/self/mountinfo") as table:
+        points = [
+            re.sub(r"\\([0-7]{3})", lambda code: chr(int(code.group(1), 8)), line.split()[4])
+            for line in table
+        ]
+    return [point for point in points if point == target or point.startswith(target + "/")]
+
+
+def plain_tree(root):
+    """Refuse a tree that holds links, special files or another device, before anything below it is deleted."""
+    top = os.lstat(root)
+    pending = [root]
+    while pending:
+        with os.scandir(pending.pop()) as listing:
+            for entry in listing:
+                info = entry.stat(follow_symlinks=False)
+                if info.st_dev != top.st_dev or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                    raise ValueError("The staging directory holds links, special files or mounts")
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(entry.path)
+
+
+def discard_staging(state):
+    """Delete the staging copies of the verified candidate while the original PG15 donor stays in place."""
+    work = Path(state["work"])
+    if (
+        work.parent != DATA or not re.fullmatch(r"dwemer-stage-[0-9a-f]{32}", work.name) or work.is_symlink()
+        or not work.is_dir() or Path(os.path.realpath(work)) != work
+    ):
+        raise ValueError("Unexpected staging path")
+    if (
+        cluster_id(17, NEW_DATA) != state["candidate_id"] or not owns_config(state)
+        or not (work / "verified.json").is_file()
+    ):
+        raise ValueError("Unexpected PG17 cleanup target")
+    if removal(state) is not None:
+        # An earlier release removed the donor, so these copies may hold the last PG15 data in the distro.
+        return
+    # The copies duplicate the donor, the only PG15 recovery source, so delete them only while the
+    # recorded original is still in place.
+    if (
+        OLD_DATA.is_symlink() or Path(os.path.realpath(OLD_DATA)) != OLD_DATA
+        or not (OLD_DATA / "PG_VERSION").is_file() or cluster_id(15, OLD_DATA) != state["donor_id"]
+    ):
+        raise ValueError(
+            "The original PG15 cluster is missing or differs from the saved donor, so the staging copies were kept"
+        )
+    if (
+        (OLD / "start.conf").read_text().strip() != "disabled"
+        or (OLD_DATA / "postmaster.pid").exists() or running(15, OLD_DATA)
+    ):
+        raise ValueError("PostgreSQL 15 is not stopped and disabled, so the staging copies were kept")
+    # rmtree crosses mount points, and bind mounts keep the device number, so consult the mount table too.
+    # A mount below the copies could reach the donor or other data; refuse before deleting anything.
+    if mounts_within(work) or os.lstat(work).st_dev != os.lstat(DATA).st_dev:
+        raise ValueError("The staging directory is or contains a mount point, so the staging copies were kept")
+    # Keep verified.json, the private verification socket and peer HBA for rollback.
+    copy, dumps = None, []
+    for item in work.iterdir():
+        info = os.lstat(item)
+        if item.name == "source-copy":
+            if not stat.S_ISDIR(info.st_mode) or info.st_dev != os.lstat(work).st_dev:
+                raise ValueError("The staging source copy is linked or not a directory, so it was kept")
+            plain_tree(item)
+            copy = item
+        elif item.name == "globals.sql" or re.fullmatch(r"[0-9]+\.dump", item.name):
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError(f"{item} is linked or not a plain file, so the staging copies were kept")
+            dumps.append(item)
+    for item in dumps:
+        item.unlink()
+    if copy is not None:
+        shutil.rmtree(copy)
+
+
+def automatic_upgrade():
+    status = automatic_status()
+    if status == "cleanup-needed":
+        # PG17 already serves; an earlier cleanup failed or was interrupted. Retry only the cleanup.
+        cleanup_staging()
+    elif status == "needed":
+        if recover():
+            raise ValueError("Recovered interrupted maintenance; retry the update")
+        upgrade(automatic=True)
+
+
+def cleanup_target(state):
+    """Refuse unless the serving PG17 is the journaled candidate with its marked configuration."""
+    if cluster_id(17, NEW_DATA) != state.get("candidate_id") or not owns_config(state):
+        raise ValueError("The PG17 cluster or configuration differs from the maintenance journal; nothing was changed")
+
+
+def cleanup_staging():
+    """Retry only the staging cleanup of the serving verified PG17. Idempotent; never stages or rolls back."""
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    if state.get("phase") != "active":
+        raise ValueError("No serving PostgreSQL 17 migration is recorded, so nothing was cleaned or upgraded")
+    verify_active(17, NEW_DATA)
+    cleanup_target(state)
+    # A completed cleanup leaves the journal as it is.
+    if not state.get("cleaned"):
+        clean_staging(state)
+
+
+def clean_staging(state):
+    """Delete the staging copies after cutover. A failure leaves PG17 serving, and the next update retries."""
+    verify_active(17, NEW_DATA)
+    try:
+        discard_staging(state)
+    except Exception as error:
+        raise ValueError(
+            f"PostgreSQL 17 is serving, but cleanup stopped: {error}. The next update retries the cleanup"
+        ) from error
+    state["cleaned"] = True
+    phase(state, "active")
+
+
+def quarantine_path(state):
+    return OLD_DATA.with_name("." + Path(state["work"]).name + "-pg15-removing")
+
+
+def removal(state):
+    """Return a donor removal an earlier release journaled once its quarantine rename may have happened, else None."""
+    record = state.get("donor_removal")
+    if record is None:
+        return None
+    quarantine = Path(record["quarantine"])
+    if (
+        quarantine != quarantine_path(state)
+        or record["stage"] not in ("quarantine", "removing", "removed")
+        or not {"inode", "backup_sha256", "backup_bytes"} <= record.keys()
+    ):
+        raise ValueError("Unrecognized PG15 removal journal")
+    if record["stage"] == "removed":
+        return record
+    if os.path.lexists(quarantine):
+        info = os.lstat(quarantine)
+        if (
+            os.path.lexists(OLD_DATA)
+            or not stat.S_ISDIR(info.st_mode)
+            or [info.st_dev, info.st_ino] != record["inode"]
+        ):
+            raise ValueError("The PG15 quarantine does not match the removal journal; nothing was removed")
+        return record
+    if record["stage"] == "removing":
+        return record
+    # Journaled but interrupted before the rename: the donor is still intact.
+    info = os.lstat(OLD_DATA) if os.path.lexists(OLD_DATA) else None
+    if info is None or [info.st_dev, info.st_ino] != record["inode"]:
+        raise ValueError("The PG15 data directories do not match the removal journal")
+    return None
+
+
+REMOVED = "The PG15 data directory was already removed"
+
+
+def cleanup_preview():
+    """Return why the retired donor removal is not eligible. It never is, so there is no token."""
+    # Earlier releases offered to delete the PG15 donor. Core now keeps it, its disabled configuration and
+    # any Windows backup indefinitely, and never resumes or repeats a removal an earlier release journaled.
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    record = removal(state) if state.get("phase") == "active" else None
+    if record is None:
+        return "Core keeps the PostgreSQL 15 data directory and its disabled configuration for recovery"
+    # A removal interrupted after its last deletion never journaled "removed", but nothing is left.
+    if record["stage"] == "removed" or not os.path.lexists(record["quarantine"]):
+        return REMOVED
+    return (
+        f"An earlier release's interrupted PG15 removal left {record['quarantine']}; "
+        "Core no longer removes PostgreSQL 15 data, so it was kept"
+    )
+
+
+def cleanup_pg15(confirm=None):
+    """Refuse the retired donor removal, keeping the replies older launchers expect."""
+    reason = cleanup_preview()
+    if confirm is not None:
+        raise ValueError(f"The cleanup preview is stale ({reason}); nothing was removed. Preview again")
+    if reason == REMOVED:
+        # A completed removal still reports success, as before, without changing anything.
+        return 0
+    raise ValueError(f"{reason}; nothing was removed")
+
+
+def lock_distro():
+    # Share Core's existing Unix maintenance lock with update.sh and lifecycle operations.
+    path = "/run/lock/dwemerdistro-maintenance.lock"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        os.fchmod(fd, 0o644)
+    except FileExistsError:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o644
+    ):
+        os.close(fd)
+        raise ValueError("Invalid distro maintenance lock")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise Busy(
+            "An update, distro maintenance or ddistro changes operation holds the distro maintenance lock"
+        ) from None
+    return os.fdopen(fd, "rb")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "action",
+        choices=["status", "auto", "upgrade", "cleanup-staging", "rollback", "recover", "cleanup-preview",
+                 "cleanup-pg15"],
+    )
+    # Earlier launchers passed a Windows backup folder to auto and upgrade. It is accepted so they keep
+    # working, and never read, checked or written.
+    parser.add_argument("legacy_backup", nargs="?", help=argparse.SUPPRESS)
+    # cleanup-preview and cleanup-pg15 keep their replies for earlier launchers, but never remove anything.
+    parser.add_argument("--confirm-preview", metavar="TOKEN", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.confirm_preview is not None and (
+        args.action != "cleanup-pg15" or not re.fullmatch(r"[0-9a-f]{64}", args.confirm_preview)
+    ):
+        parser.error("--confirm-preview takes the 64-character lowercase token from cleanup-preview, for cleanup-pg15")
+    if os.geteuid() != 0:
+        parser.error("root required")
+    os.umask(0o077)
+    # Every update calls recover while other maintenance may hold the shared lock; skip settled journals.
+    if args.action == "recover" and settled():
+        sys.exit(0)
+
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt("maintenance interrupted")
+
+    # Closing the launcher must run the PG15 recovery path rather than leave it fenced.
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (ROOT / "lock").open("a") as lock, (ROOT / "maintenance.log").open("ab") as log:
+        try:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Busy("Another PostgreSQL maintenance operation is running") from None
+            with lock_distro():
+                if args.action not in ("status", "cleanup-preview", "cleanup-pg15"):
+                    discard_temporaries()
+                if args.action == "status":
+                    print(automatic_status())
+                elif args.action == "auto":
+                    automatic_upgrade()
+                elif args.action == "upgrade":
+                    upgrade()
+                elif args.action == "cleanup-staging":
+                    cleanup_staging()
+                elif args.action == "recover":
+                    recover()
+                elif args.action == "cleanup-preview":
+                    print(json.dumps({"eligible": False, "bytes": 0, "reason": cleanup_preview()}))
+                elif args.action == "cleanup-pg15":
+                    print(json.dumps({"freed_bytes": cleanup_pg15(args.confirm_preview)}))
+                else:
+                    rollback()
+                    state = json.loads(STATE.read_text())
+                    state.pop("retry_auto", None)
+                    phase(state, "rolled-back")
+        except Exception as error:
+            if args.action == "cleanup-preview":
+                print(json.dumps({"eligible": False, "bytes": 0, "reason": str(error)}))
+                sys.exit(0)
+            if isinstance(error, Busy):
+                print(f"Maintenance did not start and changed nothing: {error}. Retry after it finishes.",
+                      file=sys.stderr)
+                sys.exit(75)
+            print(f"Maintenance stopped: {error}. See {ROOT}/maintenance.log", file=sys.stderr)
+            sys.exit(1)

@@ -70,6 +70,22 @@ if [ -f "$DWEMER_GIT_CONFIG" ] && ! command -v git-credential-manager >/dev/null
     fi
 fi
 
+# An abrupt stop during PostgreSQL 17 maintenance can leave both clusters stopped, and this update
+# starts PostgreSQL and needs SQL below. Recover first: the helper takes the maintenance lock
+# exclusively, so it runs before the shared lock, from the source because the installed copy may
+# predate this action. It exits at once unless the journal records an unfinished phase.
+print_step "Checking for interrupted PostgreSQL maintenance"
+recover_status=0
+/usr/bin/python3 /home/dwemer/dwemerdistro/bin/ddistro_pg17_maintenance recover || recover_status=$?
+if [ "$recover_status" -eq 75 ]; then
+    # Exit 75 means a lock was busy, so recovery did not start; nothing was changed or found broken.
+    print_error "PostgreSQL or DwemerDistro maintenance is still running, so this update did not start. Retry the update after it finishes."
+    exit 75
+elif [ "$recover_status" -ne 0 ]; then
+    print_error "Interrupted PostgreSQL maintenance could not be recovered automatically."
+    exit 1
+fi
+
 MAINTENANCE_LOCK="/run/lock/dwemerdistro-maintenance.lock"
 
 # Hold the common maintenance lock shared on fd 7. ddistro changes apply/rollback take it
@@ -110,6 +126,8 @@ cp /home/dwemer/dwemerdistro/bin/* /usr/local/bin/ 2>/dev/null
 if [ $? -eq 0 ]; then
     # Set executable permissions for all scripts
     chmod +x /usr/local/bin/* 2>/dev/null
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_pg17_maintenance /usr/local/bin/ddistro_pg17_maintenance || exit 1
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_stage_pg17 /usr/local/bin/ddistro_stage_pg17 || exit 1
     # LM Studio runs as dwemer, so do not inherit root-only modes or the updater's umask.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_lmstudio /usr/local/bin/ddistro_lmstudio || exit 1
     # The launcher reads custom mod status as dwemer, so the manager must stay world-readable.

@@ -758,16 +758,29 @@ elif (
         print_header "UPDATING DWEMER DASHBOARD" "$BRANCH"
         printf ">> Pulling latest changes...\n"
         # Runtime permissions differ from Git modes; content conflicts must still fail safely.
-        git -c core.filemode=false pull --ff-only || exit 1
+        # Capture stderr in the C locale so Git's diagnostic can be matched, then show it unchanged.
+        { pull_errors=$(LC_ALL=C git -c core.filemode=false pull --ff-only 2>&1 >&3 3>&-); pull_status=$?; } 3>&1
+        [ -z "$pull_errors" ] || printf '%s\n' "$pull_errors" >&2
+        if [ "$pull_status" -ne 0 ]; then
+            # Exit 3 only when Git refuses to overwrite local tracked or untracked files.
+            case "$pull_errors" in
+                *"would be overwritten by merge"*) exit 3 ;;
+            esac
+            exit 1
+        fi
     fi
 
     echo "$PASSWORD" | sudo -S -p '' chown -R dwemer:www-data /var/www/html/Dwemer-Dashboard || exit 1
     echo "$PASSWORD" | sudo -S -p '' chmod -R 775 /var/www/html/Dwemer-Dashboard || exit 1
 ); then
     printf "${GREEN}[SUCCESS] Dwemer Dashboard updated successfully${NC}\n"
+elif [ "$?" -eq 3 ]; then
+    # The section header was printed in the subshell, so name the component explicitly.
+    mark_component_failed "Dwemer Dashboard (local edits conflict)"
+    print_warning "Dwemer Dashboard has local edits that conflict with this update; your local Dashboard edits were preserved. If this is a shared update, the database upgrade did not start. Move or undo the conflicting edits in /var/www/html/Dwemer-Dashboard (listed above), then run the update again from the launcher."
 else
-    mark_component_failed
-    print_warning "Dwemer Dashboard update failed. Resolve the Git or permission error above and retry; local files were preserved."
+    mark_component_failed "Dwemer Dashboard"
+    print_warning "Dwemer Dashboard update failed. Resolve the Git, network or permission error above and retry; local files were preserved."
 fi
 
 # MiniMe update
@@ -1167,7 +1180,7 @@ if [ "$DIALECTIC_UPDATE_FAILED" -ne 0 ]; then
     mark_component_failed "DialecticServer"
 fi
 if [ "$COMPONENT_UPDATE_FAILED" -ne 0 ]; then
-    printf "${BOLD}${RED}Shared components update finished with errors: %s${NC}\n" "$FAILED_COMPONENTS"
+    printf "${BOLD}${RED}[ERROR] Shared components update finished with errors: %s${NC}\n" "$FAILED_COMPONENTS"
     exit 1
 fi
 
