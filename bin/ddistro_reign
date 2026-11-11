@@ -85,8 +85,9 @@ start() {
 case "$command" in
     configure-web)
         a2enmod proxy proxy_http >/dev/null
-        if ! grep -Eq '^[[:space:]]*Listen[[:space:]]+([^:[:space:]]+:)?8089([[:space:]]|$)' /etc/apache2/ports.conf; then
-            printf 'Listen 0.0.0.0:8089\n' >> /etc/apache2/ports.conf
+        # 8089 belongs to ALMSIVI; older Reign installs leave that Listen line for it.
+        if ! grep -Eq '^[[:space:]]*Listen[[:space:]]+([^:[:space:]]+:)?8091([[:space:]]|$)' /etc/apache2/ports.conf; then
+            printf 'Listen 0.0.0.0:8091\n' >> /etc/apache2/ports.conf
         fi
         cat > /etc/apache2/conf-available/reign-source.conf <<'EOF'
 # Reign is a compiled application; never serve its source through another site's document root.
@@ -95,7 +96,7 @@ case "$command" in
 </Directory>
 EOF
         cat > /etc/apache2/sites-available/reign.conf <<'EOF'
-<VirtualHost *:8089>
+<VirtualHost *:8091>
     ProxyRequests Off
     # Reign's HTTP listener reads bodies directly; Apache must acknowledge Expect first.
     Proxy100Continue Off

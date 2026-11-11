@@ -242,7 +242,7 @@ select_product() {
             PRODUCT_REPOSITORY="https://github.com/Dwemer-Dynamics/ReignServer.git"
             PRODUCT_PRODUCTION_BRANCH="reign"
             PRODUCT_VHOST="reign.conf"
-            PRODUCT_PORT="8089"
+            PRODUCT_PORT="8091"
             ;;
         stobe)
             PRODUCT_ROOT="$WEB_ROOT/StobeServer"
