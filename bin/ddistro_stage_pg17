@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Restore a private UTF8 PG17 candidate from an offline PG15 recovery copy."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import signal
+import subprocess
+import tempfile
+
+BIN = {n: Path(f"/usr/lib/postgresql/{n}/bin") for n in (15, 17)}
+MANIFEST = """select datname, pg_get_userbyid(datdba) as owner, datcollate, datctype,
+ datistemplate, datallowconn, datconnlimit, pg_encoding_to_char(encoding) as encoding,
+ datlocprovider from pg_database order by datname collate "C" """
+
+
+def ident(value):
+    return '"' + value.replace('"', '""') + '"'
+
+
+def literal(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, **kwargs)
+
+
+def env(major, database):
+    return dict(
+        PATH="/usr/bin:/bin",
+        HOME=str(work),
+        LC_ALL="C",
+        PGUSER="postgres",
+        PGHOST=str(work / f"s{major}"),
+        PGPORT="55432",
+        PGDATABASE=database,
+        PGCLIENTENCODING="UTF8",
+        PGOPTIONS="-c timezone=UTC -c datestyle=ISO,YMD -c standard_conforming_strings=on",
+    )
+
+
+def sql(major, database, query):
+    return (
+        run(
+            BIN[17] / "psql",
+            "-XqAt",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            query,
+            env=env(major, database),
+            stdout=subprocess.PIPE,
+        )
+        .stdout.decode()
+        .strip()
+    )
+
+
+def rows(major, database, query):
+    return json.loads(sql(major, database, "select coalesce(json_agg(t),'[]') from (" + query + ") t"))
+
+
+def start(major, data):
+    sock = work / f"s{major}"
+    sock.mkdir(mode=0o700)
+    cfg = work / f"stage{major}.conf"
+    cfg.write_text(
+        "listen_addresses=''\nport=55432\nunix_socket_directories="
+        + literal(str(sock))
+        + "\nhba_file="
+        + literal(str(work / "hba"))
+        + "\n"
+    )
+    run(
+        BIN[major] / "pg_ctl",
+        "-D",
+        data,
+        "-o",
+        f"-c config_file={cfg}",
+        "-l",
+        work / f"pg{major}.log",
+        "-w",
+        "start",
+    )
+    started.append((major, data))
+
+
+def digest(major, database, query):
+    # COPY escapes embedded newlines. Sorting records makes the digest independent of heap order.
+    with tempfile.TemporaryFile(dir=work) as copied:
+        run(
+            BIN[17] / "psql",
+            "-XqAt",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            f"COPY ({query}) TO STDOUT",
+            env=env(major, database),
+            stdout=copied,
+        )
+        copied.seek(0)
+        with subprocess.Popen(
+            ["sort", "-T", str(work)],
+            env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            stdin=copied,
+            stdout=subprocess.PIPE,
+        ) as proc:
+            h = hashlib.sha256()
+            for chunk in iter(lambda: proc.stdout.read(1048576), b""):
+                h.update(chunk)
+            if proc.wait():
+                raise RuntimeError("could not sort verification records")
+    return h.hexdigest()
+
+
+def inventory(major, db):
+    rels = rows(
+        major,
+        db,
+        """select quote_ident(n.nspname)||'.'||quote_ident(c.relname) as name,
+        relkind, pg_get_userbyid(relowner) as owner from pg_class c join pg_namespace n on n.oid=c.relnamespace
+        where n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_(toast|temp)'
+        and relkind in ('r','p','S','m','f')""",
+    )
+    result = {}
+    for r in rels:
+        name = r["name"]
+        if r["relkind"] == "f":
+            raise ValueError("foreign tables require an external data plan")
+        columns = "last_value,is_called" if r["relkind"] == "S" else "*"
+        result[name] = [
+            r["owner"],
+            r["relkind"],
+            digest(major, db, "select " + columns + " from only " + name),
+        ]
+    result["large object chunks"] = digest(major, db, "select loid,pageno,data from pg_largeobject")
+    result["large object owners"] = digest(
+        major, db, "select oid,pg_get_userbyid(lomowner),lomacl from pg_largeobject_metadata"
+    )
+    result["database ACL"] = digest(
+        major,
+        db,
+        """select pg_get_userbyid(grantor),case when grantee=0 then 'PUBLIC'
+      else pg_get_userbyid(grantee) end, privilege_type,is_grantable from pg_database d,
+      lateral aclexplode(coalesce(datacl,acldefault('d',datdba))) where datname=current_database()""",
+    )
+    result["database settings"] = digest(
+        major,
+        db,
+        """select case when setrole=0 then '' else pg_get_userbyid(setrole) end,
+      unnest(setconfig) from pg_db_role_setting where setdatabase=(select oid from pg_database where datname=current_database())""",
+    )
+    result["installed extensions"] = digest(major, db, "select extname from pg_extension")
+    result["application relation grants"] = digest(
+        major,
+        db,
+        """select n.nspname,c.relname,
+      pg_get_userbyid(grantor),case when grantee=0 then 'PUBLIC' else pg_get_userbyid(grantee) end,
+      privilege_type,is_grantable from pg_class c join pg_namespace n on n.oid=c.relnamespace,
+      lateral aclexplode(c.relacl) where n.nspname not in ('pg_catalog','information_schema')
+      and n.nspname !~ '^pg_(temp|toast)' and not (privilege_type='MAINTAIN' and grantee=c.relowner)""",
+    )
+    return result
+
+
+def restore(source):
+    if (source / "PG_VERSION").read_text().strip() != "15" or (source / "postmaster.pid").exists():
+        raise ValueError("expected a stopped PG15 recovery copy")
+    control = run(BIN[15] / "pg_controldata", source, stdout=subprocess.PIPE, text=True).stdout
+    if not re.search(r"Database cluster state:\s+shut down\s*$", control, re.M):
+        raise ValueError("donor must be cleanly shut down")
+    if any((source / "pg_tblspc").iterdir()) or any((source / "pg_replslot").iterdir()):
+        raise ValueError("external tablespaces or replication slots require a mapped recovery plan")
+    used = 0
+    for p in source.rglob("*"):
+        if p.is_symlink():
+            raise ValueError("linked donor paths need a mapped recovery copy")
+        if p.is_file():
+            used += p.stat().st_size
+    if shutil.disk_usage(work).free < 4 * used:
+        raise ValueError("insufficient Linux staging space")
+    old = work / "source-copy"
+    shutil.copytree(source, old)
+    if any((old / f).exists() for f in ("standby.signal", "recovery.signal")):
+        raise ValueError("standby recovery requires a separate plan")
+    (old / "postgresql.auto.conf").write_text("")
+    (work / "hba").write_text("local all all peer\n")
+    start(15, old)
+    dbs = rows(15, "postgres", MANIFEST)
+    (work / "source-manifest.json").write_text(json.dumps(dbs, indent=2))
+    if any(d["datlocprovider"] != "c" or d["datconnlimit"] < -1 for d in dbs):
+        raise ValueError("unsupported locale provider or invalid database")
+    if sql(15, "postgres", "select count(*) from pg_prepared_xacts") != "0":
+        raise ValueError("resolve prepared transactions first")
+    if (
+        sql(15, "postgres", "select count(*) from pg_shseclabel where classoid='pg_database'::regclass")
+        != "0"
+    ):
+        raise ValueError("database security labels require the matching provider and restore plan")
+    new = work / "pg17"
+    base = next(d for d in dbs if d["datname"] == "template0")
+    run(
+        BIN[17] / "initdb",
+        "-D",
+        new,
+        "--encoding=UTF8",
+        "--lc-collate=" + base["datcollate"],
+        "--lc-ctype=" + base["datctype"],
+        "--auth-local=peer",
+        "--auth-host=scram-sha-256",
+        stdout=subprocess.DEVNULL,
+    )
+    start(17, new)
+    raw = run(
+        BIN[17] / "pg_dumpall", "--globals-only", env=env(15, "postgres"), stdout=subprocess.PIPE
+    ).stdout
+    marker = b"\nCREATE ROLE postgres;\n"
+    if raw.count(marker) != 1:
+        raise ValueError("unexpected bootstrap role in globals export")
+    (work / "globals.sql").write_bytes(raw)
+    run(
+        BIN[17] / "psql",
+        "-Xq",
+        "-v",
+        "ON_ERROR_STOP=1",
+        env=env(17, "postgres"),
+        input=raw.replace(marker, b"\n", 1),
+        stdout=subprocess.DEVNULL,
+    )
+    role_state = """select rolname,rolsuper,rolinherit,rolcreaterole,rolcreatedb,rolcanlogin,
+        rolreplication,rolbypassrls,rolconnlimit,rolpassword,rolvaliduntil
+        from pg_authid where rolname !~ '^pg_'"""
+    if digest(15, "postgres", role_state) != digest(17, "postgres", role_state):
+        raise ValueError("role attributes or authentication verifier mismatch")
+    admin = "stage_" + os.urandom(12).hex()
+
+    if admin in {d["datname"] for d in dbs}:
+        raise ValueError("staging name collision")
+    sql(17, "postgres", "CREATE DATABASE " + ident(admin) + " TEMPLATE template0")
+    for i, d in enumerate(sorted(dbs, key=lambda d: d["datname"] == "template0")):
+        name = d["datname"]
+        print("Checking and restoring", repr(name), flush=True)
+        q = ident(name)
+        if not d["datallowconn"]:
+            sql(15, "postgres", "ALTER DATABASE " + q + " ALLOW_CONNECTIONS true")
+        if sql(15, name, "select count(*) from pg_subscription") != "0":
+            raise ValueError("subscriptions require a replication cutover plan")
+        before = inventory(15, name)
+        archive = work / f"{i}.dump"
+        run(BIN[17] / "pg_dump", "-Fc", "--encoding=UTF8", "-f", archive, env=env(15, name))
+        if name in ("postgres", "template1"):
+            sql(17, admin, "ALTER DATABASE " + q + " IS_TEMPLATE false")
+            sql(17, admin, "DROP DATABASE " + q)
+        if name == "template0":
+            sql(17, admin, "ALTER DATABASE template0 ALLOW_CONNECTIONS true")
+        else:
+            sql(
+                17,
+                admin,
+                "CREATE DATABASE "
+                + q
+                + " TEMPLATE template0"
+                + " ENCODING 'UTF8' LC_COLLATE "
+                + literal(d["datcollate"])
+                + " LC_CTYPE "
+                + literal(d["datctype"])
+                + " OWNER "
+                + ident(d["owner"]),
+            )
+        # Connect to the UTF8 database we created. Restore database metadata explicitly below.
+        run(
+            BIN[17] / "pg_restore",
+            "--exit-on-error",
+            "-d",
+            "dbname=" + "'" + name.replace("\\", "\\\\").replace("'", "\\'") + "'",
+            archive,
+            env=env(17, name),
+            stdout=subprocess.DEVNULL,
+        )
+        dbmeta = rows(
+            15,
+            name,
+            """select datacl is not null as custom,
+          shobj_description(oid,'pg_database') as comment from pg_database where datname=current_database()""",
+        )[0]
+        if dbmeta["comment"] is not None:
+            sql(17, admin, "COMMENT ON DATABASE " + q + " IS " + literal(dbmeta["comment"]))
+        if dbmeta["custom"]:
+            sql(17, admin, "REVOKE ALL ON DATABASE " + q + " FROM PUBLIC, " + ident(d["owner"]))
+            acl = rows(
+                15,
+                name,
+                """select pg_get_userbyid(grantor) as grantor,
+              case when grantee=0 then 'PUBLIC' else quote_ident(pg_get_userbyid(grantee)) end as recipient,
+              privilege_type as privilege,is_grantable from pg_database,lateral aclexplode(datacl)
+              where datname=current_database()""",
+            )
+            for a in acl:
+                sql(
+                    17,
+                    admin,
+                    "SET ROLE "
+                    + ident(a["grantor"])
+                    + "; GRANT "
+                    + a["privilege"]
+                    + " ON DATABASE "
+                    + q
+                    + " TO "
+                    + a["recipient"]
+                    + (" WITH GRANT OPTION" if a["is_grantable"] else ""),
+                )
+        for setting in rows(
+            15,
+            name,
+            """select case when setrole<>0 then pg_get_userbyid(setrole) end as role,
+            unnest(setconfig) as opt from pg_db_role_setting where setdatabase=(select oid from pg_database
+            where datname=current_database())""",
+        ):
+            key, value = setting["opt"].split("=", 1)
+            target = (
+                "DATABASE " + q
+                if setting["role"] is None
+                else "ROLE " + ident(setting["role"]) + " IN DATABASE " + q
+            )
+            sql(
+                17,
+                admin,
+                "SELECT set_config("
+                + literal(key)
+                + ","
+                + literal(value)
+                + ",false); ALTER "
+                + target
+                + " SET "
+                + ident(key)
+                + " FROM CURRENT",
+            )
+        after = inventory(17, name)
+        differences = [k for k in before.keys() | after.keys() if before.get(k) != after.get(k)]
+        if differences:
+            raise ValueError("verification mismatch in " + repr(name) + ": " + repr(differences))
+        sql(17, admin, "ALTER DATABASE " + q + " CONNECTION LIMIT " + str(d["datconnlimit"]))
+        sql(17, admin, "ALTER DATABASE " + q + " IS_TEMPLATE " + str(d["datistemplate"]))
+        if not d["datallowconn"]:
+            sql(17, admin, "ALTER DATABASE " + q + " ALLOW_CONNECTIONS false")
+    sql(17, "postgres", "DROP DATABASE " + ident(admin))
+    expected = [dict(d, encoding="UTF8") for d in dbs]
+    if rows(17, "postgres", MANIFEST) != expected:
+        raise ValueError("database manifest mismatch")
+    return expected
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source", type=Path)
+    parser.add_argument("work", type=Path, help="new private directory on Linux storage")
+    args = parser.parse_args()
+    os.umask(0o077)
+    os.environ["LC_ALL"] = "C"
+    work = args.work.resolve()
+    source = args.source.resolve()
+    if not re.fullmatch(r"/[A-Za-z0-9_./-]+", str(work)) or work.is_relative_to(source):
+        parser.error("use a simple staging path outside the donor")
+    if pwd.getpwuid(os.geteuid()).pw_name != "postgres":
+        parser.error("run as postgres")
+    work.mkdir(mode=0o700, exist_ok=False)
+    os.chdir(work)
+    started = []
+
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt("migration interrupted")
+
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        verified = restore(source)
+    finally:
+        for major, data in reversed(started):
+            run(BIN[major] / "pg_ctl", "-D", data, "-w", "-m", "fast", "stop")
+    (work / "verified.json").write_text(json.dumps(verified, indent=2))
