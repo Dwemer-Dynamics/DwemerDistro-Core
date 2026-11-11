@@ -14,18 +14,12 @@ case "$command" in
         ;;
 esac
 
-# Any owned Reign process, including an unsupported older build, so stop can still end it safely.
-owned() {
+# Only a managed ReignServer deployment recorded in the pidfile is owned and running.
+running() {
     [ -s "$pidfile" ] || return 1
     pid=$(cat "$pidfile")
     [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || return 1
     process_executable=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || return 1
-    case "$process_executable" in "$root"/versions/*/ReignBetaServer|"$root"/versions/*/ReignServer) return 0 ;; *) return 1 ;; esac
-}
-
-# Only the current ReignServer deployment counts as running.
-running() {
-    owned || return 1
     case "$process_executable" in "$root"/versions/*/ReignServer) return 0 ;; *) return 1 ;; esac
 }
 
@@ -35,12 +29,12 @@ healthy() {
 }
 
 stop() {
-    if owned; then
+    if running; then
         # setsid creates an owned session, so only this server and its worker group receive signals.
         [ "$(ps -o sid= -p "$pid" | tr -d ' ')" = "$pid" ] || { echo 'Reign process ownership mismatch.' >&2; exit 1; }
         kill -TERM -- "-$pid"
-        for attempt in $(seq 1 30); do owned || break; sleep 1; done
-        if owned; then echo 'Reign did not stop cleanly; files were not replaced.' >&2; exit 1; fi
+        for attempt in $(seq 1 30); do running || break; sleep 1; done
+        if running; then echo 'Reign did not stop cleanly; files were not replaced.' >&2; exit 1; fi
     fi
     rm -f "$pidfile"
 }
@@ -63,7 +57,6 @@ start() {
         echo 'Running Reign failed its health check.' >&2
         return 1
     fi
-    if owned; then echo 'An unsupported Reign build is running; use Repair to replace it.' >&2; return 1; fi
     local executable="$root/current/ReignServer"
     local requirements="$root/current/services/vector-worker/requirements-linux.txt"
     [ -x "$executable" ] && [ -f "$root/current/reign-linux-artifact.json" ] && [ -f "$root/current/embedding-model.lock.json" ] && [ -f "$requirements" ] \
