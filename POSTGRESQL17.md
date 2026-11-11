@@ -1,6 +1,14 @@
 # PostgreSQL 17 migration rehearsal
 
-`bin/ddistro_stage_pg17` stages a stopped PG17 cluster from a **trusted, offline PG15 recovery copy**. Use it in an isolated Linux environment. It has no launcher or startup hook. It inventories the source catalog, including closed databases, and recreates every database with UTF8. CHIM normally uses `dwemer`, Dialectic uses `dialectic`, and Stobe uses `stobe`. The names are discovered, not hardcoded.
+## Launcher upgrade and rollback
+
+In **Settings → Database Maintenance**, choose **Upgrade** with the games idle. Select a Windows folder with room for a cold database backup. The launcher creates a private subfolder and checks free space on both the backup drive and the drive holding the WSL disk. The maintenance command supports the running Debian `15/main` cluster on port 5432 and registers the verified candidate as `17/dwemer` on the same port. App hosts, socket paths and login credentials stay in use. The operation installs missing PG17 client/server and pgvector packages on Bookworm or Trixie. It does not perform a Debian release upgrade.
+
+Core stops the donor, creates and compares a physical backup of its data and Debian configuration, then stages all databases. The backup's recovery JSON records the original startup setting and cluster identifier. Keep the tar and JSON together. The tar contains private database records and password verifiers. A failure before publication restarts the original PG15 cluster. The old data directory remains in place.
+
+**Roll back** fences the candidate and compares its logical contents with the checkpoint taken before it accepted client writes. A difference stops rollback and restarts PG17. A match restores the original PG15 cluster and startup setting. Both clusters are retained. If a machine loses power during maintenance, the root-owned journal is at `/var/lib/dwemerdistro/pg17-maintenance/state.json`; check the phase and use Roll back for recovery. A retried check restores an interrupted closed-database restriction on the matching candidate before comparing the data. Configuration changes are included in the comparison. Clusters with extension-managed tables or sequences require separate migration review. Diagnostic details go to the private `maintenance.log` beside the journal.
+
+`bin/ddistro_stage_pg17` stages a stopped PG17 cluster from a **trusted, offline PG15 recovery copy**. Use it in an isolated Linux environment. The launcher maintenance command invokes it after the external backup is verified. It inventories the source catalog, including closed databases, and recreates every database with UTF8. CHIM normally uses `dwemer`, Dialectic uses `dialectic`, and Stobe uses `stobe`. The names are discovered, not hardcoded.
 
 ## Inputs
 

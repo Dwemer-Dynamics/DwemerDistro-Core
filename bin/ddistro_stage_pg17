@@ -71,7 +71,9 @@ def start(major, data):
     sock.mkdir(mode=0o700)
     cfg = work / f"stage{major}.conf"
     cfg.write_text(
-        "listen_addresses=''\nport=55432\nunix_socket_directories="
+        # These sockets serve discardable staging copies only. Flush the stopped PG17 files
+        # before publishing the verification marker; the installed cluster uses normal fsync.
+        "fsync=off\nlisten_addresses=''\nport=55432\nunix_socket_directories="
         + literal(str(sock))
         + "\nhba_file="
         + literal(str(work / "hba"))
@@ -382,4 +384,10 @@ if __name__ == "__main__":
     finally:
         for major, data in reversed(started):
             run(BIN[major] / "pg_ctl", "-D", data, "-w", "-m", "fast", "stop")
-    (work / "verified.json").write_text(json.dumps(verified, indent=2))
+    run(BIN[17] / "initdb", "--sync-only", "-D", work / "pg17", stdout=subprocess.DEVNULL)
+    marker = work / "verified.pending"
+    with marker.open("x") as out:
+        json.dump(verified, out, indent=2)
+        out.flush()
+        os.fsync(out.fileno())
+    marker.rename(work / "verified.json")

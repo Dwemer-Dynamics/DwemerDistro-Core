@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""Cut over the standard Debian 15/main cluster to a verified UTF8 17/dwemer cluster."""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
+
+ROOT = Path("/var/lib/dwemerdistro/pg17-maintenance")
+STATE = ROOT / "state.json"
+CONF = Path("/etc/postgresql")
+DATA = Path("/var/lib/postgresql")
+OLD = CONF / "15/main"
+NEW = CONF / "17/dwemer"
+OLD_DATA = DATA / "15/main"
+NEW_DATA = DATA / "17/dwemer"
+PG = Path("/usr/lib/postgresql/17/bin")
+STAGER = "/usr/local/bin/ddistro_stage_pg17"
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, **kwargs)
+
+
+def atomic(path, value, mode):
+    temporary = path.with_name(path.name + ".pg17-" + uuid.uuid4().hex)
+    with temporary.open("x") as stream:
+        os.fchmod(stream.fileno(), mode)
+        stream.write(value)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    fd = os.open(path.parent, os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def phase(state, name):
+    state["phase"] = name
+    atomic(STATE, json.dumps(state), 0o600)
+
+
+def cluster(version, command):
+    name = "main" if version == 15 else "dwemer"
+    run(
+        "pg_ctlcluster", "--skip-systemctl-redirect", str(version), name, command, stdout=log, stderr=log
+    )
+
+
+def pg(*args, **kwargs):
+    return run("/usr/sbin/runuser", "-u", "postgres", "--", *args, **kwargs)
+
+
+def postgres_env(socket, db="postgres"):
+    return {
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C",
+        "PGHOST": str(socket),
+        "PGPORT": "5432",
+        "PGDATABASE": db,
+        "PGUSER": "postgres",
+    }
+
+
+def query(socket, statement):
+    client = PG / "psql" if (PG / "psql").exists() else Path("/usr/lib/postgresql/15/bin/psql")
+    return (
+        pg(
+            client,
+            "-XqAt",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            statement,
+            env=postgres_env(socket),
+            stdout=subprocess.PIPE,
+            stderr=log,
+        )
+        .stdout.decode()
+        .strip()
+    )
+
+
+def fingerprint(state):
+    # Run the stopped candidate on a peer-only private socket. This fences application writes
+    # throughout the comparison. Closed database data, sequences, globals and ACLs all count.
+    work = Path(state["work"])
+    pg_ctl = PG / "pg_ctl"
+    private = work / "s17"
+    options = (
+        f"-c config_file={NEW}/postgresql.conf -c listen_addresses='' "
+        f"-c unix_socket_directories={private} -c port=5432 -c hba_file={work}/hba "
+        "-c autovacuum=off -c max_logical_replication_workers=0"
+    )
+    pg(
+        pg_ctl,
+        "-D",
+        NEW_DATA,
+        "-o",
+        options,
+        "-l",
+        work / "fingerprint.log",
+        "-w",
+        "start",
+        stdout=log,
+        stderr=log,
+    )
+    try:
+        pending = ROOT / (work.name + "-closed.json")
+        if pending.exists():
+            if cluster_id(17, NEW_DATA) != state["candidate_id"]:
+                raise ValueError("Interrupted verification belongs to a different cluster")
+            quoted = '"' + json.loads(pending.read_text()).replace('"', '""') + '"'
+            query(private, "ALTER DATABASE " + quoted + " ALLOW_CONNECTIONS false")
+            pending.unlink()
+        names = json.loads(
+            query(
+                private,
+                """select json_agg(json_build_array(datname,datallowconn)
+                            order by datname collate "C") from pg_database""",
+            )
+        )
+        digest = hashlib.sha256()
+        digest.update(json.dumps(names).encode())
+        for path in sorted([NEW_DATA / "postgresql.auto.conf", *NEW.rglob("*")]):
+            if path != NEW / "start.conf" and path.is_file():
+                digest.update(json.dumps([str(path), hashlib.sha256(path.read_bytes()).hexdigest()]).encode())
+        command = ["/usr/sbin/runuser", "-u", "postgres", "--"]
+        for db, opened in [(None, True)] + names:
+            quoted = '"' + (db or "").replace('"', '""') + '"'
+            if not opened:
+                atomic(pending, json.dumps(db), 0o600)
+                query(private, "ALTER DATABASE " + quoted + " ALLOW_CONNECTIONS true")
+            try:
+                if db is not None:
+                    membership = pg(
+                        PG / "psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-c",
+                        "select count(*) from pg_depend d join pg_class c on c.oid=d.objid "
+                        "where d.classid='pg_class'::regclass and d.deptype='e' "
+                        "and c.relkind in ('r','p','m','S','f')",
+                        env=postgres_env(private, db), stdout=subprocess.PIPE, stderr=log,
+                    )
+                    if membership.stdout.strip() != b"0":
+                        raise ValueError("Extension-managed relations require a mapped migration")
+                tool = (
+                    [PG / "pg_dumpall", "--globals-only"] if db is None else [PG / "pg_dump", "--create"]
+                )
+                with subprocess.Popen(
+                    command + tool + ["--restrict-key=" + state["key"]],
+                    env=postgres_env(private, db or "postgres"),
+                    stdout=subprocess.PIPE,
+                    stderr=log,
+                ) as process:
+                    for block in iter(lambda: process.stdout.read(1024 * 1024), b""):
+                        digest.update(block)
+                    if process.wait():
+                        raise ValueError("Could not verify rollback data")
+            finally:
+                if not opened:
+                    query(private, "ALTER DATABASE " + quoted + " ALLOW_CONNECTIONS false")
+                    pending.unlink()
+        return digest.hexdigest()
+    finally:
+        pg(pg_ctl, "-D", NEW_DATA, "-m", "fast", "-w", "stop", stdout=log, stderr=log)
+
+
+def cluster_id(version, directory):
+    control = run(
+        f"/usr/lib/postgresql/{version}/bin/pg_controldata",
+        directory,
+        env=dict(os.environ, LC_ALL="C"),
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout
+    return next(
+        line.split(":", 1)[1].strip()
+        for line in control.splitlines()
+        if line.startswith("Database system identifier:")
+    )
+
+
+def restore_old(state):
+    if cluster_id(15, OLD_DATA) != state["donor_id"]:
+        raise ValueError("PG15 recovery cluster identity differs from the saved donor")
+    if NEW.exists():
+        atomic(NEW / "start.conf", "disabled\n", 0o644)
+    atomic(OLD / "start.conf", "manual\n", 0o644)
+    if not (OLD_DATA / "postmaster.pid").exists():
+        cluster(15, "start")
+    verify_active(15, OLD_DATA)
+    atomic(OLD / "start.conf", state["old_start"], 0o644)
+    phase(state, "rolled-back")
+
+
+def verify_active(major, path):
+    actual = query(
+        "/var/run/postgresql",
+        "select current_setting('server_version_num')::int / 10000 || '|' || current_setting('data_directory')",
+    )
+    if actual != f"{major}|{path}":
+        raise ValueError("Unexpected PostgreSQL version or data directory on the application socket")
+
+
+def ensure_packages():
+    needed = (PG / "pg_ctl", PG / "pg_dump", Path("/usr/share/postgresql/17/extension/vector.control"))
+    if all(p.is_file() for p in needed):
+        return
+    os_info = dict(
+        line.split("=", 1) for line in Path("/etc/os-release").read_text().splitlines() if "=" in line
+    )
+    suite = os_info.get("VERSION_CODENAME", "").strip('"')
+    if os_info.get("ID", "").strip('"') != "debian" or suite not in ("bookworm", "trixie"):
+        raise ValueError("Package provisioning supports Debian Bookworm and Trixie")
+    # Restrict this install to signed Debian sources and the upstream PostgreSQL repository on Bookworm.
+    # Isolated APT lists leave the customer's configured package sources and normal update policy intact.
+    with tempfile.TemporaryDirectory(prefix="ddistro-pg17-") as temp:
+        scratch = Path(temp)
+        scratch.chmod(0o755)
+        sources = [
+            f"deb https://deb.debian.org/debian {suite} main",
+            f"deb https://deb.debian.org/debian-security {suite}-security main",
+        ]
+        if suite == "bookworm":
+            key = scratch / "postgresql.asc"
+            run(
+                "curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--location",
+                "--proto",
+                "=https",
+                "https://www.postgresql.org/media/keys/ACCC4CF8.asc",
+                "-o",
+                key,
+                stderr=log,
+            )
+            info = run(
+                "gpg", "--batch", "--with-colons", "--show-keys", key, stdout=subprocess.PIPE, stderr=log
+            ).stdout
+            fingerprints = [
+                line.split(b":")[9] for line in info.splitlines() if line.startswith(b"fpr:")
+            ]
+            if (
+                not fingerprints
+                or fingerprints[0] != b"B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8"
+                or info.count(b"pub:") != 1
+            ):
+                raise ValueError("PostgreSQL repository key fingerprint mismatch")
+            key.chmod(0o644)
+            sources.append(
+                f"deb [signed-by={key}] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main"
+            )
+        source_list = scratch / "sources.list"
+        source_list.write_text("\n".join(sources) + "\n")
+        source_list.chmod(0o644)
+        lists = scratch / "lists"
+        lists.mkdir(mode=0o755)
+        apt = [
+            "apt-get",
+            "-o",
+            "Dir::Etc::sourcelist=" + str(source_list),
+            "-o",
+            "Dir::Etc::sourceparts=-",
+            "-o",
+            "Dir::State::lists=" + str(lists),
+            "-o",
+            "Dpkg::Options::=--force-confold",
+        ]
+        environment = dict(os.environ, DEBIAN_FRONTEND="noninteractive", NEEDRESTART_MODE="l")
+        print("Installing the PostgreSQL 17 server, client and pgvector.", flush=True)
+        run(*apt, "update", env=environment, stdout=log, stderr=log, umask=0o022)
+        run(
+            *apt,
+            "install",
+            "--no-remove",
+            "--no-install-recommends",
+            "-y",
+            "postgresql-17",
+            "postgresql-client-17",
+            "postgresql-17-pgvector",
+            env=environment,
+            stdout=log,
+            stderr=log,
+            umask=0o022,
+        )
+    if not all(p.is_file() for p in needed):
+        raise ValueError("PostgreSQL 17 prerequisites are incomplete")
+
+
+def upgrade(backup):
+    if STATE.exists():
+        previous = json.loads(STATE.read_text())
+        if previous["phase"] == "rolled-back":
+            verify_active(15, OLD_DATA)
+            tag = Path(previous["work"]).name
+            if not re.fullmatch(r"dwemer-stage-[0-9a-f]{32}", tag):
+                raise ValueError("Unrecognized previous maintenance identity")
+            if (NEW_DATA / "postmaster.pid").exists():
+                raise ValueError("The retained PG17 cluster is running")
+            if NEW_DATA.exists() and cluster_id(17, NEW_DATA) != previous.get("candidate_id"):
+                raise ValueError("Destination no longer matches the retained PG17 cluster")
+            if NEW.exists() and not (NEW / "dwemer-maintenance-id").read_text().strip() == tag:
+                raise ValueError("Destination configuration no longer matches the retained PG17 cluster")
+            # Preserve the previous run for recovery; never reuse or overwrite its files.
+            if NEW.exists():
+                NEW.rename(ROOT / (tag + "-config"))
+            if NEW_DATA.exists():
+                NEW_DATA.rename(DATA / (tag + "-retained17"))
+            STATE.rename(ROOT / (tag + ".json"))
+    if STATE.exists() or NEW.exists() or NEW_DATA.exists():
+        raise ValueError(
+            "Previous maintenance state or PG17 destination exists; retained copies were preserved"
+        )
+    if not backup or not backup.is_dir() or not str(backup.resolve()).startswith("/mnt/"):
+        raise ValueError("Select a Windows backup directory outside this distro")
+    mount_type = run(
+        "findmnt", "-n", "-o", "FSTYPE", "-T", backup, stdout=subprocess.PIPE, text=True
+    ).stdout.strip()
+    if mount_type not in ("drvfs", "9p"):
+        raise ValueError("The backup directory must be on a mounted Windows volume")
+    if not Path(STAGER).is_file():
+        raise ValueError("The distro is missing its verified PG17 staging tool")
+    verify_active(15, OLD_DATA)
+    for setting, expected in (
+        ("config_file", OLD / "postgresql.conf"),
+        ("hba_file", OLD / "pg_hba.conf"),
+        ("ident_file", OLD / "pg_ident.conf"),
+    ):
+        if query("/var/run/postgresql", "show " + setting) != str(expected):
+            raise ValueError("Custom PostgreSQL configuration paths require a mapped migration")
+    if OLD.is_symlink() or OLD_DATA.is_symlink() or any(x.is_symlink() for tree in (OLD, OLD_DATA) for x in tree.rglob("*")) or any((OLD_DATA / "pg_tblspc").iterdir()):
+        raise ValueError("Linked configuration or external tablespaces require a mapped backup")
+    auto = OLD_DATA / "postgresql.auto.conf"
+    if auto.exists() and any(
+        line.strip() and not line.lstrip().startswith("#") for line in auto.read_text().splitlines()
+    ):
+        raise ValueError("Review ALTER SYSTEM settings before upgrading")
+    source_size = int(run("du", "-sb", OLD_DATA, stdout=subprocess.PIPE).stdout.split()[0])
+    if (
+        shutil.disk_usage(backup).free < source_size * 1.1
+        or shutil.disk_usage(DATA).free < source_size * 4
+    ):
+        raise ValueError("Insufficient space for the backup and staging copies")
+    token = uuid.uuid4().hex
+    work = DATA / ("dwemer-stage-" + token)
+    state = {
+        "work": str(work),
+        "backup": str(backup / ("Dwemer-PG15-" + token + ".tar")),
+        "old_start": (OLD / "start.conf").read_text(),
+        "key": secrets.token_hex(32),
+        "donor_id": query("/var/run/postgresql", "select system_identifier from pg_control_system()"),
+    }
+    phase(state, "staging")
+    try:
+        atomic(OLD / "start.conf", "manual\n", 0o644)
+        cluster(15, "stop")
+        atomic(OLD / "start.conf", "disabled\n", 0o644)
+        archive = Path(state["backup"])
+        paths = [str(OLD_DATA.relative_to("/")), str(OLD.relative_to("/"))]
+        print("Saving and comparing the stopped PostgreSQL 15 backup.", flush=True)
+        with archive.open("xb") as out:
+            run("tar", "-C", "/", "-b", "2048", "-cf", "-", *paths, stdout=out, stderr=log)
+            out.flush()
+            os.fsync(out.fileno())
+        run("tar", "-C", "/", "--compare", "-f", archive, stdout=log, stderr=log)
+        with archive.with_suffix(".recovery.json").open("x") as meta:
+            json.dump(
+                {
+                    "postgres_major": 15,
+                    "data": str(OLD_DATA),
+                    "config": str(OLD),
+                    "system_identifier": state["donor_id"],
+                    "original_start_conf": state["old_start"],
+                },
+                meta,
+            )
+            meta.flush()
+            os.fsync(meta.fileno())
+        ensure_packages()
+        # The archive captured disabled startup while the original remains fenced.
+        print("Restoring and verifying all databases as UTF8.", flush=True)
+        pg("python3", STAGER, OLD_DATA, work, stdout=log, stderr=log)
+        if not (work / "verified.json").is_file():
+            raise ValueError("Missing verified candidate")
+        if not NEW_DATA.parent.exists():
+            NEW_DATA.parent.mkdir()
+            NEW_DATA.parent.chmod(0o755)
+        state["candidate_id"] = cluster_id(17, work / "pg17")
+        phase(state, "staging")
+        (work / "pg17").rename(NEW_DATA)
+        if not NEW.parent.exists():
+            NEW.parent.mkdir()
+            NEW.parent.chmod(0o755)
+        shutil.copytree(OLD, NEW)
+        atomic(NEW / "dwemer-maintenance-id", work.name, 0o600)
+        for item in (NEW, *NEW.rglob("*")):
+            if item.name == "dwemer-maintenance-id":
+                continue
+            original = (OLD / item.relative_to(NEW)).stat()
+            os.chown(item, original.st_uid, original.st_gid)
+        for key, value in (
+            ("data_directory", str(NEW_DATA)),
+            ("hba_file", str(NEW / "pg_hba.conf")),
+            ("ident_file", str(NEW / "pg_ident.conf")),
+            ("external_pid_file", "/var/run/postgresql/17-dwemer.pid"),
+            ("port", "5432"),
+        ):
+            run("pg_conftool", "17", "dwemer", "set", key, value, stdout=log, stderr=log)
+        state["baseline"] = fingerprint(state)
+        phase(state, "publishing")
+        atomic(NEW / "start.conf", "manual\n", 0o644)
+        cluster(17, "start")
+        verify_active(17, NEW_DATA)
+        atomic(NEW / "start.conf", state["old_start"], 0o644)
+        phase(state, "active")
+        print("PostgreSQL 17 is serving on port 5432. Original cluster and external backup retained.")
+    except BaseException:
+        if state["phase"] == "staging":
+            restore_old(state)
+        raise
+
+
+def rollback():
+    state = json.loads(STATE.read_text())
+    if state["phase"] == "rolled-back":
+        verify_active(15, OLD_DATA)
+        return
+    if state["phase"] in ("active", "publishing", "checking"):
+        status = subprocess.run(
+            ["/usr/sbin/runuser", "-u", "postgres", "--", PG / "pg_ctl", "-D", NEW_DATA, "status"],
+            stdout=log, stderr=log,
+        )
+        if status.returncode == 0:
+            private = Path(state["work"]) / "s17"
+            if (private / ".s.PGSQL.5432").is_socket():
+                if query(private, "select system_identifier from pg_control_system()") != state["candidate_id"]:
+                    raise ValueError("Unexpected cluster on private verification socket")
+                pg(PG / "pg_ctl", "-D", NEW_DATA, "-m", "fast", "-w", "stop", stdout=log, stderr=log)
+            else:
+                verify_active(17, NEW_DATA)
+                cluster(17, "stop")
+        elif status.returncode != 3:
+            raise ValueError("Could not determine PG17 cluster status")
+        atomic(NEW / "start.conf", "disabled\n", 0o644)
+        phase(state, "checking")
+        try:
+            if fingerprint(state) != state["baseline"]:
+                raise ValueError(
+                    "PG17 data or permissions changed. Rollback refused to preserve those writes."
+                )
+        except BaseException:
+            if (ROOT / (Path(state["work"]).name + "-closed.json")).exists():
+                raise ValueError(
+                    "Verification interrupted; recover the recorded database restriction before restart"
+                )
+            atomic(NEW / "start.conf", "manual\n", 0o644)
+            cluster(17, "start")
+            verify_active(17, NEW_DATA)
+            atomic(NEW / "start.conf", state["old_start"], 0o644)
+            phase(state, "active")
+            raise
+    elif state["phase"] != "staging":
+        raise ValueError("Unknown migration state")
+    restore_old(state)
+    print("PostgreSQL 15 is serving on port 5432. PG17 was retained.")
+
+
+def lock_distro():
+    # Share Core's existing Unix maintenance lock with update.sh and lifecycle operations.
+    path = "/run/lock/dwemerdistro-maintenance.lock"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        os.fchmod(fd, 0o644)
+    except FileExistsError:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o644
+    ):
+        os.close(fd)
+        raise ValueError("Invalid distro maintenance lock")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise ValueError("Another distro maintenance operation is running") from None
+    return os.fdopen(fd, "rb")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["upgrade", "rollback"])
+    parser.add_argument("backup", nargs="?", type=Path)
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        parser.error("root required")
+    os.umask(0o077)
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (ROOT / "lock").open("a") as lock, (ROOT / "maintenance.log").open("ab") as log:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with lock_distro():
+                if args.action == "upgrade":
+                    upgrade(args.backup)
+                else:
+                    rollback()
+        except Exception as error:
+            print(f"Maintenance stopped: {error}. See {ROOT}/maintenance.log", file=sys.stderr)
+            sys.exit(1)
