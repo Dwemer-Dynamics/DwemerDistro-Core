@@ -1,4 +1,4 @@
-"""Focused PG17 retry, rollback-guard and dump-hash regressions. No live distro, cluster or SQL."""
+"""Focused PG17 retry, rollback-guard, donor-retention and dump-hash regressions. No live distro, cluster or SQL."""
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -6,11 +6,11 @@ import io
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
-import time
 import types
 import unittest
 from unittest.mock import patch
@@ -141,14 +141,15 @@ class Journal(unittest.TestCase):
         building.mkdir(parents=True)
         (m.NEW / "dwemer-maintenance-id").unlink()
         self.journal(candidate_id="17id")
-        with patch.object(m, "ROOT", root), patch.object(m, "CONF", conf), patch.object(m, "verify_active"):
+        with patch.object(m, "ROOT", root), patch.object(m, "CONF", conf), patch.object(m, "verify_active"), \
+             patch.object(m, "STAGER", str(m.DATA / "missing-stager")):
             with self.assertRaisesRegex(ValueError, "lacks the retained PG17 cluster's maintenance marker"):
-                m.upgrade(None)
+                m.upgrade()
             self.assertTrue(m.NEW.is_dir() and building.is_dir() and m.STATE.is_file())
             # A marked destination and an unpublished build of that run are retained, never reused.
             (m.NEW / "dwemer-maintenance-id").write_text(TAG)
-            with self.assertRaisesRegex(ValueError, "Select a Windows backup directory"):
-                m.upgrade(None)
+            with self.assertRaisesRegex(ValueError, "missing its verified PG17 staging tool"):
+                m.upgrade()
         self.assertEqual(sorted(path.name for path in root.iterdir()),
                          [TAG + "-config", TAG + "-config-partial", TAG + ".json"])
 
@@ -174,355 +175,292 @@ class Journal(unittest.TestCase):
             self.assertTrue(linked.exists())
 
 
-class DonorRemoval(unittest.TestCase):
+class RetainedDonor(unittest.TestCase):
+    """Upgrades keep the PG15 donor and never use a Windows backup; earlier journals stay guarded."""
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         base = Path(os.path.realpath(temp.name))
-        paths = {"STATE": base / "state.json", "DATA": base, "OLD_DATA": base / "15" / "main",
-                 "OLD": base / "etc15", "NEW": base / "17"}
+        paths = {"ROOT": base / "root", "STATE": base / "root" / "state.json", "CONF": base / "etc",
+                 "DATA": base / "lib", "OLD": base / "etc" / "15" / "main", "NEW": base / "etc" / "17" / "dwemer",
+                 "OLD_DATA": base / "lib" / "15" / "main", "NEW_DATA": base / "lib" / "17" / "dwemer",
+                 "STAGER": str(base / "stager")}
         for key, value in paths.items():
             patcher = patch.object(m, key, value)
             patcher.start()
             self.addCleanup(patcher.stop)
         m.log = None
-        (m.OLD_DATA / "base" / "1").mkdir(parents=True)
+        m.ROOT.mkdir()
+        Path(m.STAGER).write_text("")
+        (m.OLD_DATA / "pg_tblspc").mkdir(parents=True)
         (m.OLD_DATA / "PG_VERSION").write_text("15\n")
-        (m.OLD_DATA / "base" / "1" / "1259").write_bytes(b"r" * 20000)
-        (m.OLD / "conf.d").mkdir(parents=True)
+        m.OLD.mkdir(parents=True)
         for name in ("postgresql.conf", "pg_hba.conf", "pg_ident.conf"):
             (m.OLD / name).write_text("# " + name + "\n")
-        (m.OLD / "start.conf").write_text("disabled\n")
-        self.archive = base / "backup.tar"
-        self.write_archive(self.archive, tarfile.GNU_FORMAT)
-        self.state = {"phase": "active", "work": str(base / TAG), "backup": str(self.archive),
-                      "candidate_id": "17id", "donor_id": "15id", "old_start": "auto\n"}
-        self.sidecar = self.archive.with_suffix(".recovery.json")
-        self.sidecar.write_text(json.dumps({"postgres_major": 15, "system_identifier": "15id", "data": str(m.OLD_DATA),
-                                            "config": str(m.OLD), "original_start_conf": "auto\n"}))
-        self.save()
+        (m.OLD / "start.conf").write_text("auto\n")
+        # A folder an earlier launcher still passes, and a backup an earlier release left in it.
+        self.windows = base / "windows"
+        self.windows.mkdir()
+        self.legacy_tar = self.windows / "Dwemer-PG15-old.tar"
+        self.legacy_tar.write_bytes(b"earlier backup")
+        self.calls = []
+        for name, value in (("sync_dir", None), ("verify_active", None), ("ensure_packages", None),
+                            ("running", False), ("mounts_within", []),
+                            ("fingerprint", ("base", "raw")), ("seal", ["17id", "0/1000", "shut down"])):
+            patcher = patch.object(m, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, fake in (("query", self.fake_query), ("run", self.fake_run), ("cluster", self.fake_cluster), ("pg", self.fake_pg),
+                           ("cluster_id", lambda version, path: f"{version}id")):
+            patcher = patch.object(m, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for patcher in (patch.object(m.os, "chown", create=True),
+                        patch.object(m.shutil, "disk_usage", return_value=types.SimpleNamespace(free=10 ** 12))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
-    def write_archive(self, path, form):
-        with tarfile.open(path, "w", format=form) as archive:
-            for tree in (m.OLD_DATA, m.OLD):
-                archive.add(tree, arcname=str(tree.relative_to("/")))
+    def fake_query(self, socket, statement):
+        files = {"config_file": "postgresql.conf", "hba_file": "pg_hba.conf", "ident_file": "pg_ident.conf"}
+        if statement.startswith("show "):
+            return str(m.OLD / files[statement[5:]])
+        return "15id"
 
-    def save(self):
-        m.STATE.write_text(json.dumps(self.state))
+    def fake_run(self, *args, **kwargs):
+        self.calls.append(args)
+        return types.SimpleNamespace(stdout=b"1000\t" + str(m.OLD_DATA).encode() if args[0] == "du" else b"")
+
+    def fake_cluster(self, version, command):
+        self.calls.append((version, command))
+
+    def fake_pg(self, *args, **kwargs):
+        self.calls.append(args)
+        if args[1] == m.STAGER:
+            work = Path(args[3])
+            (work / "pg17").mkdir(parents=True)
+            (work / "source-copy" / "base").mkdir(parents=True)
+            for name in ("verified.json", "globals.sql", "1.dump", "hba", "source-manifest.json"):
+                (work / name).write_text("{}")
 
     def journal(self):
         return json.loads(m.STATE.read_text())
 
-    def bind(self):
-        self.state["backup_sha256"] = hashlib.sha256(self.archive.read_bytes()).hexdigest()
-        self.state["backup_bytes"] = self.archive.stat().st_size
+    def test_automatic_upgrade_keeps_the_donor_and_never_uses_a_windows_backup(self):
+        m.automatic_upgrade()
+        state = self.journal()
+        work = Path(state["work"])
+        self.assertEqual((state["phase"], state["cleaned"], state["auto_attempts"]), ("active", True, 1))
+        self.assertFalse({"backup", "backup_sha256", "backup_bytes"} & state.keys())
+        self.assertFalse(any(call[0] in ("tar", "findmnt") for call in self.calls if isinstance(call[0], str)))
+        self.assertEqual(sorted(path.name for path in self.windows.iterdir()), [self.legacy_tar.name])
+        self.assertEqual(self.legacy_tar.read_bytes(), b"earlier backup")
+        # The donor and its disabled configuration stay; only the verified staging copies go.
+        self.assertTrue((m.OLD_DATA / "PG_VERSION").is_file())
+        self.assertEqual(((m.OLD / "start.conf").read_text(), (m.NEW / "start.conf").read_text()),
+                         ("disabled\n", "auto\n"))
+        self.assertEqual(sorted(path.name for path in work.iterdir()), ["hba", "source-manifest.json", "verified.json"])
+        self.assertEqual(m.automatic_status(), "current")
 
-    def verify(self):
-        return m.verify_archive(self.state, m.donor_tree(m.OLD_DATA), m.config_tree())[:2]
+    def test_manual_upgrade_cleans_staging_too(self):
+        m.upgrade()
+        state = self.journal()
+        self.assertEqual((state["phase"], state["cleaned"]), ("active", True))
+        self.assertEqual(sorted(path.name for path in Path(state["work"]).iterdir()),
+                         ["hba", "source-manifest.json", "verified.json"])
 
-    def test_archive_check_supports_legacy_and_bound_archives(self):
-        expected = (hashlib.sha256(self.archive.read_bytes()).hexdigest(), self.archive.stat().st_size)
-        self.assertEqual(self.verify(), expected)
-        self.bind()
-        self.assertEqual(self.verify(), expected)
+    def test_staging_copies_are_kept_unless_the_original_donor_is_in_place(self):
+        # A cleanup failure after cutover leaves PG17 serving, without rollback, and the next update retries.
+        with patch.object(m, "cluster_id", lambda version, path: "replaced" if version == 15 else "17id"), \
+             patch.object(m, "rollback", side_effect=AssertionError("rollback")), \
+             self.assertRaisesRegex(ValueError, "PostgreSQL 17 is serving, but cleanup stopped: .*differs from the "
+                                    "saved donor, so the staging copies were kept. The next update retries"):
+            m.upgrade()
+        state = self.journal()
+        work = Path(state["work"])
+        self.assertEqual(((m.NEW / "start.conf").read_text(), state["phase"]), ("auto\n", "active"))
+        self.assertNotIn("cleaned", state)
+        staged = sorted(path.name for path in work.iterdir())
+        self.assertIn("source-copy", staged)
+        self.assertEqual(m.automatic_status(), "needed")
+        (m.OLD_DATA / "PG_VERSION").unlink()
+        with self.assertRaisesRegex(ValueError, "missing or differs from the saved donor"):
+            m.automatic_upgrade()
+        (m.OLD_DATA / "PG_VERSION").write_text("15\n")
+        with patch.object(m, "cluster_id", lambda version, path: "other" if version == 17 else "15id"), \
+             self.assertRaisesRegex(ValueError, "Unexpected PG17 cleanup target"):
+            m.discard_staging(self.journal())
+        self.assertEqual(sorted(path.name for path in work.iterdir()), staged)
+        self.assertNotIn("cleaned", self.journal())
 
-    def test_archive_must_match_the_whole_retained_configuration(self):
-        hba = m.OLD / "pg_hba.conf"
-        hba.write_text("host all all 0.0.0.0/0 trust\n")
-        with self.assertRaisesRegex(ValueError, "differs from its Windows backup"):
-            self.verify()
-        self.write_archive(self.archive, tarfile.GNU_FORMAT)
-        (m.OLD / "conf.d" / "extra.conf").write_text("port = 5433\n")
-        with self.assertRaisesRegex(ValueError, "does not hold the whole"):
-            self.verify()
-        (m.OLD / "conf.d" / "extra.conf").unlink()
-        hba.unlink()
-        with self.assertRaisesRegex(ValueError, "configuration is incomplete"):
-            self.verify()
+    def test_cleanup_refuses_mounts_links_and_a_live_donor_before_deleting_anything(self):
+        with patch.object(m, "cluster_id", lambda version, path: "replaced" if version == 15 else "17id"), \
+             self.assertRaises(ValueError):
+            m.upgrade()
+        work = Path(self.journal()["work"])
+        copy = work / "source-copy"
+        staged = sorted(path.name for path in work.iterdir())
 
-    def test_replaced_damaged_or_mismatched_archives_stop_removal(self):
-        self.bind()
-        self.write_archive(self.archive, tarfile.PAX_FORMAT)
-        with self.assertRaisesRegex(ValueError, "changed since it was created"):
-            self.verify()
-        self.state.pop("backup_sha256")
-        self.verify()
-        self.archive.write_bytes(self.archive.read_bytes()[:3000])
-        with self.assertRaises(ValueError):
-            self.verify()
-        self.write_archive(self.archive, tarfile.GNU_FORMAT)
-        (m.OLD_DATA / "base" / "1" / "1259").write_bytes(b"w" * 20000)
-        with self.assertRaisesRegex(ValueError, "differs from its Windows backup"):
-            self.verify()
-        self.write_archive(self.archive, tarfile.GNU_FORMAT)
-        (m.OLD_DATA / "postmaster.opts").write_text("started again\n")
-        with self.assertRaisesRegex(ValueError, "does not hold the whole"):
-            self.verify()
-        self.archive.unlink()
-        with self.assertRaises(OSError):
-            self.verify()
+        def refused(pattern):
+            with patch.object(m.shutil, "rmtree", side_effect=AssertionError("rmtree")), \
+                 self.assertRaisesRegex(ValueError, pattern):
+                m.automatic_upgrade()
+            self.assertEqual(sorted(path.name for path in work.iterdir()), staged)
+            self.assertTrue(os.path.lexists(copy) and (m.OLD_DATA / "PG_VERSION").is_file())
+            self.assertNotIn("cleaned", self.journal())
 
-    def test_links_are_refused_and_allocation_counts_whole_inodes(self):
-        os.link(m.OLD_DATA / "base" / "1" / "1259", m.OLD_DATA / "inner-link")
-        entries = m.donor_tree(m.OLD_DATA)
-        once = sum(info.st_blocks * 512 for name, info in entries.items() if name != "inner-link")
-        self.assertEqual(m.allocated_bytes(entries), once)
-        os.link(m.OLD_DATA / "PG_VERSION", m.DATA / "outside-link")
-        partial = m.donor_tree(m.OLD_DATA)
-        self.assertEqual(m.allocated_bytes(partial), once - partial["PG_VERSION"].st_blocks * 512)
-        (m.OLD_DATA / "pg_wal").symlink_to(m.DATA)
-        with self.assertRaisesRegex(ValueError, "links, special files or mounts"):
-            m.donor_tree(m.OLD_DATA)
+        # A bind mount keeps the device number, so only the mount table shows it.
+        with patch.object(m, "mounts_within", return_value=[str(copy / "base")]):
+            refused("is or contains a mount point")
+        with patch.object(m, "mounts_within", return_value=[str(work)]):
+            refused("is or contains a mount point")
+        # The donor must still be stopped and disabled.
+        with patch.object(m, "running", return_value=True):
+            refused("not stopped and disabled")
+        (m.OLD / "start.conf").write_text("auto\n")
+        refused("not stopped and disabled")
+        (m.OLD / "start.conf").write_text("disabled\n")
+        (m.OLD_DATA / "postmaster.pid").write_text("1\n")
+        refused("not stopped and disabled")
+        (m.OLD_DATA / "postmaster.pid").unlink()
+        # A linked parent of the donor path.
+        real = m.DATA / "real15"
+        (m.DATA / "15").rename(real)
+        (m.DATA / "15").symlink_to(real)
+        refused("missing or differs from the saved donor")
+        (m.DATA / "15").unlink()
+        real.rename(m.DATA / "15")
+        # A link inside the copy, and a linked copy, could lead rmtree to the donor.
+        (copy / "base" / "donor").symlink_to(m.OLD_DATA)
+        refused("holds links, special files or mounts")
+        (copy / "base" / "donor").unlink()
+        copy.rename(m.DATA / "real-copy")
+        copy.symlink_to(m.OLD_DATA)
+        refused("source copy is linked or not a directory")
+        copy.unlink()
+        (m.DATA / "real-copy").rename(copy)
+        (work / "1.dump").unlink()
+        (work / "1.dump").symlink_to(m.OLD_DATA / "PG_VERSION")
+        refused("is linked or not a plain file")
+        (work / "1.dump").unlink()
+        (work / "1.dump").write_text("{}")
+        # Once every guard passes, the retry cleans up and PG17 keeps serving.
+        m.automatic_upgrade()
+        self.assertEqual(sorted(path.name for path in work.iterdir()), ["hba", "source-manifest.json", "verified.json"])
+        self.assertEqual((self.journal()["cleaned"], m.automatic_status()), (True, "current"))
+        self.assertTrue((m.OLD_DATA / "PG_VERSION").is_file())
 
-    def resumable(self):
-        # Stub only the live-cluster and Windows mount checks; hashing, backup identity and quarantine checks stay real.
-        checks = {
-            "check_removal": patch.object(m, "check_removal", side_effect=lambda state: (
-                m.donor_tree(m.OLD_DATA), m.config_tree(), m.check_backup(state))),
-            "check_pg17": patch.object(m, "check_pg17"),
-            "check_backup": patch.object(m, "check_backup", wraps=m.check_backup),
-            "windows_volume": patch.object(m, "windows_volume"),
-            "cluster_dirs": patch.object(m, "cluster_dirs", return_value=[("15", "main", m.OLD_DATA)]),
-            "mounts_within": patch.object(m, "mounts_within", return_value=[]),
-        }
-        mocks = {name: patcher.start() for name, patcher in checks.items()}
-        for patcher in checks.values():
-            self.addCleanup(patcher.stop)
-        return mocks
+    def legacy(self, **record):
+        # An active journal from an earlier release, with its Windows backup still on disk.
+        tag = "dwemer-stage-" + "b" * 32
+        state = {"phase": "active", "work": str(m.DATA / tag), "backup": str(self.legacy_tar), "candidate_id": "17id",
+                 "donor_id": "15id", "old_start": "auto\n", "backup_sha256": "0" * 64, "backup_bytes": 14}
+        (m.DATA / tag).mkdir(parents=True)
+        for name in ("verified.json", "globals.sql"):
+            (m.DATA / tag / name).write_text("{}")
+        m.NEW.mkdir(parents=True)
+        (m.NEW / "dwemer-maintenance-id").write_text(tag)
+        self.legacy_tar.with_suffix(".recovery.json").write_text("{}")
+        if record:
+            quarantine = m.quarantine_path(state)
+            if record["stage"] != "removed":
+                m.OLD_DATA.rename(quarantine)
+                info = os.lstat(quarantine)
+                record["inode"] = [info.st_dev, info.st_ino]
+            else:
+                shutil.rmtree(m.OLD_DATA)
+            state["donor_removal"] = dict({"quarantine": str(quarantine), "inode": [0, 0], "bytes": 1,
+                                           "backup_sha256": "0" * 64, "backup_bytes": 14}, **record)
+        m.STATE.write_text(json.dumps(state))
+        return state
 
-    def interrupt_after_rename(self):
-        size = (m.OLD_DATA / "base" / "1" / "1259").stat().st_blocks * 512
-
-        def partial(path):
-            (Path(path) / "base" / "1" / "1259").unlink()
-            raise KeyboardInterrupt
-
-        with patch.object(m.shutil, "rmtree", side_effect=partial), self.assertRaises(KeyboardInterrupt):
+    def assert_cleanup_refused(self, reason):
+        before = m.STATE.read_bytes(), self.legacy_tar.read_bytes()
+        self.assertEqual(m.cleanup_preview(), reason)
+        with self.assertRaisesRegex(ValueError, re.escape(reason) + "; nothing was removed"):
             m.cleanup_pg15()
-        return size
+        with self.assertRaisesRegex(ValueError, r"The cleanup preview is stale \(" + re.escape(reason)):
+            m.cleanup_pg15("a" * 64)
+        self.assertEqual((m.STATE.read_bytes(), self.legacy_tar.read_bytes()), before)
 
-    def test_interrupted_removal_resumes_from_its_journal(self):
-        quarantine = m.quarantine_path(self.state)
-        mocks = self.resumable()
-        whole = m.allocated_bytes(m.donor_tree(m.OLD_DATA))
-        with patch.object(m.os, "rename", side_effect=KeyboardInterrupt):
-            with self.assertRaises(KeyboardInterrupt):
-                m.cleanup_pg15()
-        record = self.journal()["donor_removal"]
-        # A legacy archive without a journaled checksum is bound before the quarantine rename.
-        self.assertEqual((record["stage"], record["backup_sha256"], record["backup_bytes"]),
-                         ("quarantine", hashlib.sha256(self.archive.read_bytes()).hexdigest(),
-                          self.archive.stat().st_size))
-        self.assertIsNone(m.removal(self.journal()))
-        deleted = self.interrupt_after_rename()
-        # Each fresh attempt rechecks everything after the long comparison.
-        self.assertEqual(mocks["check_removal"].call_count, 4)
-        self.assertFalse(m.OLD_DATA.exists())
-        self.assertTrue(quarantine.is_dir())
-        mocks["check_pg17"].reset_mock()
-        mocks["check_backup"].reset_mock()
-        eligible, left, reason, _ = m.cleanup_preview()
-        self.assertEqual((eligible, left), (True, whole - deleted))
-        self.assertIn("interrupted", reason)
-        with patch.object(m, "file_digest", wraps=m.file_digest) as digest:
-            self.assertEqual(m.cleanup_pg15(), whole - deleted)
-        self.assertEqual(mocks["check_removal"].call_count, 4)
-        # The resumed run hashes the backup once and rechecks PG17 and the backup before deleting.
-        self.assertEqual((mocks["check_pg17"].call_count, mocks["check_backup"].call_count, digest.call_count),
-                         (3, 3, 1))
-        self.assertEqual(mocks["check_backup"].call_args.args[1]["backup_sha256"], record["backup_sha256"])
-        self.assertFalse(quarantine.exists())
-        self.assertEqual(self.journal()["donor_removal"]["stage"], "removed")
-        self.assertEqual(m.cleanup_pg15(), 0)
-        self.assertEqual(m.cleanup_preview(), (False, 0, "The PG15 data directory was already removed", None))
-        self.assertTrue((m.OLD / "start.conf").is_file() and self.archive.is_file())
+    def test_cleanup_is_refused_for_every_migration_and_keeps_old_replies(self):
+        keeps = "Core keeps the PostgreSQL 15 data directory and its disabled configuration for recovery"
+        m.STATE.write_text(json.dumps({"phase": "rolled-back", "work": str(m.DATA / TAG)}))
+        self.assert_cleanup_refused(keeps)
+        m.STATE.unlink()
+        m.upgrade()
+        self.assert_cleanup_refused(keeps)
+        # An earlier release's migration with every file its removal used to require is refused as well.
+        m.STATE.unlink()
+        shutil.rmtree(m.NEW)
+        self.legacy()
+        self.assert_cleanup_refused(keeps)
+        self.assertTrue((m.OLD_DATA / "PG_VERSION").is_file())
 
-    def test_resume_rechecks_backup_digest_and_nested_mounts(self):
-        quarantine = m.quarantine_path(self.state)
-        mocks = self.resumable()
-        self.interrupt_after_rename()
-        original = self.archive.read_bytes()
-        self.archive.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
-        with self.assertRaisesRegex(ValueError, "changed since it was verified"):
-            m.cleanup_pg15()
-        self.archive.write_bytes(original)
-        mocks["mounts_within"].return_value = [str(quarantine / "base")]
-        with self.assertRaisesRegex(ValueError, "mount point; it was kept"):
-            m.cleanup_preview()
-        with self.assertRaisesRegex(ValueError, "mount point; it was kept"):
-            m.cleanup_pg15()
-        self.assertTrue(quarantine.is_dir())
-        self.assertEqual(self.journal()["donor_removal"]["stage"], "removing")
+    def test_an_interrupted_earlier_removal_is_never_resumed(self):
+        state = self.legacy(stage="removing")
+        quarantine = m.quarantine_path(state)
+        self.assert_cleanup_refused(f"An earlier release's interrupted PG15 removal left {quarantine}; "
+                                    "Core no longer removes PostgreSQL 15 data, so it was kept")
+        self.assertTrue((quarantine / "PG_VERSION").is_file())
+        with self.assertRaisesRegex(ValueError, "partly deleted copy at .* was kept"):
+            m.rollback()
+        # Interrupted after its last deletion: reported as completed, still without a journal change.
+        shutil.rmtree(quarantine)
+        self.assert_cleanup_refused_with_success()
 
-    def refused_fresh(self, change, message):
-        real = m.verify_archive
-
-        def comparing(*args):
-            result = real(*args)
-            change()
-            return result
-
-        with patch.object(m, "verify_archive", comparing), \
-             patch.object(m.shutil, "rmtree", side_effect=AssertionError("rmtree")):
-            with self.assertRaisesRegex(ValueError, message):
-                m.cleanup_pg15()
-        self.assertNotIn("donor_removal", self.journal())
-        self.assertTrue((m.OLD_DATA / "base" / "1" / "1259").is_file())
-
-    def test_fresh_removal_rechecks_donor_and_backup_after_the_long_comparison(self):
-        self.resumable()
-        relation = m.OLD_DATA / "base" / "1" / "1259"
-        before = relation.stat()
-
-        def rewritten():
-            # Same size and restored mtime; only ctime records the write. Its clock is coarse, so wait a tick.
-            time.sleep(0.05)
-            relation.write_bytes(b"w" * 20000)
-            os.utime(relation, ns=(before.st_atime_ns, before.st_mtime_ns))
-
-        self.refused_fresh(rewritten, "changed during verification; nothing was removed")
-        relation.write_bytes(b"r" * 20000)
-        self.write_archive(self.archive, tarfile.GNU_FORMAT)
-
-        def replaced():
-            copy = self.archive.with_name("copy.tar")
-            copy.write_bytes(self.archive.read_bytes())
-            copy.replace(self.archive)
-
-        self.refused_fresh(replaced, "changed during verification; nothing was removed")
-
-        def linked():
-            target = self.sidecar.with_name("elsewhere.json")
-            self.sidecar.replace(target)
-            self.sidecar.symlink_to(target)
-
-        self.refused_fresh(linked, "recovery JSON is missing or linked")
-
-    def test_a_backup_that_changes_while_it_is_hashed_is_refused(self):
-        archive, grown = self.archive, []
-
-        class Growing(m.Hashed):
-            # A writer appends to the same file once the hash has started.
-            def read(self, size=-1):
-                if not grown:
-                    grown.append(True)
-                    with open(archive, "ab") as grow:
-                        grow.write(b"\0")
-                return super().read(size)
-
-        self.resumable()
-        with patch.object(m, "Hashed", Growing), \
-             self.assertRaisesRegex(ValueError, "changed while it was verified; the PG15 data was kept"):
-            m.cleanup_pg15()
-        self.assertNotIn("donor_removal", self.journal())
-        self.write_archive(self.archive, tarfile.GNU_FORMAT)
-        self.interrupt_after_rename()
-        grown.clear()
-        with patch.object(m, "Hashed", Growing), patch.object(m.shutil, "rmtree", side_effect=AssertionError):
-            with self.assertRaisesRegex(ValueError, "changed while it was verified; the PG15 data was kept"):
-                m.cleanup_pg15()
-        self.assertTrue(m.quarantine_path(self.state).is_dir())
-
-    def test_fresh_removal_checks_the_renamed_inode_before_deleting(self):
-        self.resumable()
-        decoy = m.DATA / "decoy"
-        decoy.mkdir()
-        real = os.rename
-        with patch.object(m.os, "rename", side_effect=lambda source, target: real(decoy, target)), \
-             patch.object(m.shutil, "rmtree", side_effect=AssertionError("rmtree")):
-            with self.assertRaisesRegex(ValueError, "does not match the removal journal; it was kept"):
-                m.cleanup_pg15()
-        self.assertTrue(m.quarantine_path(self.state).is_dir() and (m.OLD_DATA / "PG_VERSION").is_file())
-        self.assertEqual(self.journal()["donor_removal"]["stage"], "quarantine")
-
-    def test_resume_refuses_a_linked_recovery_json(self):
-        self.resumable()
-        self.interrupt_after_rename()
-        target = self.sidecar.with_name("elsewhere.json")
-        self.sidecar.replace(target)
-        self.sidecar.symlink_to(target)
-        with self.assertRaisesRegex(ValueError, "recovery JSON is missing or linked"):
-            m.cleanup_pg15()
-        self.assertTrue(m.quarantine_path(self.state).is_dir())
-
-    def test_a_changed_quarantine_is_never_removed(self):
-        self.state["donor_removal"] = {"stage": "removing", "quarantine": str(m.quarantine_path(self.state)),
-                                       "inode": [0, 0], "bytes": 1, "backup_sha256": "0", "backup_bytes": 1}
-        m.OLD_DATA.rename(m.quarantine_path(self.state))
-        self.save()
-        with self.assertRaisesRegex(ValueError, "does not match the removal journal"):
-            m.cleanup_pg15()
-        self.assertTrue(m.quarantine_path(self.state).is_dir())
-
-    def test_confirmed_preview_is_rechecked_before_any_change(self):
-        self.resumable()
-        stale = "The cleanup preview is stale"
-        refuse = patch.object(m.os, "rename", side_effect=AssertionError("rename"))
-        fresh = m.cleanup_preview()
-        self.assertTrue(fresh[0])
-        self.assertRegex(fresh[3], r"^[0-9a-f]{64}$")
-        self.assertEqual(m.cleanup_preview(), fresh)
-        # A journal written before an interrupted rename is only repaired after the token matches.
-        journaled = dict(self.state, donor_removal={
-            "stage": "quarantine", "quarantine": str(m.quarantine_path(self.state)),
-            "inode": [0, 0], "bytes": 1, "backup_sha256": "0", "backup_bytes": 1})
-        top = os.lstat(m.OLD_DATA)
-        journaled["donor_removal"]["inode"] = [top.st_dev, top.st_ino]
-        m.STATE.write_text(json.dumps(journaled))
-        with refuse, self.assertRaisesRegex(ValueError, stale):
-            m.cleanup_pg15("0" * 64)
-        self.assertIn("donor_removal", self.journal())
-        self.save()
-        # The donor size and the recovery JSON identity are both bound without hashing the archive.
-        extra = m.OLD_DATA / "base" / "1" / "2619"
-        extra.write_bytes(b"x" * 8192)
-        with patch.object(m, "Hashed", side_effect=AssertionError("hashed")):
-            grown = m.cleanup_preview()
-        self.assertNotEqual((grown[1], grown[3]), (fresh[1], fresh[3]))
-        with refuse, self.assertRaisesRegex(ValueError, stale):
-            m.cleanup_pg15(fresh[3])
-        extra.unlink()
-        self.assertEqual(m.cleanup_preview(), fresh)
-        self.sidecar.write_text(self.sidecar.read_text() + " ")
-        with refuse, self.assertRaisesRegex(ValueError, stale):
-            m.cleanup_pg15(fresh[3])
-        shown = m.cleanup_preview()[3]
-        # A removal that became resumable since the preview needs a new one, and the journal stays as it was.
-        self.interrupt_after_rename()
+    def assert_cleanup_refused_with_success(self):
         before = m.STATE.read_bytes()
-        with patch.object(m.shutil, "rmtree", side_effect=AssertionError("rmtree")),              self.assertRaisesRegex(ValueError, stale):
-            m.cleanup_pg15(shown)
+        self.assertEqual((m.cleanup_preview(), m.cleanup_pg15()), (m.REMOVED, 0))
+        with self.assertRaisesRegex(ValueError, "stale"):
+            m.cleanup_pg15("a" * 64)
         self.assertEqual(m.STATE.read_bytes(), before)
-        resumed = m.cleanup_preview()
-        self.assertTrue(resumed[0])
-        self.assertEqual(m.cleanup_pg15(resumed[3]), resumed[1])
-        # Completed: a confirmed request is refused as stale, while the unconfirmed CLI form still returns 0.
-        with self.assertRaisesRegex(ValueError, stale + r" \(The PG15 data directory was already removed\)"):
-            m.cleanup_pg15(resumed[3])
-        self.assertEqual(m.cleanup_pg15(), 0)
 
-    def test_confirm_preview_only_takes_a_lowercase_token_for_cleanup(self):
+    def test_a_completed_earlier_removal_still_reports_success_and_blocks_rollback(self):
+        state = self.legacy(stage="removed")
+        self.assert_cleanup_refused_with_success()
+        with self.assertRaisesRegex(ValueError, "PostgreSQL 17 keeps serving. Restore PG15 by hand from "
+                                    + re.escape(str(self.legacy_tar))):
+            m.rollback()
+        # The staging copies may hold the last PG15 data, so the update settles without deleting them.
+        m.automatic_upgrade()
+        self.assertTrue((Path(state["work"]) / "globals.sql").is_file())
+        self.assertTrue(self.journal()["cleaned"] and self.legacy_tar.is_file())
+
+    def test_rollback_refuses_before_touching_clusters_without_a_donor(self):
+        state = self.legacy(stage="quarantine")
+        untouched = {name: patch.object(m, name, side_effect=AssertionError(name))
+                     for name in ("running", "cluster", "fingerprint", "atomic", "cluster_id")}
+        for patcher in untouched.values():
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with self.assertRaisesRegex(ValueError, "complete renamed data directory remains at"):
+            m.rollback()
+        m.quarantine_path(state).rename(m.OLD_DATA)
+        (m.OLD_DATA / "PG_VERSION").unlink()
+        state.pop("donor_removal")
+        m.STATE.write_text(json.dumps(state))
+        with self.assertRaisesRegex(ValueError, "missing, so rollback changed nothing. Restore it from .*tar"):
+            m.rollback()
+        # Journals without an external backup name none.
+        state.pop("backup")
+        m.STATE.write_text(json.dumps(state))
+        with self.assertRaisesRegex(ValueError, "missing, so rollback changed nothing. Restore it before"):
+            m.rollback()
+
+    def test_cli_accepts_the_legacy_folder_and_validates_the_retired_token(self):
         script = str(Path(__file__).resolve().parents[1] / "bin" / "ddistro_pg17_maintenance")
         for args in (["cleanup-pg15", "--confirm-preview", "A" * 64], ["cleanup-pg15", "--confirm-preview", "a" * 63],
                      ["cleanup-preview", "--confirm-preview", "a" * 64]):
             run = subprocess.run([sys.executable, script, *args], capture_output=True, text=True)
             self.assertEqual(run.returncode, 2, args)
             self.assertIn("--confirm-preview", run.stderr)
-
-    def test_rollback_refuses_before_touching_clusters_without_a_donor(self):
-        untouched = {name: patch.object(m, name, side_effect=AssertionError(name))
-                     for name in ("running", "cluster", "fingerprint", "atomic", "cluster_id")}
-        for patcher in untouched.values():
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        (m.OLD_DATA / "PG_VERSION").unlink()
-        with self.assertRaisesRegex(ValueError, "PG15 data directory is missing"):
-            m.rollback()
-        self.state["donor_removal"] = {"stage": "removed", "quarantine": str(m.quarantine_path(self.state)),
-                                       "inode": [0, 0], "bytes": 1, "backup_sha256": "0", "backup_bytes": 1}
-        self.save()
-        with self.assertRaisesRegex(ValueError, "PostgreSQL 17 keeps serving"):
-            m.rollback()
+        if not hasattr(os, "geteuid") or os.geteuid() == 0:
+            self.skipTest("needs a non-root POSIX account")
+        for args in (["auto", str(self.windows)], ["upgrade", str(self.windows)], ["auto"], ["upgrade"]):
+            run = subprocess.run([sys.executable, script, *args], capture_output=True, text=True)
+            self.assertEqual((run.returncode, run.stderr.strip()[-13:]), (2, "root required"), args)
+        self.assertEqual(sorted(path.name for path in self.windows.iterdir()), [self.legacy_tar.name])
 
 
 class BoundedStream(io.BytesIO):

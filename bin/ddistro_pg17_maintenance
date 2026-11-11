@@ -14,7 +14,6 @@ import signal
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 import uuid
 
@@ -29,7 +28,7 @@ NEW_DATA = DATA / "17/dwemer"
 PG = Path("/usr/lib/postgresql/17/bin")
 STAGER = "/usr/local/bin/ddistro_stage_pg17"
 # A failure that repeats is deterministic (for example invalid SQL_ASCII bytes). Each attempt stops
-# PG15, writes a full Windows backup and retains its staging copy, so stop retrying unattended.
+# PG15 and retains its staging copy, so stop retrying unattended.
 AUTO_ATTEMPTS = 2
 
 
@@ -39,11 +38,6 @@ class Busy(ValueError):
 
 def run(*args, **kwargs):
     return subprocess.run(args, check=True, **kwargs)
-
-
-def nofollow(path, flags):
-    # Non-blocking, so a path swapped for a FIFO fails the regular-file check instead of hanging.
-    return os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
 
 
 def atomic(path, value, mode):
@@ -440,7 +434,7 @@ def allow_retry():
     phase(state, "rolled-back")
 
 
-def upgrade(backup, automatic=False):
+def upgrade(automatic=False):
     attempts = 0
     if STATE.exists():
         previous = json.loads(STATE.read_text())
@@ -475,13 +469,6 @@ def upgrade(backup, automatic=False):
         raise ValueError(
             "Previous maintenance state or PG17 destination exists; retained copies were preserved"
         )
-    if not backup or not backup.is_dir() or not str(backup.resolve()).startswith("/mnt/"):
-        raise ValueError("Select a Windows backup directory outside this distro")
-    mount_type = run(
-        "findmnt", "-n", "-o", "FSTYPE", "-T", backup, stdout=subprocess.PIPE, text=True
-    ).stdout.strip()
-    if mount_type not in ("drvfs", "9p"):
-        raise ValueError("The backup directory must be on a mounted Windows volume")
     if not Path(STAGER).is_file():
         raise ValueError("The distro is missing its verified PG17 staging tool")
     verify_active(15, OLD_DATA)
@@ -493,23 +480,20 @@ def upgrade(backup, automatic=False):
         if query("/var/run/postgresql", "show " + setting) != str(expected):
             raise ValueError("Custom PostgreSQL configuration paths require a mapped migration")
     if OLD.is_symlink() or OLD_DATA.is_symlink() or any(x.is_symlink() for tree in (OLD, OLD_DATA) for x in tree.rglob("*")) or any((OLD_DATA / "pg_tblspc").iterdir()):
-        raise ValueError("Linked configuration or external tablespaces require a mapped backup")
+        raise ValueError("Linked configuration or external tablespaces require a mapped migration")
     auto = OLD_DATA / "postgresql.auto.conf"
     if auto.exists() and any(
         line.strip() and not line.lstrip().startswith("#") for line in auto.read_text().splitlines()
     ):
         raise ValueError("Review ALTER SYSTEM settings before upgrading")
     source_size = int(run("du", "-sb", OLD_DATA, stdout=subprocess.PIPE).stdout.split()[0])
-    if (
-        shutil.disk_usage(backup).free < source_size * 1.1
-        or shutil.disk_usage(DATA).free < source_size * 4
-    ):
-        raise ValueError("Insufficient space for the backup and staging copies")
-    token = uuid.uuid4().hex
-    work = DATA / ("dwemer-stage-" + token)
+    if shutil.disk_usage(DATA).free < source_size * 4:
+        raise ValueError("Insufficient space for the staging copies")
+    work = DATA / ("dwemer-stage-" + uuid.uuid4().hex)
+    # The stopped donor and its disabled configuration stay in place as the recovery copy; no external
+    # backup is written. Journals without "backup" are also refused by older releases' donor removal.
     state = {
         "work": str(work),
-        "backup": str(backup / ("Dwemer-PG15-" + token + ".tar")),
         "old_start": (OLD / "start.conf").read_text(),
         "key": secrets.token_hex(32),
         "donor_id": query("/var/run/postgresql", "select system_identifier from pg_control_system()"),
@@ -520,43 +504,8 @@ def upgrade(backup, automatic=False):
         atomic(OLD / "start.conf", "manual\n", 0o644)
         cluster(15, "stop")
         atomic(OLD / "start.conf", "disabled\n", 0o644)
-        archive = Path(state["backup"])
-        paths = [str(OLD_DATA.relative_to("/")), str(OLD.relative_to("/"))]
-        print("Saving and comparing the stopped PostgreSQL 15 backup.", flush=True)
-        # Bind the archive checksum in the root-owned journal so donor removal can later detect a
-        # replaced or damaged Windows copy. The sidecar copy is informational only.
-        digest = hashlib.sha256()
-        with archive.open("xb") as out, subprocess.Popen(
-            ["tar", "-C", "/", "-b", "2048", "-cf", "-", *paths], stdout=subprocess.PIPE, stderr=log
-        ) as process:
-            for block in iter(lambda: process.stdout.read(1024 * 1024), b""):
-                digest.update(block)
-                out.write(block)
-            if process.wait():
-                raise ValueError("Could not write the PG15 backup")
-            out.flush()
-            os.fsync(out.fileno())
-        state["backup_sha256"] = digest.hexdigest()
-        state["backup_bytes"] = archive.stat().st_size
-        phase(state, "staging")
-        run("tar", "-C", "/", "--compare", "-f", archive, stdout=log, stderr=log)
-        with archive.with_suffix(".recovery.json").open("x") as meta:
-            json.dump(
-                {
-                    "postgres_major": 15,
-                    "data": str(OLD_DATA),
-                    "config": str(OLD),
-                    "system_identifier": state["donor_id"],
-                    "original_start_conf": state["old_start"],
-                    "sha256": state["backup_sha256"],
-                    "bytes": state["backup_bytes"],
-                },
-                meta,
-            )
-            meta.flush()
-            os.fsync(meta.fileno())
         ensure_packages()
-        # The archive captured disabled startup while the original remains fenced.
+        # The stager reads the fenced donor only to copy it; it runs PG15 on that private copy.
         print("Restoring and verifying all databases as UTF8.", flush=True)
         pg("python3", STAGER, OLD_DATA, work, stdout=log, stderr=log)
         if not (work / "verified.json").is_file():
@@ -606,7 +555,7 @@ def upgrade(backup, automatic=False):
         atomic(NEW / "start.conf", state["old_start"], 0o644)
         state.pop("seal")
         phase(state, "active")
-        print("PostgreSQL 17 is serving on port 5432. Original cluster and external backup retained.")
+        print("PostgreSQL 17 is serving on port 5432. The original PostgreSQL 15 cluster was retained.", flush=True)
     except BaseException:
         if state["phase"] == "staging":
             state["retry_auto"] = True
@@ -618,6 +567,8 @@ def upgrade(backup, automatic=False):
             phase(state, "publishing")
             rollback()
         raise
+    # Outside the rollback handler: PG17 now serves, so a cleanup failure must never roll it back.
+    clean_staging(state)
 
 
 def rollback():
@@ -626,15 +577,25 @@ def rollback():
         verify_active(15, OLD_DATA)
         return
     # Refuse before fencing PG17: without the donor, rollback would leave both clusters down.
-    if removal(state) is not None:
+    record = removal(state)
+    if record is not None:
+        kept = record["quarantine"]
+        if not os.path.lexists(kept):
+            kept = ""
+        elif record["stage"] == "quarantine":
+            kept = f"; the complete renamed data directory remains at {kept}"
+        else:
+            kept = f"; the partly deleted copy at {kept} was kept"
         raise ValueError(
-            "The PG15 data directory was removed after its Windows backup was verified, so PostgreSQL 17 "
-            f"keeps serving. Restore PG15 by hand from {state['backup']} and its recovery JSON if needed"
+            "An earlier release removed the PG15 data directory after its Windows backup was verified, so "
+            f"PostgreSQL 17 keeps serving. Restore PG15 by hand from {state.get('backup', 'that backup')} "
+            "and its recovery JSON if needed" + kept
         )
     if not (OLD_DATA / "PG_VERSION").is_file():
+        # Only migrations by earlier releases wrote an external backup.
+        source = f" from {state['backup']} and its recovery JSON" if "backup" in state else ""
         raise ValueError(
-            "The PG15 data directory is missing, so rollback changed nothing. Restore it from "
-            f"{state['backup']} and its recovery JSON before rolling back"
+            f"The PG15 data directory is missing, so rollback changed nothing. Restore it{source} before rolling back"
         )
     # Check the donor before fencing PG17, so a replaced PG15 cluster or missing PG15 binaries cannot
     # leave both clusters stopped after the comparison.
@@ -680,8 +641,7 @@ def rollback():
             except Exception:
                 raise ValueError(
                     "PG17 may hold accepted writes but could not be verified or restarted, so PostgreSQL 15 "
-                    "stays stopped. Review the log and the retained clusters before restoring PG15 by hand "
-                    "or from the external backup"
+                    "stays stopped. Review the log and the retained clusters before restoring PG15 by hand"
                 ) from None
             atomic(NEW / "start.conf", state["old_start"], 0o644)
             state.pop("seal", None)
@@ -748,37 +708,6 @@ def automatic_status():
     return "needed"
 
 
-def automatic_upgrade(backup):
-    if automatic_status() != "needed":
-        return
-    if recover():
-        raise ValueError("Recovered interrupted maintenance; retry the update")
-    state = json.loads(STATE.read_text()) if STATE.exists() else {}
-    if state.get("phase") != "active":
-        upgrade(backup, automatic=True)
-        state = json.loads(STATE.read_text())
-    verify_active(17, NEW_DATA)
-    work = Path(state["work"])
-    if work.parent != DATA or not re.fullmatch(r"dwemer-stage-[0-9a-f]{32}", work.name) or work.is_symlink():
-        raise ValueError("Unexpected staging path")
-    if cluster_id(17, NEW_DATA) != state["candidate_id"] or (NEW / "dwemer-maintenance-id").read_text().strip() != work.name:
-        raise ValueError("Unexpected PG17 cleanup target")
-    if not (work / "verified.json").is_file() or not Path(state["backup"]).is_file():
-        raise ValueError("Verified migration or recovery archive is missing")
-    # Keep the original PG15 cluster, external backup, private verification socket and peer HBA for rollback.
-    for item in work.iterdir():
-        if item.name == "source-copy":
-            shutil.rmtree(item)
-        elif item.name == "globals.sql" or re.fullmatch(r"[0-9]+\.dump", item.name):
-            item.unlink()
-    state["cleaned"] = True
-    phase(state, "active")
-
-
-def quarantine_path(state):
-    return OLD_DATA.with_name("." + Path(state["work"]).name + "-pg15-removing")
-
-
 def mounts_within(path):
     target = str(path)
     with open("/proc/self/mountinfo") as table:
@@ -789,168 +718,105 @@ def mounts_within(path):
     return [point for point in points if point == target or point.startswith(target + "/")]
 
 
-def cluster_dirs():
-    listing = run("pg_lsclusters", "--no-header", stdout=subprocess.PIPE, stderr=log, text=True).stdout
-    for line in listing.splitlines():
-        fields = line.split()
-        if len(fields) < 6:
-            raise ValueError("Could not read the PostgreSQL cluster list")
-        yield fields[0], fields[1], Path(os.path.realpath(fields[5]))
-
-
-def donor_tree(root, label="PG15 data directory"):
-    # Map every entry below root to its lstat. Links, special files and other devices stop removal,
-    # because deleting them could reach data that the backup does not hold.
+def plain_tree(root):
+    """Refuse a tree that holds links, special files or another device, before anything below it is deleted."""
     top = os.lstat(root)
-    if not stat.S_ISDIR(top.st_mode):
-        raise ValueError(f"The {label} is missing or linked")
-    entries, pending = {"": top}, [""]
+    pending = [root]
     while pending:
-        relative = pending.pop()
-        with os.scandir(os.path.join(root, relative)) as listing:
+        with os.scandir(pending.pop()) as listing:
             for entry in listing:
-                name = os.path.join(relative, entry.name)
                 info = entry.stat(follow_symlinks=False)
                 if info.st_dev != top.st_dev or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
-                    raise ValueError(f"The {label} holds links, special files or mounts")
-                entries[name] = info
+                    raise ValueError("The staging directory holds links, special files or mounts")
                 if stat.S_ISDIR(info.st_mode):
-                    pending.append(name)
-    return entries
+                    pending.append(entry.path)
 
 
-def config_tree():
-    # The archive's configuration members are the only PG15 settings left to restore with the donor gone.
-    if OLD.is_symlink() or Path(os.path.realpath(OLD)) != OLD:
-        raise ValueError("The retained PG15 configuration is missing or linked")
-    config = donor_tree(OLD, "retained PG15 configuration")
-    if any(
-        name not in config or not stat.S_ISREG(config[name].st_mode)
-        for name in ("postgresql.conf", "pg_hba.conf", "pg_ident.conf", "start.conf")
+def discard_staging(state):
+    """Delete the staging copies of the verified candidate while the original PG15 donor stays in place."""
+    work = Path(state["work"])
+    if (
+        work.parent != DATA or not re.fullmatch(r"dwemer-stage-[0-9a-f]{32}", work.name) or work.is_symlink()
+        or not work.is_dir() or Path(os.path.realpath(work)) != work
     ):
-        raise ValueError("The retained PG15 configuration is incomplete")
-    return config
+        raise ValueError("Unexpected staging path")
+    if (
+        cluster_id(17, NEW_DATA) != state["candidate_id"] or not owns_config(state)
+        or not (work / "verified.json").is_file()
+    ):
+        raise ValueError("Unexpected PG17 cleanup target")
+    if removal(state) is not None:
+        # An earlier release removed the donor, so these copies may hold the last PG15 data in the distro.
+        return
+    # The copies duplicate the donor, the only PG15 recovery source, so delete them only while the
+    # recorded original is still in place.
+    if (
+        OLD_DATA.is_symlink() or Path(os.path.realpath(OLD_DATA)) != OLD_DATA
+        or not (OLD_DATA / "PG_VERSION").is_file() or cluster_id(15, OLD_DATA) != state["donor_id"]
+    ):
+        raise ValueError(
+            "The original PG15 cluster is missing or differs from the saved donor, so the staging copies were kept"
+        )
+    if (
+        (OLD / "start.conf").read_text().strip() != "disabled"
+        or (OLD_DATA / "postmaster.pid").exists() or running(15, OLD_DATA)
+    ):
+        raise ValueError("PostgreSQL 15 is not stopped and disabled, so the staging copies were kept")
+    # rmtree crosses mount points, and bind mounts keep the device number, so consult the mount table too.
+    # A mount below the copies could reach the donor or other data; refuse before deleting anything.
+    if mounts_within(work) or os.lstat(work).st_dev != os.lstat(DATA).st_dev:
+        raise ValueError("The staging directory is or contains a mount point, so the staging copies were kept")
+    # Keep verified.json, the private verification socket and peer HBA for rollback.
+    copy, dumps = None, []
+    for item in work.iterdir():
+        info = os.lstat(item)
+        if item.name == "source-copy":
+            if not stat.S_ISDIR(info.st_mode) or info.st_dev != os.lstat(work).st_dev:
+                raise ValueError("The staging source copy is linked or not a directory, so it was kept")
+            plain_tree(item)
+            copy = item
+        elif item.name == "globals.sql" or re.fullmatch(r"[0-9]+\.dump", item.name):
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError(f"{item} is linked or not a plain file, so the staging copies were kept")
+            dumps.append(item)
+    for item in dumps:
+        item.unlink()
+    if copy is not None:
+        shutil.rmtree(copy)
 
 
-def allocated_bytes(entries):
-    # Allocated blocks, not apparent size. A hard-linked file frees space only when every link goes.
-    links, total = {}, 0
-    for info in entries.values():
-        key = (info.st_dev, info.st_ino)
-        links[key] = links.get(key, 0) + 1
-        if links[key] == (info.st_nlink if stat.S_ISREG(info.st_mode) else 1):
-            total += info.st_blocks * 512
-    return total
+def automatic_upgrade():
+    if automatic_status() != "needed":
+        return
+    if recover():
+        raise ValueError("Recovered interrupted maintenance; retry the update")
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    if state.get("phase") != "active":
+        upgrade(automatic=True)
+    else:
+        # PG17 already serves; an earlier cleanup failed or was interrupted. Retry only the cleanup.
+        clean_staging(state)
 
 
-class Hashed:
-    def __init__(self, raw):
-        self.raw, self.digest, self.size = raw, hashlib.sha256(), 0
-
-    def read(self, size=-1):
-        data = self.raw.read(size)
-        self.digest.update(data)
-        self.size += len(data)
-        return data
-
-
-def signature(info):
-    # ctime moves with every write, chmod, chown, link or rename, even when mtime is set back.
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid, info.st_gid, info.st_size,
-            info.st_mtime_ns, info.st_ctime_ns)
-
-
-def signatures(entries, top=True):
-    return {name: signature(info) for name, info in entries.items() if top or name}
-
-
-def held_backup(raw):
-    # Hash through one descriptor and require the file unchanged across the whole read.
-    held = os.fstat(raw.fileno())
-    if not stat.S_ISREG(held.st_mode):
-        raise ValueError("The Windows backup is not a regular file")
-    return signature(held)
-
-
-def unchanged_backup(raw, held):
-    if signature(os.fstat(raw.fileno())) != held:
-        raise ValueError("The Windows backup changed while it was verified; the PG15 data was kept")
-
-
-def file_digest(path):
-    """Return the SHA-256, size and identity of a file that stayed unchanged while it was read."""
-    with open(path, "rb", opener=nofollow) as raw:
-        held = held_backup(raw)
-        source = Hashed(raw)
-        for _ in iter(lambda: source.read(1024 * 1024), b""):
-            pass
-        unchanged_backup(raw, held)
-    return source.digest.hexdigest(), source.size, held
-
-
-def verify_archive(state, entries, config):
-    """Return the archive SHA-256, size and identity after comparing it with the donor and configuration."""
-    # One streaming pass compares every stopped donor and retained configuration entry with the
-    # archive, so archives written before checksums were journaled are still checked in full.
-    trees = (
-        (str(OLD_DATA.relative_to("/")), OLD_DATA, entries, set()),
-        (str(OLD.relative_to("/")), OLD, config, set()),
-    )
-
-    def differs():
-        return ValueError("The PG15 data directory or configuration differs from its Windows backup")
-
+def clean_staging(state):
+    """Delete the staging copies after cutover. A failure leaves PG17 serving, and the next update retries."""
+    verify_active(17, NEW_DATA)
     try:
-        with open(state["backup"], "rb", opener=nofollow) as raw:
-            held = held_backup(raw)
-            source = Hashed(raw)
-            with tarfile.open(fileobj=source, mode="r|") as archive:
-                for member in archive:
-                    name = member.name.rstrip("/")
-                    if os.path.normpath(name) != name:
-                        raise ValueError("The Windows backup holds an unexpected path")
-                    for prefix, root, tree, seen in trees:
-                        if name == prefix or name.startswith(prefix + "/"):
-                            relative = name[len(prefix) + 1:]
-                            break
-                    else:
-                        raise ValueError("The Windows backup holds files outside the PG15 cluster")
-                    info = tree.get(relative)
-                    if info is None or relative in seen:
-                        raise differs()
-                    seen.add(relative)
-                    if (member.mode & 0o7777, member.uid, member.gid) != (
-                        stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid
-                    ):
-                        raise differs()
-                    if member.isdir() and stat.S_ISDIR(info.st_mode):
-                        continue
-                    if not (member.isreg() and stat.S_ISREG(info.st_mode) and member.size == info.st_size):
-                        raise differs()
-                    stored = archive.extractfile(member)
-                    path = os.path.join(str(root), relative)
-                    with open(path, "rb", opener=nofollow) as disk:
-                        for block in iter(lambda: stored.read(1024 * 1024), b""):
-                            if disk.read(len(block)) != block:
-                                raise differs()
-                        if disk.read(1):
-                            raise differs()
-            for _ in iter(lambda: source.read(1024 * 1024), b""):
-                pass
-            unchanged_backup(raw, held)
-    except tarfile.TarError:
-        raise ValueError("The Windows backup is damaged") from None
-    if "backup_sha256" in state and (source.digest.hexdigest(), source.size) != (
-        state["backup_sha256"], state["backup_bytes"]
-    ):
-        raise ValueError("The Windows backup changed since it was created")
-    if any(set(tree) != seen for _, _, tree, seen in trees):
-        raise ValueError("The Windows backup does not hold the whole PG15 cluster and configuration")
-    return source.digest.hexdigest(), source.size, held
+        discard_staging(state)
+    except Exception as error:
+        raise ValueError(
+            f"PostgreSQL 17 is serving, but cleanup stopped: {error}. The next update retries the cleanup"
+        ) from error
+    state["cleaned"] = True
+    phase(state, "active")
 
 
-def removal(state, repair=False):
-    """Return the journaled donor removal once its quarantine rename may have happened, else None."""
+def quarantine_path(state):
+    return OLD_DATA.with_name("." + Path(state["work"]).name + "-pg15-removing")
+
+
+def removal(state):
+    """Return a donor removal an earlier release journaled once its quarantine rename may have happened, else None."""
     record = state.get("donor_removal")
     if record is None:
         return None
@@ -978,234 +844,38 @@ def removal(state, repair=False):
     info = os.lstat(OLD_DATA) if os.path.lexists(OLD_DATA) else None
     if info is None or [info.st_dev, info.st_ino] != record["inode"]:
         raise ValueError("The PG15 data directories do not match the removal journal")
-    if repair:
-        state.pop("donor_removal")
-        phase(state, state["phase"])
     return None
 
 
-def check_pg17(state):
-    if state.get("phase") != "active":
-        raise ValueError("PostgreSQL 17 is not the active migrated cluster")
-    work = Path(state["work"])
-    if work.parent != DATA or not re.fullmatch(r"dwemer-stage-[0-9a-f]{32}", work.name):
-        raise ValueError("Unrecognized maintenance identity")
-    verify_active(17, NEW_DATA)
-    if (
-        query("/var/run/postgresql", "select system_identifier from pg_control_system()") != state["candidate_id"]
-        or cluster_id(17, NEW_DATA) != state["candidate_id"]
-        or not owns_config(state)
-        or not (work / "verified.json").is_file()
-    ):
-        raise ValueError("PostgreSQL 17 does not match the verified migration")
-
-
-def windows_volume(archive):
-    mount_type = run(
-        "findmnt", "-n", "-o", "FSTYPE", "-T", archive, stdout=subprocess.PIPE, text=True
-    ).stdout.strip()
-    if not str(archive).startswith("/mnt/") or mount_type not in ("drvfs", "9p"):
-        raise ValueError("The Windows backup is not on a mounted Windows volume")
-
-
-def check_backup(state, record=None):
-    """Check the Windows backup and recovery JSON, and return the identity of both."""
-    archive = Path(state["backup"])
-    sidecar = archive.with_suffix(".recovery.json")
-    if archive.is_symlink() or sidecar.is_symlink() or not archive.is_file() or not sidecar.is_file():
-        raise ValueError("The Windows backup or its recovery JSON is missing or linked")
-    windows_volume(archive)
-    with open(sidecar, "rb", opener=nofollow) as stream:
-        held = os.fstat(stream.fileno())
-        if not stat.S_ISREG(held.st_mode) or held.st_size > 1024 * 1024:
-            raise ValueError("The recovery JSON is not a plain file")
-        raw = stream.read()
-    meta = json.loads(raw)
-    if (
-        meta.get("postgres_major"), meta.get("system_identifier"), meta.get("data"), meta.get("config"),
-        meta.get("original_start_conf"),
-    ) != (15, state["donor_id"], str(OLD_DATA), str(OLD), state["old_start"]):
-        raise ValueError("The recovery JSON does not describe this donor")
-    info = os.lstat(archive)
-    if "backup_sha256" in state and (
-        info.st_size != state["backup_bytes"] or meta.get("sha256") != state["backup_sha256"]
-    ):
-        raise ValueError("The Windows backup changed since it was created")
-    if record is not None and info.st_size != record["backup_bytes"]:
-        raise ValueError("The Windows backup changed since it was verified")
-    return signature(info), signature(held), hashlib.sha256(raw).hexdigest()
-
-
-def check_removal(state):
-    check_pg17(state)
-    if OLD_DATA.is_symlink() or not OLD_DATA.is_dir() or Path(os.path.realpath(OLD_DATA)) != OLD_DATA:
-        raise ValueError("The PG15 data directory is missing or linked")
-    if (OLD_DATA / "PG_VERSION").read_text().strip() != "15":
-        raise ValueError("The PG15 data directory holds another PostgreSQL version")
-    if (
-        (OLD / "start.conf").read_text().strip() != "disabled"
-        or (OLD_DATA / "postmaster.pid").exists()
-        or running(15, OLD_DATA)
-    ):
-        raise ValueError("PostgreSQL 15 is not stopped and disabled")
-    control = controldata(15, OLD_DATA)
-    if (control["Database system identifier"], control["Database cluster state"]) != (state["donor_id"], "shut down"):
-        raise ValueError("PostgreSQL 15 is not the cleanly stopped donor recorded for this migration")
-    # Bind mounts keep the device number, so consult the mount table as well.
-    if mounts_within(OLD_DATA) or os.lstat(OLD_DATA).st_dev != os.lstat(OLD_DATA.parent).st_dev:
-        raise ValueError("The PG15 data directory is or contains a mount point")
-    owners = []
-    for version, name, path in cluster_dirs():
-        if path == OLD_DATA or OLD_DATA in path.parents or path in OLD_DATA.parents:
-            owners.append((version, name, path))
-    if owners != [("15", "main", OLD_DATA)]:
-        raise ValueError("Another cluster shares the PG15 data directory, or 15/main uses a different one")
-    entries, config = donor_tree(OLD_DATA), config_tree()
-    return entries, config, check_backup(state)
-
-
-def check_quarantine(record):
-    """Return the tree of a quarantine that is still the journaled donor, or {} once it is gone."""
-    quarantine = Path(record["quarantine"])
-    if not os.path.lexists(quarantine):
-        return {}
-    info = os.lstat(quarantine)
-    if os.path.lexists(OLD_DATA) or not stat.S_ISDIR(info.st_mode) or [info.st_dev, info.st_ino] != record["inode"]:
-        raise ValueError("The PG15 quarantine does not match the removal journal; it was kept")
-    # Something may have been mounted below or registered on the quarantine since the rename.
-    if mounts_within(quarantine) or info.st_dev != os.lstat(quarantine.parent).st_dev:
-        raise ValueError("The PG15 quarantine is or contains a mount point; it was kept")
-    for _, _, path in cluster_dirs():
-        if path == quarantine or quarantine in path.parents or path in quarantine.parents:
-            raise ValueError("A registered cluster uses the PG15 quarantine; it was kept")
-    return donor_tree(quarantine, "PG15 quarantine")
-
-
-def check_resume(state, record):
-    # The journal alone does not prove that PG17 still serves, that the backup is still in place, or
-    # that the quarantine is still the journaled donor.
-    check_pg17(state)
-    backup = check_backup(state, record)
-    return check_quarantine(record), backup
-
-
-def preview_token(state, stage, donor, size, backup):
-    # Bind what the operator was shown from the quick checks alone; the archive is hashed only on removal.
-    bound = {
-        "version": 1, "work": state["work"], "phase": state["phase"], "stage": stage,
-        "candidate_id": state["candidate_id"], "donor_id": state["donor_id"], "donor": donor,
-        "bytes": size, "backup": backup,
-    }
-    return hashlib.sha256(json.dumps(bound, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+REMOVED = "The PG15 data directory was already removed"
 
 
 def cleanup_preview():
-    """Return eligibility, reclaimable bytes, a reason and, when eligible, the token that confirms it."""
+    """Return why the retired donor removal is not eligible. It never is, so there is no token."""
+    # Earlier releases offered to delete the PG15 donor. Core now keeps it, its disabled configuration and
+    # any Windows backup indefinitely, and never resumes or repeats a removal an earlier release journaled.
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
-    if state.get("phase") != "active":
-        return False, 0, "PostgreSQL 17 is not the active migrated cluster", None
-    record = removal(state)
-    if record is not None:
-        if record["stage"] == "removed":
-            return False, 0, "The PG15 data directory was already removed", None
-        left, backup = check_resume(state, record)
-        size = allocated_bytes(left)
-        donor = {"path": record["quarantine"], "inode": record["inode"], "backup_sha256": record["backup_sha256"]}
-        token = preview_token(state, record["stage"], donor, size, backup)
-        return True, size, "An interrupted PG15 removal will finish", token
-    entries, _, backup = check_removal(state)
-    size = allocated_bytes(entries)
-    top = entries[""]
-    donor = {"path": str(OLD_DATA), "inode": [top.st_dev, top.st_ino], "backup_sha256": state.get("backup_sha256")}
-    return True, size, (
-        "Removes only the stopped PG15 data directory after verifying the whole Windows backup again. "
-        "This frees space inside the distro filesystem; the Windows VHDX file keeps its size until compacted"
-    ), preview_token(state, "donor", donor, size, backup)
+    record = removal(state) if state.get("phase") == "active" else None
+    if record is None:
+        return "Core keeps the PostgreSQL 15 data directory and its disabled configuration for recovery"
+    # A removal interrupted after its last deletion never journaled "removed", but nothing is left.
+    if record["stage"] == "removed" or not os.path.lexists(record["quarantine"]):
+        return REMOVED
+    return (
+        f"An earlier release's interrupted PG15 removal left {record['quarantine']}; "
+        "Core no longer removes PostgreSQL 15 data, so it was kept"
+    )
 
 
 def cleanup_pg15(confirm=None):
-    """Remove the verified PG15 donor and return the bytes this call freed."""
+    """Refuse the retired donor removal, keeping the replies older launchers expect."""
+    reason = cleanup_preview()
     if confirm is not None:
-        # The launcher confirms one preview. Recheck it under this lock before anything changes, so a
-        # removal that finished, resumed or whose donor, size or backup changed since is refused.
-        eligible, _, reason, token = cleanup_preview()
-        if not eligible:
-            raise ValueError(f"The cleanup preview is stale ({reason}); nothing was removed. Preview again")
-        if not secrets.compare_digest(token, confirm):
-            raise ValueError(
-                "The cleanup preview is stale: the PG15 donor, its Windows backup or the removal changed since "
-                "it was shown; nothing was removed. Preview again"
-            )
-    if not STATE.exists():
-        raise ValueError("PostgreSQL 17 is not the active migrated cluster")
-    state = json.loads(STATE.read_text())
-    if state["phase"] != "active":
-        raise ValueError("PostgreSQL 17 is not the active migrated cluster")
-    record = removal(state, repair=True)
-    if record is None:
-        entries, config, backup = check_removal(state)
-        digest, size, held = verify_archive(state, entries, config)
-        # The comparison takes long enough for the donor, either cluster or the Windows copy to change.
-        # Recheck them all, and require the hashed file and every compared entry unchanged, ctime included.
-        again, config_again, backup_again = check_removal(state)
-        if (
-            held != backup[0] or backup_again != backup
-            or signatures(again) != signatures(entries) or signatures(config_again) != signatures(config)
-        ):
-            raise ValueError(
-                "The PG15 cluster, its configuration or the Windows backup changed during verification; "
-                "nothing was removed"
-            )
-        quarantine = quarantine_path(state)
-        if os.path.lexists(quarantine):
-            raise ValueError("The PG15 quarantine path already exists")
-        top = entries[""]
-        # Bind every verified archive, including ones written before checksums were journaled, so a
-        # resumed removal can prove the backup unchanged without a donor left to compare against.
-        record = {
-            "stage": "quarantine",
-            "quarantine": str(quarantine),
-            "inode": [top.st_dev, top.st_ino],
-            "bytes": allocated_bytes(entries),
-            "backup_sha256": digest,
-            "backup_bytes": size,
-        }
-        # Journal before the rename, so any interruption either resumes or proves the donor intact.
-        state["donor_removal"] = record
-        phase(state, "active")
-        os.rename(OLD_DATA, quarantine)
-        sync_dir(OLD_DATA.parent)
-        left = entries
-    elif record["stage"] == "removed":
+        raise ValueError(f"The cleanup preview is stale ({reason}); nothing was removed. Preview again")
+    if reason == REMOVED:
+        # A completed removal still reports success, as before, without changing anything.
         return 0
-    else:
-        left, backup = check_resume(state, record)
-        digest, size, held = file_digest(state["backup"])
-        if (digest, size) != (record["backup_sha256"], record["backup_bytes"]):
-            raise ValueError("The Windows backup changed since it was verified")
-        if held != backup[0]:
-            raise ValueError("The Windows backup changed during verification; the PG15 data was kept")
-    # Recheck just before deleting, after the long hash or the rename: PG17 serves, the same Windows copy
-    # and recovery JSON remain, and the quarantine is still the journaled inode with every entry below it
-    # unchanged. The rename itself changes only the top directory's ctime.
-    check_pg17(state)
-    if check_backup(state, record) != backup:
-        raise ValueError("The Windows backup or its recovery JSON changed during verification; the PG15 data was kept")
-    current = check_quarantine(record)
-    if signatures(current, top=False) != signatures(left, top=False):
-        raise ValueError("The PG15 quarantine differs from the verified donor; it was kept")
-    if record["stage"] == "quarantine":
-        record["stage"] = "removing"
-        phase(state, "active")
-    quarantine = Path(record["quarantine"])
-    if current:
-        if not shutil.rmtree.avoids_symlink_attacks:
-            raise ValueError("The PG15 quarantine cannot be removed safely; it was kept")
-        shutil.rmtree(quarantine)
-        sync_dir(quarantine.parent)
-    record["stage"] = "removed"
-    phase(state, "active")
-    return allocated_bytes(left)
+    raise ValueError(f"{reason}; nothing was removed")
 
 
 def lock_distro():
@@ -1240,8 +910,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "action", choices=["status", "auto", "upgrade", "rollback", "recover", "cleanup-preview", "cleanup-pg15"]
     )
-    parser.add_argument("backup", nargs="?", type=Path)
-    parser.add_argument("--confirm-preview", metavar="TOKEN", help="refuse cleanup-pg15 unless this preview is current")
+    # Earlier launchers passed a Windows backup folder to auto and upgrade. It is accepted so they keep
+    # working, and never read, checked or written.
+    parser.add_argument("legacy_backup", nargs="?", help=argparse.SUPPRESS)
+    # cleanup-preview and cleanup-pg15 keep their replies for earlier launchers, but never remove anything.
+    parser.add_argument("--confirm-preview", metavar="TOKEN", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.confirm_preview is not None and (
         args.action != "cleanup-pg15" or not re.fullmatch(r"[0-9a-f]{64}", args.confirm_preview)
@@ -1268,22 +941,18 @@ if __name__ == "__main__":
             except BlockingIOError:
                 raise Busy("Another PostgreSQL maintenance operation is running") from None
             with lock_distro():
-                if args.action not in ("status", "cleanup-preview"):
+                if args.action not in ("status", "cleanup-preview", "cleanup-pg15"):
                     discard_temporaries()
                 if args.action == "status":
                     print(automatic_status())
                 elif args.action == "auto":
-                    automatic_upgrade(args.backup)
+                    automatic_upgrade()
                 elif args.action == "upgrade":
-                    upgrade(args.backup)
+                    upgrade()
                 elif args.action == "recover":
                     recover()
                 elif args.action == "cleanup-preview":
-                    eligible, size, reason, token = cleanup_preview()
-                    result = {"eligible": eligible, "bytes": size, "reason": reason}
-                    if token is not None:
-                        result["token"] = token
-                    print(json.dumps(result))
+                    print(json.dumps({"eligible": False, "bytes": 0, "reason": cleanup_preview()}))
                 elif args.action == "cleanup-pg15":
                     print(json.dumps({"freed_bytes": cleanup_pg15(args.confirm_preview)}))
                 else:
