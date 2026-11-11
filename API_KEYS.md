@@ -36,3 +36,34 @@ Supported authentication checks: OpenRouter, OpenAI, Inworld, Deepgram, Google, 
 Each check has a two-second connection timeout, five-second total HTTP timeout, 128 KiB response limit, no retries/redirects/proxies, verified TLS, and exact saved-origin binding. Keys travel only in provider-specific headers. No generation, model invocation or speech synthesis occurs. Accepted confirms the read-only request was accepted, not model access. HTTP 401/403 reports Rejected (authentication or permission); 429 reports Rate limited; network, timeout, malformed response and other errors report Check failed. Response bodies and curl diagnostics never reach the UI or logs.
 
 `global-test {key_id,revision}` returns only fixed safe result/message fields. The provider catalog and key metadata expose `test_supported` so the launcher does not guess support.
+
+## Consumer socket (`ddistro_keys_api`)
+
+Local products in a sibling WSL distro (currently Reign's `ReignServer` distro) use global keys through one Unix
+socket at `/mnt/wsl/dwemerdistro-keys/keys.sock`, on WSL2's tmpfs shared by distros on the same kernel. There is no
+network listener, Windows exposure or interop. The directory must be root-owned and not group/other-writable or the
+server refuses to start; it never repairs an existing path.
+
+- **Trust:** peer UIDs mean nothing across distros, so each request carries a client token. Enrollment is two-phase
+  and root only (never a socket operation): `ddistro_keys_api register <id> --providers a,b` stages a new token and
+  prints it once with a non-secret stage id beside the current one, `commit <id> --stage <stage>` makes it current
+  once the consumer stored it, and `discard <id> --stage <stage>` drops it after a failed provisioning, so the
+  previous working token is never lost. A second `register` is refused (`stage_pending`) while a stage exists, and a
+  wrong stage id is refused (`stage_mismatch`); a stage left by a crashed run can be dropped explicitly with
+  `discard <id> --abandoned` once it is 10 minutes old. Only SHA-256
+  digests are kept in `/var/lib/dwemerdistro/keys-api/clients.json` (root 0600, atomic replace under a state lock).
+  `revoke <id>` removes the client. Provision the token over stdin straight into the consumer's root-owned file;
+  never through argv, environment or logs.
+- **Operations:** one JSON line per connection (8 KiB max, 10 s timeout, 8 concurrent handlers). `status` returns
+  masked rows and the catalog for the client's providers only. `resolve {key_id, provider, origin}` checks the UUID,
+  provider, exact origin and saved value, then reveals at the current revision; a concurrent change returns `changed`
+  and is never retried. `edit`/`create` reuse the dashboard rail's request shapes, lock and outcomes (`unknown` means
+  reload, never retry). `version` is the only unauthenticated operation. There is no reveal by id, delete, bind, test
+  or import, and no secret or metadata cache.
+- **Lifecycle:** `start_env` and `update.sh` run `ensure` only when a client is enrolled. `ensure` is serialized by a
+  lifecycle lock and starts no other service (PostgreSQL stays with `start_env`; store readiness is reported per
+  request). A running server holds a server lock for its life, so a second `serve` never unlinks the active socket; a
+  stale server is stopped only when its pid's argv is exactly `python3 -I ddistro_keys_api serve`, and replaced only
+  after its exit is confirmed. `hold` runs `ensure` and keeps the distro alive for the
+  consumer's explicit Windows keep-alive session. When this distro is stopped the consumer reports the keys as
+  unavailable; it has no fallback copy.

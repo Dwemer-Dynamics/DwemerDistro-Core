@@ -1,0 +1,511 @@
+#!/usr/bin/python3 -I
+"""Consumer socket for global API keys: enrolled local products (Reign) read masked status, resolve the current
+secret of a key they were bound to, and create/edit keys of their allowed providers.
+
+Root-only. The socket lives on WSL2's shared /mnt/wsl tmpfs so a sibling distro reaches it without a network listener,
+Windows exposure or interop. Peer UIDs mean nothing across distros, so every request carries a client token registered
+by root here (`register` stages it and prints it once; `commit` makes it current; only SHA-256 digests are kept). It
+reuses ddistro_dashboard_keys' trusted loader, readiness check, request shapes, lock and save outcomes, and never runs
+store setup or starts other services. There is no reveal by id, delete, bind, test or import. Nothing but fixed events
+is logged; secrets never reach argv, env or logs.
+"""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import hmac
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import signal
+import socket
+import socketserver
+import stat
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = 1
+SELF = '/usr/local/bin/ddistro_keys_api'
+DASHBOARD = Path('/usr/local/bin/ddistro_dashboard_keys')
+SOCKET_DIR = '/mnt/wsl/dwemerdistro-keys'
+SOCKET = SOCKET_DIR + '/keys.sock'
+STATE = '/var/lib/dwemerdistro/keys-api'
+CLIENTS = STATE + '/clients.json'
+STATE_LOCK = STATE + '/clients.lock'
+PIDFILE = '/run/ddistro-keys-api.pid'
+HOLD_LOCK = '/run/lock/ddistro-keys-api-hold.lock'
+# Lock files are reused, never unlinked or replaced. ensure serializes on LIFECYCLE_LOCK; a server holds SERVER_LOCK for
+# its whole life, so no second serve can unlink the active socket.
+LIFECYCLE_LOCK = '/run/lock/ddistro-keys-api-lifecycle.lock'
+SERVER_LOCK = '/run/lock/ddistro-keys-api-server.lock'
+# The kernel runs the shebang as: python3 -I SELF serve. Nothing else is ever signalled.
+SERVE_CMDLINE = [b'/usr/bin/python3', b'-I', SELF.encode(), b'serve']
+MAX_REQUEST = 8192
+TIMEOUT = 10
+SLOTS = 8
+ID = re.compile(r'[a-z][a-z0-9_-]{0,31}')
+PROVIDER = re.compile(r'[a-z0-9_]{1,32}')
+# The store's origin form: lowercase host, or a bracketed IPv6 literal such as http://[::1]:1234, and an explicit port.
+ORIGIN = re.compile(r'https?://(?:[A-Za-z0-9.-]{1,253}|\[[0-9a-f:.]{2,45}\]):[0-9]{1,5}')
+UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+STAGE = re.compile(r'[0-9a-f]{16}')
+# A stage older than this may be dropped explicitly with `discard <id> --abandoned`; nothing expires it silently.
+STAGE_ABANDONED_AFTER = 600
+
+
+class Refusal(Exception):
+    pass
+
+
+def fail(outcome):
+    return {'ok': False, 'outcome': outcome}
+
+
+def generation():
+    """The installed helper's current hash. A server reports the value it captured at startup, so ensure can tell an
+    outdated process from the file now on disk."""
+    return hashlib.sha256(Path(SELF).read_bytes()).hexdigest() if os.path.exists(SELF) else 'source'
+
+
+def dashboard_module():
+    """The installed dashboard rail as a library, behind the same root-owned trust check as its own key loader."""
+    info = DASHBOARD.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise PermissionError
+    loader = importlib.machinery.SourceFileLoader('ddistro_dashboard_keys_library', str(DASHBOARD))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def trusted_dir(path, create=False, mode=0o755):
+    """Root-owned and not group/other-writable; an existing untrusted directory is refused, never repaired."""
+    if create and not os.path.lexists(path):
+        os.mkdir(path, mode)
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise Refusal('untrusted_socket_dir' if path == SOCKET_DIR else 'untrusted_state')
+
+
+def state_dir():
+    trusted_dir(os.path.dirname(STATE), create=True)
+    trusted_dir(STATE, create=True, mode=0o700)
+
+
+def lock_file(path, blocking=True):
+    """An exclusive flock on a root-owned regular file that is reused, never replaced."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise Refusal('untrusted_lock')
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def load_clients():
+    if not os.path.lexists(CLIENTS):
+        return {}
+    fd = os.open(CLIENTS, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd, 'rb') as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077 or info.st_size > 65536:
+            raise Refusal('state_untrusted')
+        data = json.loads(handle.read())
+    return data if isinstance(data, dict) else {}
+
+
+def save_clients(clients):
+    """Atomic replace from a fresh exclusive temp file in the trusted state directory; callers hold STATE_LOCK."""
+    state_dir()
+    temp = f'{CLIENTS}.{secrets.token_hex(8)}.tmp'
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            json.dump(clients, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, CLIENTS)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp)
+
+
+def authenticate(token):
+    """The enrolled client whose current or staged token digest matches, compared in constant time; None otherwise."""
+    if not isinstance(token, str) or not 20 <= len(token) <= 128:
+        return None
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    found = None
+    for name, entry in load_clients().items():
+        if not isinstance(entry, dict):
+            continue
+        # A staged token works beside the current one until commit/discard, so a failed re-enrollment never strands
+        # the consumer's working token.
+        for field, providers in (('sha256', 'providers'), ('pending_sha256', 'pending_providers')):
+            if isinstance(entry.get(field), str) and hmac.compare_digest(entry[field], digest):
+                found = {'id': name, 'providers': entry.get(providers)}
+    return found
+
+
+class Broker:
+    def __init__(self, dash, serving_generation=None):
+        self.dash = dash
+        self.keys = dash.keys_module()
+        self.generation = serving_generation or generation()
+
+    def listed(self):
+        if not self.dash.ready(self.keys):
+            raise Refusal('not_configured')
+        data = self.dash.listed(self.keys)
+        if not isinstance(data, dict) or not isinstance(data.get('keys'), list) \
+                or not isinstance(data.get('providers'), dict):
+            raise Refusal('unavailable')
+        return data
+
+    def status(self, client):
+        data = self.listed()
+        allowed = set(client['providers'])
+        rows = []
+        for key in data['keys']:
+            row = self.dash.view(key)
+            if row is None:
+                return fail('unavailable')
+            origin = key.get('origin')
+            if row['provider'] in allowed and isinstance(origin, str) and ORIGIN.fullmatch(origin):
+                rows.append(dict(row, origin=origin))
+        providers = [{'provider': name, 'origin': d.get('origin') if isinstance(d, dict) else None}
+                     for name, d in data['providers'].items() if name in allowed]
+        return {'ok': True, 'outcome': 'listed', 'keys': rows, 'providers': providers}
+
+    def resolve(self, client, body):
+        """ddistro_agent.openrouter_key's sequence: status, exact UUID/provider/origin, then reveal at that revision."""
+        if not isinstance(body, dict) or set(body) != {'key_id', 'provider', 'origin'} \
+                or not isinstance(body['key_id'], str) or not UUID.fullmatch(body['key_id']) \
+                or body['provider'] not in client['providers'] or not isinstance(body['origin'], str):
+            return fail('invalid')
+        entry = next((k for k in self.listed()['keys'] if isinstance(k, dict) and k.get('key_id') == body['key_id']), None)
+        if entry is None:
+            return fail('missing')
+        if entry.get('provider') != body['provider'] or entry.get('origin') != body['origin']:
+            return fail('wrong_provider')
+        revision = entry.get('revision')
+        if entry.get('configured') is not True or type(revision) is not int:
+            return fail('not_configured')
+        revealed = self.keys.invoke('global-reveal', {'key_id': body['key_id'], 'revision': revision})
+        if revealed.get('outcome') == 'conflict':
+            return fail('changed')
+        data = revealed.get('data') if revealed.get('ok') is True else None
+        secret = data.get('secret') if isinstance(data, dict) else None
+        if not isinstance(secret, str) or not self.dash.SECRET.fullmatch(secret):
+            return fail('unavailable')
+        return {'ok': True, 'outcome': 'resolved', 'secret': secret, 'revision': revision}
+
+    def write(self, client, body, create):
+        raw = json.dumps(body).encode() if isinstance(body, dict) else b''
+        request = (self.dash.parse_create if create else self.dash.parse_edit)(raw)
+        if request is None:
+            return fail('invalid')
+        data = self.listed()
+        if create:
+            definition = data['providers'].get(request['provider'])
+            if request['provider'] not in client['providers'] or not isinstance(definition, dict):
+                return fail('invalid')
+            origin = request['origin'] or definition.get('origin')
+            provider = request['provider']
+        else:
+            # Edits keep provider/origin; the key itself must belong to an allowed provider.
+            entry = next((k for k in data['keys'] if isinstance(k, dict) and k.get('key_id') == request['key_id']), None)
+            if entry is None:
+                return fail('missing')
+            if entry.get('provider') not in client['providers']:
+                return fail('invalid')
+            origin, provider = entry.get('origin'), entry.get('provider')
+        result = self.dash.save(self.keys, request, create)
+        if result.get('ok') and isinstance(result.get('key'), dict):
+            result['key'] = dict(result['key'], origin=origin, provider=provider)
+        return result
+
+    def handle(self, raw):
+        try:
+            request = json.loads(raw.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError):
+            return fail('invalid')
+        if not isinstance(request, dict) or not isinstance(request.get('op'), str):
+            return fail('invalid')
+        op = request['op']
+        if op == 'version':
+            return {'ok': True, 'outcome': 'version', 'version': VERSION, 'generation': self.generation}
+        try:
+            client = authenticate(request.get('token'))
+        except (OSError, ValueError, Refusal):
+            return fail('unavailable')
+        if client is None or not isinstance(client.get('providers'), list):
+            return fail('unauthorized')
+        body = request.get('body')
+        try:
+            if op == 'status':
+                return self.status(client)
+            if op == 'resolve':
+                return self.resolve(client, body)
+        except Refusal as error:
+            return fail(str(error) if str(error) in ('not_configured',) else 'unavailable')
+        except Exception:
+            return fail('unavailable')
+        if op in ('edit', 'create'):
+            try:
+                return self.write(client, body, op == 'create')
+            except Refusal as error:
+                return fail(str(error) if str(error) == 'not_configured' else 'unavailable')
+            except Exception:
+                # A failure after dispatch may have written; the consumer must reload rather than retry.
+                return fail('unknown')
+        return fail('invalid')
+
+
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        server = self.server
+        if not server.slots.acquire(blocking=False):
+            self.reply(fail('busy'))
+            return
+        try:
+            self.request.settimeout(TIMEOUT)
+            raw = b''
+            while len(raw) <= MAX_REQUEST and not raw.endswith(b'\n'):
+                chunk = self.request.recv(4096)
+                if not chunk:
+                    break
+                raw += chunk
+            self.reply(fail('invalid') if len(raw) > MAX_REQUEST else server.broker.handle(raw))
+        except Exception:
+            # Never log the request, its token or a traceback whose frames could hold them.
+            self.reply(fail('unavailable'))
+        finally:
+            server.slots.release()
+
+    def reply(self, result):
+        with contextlib.suppress(OSError):
+            self.request.sendall(json.dumps(result).encode() + b'\n')
+
+
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # socketserver's default prints a traceback; its frames can carry request payloads.
+        print(json.dumps({'event': 'handler_error'}), flush=True)
+
+
+def call(request, timeout=5):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(SOCKET)
+        sock.sendall(json.dumps(request).encode() + b'\n')
+        data = b''
+        while not data.endswith(b'\n') and len(data) < 65536:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    return json.loads(data)
+
+
+def serve():
+    serving_generation = generation()
+    # Held for the process lifetime: only the holder may unlink and rebind the socket.
+    try:
+        server_lock = lock_file(SERVER_LOCK, blocking=False)
+    except BlockingIOError:
+        raise Refusal('already_running')
+    trusted_dir(SOCKET_DIR, create=True)
+    if os.path.lexists(SOCKET):
+        info = os.lstat(SOCKET)
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0:
+            raise Refusal('untrusted_socket')
+        os.unlink(SOCKET)
+    server = Server(SOCKET, Handler)
+    # Token-authenticated; the socket must be connectable by the consumer's service account in its own distro.
+    os.chmod(SOCKET, 0o666)
+    server.slots = threading.BoundedSemaphore(SLOTS)
+    server.broker = Broker(dashboard_module(), serving_generation)
+    server.lock_fd = server_lock
+    fd = os.open(PIDFILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+    print(json.dumps({'event': 'started', 'pid': os.getpid()}), flush=True)
+    server.serve_forever()
+
+
+def running():
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        reply = call({'op': 'version'}, 2)
+        return reply.get('version') == VERSION and reply.get('generation') == generation()
+    return False
+
+
+def owned_server(pid, proc='/proc', owner=0):
+    """A root process whose argv is exactly this helper's serve; anything else is never signalled."""
+    with contextlib.suppress(OSError):
+        return os.stat(f'{proc}/{pid}').st_uid == owner and \
+            Path(f'{proc}/{pid}/cmdline').read_bytes().rstrip(b'\0').split(b'\0') == SERVE_CMDLINE
+    return False
+
+
+def stop_owned(proc='/proc', kill=os.kill, wait=5.0, owner=0):
+    """Stop a stale server named by the pidfile, only when it is this helper's serve, and wait for its exit."""
+    try:
+        pid = int(Path(PIDFILE).read_text().strip())
+    except (OSError, ValueError):
+        return
+    if pid <= 1 or not owned_server(pid, proc, owner):
+        return
+    kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + wait
+    while owned_server(pid, proc, owner):
+        if time.monotonic() > deadline:
+            raise Refusal('stale_server_did_not_exit')
+        time.sleep(0.05)
+
+
+def ensure():
+    """Serialized. Keeps a current server, or replaces a stale one after its verified exit. Starts no other service:
+    PostgreSQL stays with start_env, and store readiness is reported per request (not_configured/unavailable)."""
+    lifecycle = lock_file(LIFECYCLE_LOCK)
+    try:
+        if running():
+            return
+        stop_owned()
+        # A live (possibly unresponsive) holder keeps its socket; never start a second server underneath it.
+        try:
+            os.close(lock_file(SERVER_LOCK, blocking=False))
+        except BlockingIOError:
+            raise Refusal('server_busy')
+        state_dir()
+        log = os.open(STATE + '/service.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(log, 'ab') as output:
+            child = subprocess.Popen([SELF, 'serve'], stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                     start_new_session=True, close_fds=True, env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'})
+        for _ in range(50):
+            if running():
+                return
+            if child.poll() is not None:
+                break
+            time.sleep(0.1)
+        raise Refusal('start_failed')
+    finally:
+        os.close(lifecycle)
+
+
+def hold():
+    """Keep the store distro alive for a consumer: ensure, then sleep under a lock owned by this session. With a holder
+    already present this still ensures (recovering a crashed or outdated server) and exits, so exactly one hold remains."""
+    try:
+        fd = lock_file(HOLD_LOCK, blocking=False)
+    except BlockingIOError:
+        fd = None
+    ensure()
+    if fd is None:
+        return 0
+    while fd:
+        time.sleep(3600)
+
+
+def manage(command, client, providers, clients, stage=None, abandoned=False, now=None):
+    """Two-phase enrollment. register stages one token beside the current one and returns its stage id; commit promotes
+    and discard drops only that stage, so concurrent runs never commit each other's token. A second register is refused
+    while a stage exists; `discard --abandoned` drops a stage only after STAGE_ABANDONED_AFTER. Nothing is retried."""
+    now = time.time() if now is None else now
+    entry = clients.get(client) if isinstance(clients.get(client), dict) else {}
+    pending = entry.get('pending_stage') if entry.get('pending_sha256') else None
+    if command == 'register':
+        names = sorted(set(providers.split(',')))
+        if not names or len(names) > 32 or not all(PROVIDER.fullmatch(p) for p in names):
+            raise Refusal('invalid_providers')
+        if entry.get('pending_sha256'):
+            raise Refusal('stage_pending')
+        token, stage = secrets.token_urlsafe(32), secrets.token_hex(8)
+        clients[client] = dict(entry, pending_sha256=hashlib.sha256(token.encode()).hexdigest(), pending_providers=names,
+                               pending_stage=stage, pending_created=int(now))
+        save_clients(clients)
+        return {'client': client, 'token': token, 'stage': stage, 'socket': SOCKET, 'providers': names}
+    if command in ('commit', 'discard'):
+        if not entry.get('pending_sha256'):
+            raise Refusal('nothing_staged')
+        if abandoned and command == 'discard':
+            created = entry.get('pending_created')
+            if type(created) is not int or now - created < STAGE_ABANDONED_AFTER:
+                raise Refusal('stage_active')
+        elif not (isinstance(stage, str) and isinstance(pending, str) and hmac.compare_digest(stage, pending)):
+            raise Refusal('stage_mismatch')
+    if command == 'commit':
+        clients[client] = {'sha256': entry['pending_sha256'], 'providers': entry['pending_providers']}
+    elif command == 'discard':
+        kept = {k: v for k, v in entry.items() if not k.startswith('pending_')}
+        if kept.get('sha256'):
+            clients[client] = kept
+        else:
+            clients.pop(client, None)
+    else:
+        clients.pop(client, None)
+    save_clients(clients)
+    return {command: True}
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__)
+    subs = parser.add_subparsers(dest='command', required=True)
+    for name in ('serve', 'ensure', 'hold', 'clients'):
+        subs.add_parser(name)
+    register = subs.add_parser('register', help='root: stage a consumer token; it is printed once')
+    register.add_argument('client')
+    register.add_argument('--providers', required=True)
+    for name in ('commit', 'discard', 'revoke'):
+        sub = subs.add_parser(name)
+        sub.add_argument('client')
+        if name != 'revoke':
+            sub.add_argument('--stage', type=lambda v: v if STAGE.fullmatch(v) else parser.error('invalid stage'))
+    subs.choices['discard'].add_argument('--abandoned', action='store_true',
+                                         help=f'drop a stage older than {STAGE_ABANDONED_AFTER} s left by a crashed run')
+    args = parser.parse_args(argv)
+    if os.geteuid() != 0:
+        raise Refusal('root_required')
+    if args.command == 'serve':
+        return serve()
+    if args.command == 'ensure':
+        ensure()
+        print('{"ready":true}')
+        return 0
+    if args.command == 'hold':
+        return hold()
+    if args.command == 'clients':
+        # Exit 0 only when a committed consumer exists; start_env uses this to decide whether to run ensure.
+        return 0 if any(isinstance(e, dict) and e.get('sha256') for e in load_clients().values()) else 3
+    if not ID.fullmatch(args.client):
+        raise Refusal('invalid_client')
+    state_dir()
+    lock = lock_file(STATE_LOCK)
+    try:
+        print(json.dumps(manage(args.command, args.client, getattr(args, 'providers', ''), load_clients(),
+                                getattr(args, 'stage', None), getattr(args, 'abandoned', False))))
+    finally:
+        os.close(lock)
+    return 0
+
+
+if __name__ == '__main__':
+    os.umask(0o022)
+    try:
+        sys.exit(main(sys.argv[1:]) or 0)
+    except (Refusal, OSError, ValueError, BlockingIOError) as error:
+        sys.stderr.write(json.dumps({'error': str(error) if isinstance(error, Refusal) else 'unavailable'}) + '\n')
+        sys.exit(1)

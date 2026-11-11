@@ -134,6 +134,11 @@ if [ $? -eq 0 ]; then
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_keys /usr/local/bin/ddistro_keys || exit 1
     # Dashboard API Keys rail: masked status, existing-key edits, new catalog keys and saved-key tests, through one exact four-verb root rule.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_dashboard_keys /usr/local/bin/ddistro_dashboard_keys || exit 1
+    # Global API Keys consumer socket (/mnt/wsl); ensure restarts a stale server only when a consumer is enrolled.
+    install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_keys_api /usr/local/bin/ddistro_keys_api || exit 1
+    if /usr/local/bin/ddistro_keys_api clients; then
+        /usr/local/bin/ddistro_keys_api ensure >/dev/null || echo "Global API Keys consumer socket did not restart; run ddistro_keys_api ensure."
+    fi
     dashboard_keys_rule=$(mktemp) || exit 1
     printf '%s\n' 'www-data ALL=(root) NOPASSWD: /usr/local/bin/ddistro_dashboard_keys status, /usr/local/bin/ddistro_dashboard_keys edit, /usr/local/bin/ddistro_dashboard_keys create, /usr/local/bin/ddistro_dashboard_keys test' > "$dashboard_keys_rule"
     CURRENT_STEP="validating and installing the dashboard keys sudoers rule"
