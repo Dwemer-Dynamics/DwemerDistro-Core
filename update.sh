@@ -70,6 +70,16 @@ if [ -f "$DWEMER_GIT_CONFIG" ] && ! command -v git-credential-manager >/dev/null
     fi
 fi
 
+# An abrupt stop during PostgreSQL 17 maintenance can leave both clusters stopped, and this update
+# starts PostgreSQL and needs SQL below. Recover first: the helper takes the maintenance lock
+# exclusively, so it runs before the shared lock, from the source because the installed copy may
+# predate this action. It exits at once unless the journal records an unfinished phase.
+print_step "Checking for interrupted PostgreSQL maintenance"
+if ! /usr/bin/python3 /home/dwemer/dwemerdistro/bin/ddistro_pg17_maintenance recover; then
+    print_error "Interrupted PostgreSQL maintenance could not be recovered automatically."
+    exit 1
+fi
+
 MAINTENANCE_LOCK="/run/lock/dwemerdistro-maintenance.lock"
 
 # Hold the common maintenance lock shared on fd 7. ddistro changes apply/rollback take it

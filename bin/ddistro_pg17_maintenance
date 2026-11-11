@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -26,6 +27,9 @@ OLD_DATA = DATA / "15/main"
 NEW_DATA = DATA / "17/dwemer"
 PG = Path("/usr/lib/postgresql/17/bin")
 STAGER = "/usr/local/bin/ddistro_stage_pg17"
+# A failure that repeats is deterministic (for example invalid SQL_ASCII bytes). Each attempt stops
+# PG15, writes a full Windows backup and retains its staging copy, so stop retrying unattended.
+AUTO_ATTEMPTS = 2
 
 
 def run(*args, **kwargs):
@@ -132,11 +136,18 @@ def fingerprint(state):
                             order by datname collate "C") from pg_database""",
             )
         )
-        digest = hashlib.sha256()
-        digest.update(json.dumps(names).encode())
+        # Format 2 skips the version header comments; the legacy digest covers every byte, as
+        # baselines recorded before format 2 did.
+        digest, legacy = hashlib.sha256(), hashlib.sha256()
+
+        def update(data):
+            digest.update(data)
+            legacy.update(data)
+
+        update(json.dumps(names).encode())
         for path in sorted([NEW_DATA / "postgresql.auto.conf", *NEW.rglob("*")]):
             if path != NEW / "start.conf" and path.is_file():
-                digest.update(json.dumps([str(path), hashlib.sha256(path.read_bytes()).hexdigest()]).encode())
+                update(json.dumps([str(path), hashlib.sha256(path.read_bytes()).hexdigest()]).encode())
         command = ["/usr/sbin/runuser", "-u", "postgres", "--"]
         for db, opened in [(None, True)] + names:
             quoted = '"' + (db or "").replace('"', '""') + '"'
@@ -163,20 +174,29 @@ def fingerprint(state):
                     stdout=subprocess.PIPE,
                     stderr=log,
                 ) as process:
+                    # Package minor updates change only these header comments, not the data. Read
+                    # the header with bounded lines, then hash fixed blocks so no row is held whole.
+                    for _ in range(12):
+                        line = process.stdout.readline(4096)
+                        legacy.update(line)
+                        if not (line.startswith(b"-- Dumped ") and line.endswith(b"\n")):
+                            digest.update(line)
+                        if not line.endswith(b"\n"):
+                            break
                     for block in iter(lambda: process.stdout.read(1024 * 1024), b""):
-                        digest.update(block)
+                        update(block)
                     if process.wait():
                         raise ValueError("Could not verify rollback data")
             finally:
                 if not opened:
                     query(private, "ALTER DATABASE " + quoted + " ALLOW_CONNECTIONS false")
                     pending.unlink()
-        return digest.hexdigest()
+        return digest.hexdigest(), legacy.hexdigest()
     finally:
         pg(pg_ctl, "-D", NEW_DATA, "-m", "fast", "-w", "stop", stdout=log, stderr=log)
 
 
-def cluster_id(version, directory):
+def controldata(version, directory):
     control = run(
         f"/usr/lib/postgresql/{version}/bin/pg_controldata",
         directory,
@@ -184,11 +204,32 @@ def cluster_id(version, directory):
         stdout=subprocess.PIPE,
         text=True,
     ).stdout
-    return next(
-        line.split(":", 1)[1].strip()
-        for line in control.splitlines()
-        if line.startswith("Database system identifier:")
+    return dict((part.strip() for part in line.split(":", 1)) for line in control.splitlines() if ":" in line)
+
+
+def cluster_id(version, directory):
+    return controldata(version, directory)["Database system identifier"]
+
+
+def seal():
+    # PostgreSQL records production state in pg_control before it accepts any connection, and every
+    # later shutdown writes a new checkpoint. An unchanged clean shutdown proves no client wrote to PG17.
+    control = controldata(17, NEW_DATA)
+    keys = ("Database system identifier", "Latest checkpoint location", "Latest checkpoint's REDO location",
+            "Time of latest checkpoint", "Database cluster state")
+    return [control[key] for key in keys]
+
+
+def running(version, directory):
+    # pg_ctl checks the postmaster process, so a pid file left by power loss reads as stopped.
+    status = subprocess.run(
+        ["/usr/sbin/runuser", "-u", "postgres", "--", f"/usr/lib/postgresql/{version}/bin/pg_ctl",
+         "-D", directory, "status"],
+        stdout=log, stderr=log,
     )
+    if status.returncode not in (0, 3):
+        raise ValueError(f"Could not determine PG{version} cluster status")
+    return status.returncode == 0
 
 
 def restore_old(state):
@@ -197,7 +238,7 @@ def restore_old(state):
     if NEW.exists():
         atomic(NEW / "start.conf", "disabled\n", 0o644)
     atomic(OLD / "start.conf", "manual\n", 0o644)
-    if not (OLD_DATA / "postmaster.pid").exists():
+    if not running(15, OLD_DATA):
         cluster(15, "start")
     verify_active(15, OLD_DATA)
     atomic(OLD / "start.conf", state["old_start"], 0o644)
@@ -300,10 +341,19 @@ def ensure_packages():
         raise ValueError("PostgreSQL 17 prerequisites are incomplete")
 
 
-def upgrade(backup):
+def allow_retry():
+    state = json.loads(STATE.read_text())
+    state["retry_auto"] = True
+    phase(state, "rolled-back")
+
+
+def upgrade(backup, automatic=False):
+    attempts = 0
     if STATE.exists():
         previous = json.loads(STATE.read_text())
         if previous["phase"] == "rolled-back":
+            if automatic:
+                attempts = previous.get("auto_attempts", 0)
             verify_active(15, OLD_DATA)
             tag = Path(previous["work"]).name
             if not re.fullmatch(r"dwemer-stage-[0-9a-f]{32}", tag):
@@ -362,6 +412,7 @@ def upgrade(backup):
         "old_start": (OLD / "start.conf").read_text(),
         "key": secrets.token_hex(32),
         "donor_id": query("/var/run/postgresql", "select system_identifier from pg_control_system()"),
+        "auto_attempts": attempts + 1 if automatic else 0,
     }
     phase(state, "staging")
     try:
@@ -404,8 +455,10 @@ def upgrade(backup):
         if not NEW.parent.exists():
             NEW.parent.mkdir()
             NEW.parent.chmod(0o755)
-        shutil.copytree(OLD, NEW)
+        # Mark the directory before copying so an interrupted copy is still recognized as ours.
+        NEW.mkdir()
         atomic(NEW / "dwemer-maintenance-id", work.name, 0o600)
+        shutil.copytree(OLD, NEW, dirs_exist_ok=True)
         for item in (NEW, *NEW.rglob("*")):
             if item.name == "dwemer-maintenance-id":
                 continue
@@ -419,18 +472,29 @@ def upgrade(backup):
             ("port", "5432"),
         ):
             run("pg_conftool", "17", "dwemer", "set", key, value, stdout=log, stderr=log)
-        state["baseline"] = fingerprint(state)
+        state["baseline"], _ = fingerprint(state)
+        state["baseline_format"] = 2
+        state["seal"] = seal()
+        if state["seal"][-1] != "shut down":
+            raise ValueError("PG17 candidate did not shut down cleanly after verification")
         phase(state, "publishing")
         atomic(NEW / "start.conf", "manual\n", 0o644)
         cluster(17, "start")
         verify_active(17, NEW_DATA)
         atomic(NEW / "start.conf", state["old_start"], 0o644)
+        state.pop("seal")
         phase(state, "active")
         print("PostgreSQL 17 is serving on port 5432. Original cluster and external backup retained.")
     except BaseException:
         if state["phase"] == "staging":
             state["retry_auto"] = True
             restore_old(state)
+        elif state["phase"] == "publishing":
+            # PG15 is fenced and PG17 failed to come up; do not leave both clusters down. Journal the
+            # retry first so an interrupted rollback still resumes as a failed automatic attempt.
+            state["retry_auto"] = True
+            phase(state, "publishing")
+            rollback()
         raise
 
 
@@ -440,11 +504,20 @@ def rollback():
         verify_active(15, OLD_DATA)
         return
     if state["phase"] in ("active", "publishing", "checking"):
-        status = subprocess.run(
-            ["/usr/sbin/runuser", "-u", "postgres", "--", PG / "pg_ctl", "-D", NEW_DATA, "status"],
-            stdout=log, stderr=log,
-        )
-        if status.returncode == 0:
+        if (
+            cluster_id(17, NEW_DATA) != state["candidate_id"]
+            or (NEW / "dwemer-maintenance-id").read_text().strip() != Path(state["work"]).name
+        ):
+            raise ValueError("The PG17 cluster differs from the maintenance journal")
+        is_running = running(17, NEW_DATA)
+        if state["phase"] != "active" and "seal" in state and not is_running and seal() == state["seal"]:
+            # Never started since the verified shutdown, so it accepted no writes. Starting it to
+            # compare could itself fail and strand PG15, so retain it untouched.
+            atomic(NEW / "start.conf", "disabled\n", 0o644)
+            restore_old(state)
+            print("PostgreSQL 15 is serving on port 5432. The unpublished PG17 candidate was retained.")
+            return
+        if is_running:
             private = Path(state["work"]) / "s17"
             if (private / ".s.PGSQL.5432").is_socket():
                 if query(private, "select system_identifier from pg_control_system()") != state["candidate_id"]:
@@ -453,12 +526,11 @@ def rollback():
             else:
                 verify_active(17, NEW_DATA)
                 cluster(17, "stop")
-        elif status.returncode != 3:
-            raise ValueError("Could not determine PG17 cluster status")
         atomic(NEW / "start.conf", "disabled\n", 0o644)
         phase(state, "checking")
         try:
-            if fingerprint(state) != state["baseline"]:
+            current, legacy = fingerprint(state)
+            if (current if state.get("baseline_format") == 2 else legacy) != state["baseline"]:
                 raise ValueError(
                     "PG17 data or permissions changed. Rollback refused to preserve those writes."
                 )
@@ -467,10 +539,19 @@ def rollback():
                 raise ValueError(
                     "Verification interrupted; recover the recorded database restriction before restart"
                 )
-            atomic(NEW / "start.conf", "manual\n", 0o644)
-            cluster(17, "start")
-            verify_active(17, NEW_DATA)
+            try:
+                atomic(NEW / "start.conf", "manual\n", 0o644)
+                cluster(17, "start")
+                verify_active(17, NEW_DATA)
+            except Exception:
+                raise ValueError(
+                    "PG17 may hold accepted writes but could not be verified or restarted, so PostgreSQL 15 "
+                    "stays stopped. Review the log and the retained clusters before restoring PG15 by hand "
+                    "or from the external backup"
+                ) from None
             atomic(NEW / "start.conf", state["old_start"], 0o644)
+            state.pop("seal", None)
+            state.pop("retry_auto", None)
             phase(state, "active")
             raise
     elif state["phase"] != "staging":
@@ -479,15 +560,52 @@ def rollback():
     print("PostgreSQL 15 is serving on port 5432. PG17 was retained.")
 
 
+def settled():
+    return not STATE.exists() or json.loads(STATE.read_text())["phase"] in ("active", "rolled-back")
+
+
+def recover():
+    # An abrupt stop mid-maintenance can leave both clusters fenced, so update.sh runs this before
+    # it starts PostgreSQL or needs SQL. Settled journals are left alone without any cluster access.
+    if settled():
+        return False
+    state = json.loads(STATE.read_text())
+    work = Path(state["work"])
+    if work.parent != DATA or not re.fullmatch(r"dwemer-stage-[0-9a-f]{32}", work.name):
+        raise ValueError("Unrecognized interrupted maintenance identity")
+    # An interrupted upgrade counts as a failed automatic attempt; an interrupted explicit rollback stays held.
+    retry = state["phase"] in ("staging", "publishing") or state.get("retry_auto")
+    try:
+        rollback()
+    except Exception:
+        # A candidate that changed after publication keeps serving; its writes are the newer data.
+        if json.loads(STATE.read_text())["phase"] == "active":
+            verify_active(17, NEW_DATA)
+            print("Recovered interrupted maintenance. PostgreSQL 17 accepted writes and keeps serving.")
+            return True
+        raise
+    if retry:
+        allow_retry()
+    return True
+
+
 def automatic_status():
     if STATE.exists():
         state = json.loads(STATE.read_text())
         if state["phase"] == "active":
             verify_active(17, NEW_DATA)
             return "current" if state.get("cleaned") else "needed"
-        if state["phase"] == "rolled-back" and not state.get("retry_auto"):
+        if state["phase"] == "rolled-back":
             verify_active(15, OLD_DATA)
-            return "held"
+            # Held means an operator chose PG15. Exhausted retries stay a failure until one decides.
+            if not state.get("retry_auto"):
+                return "held"
+            if state.get("auto_attempts", 0) >= AUTO_ATTEMPTS:
+                raise ValueError(
+                    f"The automatic PostgreSQL 17 upgrade failed {AUTO_ATTEMPTS} times and PostgreSQL 15 "
+                    "is serving. Review the log, then in Settings > Database Maintenance choose Upgrade "
+                    "to try again or Roll back to stay on PostgreSQL 15"
+                )
         return "needed"
     if not (OLD_DATA / "PG_VERSION").is_file():
         return "unsupported"
@@ -498,12 +616,11 @@ def automatic_status():
 def automatic_upgrade(backup):
     if automatic_status() != "needed":
         return
-    state = json.loads(STATE.read_text()) if STATE.exists() else {}
-    if state and state["phase"] not in ("active", "rolled-back"):
-        rollback()
+    if recover():
         raise ValueError("Recovered interrupted maintenance; retry the update")
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
     if state.get("phase") != "active":
-        upgrade(backup)
+        upgrade(backup, automatic=True)
         state = json.loads(STATE.read_text())
     verify_active(17, NEW_DATA)
     work = Path(state["work"])
@@ -550,12 +667,22 @@ def lock_distro():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["status", "auto", "upgrade", "rollback"])
+    parser.add_argument("action", choices=["status", "auto", "upgrade", "rollback", "recover"])
     parser.add_argument("backup", nargs="?", type=Path)
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("root required")
     os.umask(0o077)
+    # Every update calls recover while other maintenance may hold the shared lock; skip settled journals.
+    if args.action == "recover" and settled():
+        sys.exit(0)
+
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt("maintenance interrupted")
+
+    # Closing the launcher must run the PG15 recovery path rather than leave it fenced.
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (ROOT / "lock").open("a") as lock, (ROOT / "maintenance.log").open("ab") as log:
         try:
@@ -567,6 +694,8 @@ if __name__ == "__main__":
                     automatic_upgrade(args.backup)
                 elif args.action == "upgrade":
                     upgrade(args.backup)
+                elif args.action == "recover":
+                    recover()
                 else:
                     rollback()
                     state = json.loads(STATE.read_text())
