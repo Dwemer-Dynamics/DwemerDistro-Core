@@ -438,6 +438,10 @@ def upgrade(automatic=False):
     attempts = 0
     if STATE.exists():
         previous = json.loads(STATE.read_text())
+        if previous.get("phase") == "active" and not previous.get("cleaned"):
+            # The verified PG17 already serves; an Upgrade retries only its staging cleanup.
+            cleanup_staging()
+            return
         if previous["phase"] == "rolled-back":
             if automatic:
                 attempts = previous.get("auto_attempts", 0)
@@ -612,6 +616,9 @@ def rollback():
             restore_old(state, fallback=True)
             print("PostgreSQL 15 is serving on port 5432. The unpublished PG17 candidate was retained.")
             return
+        # Journal the rollback before PG17 is stopped or disabled. An abrupt stop from here on leaves an
+        # unfinished phase, so the next update compares PG17 and keeps it serving if it accepted writes.
+        phase(state, "checking")
         if is_running:
             private = Path(state["work"]) / "s17"
             if (private / ".s.PGSQL.5432").is_socket():
@@ -622,7 +629,6 @@ def rollback():
                 verify_active(17, NEW_DATA)
                 cluster(17, "stop")
         atomic(NEW / "start.conf", "disabled\n", 0o644)
-        phase(state, "checking")
         try:
             current, legacy = fingerprint(state)
             if (current if state.get("baseline_format") == 2 else legacy) != state["baseline"]:
@@ -670,6 +676,11 @@ def recover():
         raise ValueError("Unrecognized interrupted maintenance identity")
     # An interrupted upgrade counts as a failed automatic attempt; an interrupted explicit rollback stays held.
     retry = state["phase"] in ("staging", "publishing") or state.get("retry_auto")
+    if retry and not state.get("retry_auto"):
+        # Journal it first: the rollback below moves past staging or publishing, and a recovery that is
+        # itself interrupted must still resume as a failed automatic attempt, not as a held rollback.
+        state["retry_auto"] = True
+        phase(state, state["phase"])
     try:
         rollback()
     except Exception:
@@ -687,9 +698,15 @@ def recover():
 def automatic_status():
     if STATE.exists():
         state = json.loads(STATE.read_text())
-        if state["phase"] == "active":
+        if state.get("phase") == "active":
             verify_active(17, NEW_DATA)
-            return "current" if state.get("cleaned") else "needed"
+            if state.get("cleaned"):
+                return "current"
+            # The verified PG17 already serves; only its staging copies remain, so never stage again.
+            cleanup_target(state)
+            return "cleanup-needed"
+        if state.get("phase") not in ("staging", "publishing", "checking", "rolled-back"):
+            raise ValueError("Unknown migration state; nothing was changed")
         if state["phase"] == "rolled-back":
             verify_active(15, OLD_DATA)
             # Held means an operator chose PG15. Exhausted retries stay a failure until one decides.
@@ -786,15 +803,31 @@ def discard_staging(state):
 
 
 def automatic_upgrade():
-    if automatic_status() != "needed":
-        return
-    if recover():
-        raise ValueError("Recovered interrupted maintenance; retry the update")
+    status = automatic_status()
+    if status == "cleanup-needed":
+        # PG17 already serves; an earlier cleanup failed or was interrupted. Retry only the cleanup.
+        cleanup_staging()
+    elif status == "needed":
+        if recover():
+            raise ValueError("Recovered interrupted maintenance; retry the update")
+        upgrade(automatic=True)
+
+
+def cleanup_target(state):
+    """Refuse unless the serving PG17 is the journaled candidate with its marked configuration."""
+    if cluster_id(17, NEW_DATA) != state.get("candidate_id") or not owns_config(state):
+        raise ValueError("The PG17 cluster or configuration differs from the maintenance journal; nothing was changed")
+
+
+def cleanup_staging():
+    """Retry only the staging cleanup of the serving verified PG17. Idempotent; never stages or rolls back."""
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
     if state.get("phase") != "active":
-        upgrade(automatic=True)
-    else:
-        # PG17 already serves; an earlier cleanup failed or was interrupted. Retry only the cleanup.
+        raise ValueError("No serving PostgreSQL 17 migration is recorded, so nothing was cleaned or upgraded")
+    verify_active(17, NEW_DATA)
+    cleanup_target(state)
+    # A completed cleanup leaves the journal as it is.
+    if not state.get("cleaned"):
         clean_staging(state)
 
 
@@ -908,7 +941,9 @@ def lock_distro():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "action", choices=["status", "auto", "upgrade", "rollback", "recover", "cleanup-preview", "cleanup-pg15"]
+        "action",
+        choices=["status", "auto", "upgrade", "cleanup-staging", "rollback", "recover", "cleanup-preview",
+                 "cleanup-pg15"],
     )
     # Earlier launchers passed a Windows backup folder to auto and upgrade. It is accepted so they keep
     # working, and never read, checked or written.
@@ -949,6 +984,8 @@ if __name__ == "__main__":
                     automatic_upgrade()
                 elif args.action == "upgrade":
                     upgrade()
+                elif args.action == "cleanup-staging":
+                    cleanup_staging()
                 elif args.action == "recover":
                     recover()
                 elif args.action == "cleanup-preview":

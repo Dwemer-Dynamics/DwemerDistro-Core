@@ -36,7 +36,7 @@ class Journal(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         base = Path(temp.name)
-        paths = {"STATE": base / "state.json", "DATA": base, "OLD_DATA": base / "15" / "main",
+        paths = {"ROOT": base, "STATE": base / "state.json", "DATA": base, "OLD_DATA": base / "15" / "main",
                  "NEW_DATA": base / "17" / "dwemer", "OLD": base / "etc15", "NEW": base / "17"}
         for key, value in paths.items():
             patcher = patch.object(m, key, value)
@@ -133,6 +133,71 @@ class Journal(unittest.TestCase):
         message, calls, _, state = self.rollback_with(set(), pg15_running=True)
         self.assertIn("could not be confirmed stopped, so PostgreSQL 17 stays stopped", message)
         self.assertEqual((calls, state["phase"]), ([(15, "stop")], "checking"))
+
+    def crash_then_recover(self, first, boundary, changed, **journal):
+        # first() is killed right after the boundary event; the next update's recover() must leave one cluster
+        # serving. up models which cluster runs on the application socket.
+        m.OLD.mkdir(exist_ok=True)
+        (m.OLD / "start.conf").write_text("disabled\n")
+        (m.NEW / "start.conf").write_text("auto\n")
+        self.journal(**dict(dict(phase="active", candidate_id="17id", donor_id="15id", baseline="base",
+                                 baseline_format=2, old_start="auto\n", cleaned=True), **journal))
+        up, real_atomic, armed = {15: False, 17: True}, m.atomic, [boundary]
+
+        def event(name):
+            if armed and name == armed[0]:
+                armed.clear()
+                raise KeyboardInterrupt("killed")
+
+        def atomic(path, value, mode):
+            real_atomic(path, value, mode)
+            event(json.loads(value)["phase"] if path == m.STATE else f"{path.parent.name}:{value.strip()}")
+
+        def cluster(version, command):
+            up[version] = command == "start"
+            event(f"{version}:{command}")
+
+        def verify_active(major, path):
+            if not up[major] or up[{15: 17, 17: 15}[major]]:
+                raise ValueError("unexpected cluster")
+
+        # PG17 started after its sealed shutdown, so its checkpoint no longer matches the seal.
+        with patch.object(m, "seal", return_value=["17id", "0/2000", "shut down"]), \
+             patch.object(m, "cluster_id", side_effect=lambda version, path: f"{version}id"), \
+             patch.object(m, "running", side_effect=lambda version, path: up[version]), \
+             patch.object(m, "cluster", cluster), patch.object(m, "atomic", atomic), \
+             patch.object(m, "verify_active", verify_active), \
+             patch.object(m, "fingerprint", return_value=("changed" if changed else "base", "raw")):
+            with self.assertRaises(KeyboardInterrupt):
+                first()
+            self.assertEqual(json.loads(m.STATE.read_text())["phase"], "checking")
+            self.assertTrue(m.recover())
+            status = m.automatic_status()
+        starts = ((m.OLD / "start.conf").read_text(), (m.NEW / "start.conf").read_text())
+        return up, starts, status, json.loads(m.STATE.read_text())
+
+    def test_a_killed_rollback_is_journaled_before_pg17_stops_and_recovers_either_cluster(self):
+        for boundary in ("checking", "17:stop", "17:disabled"):
+            for changed in (False, True):
+                with self.subTest(boundary=boundary, changed=changed):
+                    up, starts, status, state = self.crash_then_recover(m.rollback, boundary, changed)
+                    if changed:
+                        # Writes accepted while PG17 was live keep it serving; PG15 stays fenced.
+                        self.assertEqual((up, starts, status, state["phase"]),
+                                         ({15: False, 17: True}, ("disabled\n", "auto\n"), "current", "active"))
+                    else:
+                        # The explicit rollback completes and stays held on PG15.
+                        self.assertEqual((up, starts, status, state["phase"]),
+                                         ({15: True, 17: False}, ("auto\n", "disabled\n"), "held", "rolled-back"))
+                    self.assertNotIn("retry_auto", state)
+
+    def test_a_killed_recovery_of_an_automatic_upgrade_stays_an_automatic_retry(self):
+        # The upgrade died while publishing with PG17 live, then its recovery died after fencing PG17.
+        up, starts, status, state = self.crash_then_recover(
+            m.recover, "17:stop", False, phase="publishing", seal=["17id", "0/1000", "shut down"], auto_attempts=1,
+            cleaned=False)
+        self.assertEqual((up, starts, status, state["phase"], state["retry_auto"]),
+                         ({15: True, 17: False}, ("auto\n", "disabled\n"), "needed", "rolled-back", True))
 
     def test_retained_runs_never_adopt_an_unmarked_destination(self):
         root, conf = m.DATA / "root", m.DATA / "conf"
@@ -282,7 +347,7 @@ class RetainedDonor(unittest.TestCase):
         self.assertNotIn("cleaned", state)
         staged = sorted(path.name for path in work.iterdir())
         self.assertIn("source-copy", staged)
-        self.assertEqual(m.automatic_status(), "needed")
+        self.assertEqual(m.automatic_status(), "cleanup-needed")
         (m.OLD_DATA / "PG_VERSION").unlink()
         with self.assertRaisesRegex(ValueError, "missing or differs from the saved donor"):
             m.automatic_upgrade()
@@ -292,6 +357,56 @@ class RetainedDonor(unittest.TestCase):
             m.discard_staging(self.journal())
         self.assertEqual(sorted(path.name for path in work.iterdir()), staged)
         self.assertNotIn("cleaned", self.journal())
+
+    def test_cleanup_retries_clean_only_even_when_low_on_space_and_refuse_changed_state(self):
+        with patch.object(m, "cluster_id", lambda version, path: "replaced" if version == 15 else "17id"), \
+             self.assertRaises(ValueError):
+            m.upgrade()
+        work = Path(self.journal()["work"])
+        staged = sorted(path.name for path in work.iterdir())
+        pending = m.STATE.read_bytes()
+        # No retry may stage, start or stop a cluster, or check staging space.
+        for name in ("pg", "cluster", "ensure_packages"):
+            patcher = patch.object(m, name, side_effect=AssertionError(name))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        low = patch.object(m.shutil, "disk_usage", return_value=types.SimpleNamespace(free=0))
+        low.start()
+        self.addCleanup(low.stop)
+        # Changed state or configuration is refused without cleaning anything or starting an upgrade.
+        changes = ((dict(phase="rolled-back"), "No serving PostgreSQL 17 migration"),
+                   (dict(phase="mystery"), "No serving PostgreSQL 17 migration"),
+                   (dict(candidate_id="other"), "differs from the maintenance journal"),
+                   (dict(work=str(m.DATA / ("dwemer-stage-" + "c" * 32))), "differs from the maintenance journal"))
+        for change, reason in changes:
+            with self.subTest(change=change):
+                m.STATE.write_text(json.dumps(dict(json.loads(pending), **change)))
+                before = m.STATE.read_bytes()
+                with self.assertRaisesRegex(ValueError, reason):
+                    m.cleanup_staging()
+                self.assertEqual((m.STATE.read_bytes(), sorted(path.name for path in work.iterdir())), (before, staged))
+        m.STATE.write_text(json.dumps(dict(json.loads(pending), phase="mystery")))
+        with self.assertRaisesRegex(ValueError, "Unknown migration state"):
+            m.automatic_status()
+        m.STATE.write_bytes(pending)
+        self.assertEqual((m.automatic_status(), m.STATE.read_bytes()), ("cleanup-needed", pending))
+        # Manual Upgrade and the update both retry only the cleanup, whose guard still fails here.
+        with patch.object(m, "cluster_id", lambda version, path: "replaced" if version == 15 else "17id"):
+            for retry in (m.upgrade, m.automatic_upgrade, m.cleanup_staging):
+                with self.subTest(retry=retry.__name__), \
+                     self.assertRaisesRegex(ValueError, "PostgreSQL 17 is serving, but cleanup stopped"):
+                    retry()
+                self.assertEqual((m.STATE.read_bytes(), sorted(path.name for path in work.iterdir())), (pending, staged))
+        m.cleanup_staging()
+        cleaned = m.STATE.read_bytes()
+        self.assertEqual(sorted(path.name for path in work.iterdir()), ["hba", "source-manifest.json", "verified.json"])
+        # Repeats are idempotent and keep the completed journal byte for byte.
+        m.cleanup_staging()
+        m.automatic_upgrade()
+        self.assertEqual((m.automatic_status(), m.STATE.read_bytes()), ("current", cleaned))
+        with self.assertRaisesRegex(ValueError, "Previous maintenance state"):
+            m.upgrade()
+        self.assertEqual(m.STATE.read_bytes(), cleaned)
 
     def test_cleanup_refuses_mounts_links_and_a_live_donor_before_deleting_anything(self):
         with patch.object(m, "cluster_id", lambda version, path: "replaced" if version == 15 else "17id"), \
