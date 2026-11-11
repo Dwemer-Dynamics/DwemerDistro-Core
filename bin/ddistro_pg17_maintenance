@@ -429,6 +429,7 @@ def upgrade(backup):
         print("PostgreSQL 17 is serving on port 5432. Original cluster and external backup retained.")
     except BaseException:
         if state["phase"] == "staging":
+            state["retry_auto"] = True
             restore_old(state)
         raise
 
@@ -478,6 +479,50 @@ def rollback():
     print("PostgreSQL 15 is serving on port 5432. PG17 was retained.")
 
 
+def automatic_status():
+    if STATE.exists():
+        state = json.loads(STATE.read_text())
+        if state["phase"] == "active":
+            verify_active(17, NEW_DATA)
+            return "current" if state.get("cleaned") else "needed"
+        if state["phase"] == "rolled-back" and not state.get("retry_auto"):
+            verify_active(15, OLD_DATA)
+            return "held"
+        return "needed"
+    if not (OLD_DATA / "PG_VERSION").is_file():
+        return "unsupported"
+    verify_active(15, OLD_DATA)
+    return "needed"
+
+
+def automatic_upgrade(backup):
+    if automatic_status() != "needed":
+        return
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    if state and state["phase"] not in ("active", "rolled-back"):
+        rollback()
+        raise ValueError("Recovered interrupted maintenance; retry the update")
+    if state.get("phase") != "active":
+        upgrade(backup)
+        state = json.loads(STATE.read_text())
+    verify_active(17, NEW_DATA)
+    work = Path(state["work"])
+    if work.parent != DATA or not re.fullmatch(r"dwemer-stage-[0-9a-f]{32}", work.name) or work.is_symlink():
+        raise ValueError("Unexpected staging path")
+    if cluster_id(17, NEW_DATA) != state["candidate_id"] or (NEW / "dwemer-maintenance-id").read_text().strip() != work.name:
+        raise ValueError("Unexpected PG17 cleanup target")
+    if not (work / "verified.json").is_file() or not Path(state["backup"]).is_file():
+        raise ValueError("Verified migration or recovery archive is missing")
+    # Keep the original PG15 cluster, external backup, private verification socket and peer HBA for rollback.
+    for item in work.iterdir():
+        if item.name == "source-copy":
+            shutil.rmtree(item)
+        elif item.name == "globals.sql" or re.fullmatch(r"[0-9]+\.dump", item.name):
+            item.unlink()
+    state["cleaned"] = True
+    phase(state, "active")
+
+
 def lock_distro():
     # Share Core's existing Unix maintenance lock with update.sh and lifecycle operations.
     path = "/run/lock/dwemerdistro-maintenance.lock"
@@ -505,7 +550,7 @@ def lock_distro():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["upgrade", "rollback"])
+    parser.add_argument("action", choices=["status", "auto", "upgrade", "rollback"])
     parser.add_argument("backup", nargs="?", type=Path)
     args = parser.parse_args()
     if os.geteuid() != 0:
@@ -516,10 +561,17 @@ if __name__ == "__main__":
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with lock_distro():
-                if args.action == "upgrade":
+                if args.action == "status":
+                    print(automatic_status())
+                elif args.action == "auto":
+                    automatic_upgrade(args.backup)
+                elif args.action == "upgrade":
                     upgrade(args.backup)
                 else:
                     rollback()
+                    state = json.loads(STATE.read_text())
+                    state.pop("retry_auto", None)
+                    phase(state, "rolled-back")
         except Exception as error:
             print(f"Maintenance stopped: {error}. See {ROOT}/maintenance.log", file=sys.stderr)
             sys.exit(1)
