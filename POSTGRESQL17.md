@@ -2,6 +2,8 @@
 
 ## Launcher upgrade and rollback
 
+The normal launcher distro update upgrades a standard PG15 installation without a database prompt. The launcher waits while a supported Windows game is running, creates a private Windows backup folder, and records the system release only after database maintenance succeeds. After verifying the candidate, Core deletes the temporary source cluster copy, numbered logical dumps, and staging role dump. It keeps the original PG15 cluster and verified external backup for recovery. A completed upgrade skips on the next update. An explicit rollback holds the installation on PG15 until an operator initiates another upgrade.
+
 In **Settings → Database Maintenance**, choose **Upgrade** with the games idle. Select a Windows folder with room for a cold database backup. The launcher creates a private subfolder and checks free space on both the backup drive and the drive holding the WSL disk. The maintenance command supports the running Debian `15/main` cluster on port 5432 and registers the verified candidate as `17/dwemer` on the same port. App hosts, socket paths and login credentials stay in use. The operation installs missing PG17 client/server and pgvector packages on Bookworm or Trixie. It does not perform a Debian release upgrade.
 
 Core stops the donor, creates and compares a physical backup of its data and Debian configuration, then stages all databases. The backup's recovery JSON records the original startup setting and cluster identifier. Keep the tar and JSON together. The tar contains private database records and password verifiers. A failure before publication restarts the original PG15 cluster. The old data directory remains in place.

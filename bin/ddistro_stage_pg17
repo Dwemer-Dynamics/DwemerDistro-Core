@@ -165,7 +165,9 @@ def inventory(major, db):
         """select n.nspname,c.relname,
       pg_get_userbyid(grantor),case when grantee=0 then 'PUBLIC' else pg_get_userbyid(grantee) end,
       privilege_type,is_grantable from pg_class c join pg_namespace n on n.oid=c.relnamespace,
-      lateral aclexplode(c.relacl) where n.nspname not in ('pg_catalog','information_schema')
+      lateral aclexplode(coalesce(c.relacl, acldefault(
+        case when c.relkind='S' then 's'::"char" else 'r'::"char" end,c.relowner)))
+      where c.relkind in ('r','p','v','m','S','f') and n.nspname not in ('pg_catalog','information_schema')
       and n.nspname !~ '^pg_(temp|toast)' and not (privilege_type='MAINTAIN' and grantee=c.relowner)""",
     )
     return result
