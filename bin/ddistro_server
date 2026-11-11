@@ -478,7 +478,7 @@ install_state() {
 
     if [ "$PRODUCT" = lorkhan ] && [ "$repo_state" = managed ] && { [ ! -f "$WEB_ROOT/LorkhanServer/index.php" ] || [ ! -e /etc/apache2/sites-enabled/lorkhanserver.conf ]; }; then
         printf 'needs-repair\n'
-    elif [ "$PRODUCT" = reign ] && [ "$repo_state" = managed ] && [ ! -x /var/www/html/ReignServer/runtime/current/ReignServer ] && [ ! -x /var/www/html/ReignServer/runtime/current/ReignBetaServer ]; then
+    elif [ "$PRODUCT" = reign ] && [ "$repo_state" = managed ] && { [ ! -f "$PRODUCT_ROOT/ReignServer.csproj" ] || [ ! -x /var/www/html/ReignServer/runtime/current/ReignServer ] || [ ! -f /var/www/html/ReignServer/runtime/current/reign-linux-artifact.json ]; }; then
         printf 'needs-repair\n'
     elif [ "$repo_state" = "managed" ] && [ "$db_state" != "absent" ]; then
         printf 'installed\n'
@@ -1444,6 +1444,10 @@ startup_product() {
             info "$key is not installed; startup skipped."
         fi
         remove_vhost
+        return 0
+    fi
+    if [ "$PRODUCT" = reign ] && [ "$state" != managed ]; then
+        info "$key is not a current ReignServer deployment and needs repair; startup skipped."
         return 0
     fi
     if [ "$state" = "legacy" ]; then
