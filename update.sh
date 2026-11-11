@@ -75,7 +75,13 @@ fi
 # exclusively, so it runs before the shared lock, from the source because the installed copy may
 # predate this action. It exits at once unless the journal records an unfinished phase.
 print_step "Checking for interrupted PostgreSQL maintenance"
-if ! /usr/bin/python3 /home/dwemer/dwemerdistro/bin/ddistro_pg17_maintenance recover; then
+recover_status=0
+/usr/bin/python3 /home/dwemer/dwemerdistro/bin/ddistro_pg17_maintenance recover || recover_status=$?
+if [ "$recover_status" -eq 75 ]; then
+    # Exit 75 means a lock was busy, so recovery did not start; nothing was changed or found broken.
+    print_error "PostgreSQL or DwemerDistro maintenance is still running, so this update did not start. Retry the update after it finishes."
+    exit 75
+elif [ "$recover_status" -ne 0 ]; then
     print_error "Interrupted PostgreSQL maintenance could not be recovered automatically."
     exit 1
 fi
