@@ -878,6 +878,29 @@ EOF
     a2ensite "$PRODUCT_VHOST" >/dev/null 2>&1 || true
 }
 
+# Print enabled Apache sites, other than this product's own, that declare a vhost on its public port.
+# Names only: site contents may hold credentials and must not reach manager output.
+apache_port_claimants() {
+    local site
+    local own_site
+    [ -n "$PRODUCT_VHOST" ] || return 0
+    own_site="$(readlink -f "/etc/apache2/sites-available/$PRODUCT_VHOST")"
+    for site in /etc/apache2/sites-enabled/*; do
+        [ -e "$site" ] || continue
+        [ "${site##*/}" != "$PRODUCT_VHOST" ] && [ "$(readlink -f -- "$site")" != "$own_site" ] || continue
+        if grep -qiE "^[[:space:]]*<VirtualHost[[:space:]][^>]*:${PRODUCT_PORT}([[:space:]]|>)" -- "$site" 2>/dev/null; then
+            printf '%s\n' "${site##*/}"
+        fi
+    done
+}
+
+# Read-only: another product owns the port, so leave its site and the shared Listen untouched.
+require_web_port_available() {
+    local claimants
+    claimants="$(apache_port_claimants)"
+    [ -z "$claimants" ] || fail "Apache site ${claimants//$'\n'/, } already uses $PRODUCT port $PRODUCT_PORT. Disable or move that site, then retry; $PRODUCT was not changed."
+}
+
 remove_vhost() {
     local ports_conf="/etc/apache2/ports.conf"
     if [ -z "$PRODUCT_VHOST" ]; then
@@ -887,7 +910,8 @@ remove_vhost() {
     a2dissite "$PRODUCT_VHOST" >/dev/null 2>&1 || true
     rm -f "/etc/apache2/sites-enabled/$PRODUCT_VHOST" "/etc/apache2/sites-available/$PRODUCT_VHOST"
     rm -f "/var/log/apache2/${PRODUCT}_error.log" "/var/log/apache2/${PRODUCT}_access.log"
-    if [ -f "$ports_conf" ]; then
+    # Another enabled site may share the Listen line, so keep it while any site still claims the port.
+    if [ -f "$ports_conf" ] && [ -z "$(apache_port_claimants)" ]; then
         sed -i "/^[[:space:]]*Listen[[:space:]].*:${PRODUCT_PORT}[[:space:]]*$/d; /^[[:space:]]*Listen[[:space:]]*${PRODUCT_PORT}[[:space:]]*$/d" "$ports_conf"
     fi
 }
@@ -1425,6 +1449,7 @@ startup_product() {
     if [ "$state" = "legacy" ]; then
         info "$key uses a legacy deployment; database startup will continue without Git adoption."
     fi
+    [ "$PRODUCT" != reign ] || require_web_port_available
     bootstrap_database
     write_vhost
     apply_permissions
@@ -1515,6 +1540,7 @@ case "$COMMAND" in
         done
         require_root "$COMMAND" "$PRODUCT" --branch "$BRANCH_CHOICE"
         acquire_operation_lock
+        [ "$PRODUCT" != reign ] || require_web_port_available
         BRANCH=$(resolve_branch "$BRANCH_CHOICE") || exit $?
         require_php_security
         start_postgres
