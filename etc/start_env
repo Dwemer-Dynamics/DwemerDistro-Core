@@ -625,7 +625,8 @@ if [ -x "$SERVER_MANAGER" ]; then
     "$SERVER_MANAGER" startup lorkhan || echo "WARNING: LORKHAN worker failed to start; check its log."
 fi
 
-if [ -x /var/www/html/ReignServer/runtime/current/ReignBetaServer ]; then
+# Only current ReignServer builds are supported; uninstall removes current.
+if [ -x /var/www/html/ReignServer/runtime/current/ReignServer ]; then
     /usr/local/bin/ddistro_reign start || echo "WARNING: Reign failed to start; check its log."
 fi
 
