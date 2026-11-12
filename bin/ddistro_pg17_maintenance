@@ -122,6 +122,9 @@ def postgres_env(socket, db="postgres"):
         "PGPORT": "5432",
         "PGDATABASE": db,
         "PGUSER": "postgres",
+        # A saved ALTER ROLE postgres ... SET role would otherwise run these sessions as a role that
+        # may not read the data. This overrides it for this session only; normal clients keep it.
+        "PGOPTIONS": "-c role=none",
     }
 
 

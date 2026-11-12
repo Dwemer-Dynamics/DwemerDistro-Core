@@ -41,7 +41,9 @@ def env(major, database):
         PGPORT="55432",
         PGDATABASE=database,
         PGCLIENTENCODING="UTF8",
-        PGOPTIONS="-c timezone=UTC -c datestyle=ISO,YMD -c standard_conforming_strings=on",
+        # role=none keeps these sessions postgres even where a saved setting such as ALTER ROLE
+        # postgres IN DATABASE ... SET role switches normal logins to a role that cannot read the data.
+        PGOPTIONS="-c timezone=UTC -c datestyle=ISO,YMD -c standard_conforming_strings=on -c role=none",
     )
 
 
@@ -332,6 +334,11 @@ def restore(source):
                 if setting["role"] is None
                 else "ROLE " + ident(setting["role"]) + " IN DATABASE " + q
             )
+            if key == "role":
+                # set_config would switch this session to that role before the ALTER. role is a plain
+                # string setting, so the saved value replays verbatim as one literal.
+                sql(17, admin, "ALTER " + target + " SET role TO " + literal(value))
+                continue
             sql(
                 17,
                 admin,
