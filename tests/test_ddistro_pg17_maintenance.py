@@ -29,6 +29,67 @@ def load(name):
 
 m = load("ddistro_pg17_maintenance")
 TAG = "dwemer-stage-" + "a" * 32
+# start.conf as pg_createcluster writes it on Debian, and as the deployed ASUS clone has it.
+STOCK_HEADER = (
+    "# Automatic startup configuration\n"
+    "#   auto: automatically start the cluster\n"
+    "#   manual: manual startup with pg_ctlcluster/postgresql@.service only\n"
+    "#   disabled: refuse to start cluster\n"
+    "# See pg_createcluster(1) for details. When running from systemd,\n"
+    "# invoke 'systemctl daemon-reload' after editing this file.\n"
+)
+
+
+def stock(mode, blank=True):
+    return STOCK_HEADER + ("\n" if blank else "") + mode + "\n"
+
+
+class StartConf(unittest.TestCase):
+    """start.conf is read as postgresql-common reads it, and anything not provably one mode is refused."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+        self.conf = self.base / "conf"
+        self.conf.mkdir()
+
+    def mode(self, content):
+        path = self.conf / "start.conf"
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content)
+        return m.start_mode(self.conf)
+
+    def test_stock_and_plain_settings_are_read(self):
+        for mode in ("auto", "manual", "disabled"):
+            for content in (mode + "\n", mode, stock(mode), stock(mode, blank=False), "\n  " + mode + " \t\n\n",
+                            stock(mode) + "# trailing note\n", "  # indented comment\n" + mode + "  # why\n",
+                            mode + "\r\n"):
+                self.assertEqual(self.mode(content), mode, repr(content))
+
+    def test_ambiguous_unrecognised_or_unreadable_settings_are_refused(self):
+        for content in ("", "\n\n", STOCK_HEADER, stock("auto") + "manual\n", "auto\nauto\n",
+                        stock("disabled") + "auto\n", "automatic\n", "Auto\n", "auto manual\n", "auto=1\n",
+                        "disable\n", stock("on"), "#auto\n", "﻿auto\n", b"auto\n\xff\n"):
+            self.assertIsNone(self.mode(content), repr(content))
+
+    def test_links_and_non_files_are_refused(self):
+        target = self.base / "elsewhere"
+        target.write_text(stock("auto"))
+        (self.conf / "start.conf").symlink_to(target)
+        self.assertIsNone(m.start_mode(self.conf))
+        (self.conf / "start.conf").unlink()
+        (self.conf / "start.conf").mkdir()
+        self.assertIsNone(m.start_mode(self.conf))
+        self.assertIsNone(m.start_mode(self.base / "missing"))
+        real = self.base / "real"
+        real.mkdir()
+        (real / "start.conf").write_text(stock("auto"))
+        (self.base / "linked").symlink_to(real)
+        self.assertIsNone(m.start_mode(self.base / "linked"))
+        self.assertEqual(m.start_mode(real), "auto")
 
 
 class Journal(unittest.TestCase):
@@ -240,6 +301,92 @@ class Journal(unittest.TestCase):
             self.assertTrue(linked.exists())
 
 
+class ReopenedDistro(unittest.TestCase):
+    """A reopened distro has not started PostgreSQL yet; status proves the stopped PG17 offline."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name)
+        paths = {"ROOT": base, "STATE": base / "state.json", "DATA": base, "OLD_DATA": base / "15" / "main",
+                 "NEW_DATA": base / "17" / "dwemer", "OLD": base / "etc15", "NEW": base / "etc17"}
+        for key, value in paths.items():
+            patcher = patch.object(m, key, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        m.NEW.mkdir()
+        m.OLD.mkdir()
+        (m.NEW / "dwemer-maintenance-id").write_text(TAG)
+        (m.NEW / "start.conf").write_text("auto\n")
+        (m.OLD / "start.conf").write_text("disabled\n")
+        m.STATE.write_text(json.dumps({"phase": "active", "cleaned": True, "work": str(m.DATA / TAG),
+                                       "candidate_id": "17id", "donor_id": "15id"}))
+        m.log = None
+
+    def status(self, running=(), serves=False, identity="17id", state="shut down"):
+        control = {"Database system identifier": identity, "Database cluster state": state}
+        with patch.object(m, "running", side_effect=lambda version, _d: version in running), \
+                patch.object(m, "socket_serves", return_value=serves), \
+                patch.object(m, "controldata", return_value=control), \
+                patch.object(m, "verify_active", side_effect=ValueError("Unexpected PostgreSQL version")) as verify:
+            try:
+                return m.automatic_status(), verify.called
+            except ValueError as error:
+                return str(error), verify.called
+
+    def test_a_stopped_journaled_pg17_is_current_without_any_start_or_query(self):
+        self.assertEqual(self.status(), ("current", False))
+        self.assertEqual(self.status(state="in production"), ("current", False))
+        (m.NEW / "start.conf").write_text("manual\n")
+        self.assertEqual(self.status(), ("current", False))
+        state = json.loads(m.STATE.read_text())
+        m.STATE.write_text(json.dumps(dict(state, cleaned=False)))
+        self.assertEqual(self.status(), ("cleanup-needed", False))
+
+    def test_a_live_server_is_still_verified_and_a_wrong_or_changed_cluster_refused(self):
+        # Anything serving the application socket, or PG17 running at all, goes through the SQL check.
+        self.assertEqual(self.status(serves=True), ("Unexpected PostgreSQL version", True))
+        self.assertEqual(self.status(running=(17,)), ("Unexpected PostgreSQL version", True))
+        for kwargs in ({"identity": "other"}, {"state": "in archive recovery"}):
+            self.assertRegex(self.status(**kwargs)[0], "differs from the maintenance journal", kwargs)
+        self.assertRegex(self.status(running=(15,))[0], "PostgreSQL 15 is not stopped and disabled")
+        (m.NEW / "dwemer-maintenance-id").write_text("dwemer-stage-" + "b" * 32)
+        self.assertRegex(self.status()[0], "differs from the maintenance journal")
+        (m.NEW / "dwemer-maintenance-id").write_text(TAG)
+        (m.NEW / "start.conf").write_text("disabled\n")
+        self.assertRegex(self.status()[0], "differs from the maintenance journal")
+        (m.NEW / "start.conf").write_text("auto\n")
+        (m.OLD / "start.conf").write_text("manual\n")
+        self.assertRegex(self.status()[0], "PostgreSQL 15 is not stopped and disabled")
+
+    def test_stock_commented_start_conf_is_current_and_invalid_ones_are_refused(self):
+        # The deployed clone: Debian's six comment lines, then auto; PG15 disabled the same way.
+        for new, old in ((stock("auto", blank=False), "disabled\n"), (stock("auto"), stock("disabled")),
+                         (stock("manual"), stock("disabled", blank=False))):
+            (m.NEW / "start.conf").write_text(new)
+            (m.OLD / "start.conf").write_text(old)
+            self.assertEqual(self.status(), ("current", False), (new, old))
+        # Comments never vouch for a different identity, configuration owner or running PG15.
+        self.assertRegex(self.status(identity="other")[0], "differs from the maintenance journal")
+        self.assertRegex(self.status(running=(15,))[0], "PostgreSQL 15 is not stopped and disabled")
+        (m.NEW / "dwemer-maintenance-id").write_text("dwemer-stage-" + "b" * 32)
+        self.assertRegex(self.status()[0], "differs from the maintenance journal")
+        (m.NEW / "dwemer-maintenance-id").write_text(TAG)
+        for new in (STOCK_HEADER, stock("disabled"), stock("auto") + "manual\n", stock("automatic"), ""):
+            (m.NEW / "start.conf").write_text(new)
+            self.assertRegex(self.status()[0], "differs from the maintenance journal", repr(new))
+        (m.NEW / "start.conf").write_text(stock("auto"))
+        for old in (STOCK_HEADER, stock("auto"), stock("disabled") + "auto\n", stock("disabledx"), ""):
+            (m.OLD / "start.conf").write_text(old)
+            self.assertRegex(self.status()[0], "PostgreSQL 15 is not stopped and disabled", repr(old))
+        (m.OLD / "start.conf").write_text("disabled\n")
+        target = m.ROOT / "linked-start.conf"
+        target.write_text(stock("auto"))
+        (m.NEW / "start.conf").unlink()
+        (m.NEW / "start.conf").symlink_to(target)
+        self.assertRegex(self.status()[0], "differs from the maintenance journal")
+
+
 class RetainedDonor(unittest.TestCase):
     """Upgrades keep the PG15 donor and never use a Windows backup; earlier journals stay guarded."""
 
@@ -271,7 +418,7 @@ class RetainedDonor(unittest.TestCase):
         self.legacy_tar.write_bytes(b"earlier backup")
         self.calls = []
         for name, value in (("sync_dir", None), ("verify_active", None), ("ensure_packages", None),
-                            ("running", False), ("mounts_within", []),
+                            ("running", False), ("socket_serves", True), ("mounts_within", []),
                             ("fingerprint", ("base", "raw")), ("seal", ["17id", "0/1000", "shut down"])):
             patcher = patch.object(m, name, return_value=value)
             patcher.start()
@@ -326,6 +473,19 @@ class RetainedDonor(unittest.TestCase):
                          ("disabled\n", "auto\n"))
         self.assertEqual(sorted(path.name for path in work.iterdir()), ["hba", "source-manifest.json", "verified.json"])
         self.assertEqual(m.automatic_status(), "current")
+
+    def test_a_stock_commented_pg15_start_conf_carries_over_and_stays_current(self):
+        (m.OLD / "start.conf").write_text(stock("auto"))
+        m.automatic_upgrade()
+        state = self.journal()
+        self.assertEqual((state["phase"], state["cleaned"]), ("active", True))
+        self.assertEqual(((m.OLD / "start.conf").read_text(), (m.NEW / "start.conf").read_text()),
+                         ("disabled\n", stock("auto")))
+        with patch.object(m, "socket_serves", return_value=False), \
+             patch.object(m, "controldata", return_value={"Database system identifier": state["candidate_id"],
+                                                          "Database cluster state": "shut down"}), \
+             patch.object(m, "verify_active", side_effect=AssertionError("verify_active")):
+            self.assertEqual(m.automatic_status(), "current")
 
     def test_manual_upgrade_cleans_staging_too(self):
         m.upgrade()
@@ -432,8 +592,9 @@ class RetainedDonor(unittest.TestCase):
         # The donor must still be stopped and disabled.
         with patch.object(m, "running", return_value=True):
             refused("not stopped and disabled")
-        (m.OLD / "start.conf").write_text("auto\n")
-        refused("not stopped and disabled")
+        for content in ("auto\n", stock("auto"), STOCK_HEADER, stock("disabled") + "auto\n"):
+            (m.OLD / "start.conf").write_text(content)
+            refused("not stopped and disabled")
         (m.OLD / "start.conf").write_text("disabled\n")
         (m.OLD_DATA / "postmaster.pid").write_text("1\n")
         refused("not stopped and disabled")

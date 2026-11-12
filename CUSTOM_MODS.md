@@ -319,7 +319,7 @@ fields are rejected.
 | `name`, `description` | Plain text, at most 60 and 300 characters. `description` and `project_url` are optional. |
 | `author` | Optional author or team display name: text of at most 80 characters after trimming, with no control characters. Allowed in versions 1 and 2. Without it the launcher shows the repository owner. |
 | `dashboard_path`, `health_path` | Relative paths inside the mod folder. Segments use `A-Z a-z 0-9 . _ -`, may not start with `.`, and may not be `..`. `health_path` must be a tracked file. |
-| `requirements` | Exactly `{"php": "8.2", "postgresql": true}`. |
+| `requirements` | Exactly `{"php": "8.2", "postgresql": true}`. The value is kept for existing manifests; mods run on the shared PHP that `ensure_php_security` verifies for the Debian release (PHP 8.2 on Debian 12, PHP 8.4 on Debian 13), and `php -l` and the migration script run on that runtime. |
 | `setup.config_template` | Tracked `.php` file. It must contain `'<token_placeholder>'` and `'<database_placeholder>'` exactly once each, as quoted PHP strings. |
 | `setup.config_path` | Untracked private `.php` file. A repository that tracks it is rejected. |
 | `setup.migrate_script` | Tracked `.php` script, safe to run repeatedly. It reads `config_path` and exits non-zero on failure. |

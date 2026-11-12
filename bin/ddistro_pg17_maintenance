@@ -72,6 +72,27 @@ def owns_config(state):
     )
 
 
+def start_mode(directory):
+    """The start.conf mode as postgresql-common reads it, or None when that is not provable.
+
+    Debian ignores blank lines and '#' comments (also after a setting) and takes the first setting.
+    Only a plain file holding exactly one setting that is exactly auto, manual or disabled counts;
+    no setting (Debian's implicit auto), several settings, prefixes such as 'automatic' that Debian
+    would still accept, unreadable text or a link are all refused."""
+    path = directory / "start.conf"
+    if directory.is_symlink() or path.is_symlink() or not path.is_file():
+        return None
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    settings = [line.split("#", 1)[0].strip() for line in text.splitlines()]
+    settings = [setting for setting in settings if setting]
+    if len(settings) != 1 or settings[0] not in ("auto", "manual", "disabled"):
+        return None
+    return settings[0]
+
+
 def discard_temporaries():
     """Remove files that an interrupted atomic() write left behind, once they are provably its own."""
     # Only this tool writes these names, with a random 128-bit suffix, and it holds the maintenance
@@ -342,6 +363,48 @@ def verify_active(major, path):
     )
     if actual != f"{major}|{path}":
         raise ValueError("Unexpected PostgreSQL version or data directory on the application socket")
+
+
+APP_SOCKET = Path("/var/run/postgresql")
+# pg_control states of a primary that is not running: cleanly stopped, or stopped abruptly (WSL
+# terminated) and recovered by its next start. A standby or archive recovery state is not ours.
+STOPPED_STATES = ("shut down", "in production", "in crash recovery")
+
+
+def socket_serves(directory=APP_SOCKET):
+    """True when a server accepts connections on the application socket. The probe connects and
+    closes without sending anything, so it starts and changes nothing."""
+    import socket
+
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(5)
+    try:
+        probe.connect(str(directory / ".s.PGSQL.5432"))
+    except (FileNotFoundError, ConnectionRefusedError):
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+def verify_registered(state):
+    """The journaled PG17 serves the application socket, or nothing serves PostgreSQL and the stopped
+    17/dwemer is provably the one start_env starts next: the journaled candidate with its marked
+    configuration, an auto or manual start.conf, and PG15 stopped and disabled. Reads only; a wrong
+    live server on the socket is still refused."""
+    if running(17, NEW_DATA) or socket_serves():
+        verify_active(17, NEW_DATA)
+        return "serving"
+    control = controldata(17, NEW_DATA)
+    if (
+        control["Database system identifier"] != state.get("candidate_id") or not owns_config(state)
+        or control["Database cluster state"] not in STOPPED_STATES
+        or start_mode(NEW) not in ("auto", "manual")
+    ):
+        raise ValueError("PostgreSQL 17 is stopped and differs from the maintenance journal; nothing was changed")
+    if start_mode(OLD) != "disabled" or running(15, OLD_DATA):
+        raise ValueError("PostgreSQL 15 is not stopped and disabled; nothing was changed")
+    return "stopped"
 
 
 def ensure_packages():
@@ -702,7 +765,8 @@ def automatic_status():
     if STATE.exists():
         state = json.loads(STATE.read_text())
         if state.get("phase") == "active":
-            verify_active(17, NEW_DATA)
+            # A reopened distro has not started PostgreSQL yet; the stopped candidate counts as current.
+            verify_registered(state)
             if state.get("cleaned"):
                 return "current"
             # The verified PG17 already serves; only its staging copies remain, so never stage again.
@@ -778,7 +842,7 @@ def discard_staging(state):
             "The original PG15 cluster is missing or differs from the saved donor, so the staging copies were kept"
         )
     if (
-        (OLD / "start.conf").read_text().strip() != "disabled"
+        start_mode(OLD) != "disabled"
         or (OLD_DATA / "postmaster.pid").exists() or running(15, OLD_DATA)
     ):
         raise ValueError("PostgreSQL 15 is not stopped and disabled, so the staging copies were kept")
@@ -827,7 +891,7 @@ def cleanup_staging():
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
     if state.get("phase") != "active":
         raise ValueError("No serving PostgreSQL 17 migration is recorded, so nothing was cleaned or upgraded")
-    verify_active(17, NEW_DATA)
+    verify_registered(state)
     cleanup_target(state)
     # A completed cleanup leaves the journal as it is.
     if not state.get("cleaned"):
@@ -836,7 +900,7 @@ def cleanup_staging():
 
 def clean_staging(state):
     """Delete the staging copies after cutover. A failure leaves PG17 serving, and the next update retries."""
-    verify_active(17, NEW_DATA)
+    verify_registered(state)
     try:
         discard_staging(state)
     except Exception as error:
@@ -961,6 +1025,11 @@ if __name__ == "__main__":
     if os.geteuid() != 0:
         parser.error("root required")
     os.umask(0o077)
+    # A Debian 13 upgrade fences PostgreSQL until it is verified and released; touch neither cluster.
+    if os.path.exists("/etc/dwemer/trixie-upgrade.fence"):
+        print("Maintenance did not start and changed nothing: a Debian 13 upgrade is in progress. Retry after it "
+              "finishes.", file=sys.stderr)
+        sys.exit(75)
     # Every update calls recover while other maintenance may hold the shared lock; skip settled journals.
     if args.action == "recover" and settled():
         sys.exit(0)

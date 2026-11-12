@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# DWEMERDISTRO_TRIXIE_FENCE: while a Debian 13 upgrade is fenced, in progress or awaiting its
+# verification and release, no service may start or write. ddistro_trixie_maintenance release
+# removes the fence.
+if [ -e /etc/dwemer/trixie-upgrade.fence ]; then
+    echo "A Debian 13 upgrade is in progress; services were not started. Continue it from the DwemerDistro Launcher."
+    exit 0
+fi
+
 # Also covers imported images on WSL versions without boot.command support.
 /usr/local/bin/initialize_fresh_distro || exit 1
 

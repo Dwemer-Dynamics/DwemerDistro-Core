@@ -1,0 +1,3618 @@
+#!/usr/bin/env python3
+"""Upgrade a verified DwemerDistro from Debian 12 (Bookworm) to Debian 13 (Trixie).
+
+Root only. Only the Launcher's OS maintenance runs it; update.sh installs it but never runs it.
+
+  status    [--json]  Report the upgrade state. Reads files only; changes nothing.
+  preflight [--json]  Check the layout and rehearse the APT solution against the signed Trixie
+                      suites in a private APT directory. Downloads packages; changes no system state.
+                      A stopped PG17 (a reopened distro) is proven to be the journaled cluster
+                      offline, inspected on a private socket only and stopped again.
+  upgrade --prepare --plan-id ID
+                      Fence writers (Apache, PHP-FPM, PostgreSQL) and issue a capture token. The
+                      Launcher then terminates the distro and exports and verifies a recovery copy.
+  upgrade --capture-token TOKEN --recovery-sha256 HEX --recovery-bytes N
+                      Run (or resume) the upgrade against that verified recovery copy.
+  upgrade --cancel    Release the fence before any package changed.
+  verify    [--json]  After the distro restarted: verify the upgraded system privately. The fence
+                      stays; no application may write yet.
+  release   [--json]  After a successful verify, once the Launcher has durably recorded that it will
+                      no longer roll back automatically: open the system for writes. Repeatable.
+
+Exit codes: 0 done; 1 failed (see the log); 2 usage; 3 deferred, nothing changed; 4 restart the
+distro, then verify again; 75 another maintenance operation is running, nothing changed.
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+import uuid
+
+ROOT = Path("/var/lib/dwemerdistro/trixie-maintenance")
+STATE = ROOT / "state.json"
+PLAN = ROOT / "plan.json"
+# Lists closed databases that are temporarily open on the private PG17 socket; they are closed
+# again before that server serves anything else, and before the fence is removed.
+CLOSED_OPEN = ROOT / "closed-open.json"
+APT_DIR = ROOT / "apt"
+SOURCES_BACKUP = ROOT / "apt-sources-bookworm"
+PREFERENCES_BACKUP = ROOT / "apt-preferences-bookworm"
+LOG = ROOT / "maintenance.log"
+# World-readable, so start_env and update.sh see it as any user. Its presence fences every writer.
+FENCE = Path("/etc/dwemer/trixie-upgrade.fence")
+FENCE_GUARD = "DWEMERDISTRO_TRIXIE_FENCE"
+START_ENV = Path("/etc/start_env")
+DISTRO_LOCK = "/run/lock/dwemerdistro-maintenance.lock"
+PHP_LOCK = "/run/lock/dwemerdistro-php-security.lock"
+PG17_ROOT = Path("/var/lib/dwemerdistro/pg17-maintenance")
+PG17_STATE = PG17_ROOT / "state.json"
+PG_CONF = Path("/etc/postgresql")
+PG_DATA = Path("/var/lib/postgresql")
+OLD_CONF, NEW_CONF = PG_CONF / "15/main", PG_CONF / "17/dwemer"
+OLD_DATA, NEW_DATA = PG_DATA / "15/main", PG_DATA / "17/dwemer"
+APT_SOURCES = Path("/etc/apt/sources.list")
+APT_PARTS = Path("/etc/apt/sources.list.d")
+APT_PREFERENCES = (Path("/etc/apt/preferences"), Path("/etc/apt/preferences.d"))
+POLICY = Path("/usr/sbin/policy-rc.d")
+POLICY_ASIDE = ROOT / "policy-rc.d.saved"
+WSL_CONF = Path("/etc/wsl.conf")
+MACHINE_ID = Path("/etc/machine-id")
+FRESH_IMAGE = Path("/var/lib/dwemerdistro/fresh-image")
+# ensure_postgres_utf8 keeps the original template1 under this name, closed, and records an
+# unfinished rename in its pending file.
+RETAINED_TEMPLATE = re.compile(r"^ddistro_template1_before_utf8_[0-9]{14}$")
+UTF8_PENDING = Path("/var/lib/dwemerdistro/postgres-template-5432.pending")
+RETAINED_MAX_BYTES = 64 * 1024 ** 2
+REIGN = Path("/var/www/html/ReignServer/runtime/current")
+PHP_SECURITY = "/usr/local/bin/ensure_php_security"
+
+SOURCE, TARGET = "bookworm", "trixie"
+SOURCE_PHP, TARGET_PHP = "8.2", "8.4"
+SOURCE_PYTHON, TARGET_PYTHON = "3.11", "3.13"
+DEBIAN_KEYRING = "/usr/share/keyrings/debian-archive-keyring.gpg"
+PGDG_FINGERPRINT = "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8"
+PGDG_KEY_LOCAL = Path("/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc")
+PGDG_KEY_URL = "https://www.postgresql.org/media/keys/ACCC4CF8.asc"
+# Source identity is the exact URI host and path, the suites and components, and the signing
+# policy; a substring of the URI never identifies a source. Every recognised entry names exactly
+# one URI, and any option other than an architecture list including amd64, a language list or the
+# expected Signed-By (trusted=yes, allow-insecure, ...) leaves it unrecognised.
+# Debian's own hosts: the CDN, the security host and the official ftp(.<country>) mirrors. They
+# need no Signed-By (debian-archive-keyring populates APT's default trust) or name that keyring.
+DEBIAN_MIRROR = re.compile(r"^(deb|ftp|ftp\.[a-z]{2})\.debian\.org$")
+DEBIAN_SECURITY_HOSTS = {"deb.debian.org", "security.debian.org"}
+DEBIAN_KEYRINGS = {DEBIAN_KEYRING, "/usr/share/keyrings/debian-archive-keyring.pgp"}
+DEBIAN_COMPONENTS = {"main", "contrib", "non-free", "non-free-firmware"}
+# PGDG must name a keyring holding exactly its pinned key, as postgresql-common's setup writes.
+PGDG_HOST, PGDG_PATH = "apt.postgresql.org", "/pub/repos/apt"
+# Distribution-independent third-party sources that keep working on Trixie unchanged, entry and
+# keyring as their installer writes them: URI, suite, components, the primary keys its Signed-By
+# keyring may hold (the current signing key first, which it must hold), the origin APT reports and
+# the packages the rehearsal may take from it. GitHub publishes its current key and the one it
+# replaced in one keyring (install_linux.md; repair_github_cli_keyring keeps it current); the feed
+# carries only gh. The entry stays as it is; only an installed gh is upgraded from it.
+AGNOSTIC_SOURCES = {
+    "github-cli": {
+        "uri": "https://cli.github.com/packages", "suite": "stable", "components": ("main",),
+        "fingerprints": ("7F38BBB59D064DBCB3D84D725612B36462313325", "2C6106201985B60E6C7AC87323F3D4EA75716059"),
+        "origin": "cli.github.com", "packages": r"^gh$",
+    },
+}
+# The DwemerDistro 3.4.5 installer leaves this rolling source active next to the Bookworm ones.
+# Only this exact line is recognised; the upgrade disables it, because testing is no release.
+STOCK_TESTING = "deb http://deb.debian.org/debian testing main non-free contrib"
+ROLLING_SUITES = {"testing", "unstable", "sid", "experimental", "forky", "rc-buggy"}
+# Debian 13 ships no package of these names nor a successor (Python 3.12 removed distutils and
+# lib2to3; curl removed its NSS backend). Removing them, even when installed manually, is part of
+# the release upgrade, but only when the Trixie lists confirm the name is gone.
+DROPPED_IN_TRIXIE = {"python3-distutils": "Python 3.12 removed distutils",
+                     "python3-lib2to3": "Python 3.13 removed lib2to3",
+                     "libcurl3-nss": "curl removed its NSS backend",
+                     "python3.11-venv": "Debian 13 ships no Python 3.11"}
+# A dropped package is accepted only while the package it serves stays installed: existing Python
+# 3.11 venvs keep running on the retained interpreter; only creating new ones loses its wheels.
+DROPPED_NEEDS = {"python3.11-venv": f"python{SOURCE_PYTHON}"}
+# The stock Debian CUDA profiling and injection libraries carry the CUDA series in their names
+# (libcupti11.8 -> libcupti12). Removing a manually installed one is accepted only when Debian 13
+# dropped the name, the plan brings the same library of a newer series, and nothing unpackaged
+# outside APT (venvs, /usr/local, /opt) loads its old soname.
+CUDA_SOURCE = "nvidia-cuda-toolkit"
+CUDA_PROFILING = re.compile(r"^(libcupti|libcuinj64-|libaccinj64-)([0-9]+(?:\.[0-9]+)*)$")
+# Debian's NVIDIA kernel module. Under WSL the GPU is reached through the host's /usr/lib/wsl/lib and
+# no NVIDIA module loads on the stock WSL kernel, yet Debian's DKMS postinst (autoinstall_all_kernels)
+# builds it for every kernel with /lib/modules/<release>/build/include, the WSL kernel included.
+# DKMS reads /etc/dkms/<module>-<version>-<kernel>.conf after the packaged dkms.conf (dkms(8));
+# BUILD_EXCLUSIVE_KERNEL="^$" there makes it skip that one kernel with exit 77, which
+# common.postinst and dkms autoinstall pass over. dkms 3.2 then reads the files below it.
+NVIDIA_MODULE = "nvidia-kernel-dkms"
+WSL_KERNEL = re.compile(r"^[0-9]+(\.[0-9]+){2,3}-microsoft-standard-WSL2$")
+WSL_LIB = Path("/usr/lib/wsl/lib")
+KERNEL_RELEASE = Path("/proc/sys/kernel/osrelease")
+DKMS_CONF = Path("/etc/dkms")
+DKMS_ARCH = "x86_64"
+DKMS_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+~-]*$")
+UNPACKAGED_ROOTS = ("/usr/local", "/opt")
+UNPACKAGED_LIMIT = 50000
+# Debian 13's gpg-wks-server depends on a mail transport. Without one installed, APT would choose
+# exim4, a new mail server; esmtp-run, which only relays when called and ships no service, is
+# requested instead. msmtp-mta is no such relay: it ships msmtpd.service.
+MTA_DAEMONS = {"exim4-daemon-light", "exim4-daemon-heavy", "postfix", "msmtp-mta"}
+RELAY_MTA = "esmtp-run"
+# Verified Debian 13 takeovers whose successor Provides but does not Replace the old name: Bookworm's
+# libtinfo-dev ships nothing outside /usr/share/doc and depends on libncurses-dev, whose Trixie build
+# Provides libtinfo-dev (its Replaces names only ncurses-dev). Accepted only with that empty payload.
+DOC_ONLY_SUCCESSORS = {"libtinfo-dev": "libncurses-dev"}
+# The vendor feeds Core's own installers add on Debian 12: NVIDIA CUDA (install_cuda_dependencies,
+# through cuda-keyring) and Microsoft .NET (ddistro_reign build). Only these exact entries are
+# recognised; each moves to the vendor's Debian 13 feed, signed by a key fetched for that feed and
+# accepted only with its pinned fingerprint (the Debian 12 keys are not reused). APT pins let a feed
+# supply only the versioned user-space packages below: never a GPU driver, compat libcuda, kernel
+# module or the vendor's own feed package. Any other vendor entry defers as apt-third-party.
+VENDORS = {
+    "nvidia-cuda": {
+        "source": ("https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64", "/", (),
+                   "/usr/share/keyrings/cuda-archive-keyring.gpg"),
+        "target": ("https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64", "/", ()),
+        "key_url": "https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/8793F200.pub",
+        "fingerprint": "02182E60104FCDC26EAE1B8597A5D4CB8793F200",
+        "origin": "developer.download.nvidia.com",
+        "packages": r"^((cuda-(cudart|cudart-dev|driver-dev|cccl|nvcc|crt|nvvm|culibos-dev|nvrtc|nvrtc-dev|cupti|cupti-dev"
+                    r"|nvtx|nvml-dev|profiler-api|sanitizer|cuobjdump|nvdisasm|nvprune|cuxxfilt|libraries|libraries-dev"
+                    r"|minimal-build)|lib(cublas|cufft|curand|cusolver|cusparse|nvjitlink|npp|nvjpeg|nvfatbin|cufile)(-dev)?)"
+                    r"-[0-9]+-[0-9]+|cuda-toolkit(-[0-9]+){0,2}-config-common)$",
+    },
+    "microsoft": {
+        "source": ("https://packages.microsoft.com/debian/12/prod", SOURCE, ("main",), "/usr/share/keyrings/microsoft-prod.gpg"),
+        "target": ("https://packages.microsoft.com/debian/13/prod", TARGET, ("main",)),
+        "key_url": "https://packages.microsoft.com/keys/microsoft-2025.asc",
+        "fingerprint": "AA86F75E427A19DD33346403EE4D7792F748182B",
+        "origin": "packages.microsoft.com",
+        "packages": r"^((dotnet-(sdk|runtime|runtime-deps|hostfxr|targeting-pack|apphost-pack)|aspnetcore-(runtime|targeting-pack)"
+                    r"|netstandard-targeting-pack)-[0-9]+\.[0-9]+|netstandard-targeting-pack-[0-9]+\.[0-9]+-[0-9]+\.[0-9]+"
+                    r"|dotnet-host(-[0-9]+\.[0-9]+)?)$",
+    },
+}
+VENDOR_KEYRINGS = Path("/etc/apt/keyrings")
+# Read before preferences.d/stable, so its general pins win over the 900 Trixie release pin.
+VENDOR_PINS_NAME = "dwemerdistro-vendors"
+# CUDA homes (/usr/local/cuda-12.8) and the alternatives links that select them stay as they are.
+CUDA_PARENT = Path("/usr/local")
+# The only packages the private APT policy lets PGDG supply; everything else comes from Debian.
+PGDG_PINNED = re.compile(r"^(postgresql(-.+)?|libpq5|libpq-dev|pgdg-keyring)$")
+# /etc/apt/preferences.d/stable as the DwemerDistro 3.4.5 installer writes it, compared by meaning:
+# (package, archive, priority). Any other pin defers. At the cutover it is kept in
+# PREFERENCES_BACKUP and replaced by TRIXIE_PREFERENCES, which pins only Debian 13 release suites
+# (security and updates included) and keeps PostgreSQL on PGDG as the rehearsal did; the 900
+# release pin alone would move PostgreSQL 17 to Debian's own builds at a Debian point release.
+STOCK_PREFERENCES = "stable"
+STOCK_PINS = [("*", "bookworm", 900), ("*", "testing", 300)]
+TRIXIE_PREFERENCES = (
+    "# Debian 13 form of the DwemerDistro release pin, written by ddistro_trixie_maintenance. The Debian 12\n"
+    "# original is kept in /var/lib/dwemerdistro/trixie-maintenance/apt-preferences-bookworm/.\n"
+    "Package: postgresql postgresql-* libpq5 libpq-dev pgdg-keyring\nPin: origin apt.postgresql.org\nPin-Priority: 950\n\n"
+    + "\n".join(f"Package: *\nPin: release n={suite}\nPin-Priority: 900\n"
+                for suite in (TARGET, f"{TARGET}-updates", f"{TARGET}-security"))
+)
+# Removing one of these, or failing to upgrade one to a Trixie build, defers the upgrade.
+PROTECTED = re.compile(r"^(postgresql(-[0-9]+(-.+)?|-common|-client-common|-client-[0-9]+)?|libpq5|apache2(-bin|-data|-utils)?"
+                       r"|sudo|ca-certificates|git|python3|python3-venv|openssl|curl|debian-archive-keyring)$")
+PG_PACKAGE = re.compile(r"^(postgresql(-[0-9]+(-.+)?|-common|-client-common|-client-[0-9]+)?|libpq5)$")
+# PHP 8.4 deprecates these, so they are not carried to its configuration.
+PHP_NOT_CARRIED = {"session.sid_length", "session.sid_bits_per_character", "extension_dir"}
+PHP_SAPIS = ("apache2", "cli", "fpm")
+LIB_DIRS = ("/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu", "/lib", "/usr/lib", "/lib64", "/usr/lib64")
+VENV_ROOTS = ("/home", "/opt", "/srv", "/usr/local", "/var/www", "/var/lib/dwemerdistro")
+VENV_DEPTH = 6
+PRUNE = {".git", ".cache", "node_modules", "__pycache__", "site-packages", "dist-packages"}
+# glibc 2.41 (Debian 13) no longer makes the stack executable for dlopen: a shared object whose
+# PT_GNU_STACK asks for one (PF_X) fails to import ("cannot enable executable stack as shared object
+# requires"). Any such file in a venv defers, except these exact stock wheel files, which do not need
+# it: the upgrade clears PF_X in that one program header (what patchelf --clear-execstack does) after
+# a patched copy imported and ran under the venv's own Python before anything was written, updates
+# that file's line in the wheel's RECORD, and verify imports it again on Debian 13. Keyed by venv and
+# path inside it; any other venv, path, size, digest or RECORD line (a private build) defers.
+EXECSTACK_STOCK = {
+    ("/home/dwemer/python-stt", "lib/python3.11/site-packages/ctranslate2.libs/libctranslate2-d3638643.so.4.4.0"): {
+        "bytes": 71690457, "sha256": "3fdf882ba5de43ac05bace3538dd980715848deec75b563d6e7fa6a79c3bdd78",
+        "record": "lib/python3.11/site-packages/ctranslate2-4.4.0.dist-info/RECORD", "module": "ctranslate2",
+        # Copied together into the scratch probe: the extension module loads the library via $ORIGIN.
+        "packages": ("ctranslate2", "ctranslate2.libs"),
+    },
+}
+PT_GNU_STACK, PF_X = 0x6474E551, 1
+# LocalWhisper runs from its directory with config.yaml (a link to one of its config-*.yaml), whose
+# faster_whisper model and model_cache_dir pick the model; that one runs in the speech probe, else the
+# smallest converted model under these roots.
+WHISPER_HOME = "/home/dwemer/remote-faster-whisper"
+WHISPER_MODEL_ROOTS = (WHISPER_HOME + "/models", "/home/dwemer/.cache/huggingface/hub")
+EXECSTACK_PROBE_TIMEOUT = 900
+EXECSTACK_PROBE = r"""
+import os, sys
+site, name, models = sys.argv[1], sys.argv[2], sys.argv[3:]
+if site:
+    sys.path.insert(0, site)
+import importlib
+module = importlib.import_module(name)
+libs = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(module.__file__))), name + ".libs") + "/"
+if site and not os.path.realpath(module.__file__).startswith(os.path.realpath(site) + "/"):
+    sys.exit("imported %s from %s, not the probe copy" % (name, module.__file__))
+maps = open("/proc/self/maps").read().splitlines()
+if not any(libs in line for line in maps):
+    sys.exit("%s did not map its bundled library from %s" % (name, libs))
+if any(line.endswith("[stack]") and "x" in line.split()[1] for line in maps):
+    sys.exit("the stack is executable")
+import numpy
+types = module.get_supported_compute_types("cpu")
+view = module.StorageView.from_array(numpy.arange(6, dtype=numpy.float32).reshape(2, 3))
+if numpy.array(view).tolist() != [[0, 1, 2], [3, 4, 5]]:
+    sys.exit("StorageView round trip failed")
+if models:
+    model = module.models.Whisper(models[0], device="cpu", compute_type="int8" if "int8" in types else "default")
+    features = numpy.zeros((1, getattr(model, "n_mels", 80), 3000), dtype=numpy.float32)
+    if not model.detect_language(module.StorageView.from_array(features))[0]:
+        sys.exit("Whisper detected no language")
+    print("speech")
+else:
+    print("import")
+"""
+# Writers stopped by the fence when running: the web runtime and PHP-FPM. PostgreSQL is stopped
+# separately and checked by its pg_control seal.
+WRITERS = ("apache2", f"php{SOURCE_PHP}-fpm")
+SPACE_MARGIN = 2 * 1024 ** 3
+# Room per entry for a tar header and a pax extended header (long names, xattrs, ACLs).
+EXPORT_ENTRY_BYTES = 3 * 512
+PLAN_MAX_AGE = 7 * 86400
+SCHEMA = 1
+EXIT_DEFERRED, EXIT_RESTART, EXIT_BUSY = 3, 4, 75
+
+log = None
+
+
+class Deferred(ValueError):
+    """The upgrade cannot start safely; nothing was changed."""
+
+    def __init__(self, reasons):
+        self.reasons = list(reasons)
+        super().__init__("; ".join(f"{r['code']}: {r['detail']}" for r in self.reasons))
+
+
+class Busy(ValueError):
+    """Another maintenance operation holds a lock, so this one changed nothing."""
+
+
+class RestartRequired(ValueError):
+    """Processes still run code that the upgrade replaced."""
+
+
+def reason(code, detail):
+    return {"code": code, "detail": detail}
+
+
+# ---------------------------------------------------------------------------------------------
+# Small utilities
+
+
+def run(*args, **kwargs):
+    kwargs.setdefault("stdout", log)
+    kwargs.setdefault("stderr", log)
+    return subprocess.run([str(a) for a in args], check=True, **kwargs)
+
+
+def output(*args, env=None, check=True):
+    result = subprocess.run([str(a) for a in args], stdout=subprocess.PIPE, stderr=log, env=env, check=check)
+    return result.stdout.decode(errors="replace")
+
+
+def note(message):
+    if log is not None:
+        log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n".encode())
+        log.flush()
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def sync_dir(path):
+    fd = os.open(path, os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic(path, value, mode, like=None):
+    """Replace path durably. like: keep the owner of that existing file. Bytes are written as they are."""
+    temporary = path.with_name(path.name + ".trixie-" + uuid.uuid4().hex)
+    stream = temporary.open("xb" if isinstance(value, bytes) else "x")
+    # Only the temporary file this call created is removed when it fails.
+    try:
+        with stream:
+            os.fchmod(stream.fileno(), mode)
+            if like is not None:
+                info = os.stat(like)
+                os.fchown(stream.fileno(), info.st_uid, info.st_gid)
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    sync_dir(path.parent)
+
+
+def load_state():
+    return json.loads(STATE.read_text()) if STATE.is_file() else None
+
+
+def save_state(state, phase=None):
+    if phase is not None:
+        state["phase"] = phase
+    state["updated_at"] = int(time.time())
+    atomic(STATE, json.dumps(state, indent=1, sort_keys=True), 0o600)
+
+
+def os_release(path=Path("/etc/os-release")):
+    values = {}
+    for line in path.read_text().splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"')
+    return values
+
+
+def version_lt(a, b):
+    return subprocess.run(["dpkg", "--compare-versions", a, "lt", b]).returncode == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# Package and source inventory (read-only)
+
+
+def installed_packages():
+    """name (without :arch) -> {status, version, source, arch}."""
+    text = output("dpkg-query", "-W", "-f",
+                  "${db:Status-Abbrev}\t${binary:Package}\t${Version}\t${source:Package}\t${Architecture}\n")
+    return parse_installed(text)
+
+
+def parse_installed(text):
+    packages = {}
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 5:
+            continue
+        status, name, version, source, arch = parts
+        status = status.strip()
+        if status in ("un", "pn"):
+            continue
+        packages[name.split(":")[0]] = {"status": status, "version": version, "source": source or name, "arch": arch}
+    return packages
+
+
+def parse_one_line_source(line):
+    text = line.split("#", 1)[0].strip()
+    match = re.match(r"^(deb|deb-src)\s+(\[[^\]]*\]\s+)?(\S+)\s+(\S+)(.*)$", text)
+    if not match:
+        return None
+    return {"types": [match.group(1)], "options": (match.group(2) or "").strip(), "uris": [match.group(3)],
+            "suites": [match.group(4)], "components": match.group(5).split(), "enabled": True,
+            "line": " ".join(text.split())}
+
+
+def parse_deb822(text):
+    stanzas = []
+    for block in re.split(r"\n\s*\n", text):
+        fields, key = {}, None
+        for raw in block.splitlines():
+            if raw.startswith("#"):
+                continue
+            if raw[:1] in (" ", "\t") and key:
+                fields[key] += " " + raw.strip()
+                continue
+            if ":" in raw:
+                key, value = raw.split(":", 1)
+                key = key.strip().lower()
+                fields[key] = value.strip()
+        if "uris" not in fields:
+            continue
+        stanzas.append({
+            "types": fields.get("types", "").split(), "uris": fields.get("uris", "").split(),
+            "suites": fields.get("suites", "").split(), "components": fields.get("components", "").split(),
+            "options": fields.get("signed-by", ""), "enabled": fields.get("enabled", "yes").lower() != "no",
+            "fields": fields,
+        })
+    return stanzas
+
+
+def vendor_keyring(vendor):
+    return VENDOR_KEYRINGS / f"dwemerdistro-{vendor}-debian13.gpg"
+
+
+def entry_options(entry):
+    """An entry's options as a dict (architectures as "arch", languages as "lang"), or None when
+    one is not a plain key=value item."""
+    if "fields" in entry:
+        options = {k: v for k, v in entry["fields"].items() if k not in ("types", "uris", "suites", "components", "enabled")}
+    else:
+        items = entry["options"].strip("[]").split()
+        if not all("=" in item for item in items):
+            return None
+        options = dict(item.split("=", 1) for item in items)
+    for long, short in (("architectures", "arch"), ("languages", "lang")):
+        if long in options:
+            if short in options:
+                return None
+            options[short] = options.pop(long)
+    return options
+
+
+def plain_options(entry, allowed=()):
+    """The Signed-By value (or None) when an entry has only an architecture list including amd64,
+    the allowed extra keys and Signed-By; False when it has anything else."""
+    options = entry_options(entry)
+    if options is None:
+        return False
+    arch = options.pop("arch", None)
+    if arch is not None and "amd64" not in re.split(r"[,\s]+", arch):
+        return False
+    signed = options.pop("signed-by", None)
+    return False if set(options) - set(allowed) else signed
+
+
+def single_uri(entry):
+    """(scheme, host, path) of an entry's only http(s) URI without credentials, port, query or
+    fragment, else None."""
+    if len(entry["uris"]) != 1:
+        return None
+    try:
+        parts = urlsplit(entry["uris"][0])
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or parts.username or parts.password or port or parts.query \
+            or parts.fragment or not parts.hostname or parts.netloc != parts.hostname:
+        return None
+    return parts.scheme, parts.hostname, parts.path.rstrip("/")
+
+
+def keyring_fingerprints(path):
+    """The primary fingerprints of the keys a regular keyring file holds, else None."""
+    return key_fingerprints(path) if os.path.isfile(path) else None
+
+
+def signed_with(signed, fingerprint, also=()):
+    """True when Signed-By names one absolute keyring holding the pinned key and no primary key
+    other than those also allowed."""
+    if not signed or not signed.startswith("/") or re.search(r"[\s,]", signed):
+        return False
+    keys = keyring_fingerprints(signed)
+    return bool(keys) and fingerprint in keys and set(keys) <= {fingerprint, *also}
+
+
+def agnostic_match(entry):
+    """The name of the exact distribution-independent source an entry is, else None."""
+    if entry["types"] != ["deb"] or len(entry["uris"]) != 1 or single_uri(entry) is None:
+        return None
+    for name, spec in AGNOSTIC_SOURCES.items():
+        if entry["uris"][0].rstrip("/") == spec["uri"] and entry["suites"] == [spec["suite"]] \
+                and entry["components"] == list(spec["components"]) \
+                and signed_with(plain_options(entry), spec["fingerprints"][0], spec["fingerprints"][1:]):
+            return name
+    return None
+
+
+def vendor_match(entry):
+    """(vendor, "source" or "target") for an exact Core vendor entry in its Debian 12 or migrated
+    Debian 13 form, else None. Besides the URI, suite, components and keyring only an architecture
+    list that includes amd64 is allowed."""
+    if entry["types"] != ["deb"] or len(entry["uris"]) != 1 or len(entry["suites"]) != 1:
+        return None
+    signed = plain_options(entry)
+    if signed is False:
+        return None
+    uri = entry["uris"][0].rstrip("/")
+    for vendor, spec in VENDORS.items():
+        for form, (base, suite, components), keyring in (("source", spec["source"][:3], spec["source"][3]),
+                                                          ("target", spec["target"], vendor_keyring(vendor).as_posix())):
+            if uri == base and entry["suites"] == [suite] and entry["components"] == list(components) and signed == keyring:
+                return vendor, form
+    return None
+
+
+def vendor_keys(entries, kind="vendor"):
+    """The vendors whose recognised feeds the entries of that kind name."""
+    return sorted({vendor_match(e)[0] for e in entries if e["kind"] == kind})
+
+
+def debian_entry(entry, location):
+    """True for a Debian main-archive or security entry on Debian's own hosts with Debian's signing."""
+    if not entry["types"] or set(entry["types"]) - {"deb", "deb-src"} or not entry["suites"] \
+            or not entry["components"] or set(entry["components"]) - DEBIAN_COMPONENTS:
+        return False
+    signed = plain_options(entry, allowed=("lang",))
+    if signed is False or signed is not None and signed not in DEBIAN_KEYRINGS:
+        return False
+    _scheme, host, path = location
+    if path == "/debian" and DEBIAN_MIRROR.match(host):
+        suites = {SOURCE, f"{SOURCE}-updates", f"{SOURCE}-backports", f"{SOURCE}-proposed-updates",
+                  TARGET, f"{TARGET}-updates", f"{TARGET}-backports"}
+    elif path == "/debian-security" and host in DEBIAN_SECURITY_HOSTS:
+        suites = {f"{SOURCE}-security", f"{TARGET}-security"}
+    else:
+        return False
+    return set(entry["suites"]) <= suites
+
+
+def classify_source(entry):
+    if entry.get("line") == STOCK_TESTING:
+        return "stock-testing"
+    vendor = vendor_match(entry)
+    if vendor:
+        return "vendor" if vendor[1] == "source" else "vendor-target"
+    location = single_uri(entry)
+    if location is None:
+        return "other"
+    _scheme, host, path = location
+    if host == PGDG_HOST and path == PGDG_PATH:
+        if set(entry["types"]) <= {"deb", "deb-src"} and entry["types"] and entry["components"] == ["main"] \
+                and len(entry["suites"]) == 1 and entry["suites"][0] in (f"{SOURCE}-pgdg", f"{TARGET}-pgdg") \
+                and signed_with(plain_options(entry), PGDG_FINGERPRINT):
+            return "pgdg"
+        return "other"
+    if agnostic_match(entry):
+        return "agnostic"
+    if debian_entry(entry, location):
+        return "debian"
+    return "other"
+
+
+def apt_sources():
+    entries = []
+    files = [APT_SOURCES] if APT_SOURCES.is_file() else []
+    if APT_PARTS.is_dir():
+        files += sorted(p for p in APT_PARTS.iterdir() if p.suffix in (".list", ".sources"))
+    for path in files:
+        text = path.read_text(errors="replace")
+        found = parse_deb822(text) if path.suffix == ".sources" else \
+            [e for e in map(parse_one_line_source, text.splitlines()) if e]
+        for entry in found:
+            entry["file"] = str(path)
+            entry["kind"] = classify_source(entry)
+            entries.append(entry)
+    return [e for e in entries if e["enabled"]]
+
+
+def main_archive_components(entries):
+    """Components the active main-archive release entries carry; after the upgrade they are Trixie's.
+    Trixie entries count too, so a rerun after a crash between two files sees the same coverage."""
+    covered = set()
+    for entry in entries:
+        if entry["kind"] == "debian" and {SOURCE, TARGET} & set(entry["suites"]) and "deb" in entry["types"] \
+                and not entry["uris"][0].rstrip("/").endswith("-security"):
+            covered.update(entry["components"])
+    return covered
+
+
+def rewrite_suites(text, deb822, covered=frozenset()):
+    """Move Debian and PGDG suites from Bookworm to Trixie; every other entry stays byte-for-byte.
+    The stock testing line is commented out; components it alone carried move to a Trixie line."""
+    mapping = {SOURCE: TARGET, f"{SOURCE}-updates": f"{TARGET}-updates", f"{SOURCE}-security": f"{TARGET}-security",
+               f"{SOURCE}-backports": f"{TARGET}-backports", f"{SOURCE}-pgdg": f"{TARGET}-pgdg"}
+
+    def swap(words):
+        return " ".join(mapping.get(word, word) for word in words.split())
+
+    if not deb822:
+        lines = []
+        for line in text.splitlines(keepends=True):
+            entry = parse_one_line_source(line)
+            if entry and classify_source(entry) == "stock-testing":
+                body = line.rstrip("\r\n")
+                replacement = ["# Disabled by ddistro_trixie_maintenance for Debian 13 (original in "
+                               f"{SOURCES_BACKUP.name}): {body}"]
+                missing = [c for c in entry["components"] if c not in covered]
+                if missing:
+                    replacement.append(f"deb http://deb.debian.org/debian {TARGET} {' '.join(missing)}")
+                lines.append("\n".join(replacement) + line[len(body):])
+                continue
+            if entry and classify_source(entry) in ("debian", "pgdg"):
+                suite = entry["suites"][0]
+                line = re.sub(r"(\s)" + re.escape(suite) + r"(\s|$)", lambda m: m.group(1) + mapping.get(suite, suite) + m.group(2),
+                              line, count=1)
+            elif entry and classify_source(entry) == "vendor":
+                vendor = vendor_match(entry)[0]
+                (old_uri, old_suite, _, old_key), (new_uri, new_suite, _) = VENDORS[vendor]["source"], VENDORS[vendor]["target"]
+                keyring = vendor_keyring(vendor).as_posix()
+                line = re.sub(r"signed-by=" + re.escape(old_key) + r"(?=[\s\]])", lambda _: f"signed-by={keyring}", line, count=1)
+                line = re.sub(r"(\s)" + re.escape(old_uri) + r"(/?\s+)" + re.escape(old_suite) + r"(?=\s|$)",
+                              lambda m: m.group(1) + new_uri + m.group(2) + new_suite, line, count=1)
+            lines.append(line)
+        return "".join(lines)
+    blocks = re.split(r"(\n\s*\n)", text)
+    for index in range(0, len(blocks), 2):
+        stanza = parse_deb822(blocks[index])
+        if stanza and classify_source(stanza[0]) in ("debian", "pgdg"):
+            blocks[index] = re.sub(r"(?im)^(suites:)([^\n]*)$", lambda m: m.group(1) + " " + swap(m.group(2)), blocks[index])
+        elif stanza and classify_source(stanza[0]) == "vendor":
+            vendor = vendor_match(stanza[0])[0]
+            new_uri, new_suite, _ = VENDORS[vendor]["target"]
+            for field, value in (("uris", new_uri), ("suites", new_suite), ("signed-by", vendor_keyring(vendor).as_posix())):
+                blocks[index] = re.sub(rf"(?im)^({field}:[ \t]*)(\S+?)(/?)[ \t]*$",
+                                       lambda m, value=value: m.group(1) + value + (m.group(3) if field == "uris" else ""),
+                                       blocks[index], count=1)
+    return "".join(blocks)
+
+
+def apt_mark(kind):
+    return set(output("apt-mark", kind).split())
+
+
+def pin_meanings(text):
+    """APT preference stanzas -> sorted (package, archive, priority) of plain "Pin: release a=X"
+    stanzas, or None when anything else appears (other fields, continuation lines, other pins)."""
+    pins = []
+    for block in re.split(r"\n\s*\n", text):
+        fields = {}
+        for raw in block.splitlines():
+            if not raw.strip() or raw.lstrip().startswith("#"):
+                continue
+            if raw[:1] in (" ", "\t") or ":" not in raw:
+                return None
+            key, value = raw.split(":", 1)
+            key = key.strip().lower()
+            if key == "explanation":
+                continue
+            if key in fields:
+                return None
+            fields[key] = " ".join(value.split())
+        if not fields:
+            continue
+        match = re.fullmatch(r"release (?:a|archive)=([A-Za-z0-9.-]+)", fields.get("pin", ""), re.I)
+        if set(fields) != {"package", "pin", "pin-priority"} or not match or not re.fullmatch(r"-?[0-9]+", fields["pin-priority"]):
+            return None
+        pins.append((fields["package"], match.group(1).lower(), int(fields["pin-priority"])))
+    return sorted(pins)
+
+
+def preference_entries():
+    main, parts = APT_PREFERENCES
+    present = [main] if main.is_symlink() or main.exists() and not (main.is_file() and not main.read_text().strip()) else []
+    if parts.is_dir():
+        return present + sorted(parts.iterdir())
+    return present + ([parts] if parts.exists() or parts.is_symlink() else [])
+
+
+def stock_preferences():
+    """-> (the stock preferences file or None, problems). Only the installer's own pin file, alone
+    and unchanged in meaning, is accepted; any other APT preference defers."""
+    entries = preference_entries()
+    if not entries:
+        return None, []
+    stock = APT_PREFERENCES[1] / STOCK_PREFERENCES
+    if entries == [stock] and not stock.is_symlink() and stock.is_file() \
+            and pin_meanings(stock.read_text(errors="replace")) == sorted(STOCK_PINS):
+        return stock, []
+    return None, [reason("apt-preferences", f"{', '.join(map(str, entries))} pin packages other than the installer's "
+                                            "default; the upgrade does not reinterpret pins.")]
+
+
+def vendor_pins(vendors, specs=VENDORS):
+    """APT pins that let each migrated vendor feed supply only its versioned user-space packages."""
+    return "".join(f"Package: /{specs[v]['packages']}/\nPin: origin {specs[v]['origin']}\nPin-Priority: 500\n\n"
+                   f"Package: *\nPin: origin {specs[v]['origin']}\nPin-Priority: -1\n\n" for v in sorted(vendors))
+
+
+def vendor_pin_file(vendors):
+    return ("# Written by ddistro_trixie_maintenance: the migrated vendor feeds supply only versioned\n"
+            "# user-space components, never a GPU driver, compat library or kernel module.\n" + vendor_pins(vendors))
+
+
+def trixie_preference_problems(vendors=()):
+    """After the cutover only the normalized Trixie pins (or none) may remain, plus the vendor pins
+    when vendor feeds were migrated."""
+    entries = preference_entries()
+    stock = APT_PREFERENCES[1] / STOCK_PREFERENCES
+    expected = {stock: TRIXIE_PREFERENCES}
+    if vendors:
+        expected[APT_PREFERENCES[1] / VENDOR_PINS_NAME] = vendor_pin_file(vendors)
+    if all(path in expected and not path.is_symlink() and path.is_file()
+           and path.read_text(errors="replace") == expected[path] for path in entries) \
+            and (not vendors or APT_PREFERENCES[1] / VENDOR_PINS_NAME in entries):
+        return []
+    return [reason("apt-preferences", f"{', '.join(map(str, entries)) or 'Nothing'} pins other than the Debian 13 "
+                                      "release and vendor pins.")]
+
+
+def wsl_boot_problems(text):
+    """Anything WSL starts at boot could run while the upgrade is fenced. Only initialize_fresh_distro,
+    which acts on fresh images alone, is accepted; systemd must be off (absent or false)."""
+    problems, section = [], None
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            section = line.strip("[]").strip().lower()
+        elif section == "boot" and "=" in line:
+            key, value = (part.strip() for part in line.split("=", 1))
+            plain = value.strip().strip("\"'").strip()
+            if key.lower() == "systemd" and plain.lower() not in ("", "false"):
+                problems.append(reason("wsl-boot", f"/etc/wsl.conf sets systemd={value}; units could start at boot."))
+            elif key.lower() == "command" and plain not in ("", "/usr/local/bin/initialize_fresh_distro"):
+                problems.append(reason("wsl-boot", f"/etc/wsl.conf runs {value} at boot."))
+    return problems
+
+
+def dpkg_status_digest():
+    return sha256_file("/var/lib/dpkg/status")
+
+
+def instance_id(machine_id=None, fresh=None):
+    """Opaque, stable per-install identifier derived from /etc/machine-id, or None.
+
+    It is a domain-separated SHA-256 of the machine id, so the machine id itself is not disclosed.
+    An export restored elsewhere keeps the same machine id, so this only corroborates the host's
+    WSL registration and never identifies an install on its own. A prepared image that has not
+    created its own machine id yet (fresh-image marker present) has no instance_id."""
+    machine_id, fresh = machine_id or MACHINE_ID, fresh or FRESH_IMAGE
+    try:
+        if fresh.exists():
+            return None
+        value = machine_id.read_text().strip()
+    except OSError:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{32}", value) or value == "0" * 32:
+        return None
+    return "ddi1-" + hashlib.sha256(b"dwemerdistro-instance-id/v1\0" + value.encode()).hexdigest()[:40]
+
+
+def rootfs_used_bytes(root="/"):
+    """A conservative size of the root filesystem's file data for a host export.
+
+    The larger of the filesystem's allocated blocks (statvfs, which also counts metadata and the
+    journal) and a walk of that filesystem alone: each inode's data once, at the larger of its
+    apparent and allocated size (so sparse files count in full, as an uncompressed tar stores
+    them), rounded to 512-byte blocks, plus header room for every entry."""
+    info = os.statvfs(root)
+    used = (info.f_blocks - info.f_bfree) * info.f_frsize
+    device = os.lstat(root).st_dev
+    seen, total = set(), 2 * 10240
+    for current, dirs, files in os.walk(root):
+        total += EXPORT_ENTRY_BYTES
+        kept = []
+        for name in dirs:
+            try:
+                entry = os.lstat(os.path.join(current, name))
+            except OSError:
+                continue
+            if stat.S_ISLNK(entry.st_mode):
+                total += EXPORT_ENTRY_BYTES
+            elif entry.st_dev == device:
+                kept.append(name)
+        dirs[:] = kept
+        for name in files:
+            try:
+                entry = os.lstat(os.path.join(current, name))
+            except OSError:
+                continue
+            total += EXPORT_ENTRY_BYTES
+            if stat.S_ISREG(entry.st_mode) and (entry.st_dev, entry.st_ino) not in seen:
+                seen.add((entry.st_dev, entry.st_ino))
+                size = max(entry.st_size, entry.st_blocks * 512)
+                total += -(-size // 512) * 512
+    return max(used, total, 1)
+
+
+def package_files(name, arch=None):
+    for candidate in (f"{name}:{arch}.list" if arch else None, f"{name}.list"):
+        if candidate and Path("/var/lib/dpkg/info", candidate).is_file():
+            return Path("/var/lib/dpkg/info", candidate).read_text(errors="replace").splitlines()
+    return []
+
+
+# ---------------------------------------------------------------------------------------------
+# PostgreSQL layout and inventory
+
+
+def pg17_journal():
+    """The PG17 migration journal must record a serving, cleaned-up PG17 with the PG15 guards in place."""
+    if not PG17_STATE.is_file():
+        return None, [reason("pg17-not-current", "PostgreSQL 17 maintenance has not run. Complete the PG17 upgrade first.")]
+    state = json.loads(PG17_STATE.read_text())
+    problems = []
+    if state.get("phase") != "active":
+        problems.append(reason("pg17-not-current", f"The PG17 journal phase is {state.get('phase')!r}, not 'active'."))
+    elif not state.get("cleaned"):
+        problems.append(reason("pg17-not-current", "PG17 staging cleanup is still pending (cleanup-needed)."))
+    return state, problems
+
+
+def read_start(directory):
+    path = directory / "start.conf"
+    if path.is_symlink() or not path.is_file():
+        return None
+    return next((line.strip() for line in path.read_text().splitlines()
+                 if line.strip() and not line.lstrip().startswith("#")), None)
+
+
+def mount_points():
+    with open("/proc/self/mountinfo") as table:
+        return [re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), line.split()[4]) for line in table]
+
+
+def pg_layout():
+    problems = []
+    clusters = sorted(f"{v.name}/{c.name}" for v in PG_CONF.iterdir() if v.is_dir() for c in v.iterdir() if c.is_dir()) \
+        if PG_CONF.is_dir() else []
+    if clusters != ["15/main", "17/dwemer"]:
+        problems.append(reason("pg-layout", f"Expected clusters 15/main and 17/dwemer, found {clusters or 'none'}."))
+    if read_start(OLD_CONF) != "disabled":
+        problems.append(reason("pg15-guard", "The retained PG15 cluster must stay stopped with start.conf 'disabled'."))
+    if read_start(NEW_CONF) not in ("auto", "manual"):
+        problems.append(reason("pg-layout", "17/dwemer start.conf is not auto or manual."))
+    for path in (PG_CONF, PG_DATA, OLD_CONF, NEW_CONF, OLD_DATA, NEW_DATA):
+        if path.is_symlink() or Path(os.path.realpath(path)) != path:
+            problems.append(reason("pg-layout", f"{path} is linked; linked PostgreSQL paths are not supported."))
+    points = [p for p in mount_points() if p == str(PG_DATA) or p.startswith(str(PG_DATA) + "/")]
+    if points:
+        problems.append(reason("pg-layout", f"Mount points under {PG_DATA}: {', '.join(points)}."))
+    for data in (OLD_DATA, NEW_DATA):
+        tablespaces = data / "pg_tblspc"
+        if tablespaces.is_dir() and any(tablespaces.iterdir()):
+            problems.append(reason("pg-layout", f"{data} uses external tablespaces."))
+    return problems
+
+
+def controldata(major, directory):
+    text = output(f"/usr/lib/postgresql/{major}/bin/pg_controldata", directory, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"})
+    return dict((part.strip() for part in line.split(":", 1)) for line in text.splitlines() if ":" in line)
+
+
+def pg17_seal():
+    control = controldata(17, NEW_DATA)
+    return [control[k] for k in ("Database system identifier", "Latest checkpoint location", "Time of latest checkpoint",
+                                 "Database cluster state")]
+
+
+def pg_running(major, directory):
+    status = subprocess.run(["/usr/sbin/runuser", "-u", "postgres", "--", f"/usr/lib/postgresql/{major}/bin/pg_ctl",
+                             "-D", str(directory), "status"], stdout=log, stderr=log)
+    if status.returncode not in (0, 3):
+        raise ValueError(f"Could not determine PG{major} cluster status")
+    return status.returncode == 0
+
+
+PUBLIC_SOCKET = Path("/var/run/postgresql")
+# pg_control states of a primary that is not running: cleanly stopped, or stopped abruptly (WSL
+# terminated) and recovered by its next start, here on the private socket.
+STOPPED_STATES = ("shut down", "in production", "in crash recovery")
+
+
+def socket_serves(directory=PUBLIC_SOCKET):
+    """True when a server accepts connections on the application socket. The probe connects and
+    closes without sending anything, so it starts and changes nothing."""
+    import socket as sockets
+    probe = sockets.socket(sockets.AF_UNIX, sockets.SOCK_STREAM)
+    probe.settimeout(5)
+    try:
+        probe.connect(str(directory / ".s.PGSQL.5432"))
+    except (FileNotFoundError, ConnectionRefusedError):
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+def pg17_identity_problems(journal):
+    """17/dwemer on disk must be the journaled candidate, with the configuration the PG17 migration marked."""
+    marker = NEW_CONF / "dwemer-maintenance-id"
+    try:
+        identity = controldata(17, NEW_DATA)["Database system identifier"]
+        marked = not marker.is_symlink() and marker.is_file() and marker.read_text().strip() == Path(journal["work"]).name
+    except (OSError, KeyError, TypeError, subprocess.CalledProcessError):
+        identity, marked = None, False
+    if identity is None or identity != journal.get("candidate_id") or not marked:
+        return [reason("pg17-identity", "17/dwemer is not the cluster the PG17 migration journal recorded.")]
+    return []
+
+
+def pg17_application_socket(journal):
+    """The public socket when the journaled PG17 serves applications, or None when it is provably
+    stopped: neither cluster runs, nothing answers on the application socket, and the stopped
+    17/dwemer is the journaled candidate in a primary's stopped state. A server other than PG17 on
+    the socket is refused by pg_inventory; nothing here starts or changes anything."""
+    stop_private_pg17()
+    problems = pg17_identity_problems(journal)
+    if pg_running(15, OLD_DATA):
+        problems.append(reason("pg15-guard", "The retained PG15 cluster is running."))
+    if problems:
+        raise Deferred(problems)
+    if pg_running(17, NEW_DATA) or socket_serves():
+        return PUBLIC_SOCKET
+    state = controldata(17, NEW_DATA)["Database cluster state"]
+    if state not in STOPPED_STATES:
+        raise Deferred([reason("pg17-identity", f"The stopped 17/dwemer is in state {state!r}, not a primary's.")])
+    return None
+
+
+def pg17_inventory(journal):
+    """The inventory of the journaled PG17 before the fence: from its public socket while it serves,
+    else on the private socket, judging closed databases from shared catalogs only, and stopped
+    again, so a reopened distro is inspected without a public writer window or a changed start.conf."""
+    socket = pg17_application_socket(journal)
+    if socket is not None:
+        return pg_inventory(socket)
+    note("PG17 is stopped; it is inspected on the private socket and stopped again")
+    socket = private_pg17("start")
+    try:
+        return pg_inventory(socket)
+    finally:
+        private_pg17("stop")
+
+
+def psql(socket, statement, db="postgres", readonly=True):
+    options = "-c role=none" + (" -c default_transaction_read_only=on" if readonly else "")
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "PGHOST": str(socket), "PGPORT": "5432", "PGDATABASE": db,
+           "PGUSER": "postgres", "PGOPTIONS": options}
+    return output("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/lib/postgresql/17/bin/psql", "-XqAt",
+                  "-v", "ON_ERROR_STOP=1", "-c", statement, env=env).strip()
+
+
+INVENTORY_SQL = {
+    "server": "select current_setting('server_version_num')::int / 10000 || '|' || current_setting('data_directory')",
+    "roles": """select coalesce(json_agg(json_build_array(rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
+                rolcanlogin, rolreplication, rolbypassrls, rolconnlimit, md5(coalesce(rolpassword, '')), rolvaliduntil)
+                order by rolname collate "C"), '[]') from pg_authid""",
+    # Global role settings (ALTER ROLE ... SET), including per-database ones.
+    "role_settings": """select coalesce(json_agg(json_build_array(coalesce(d.datname, ''), coalesce(r.rolname, ''), s.setconfig)
+                order by 1, 2), '[]') from pg_db_role_setting s left join pg_database d on d.oid = s.setdatabase
+                left join pg_authid r on r.oid = s.setrole""",
+    "databases": """select coalesce(json_agg(json_build_array(datname, datallowconn, datlocprovider, datcollate, datctype,
+                pg_encoding_to_char(encoding), datcollversion) order by datname collate "C"), '[]') from pg_database""",
+    # Identity of every database, from shared catalogs only (no connection to the database itself):
+    # oid, name, template flag, allowconn, connection limit, owned by the bootstrap superuser, every
+    # ACL grantee is PUBLIC or the owner, tablespace, per-database role settings, shared
+    # dependencies (objects owned by or granted to other roles), and its size on disk.
+    "identity": """select coalesce(json_agg(json_build_array(d.oid::bigint, d.datname, d.datistemplate, d.datallowconn,
+                d.datconnlimit, d.datdba = 10, not exists(select 1 from aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a
+                where a.grantee not in (0, d.datdba)), t.spcname,
+                (select count(*) from pg_db_role_setting s where s.setdatabase = d.oid),
+                (select count(*) from pg_shdepend s where s.dbid = d.oid), pg_database_size(d.oid))
+                order by d.datname collate "C"), '[]') from pg_database d join pg_tablespace t on t.oid = d.dattablespace""",
+}
+# Objects beyond an empty initdb template: the test ensure_postgres_utf8 applied before retaining it.
+OBJECTS_SQL = """select (select count(*) from pg_namespace where nspname not in ('public', 'pg_catalog', 'information_schema')
+                and nspname not like 'pg_toast%' and nspname not like 'pg_temp_%')
+                + (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public')
+                + (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public')
+                + (select count(*) from pg_extension where extname <> 'plpgsql')"""
+C_LOCALES = {"C", "POSIX"}
+EXTENSIONS_SQL = """select coalesce(json_agg(json_build_array(e.extname, e.extversion, exists(select 1 from
+                pg_available_extension_versions v where v.name = e.extname and v.version = e.extversion))
+                order by e.extname collate "C"), '[]') from pg_extension e"""
+# Columns using a collation other than the database default, C or POSIX. Their order may change
+# with glibc 2.36 -> 2.41 or ICU 72 -> 76, so their indexes would need a reviewed REINDEX.
+COLLATIONS_SQL = """select coalesce(json_agg(distinct c.collname), '[]') from pg_attribute a
+                join pg_class r on r.oid = a.attrelid join pg_collation c on c.oid = a.attcollation
+                where r.relnamespace not in ('pg_catalog'::regnamespace, 'information_schema'::regnamespace)
+                and c.collname not in ('default', 'C', 'POSIX', 'ucs_basic', 'pg_c_utf8')"""
+
+
+def classify_closed(databases, identity, utf8_pending=False):
+    """Closed databases -> (retained, problems). template0 is built in and never opened. The retained
+    template1 copy of ensure_postgres_utf8 is recognised by every shared-catalog trait of an
+    untouched, empty, closed template, never by its name alone. Any other closed database defers,
+    because its contents could only be inspected by opening it."""
+    locales = {row[0]: row for row in databases}
+    retained, problems = [], []
+    for oid, name, is_template, allow, limit, bootstrap_owner, plain_acl, space, settings, shared, size in identity:
+        if allow:
+            continue
+        if name == "template0" and is_template:
+            continue
+        _name, _allow, provider, collate, ctype, *_ = locales[name]
+        traits = {
+            "a name ensure_postgres_utf8 gives": bool(RETAINED_TEMPLATE.match(name)),
+            "not a template": not is_template, "no connection limit": limit == -1,
+            "owned by the bootstrap superuser": bootstrap_owner, "privileges only for PUBLIC and the owner": plain_acl,
+            "the default tablespace": space == "pg_default", "no per-database settings": settings == 0,
+            "no objects of other roles": shared == 0, "the C locale": provider == "c" and collate in C_LOCALES
+            and ctype in C_LOCALES, f"at most {RETAINED_MAX_BYTES // 1024 ** 2} MiB": 0 < size <= RETAINED_MAX_BYTES,
+            "no unfinished UTF-8 template change": not utf8_pending,
+        }
+        failed = [trait for trait, ok in traits.items() if not ok]
+        if failed:
+            problems.append(reason("pg-closed-database", f"The closed database {name} cannot be inspected without "
+                                                         f"opening it, and it lacks {', '.join(failed)}."))
+        else:
+            retained.append(name)
+    return retained, problems
+
+
+def quote_ident(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
+def reclose_databases(socket):
+    """Close again every database an interrupted private inspection left open."""
+    if not CLOSED_OPEN.is_file():
+        return
+    for name in json.loads(CLOSED_OPEN.read_text()):
+        psql(socket, f"ALTER DATABASE {quote_ident(name)} ALLOW_CONNECTIONS false", readonly=False)
+    CLOSED_OPEN.unlink()
+    sync_dir(CLOSED_OPEN.parent)
+
+
+def inspect_closed(socket, name):
+    """Extensions, collations and objects of a closed database. Only on the private peer socket:
+    it is opened there for this one inspection, journalled first, and closed again before return."""
+    atomic(CLOSED_OPEN, json.dumps([name]), 0o600)
+    psql(socket, f"ALTER DATABASE {quote_ident(name)} ALLOW_CONNECTIONS true", readonly=False)
+    try:
+        return (json.loads(psql(socket, EXTENSIONS_SQL, db=name)), json.loads(psql(socket, COLLATIONS_SQL, db=name)),
+                int(psql(socket, OBJECTS_SQL, db=name)))
+    finally:
+        reclose_databases(socket)
+
+
+def pg_inventory(socket, private=False):
+    """Roles, role settings, databases and per-database extensions of the running PG17. On the
+    public socket closed databases are judged from shared catalogs only; on the private socket the
+    recognised retained template is also inspected, and must hold nothing beyond plpgsql."""
+    server = psql(socket, INVENTORY_SQL["server"])
+    if server != f"17|{NEW_DATA}":
+        raise ValueError(f"The socket {socket} does not serve PG17 from {NEW_DATA}")
+    inventory = {key: json.loads(psql(socket, sql)) for key, sql in INVENTORY_SQL.items() if key != "server"}
+    inventory["extensions"], inventory["collations"], inventory["objects"] = {}, {}, {}
+    inventory["retained"], inventory["closed"] = classify_closed(inventory["databases"], inventory["identity"],
+                                                                 UTF8_PENDING.exists())
+    for name, allow, *_ in inventory["databases"]:
+        if allow:
+            inventory["extensions"][name] = json.loads(psql(socket, EXTENSIONS_SQL, db=name))
+            inventory["collations"][name] = json.loads(psql(socket, COLLATIONS_SQL, db=name))
+        elif private and name in inventory["retained"]:
+            extensions, collations, objects = inspect_closed(socket, name)
+            inventory["extensions"][name], inventory["collations"][name] = extensions, collations
+            inventory["objects"][name] = objects
+    return inventory
+
+
+def retained_problems(inventory):
+    """A privately inspected retained template must still be an empty template."""
+    problems = []
+    for name, objects in inventory["objects"].items():
+        extensions = [row[0] for row in inventory["extensions"][name]]
+        if objects or extensions not in ([], ["plpgsql"]):
+            problems.append(reason("pg-closed-database", f"The closed database {name} holds objects or extensions "
+                                                         "beyond an empty template; it is not the retained template1."))
+    return problems
+
+
+def inventory_digest(inventory):
+    """Everything the OS upgrade must not change: roles, role settings, every database's identity
+    (oid, allowconn, owner, ACL, settings, locale) and every inspected database's extensions and
+    object count. Collation versions, availability flags and on-disk sizes are excluded."""
+    stable = {
+        "roles": inventory["roles"], "role_settings": inventory["role_settings"],
+        "databases": [row[:6] for row in inventory["databases"]],
+        "identity": [row[:10] for row in inventory.get("identity", [])],
+        "extensions": {db: [row[:2] for row in rows] for db, rows in inventory["extensions"].items()},
+        "objects": inventory.get("objects", {}),
+    }
+    return hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
+
+
+def collation_problems(inventory):
+    problems = []
+    safe = {"C", "POSIX", "C.UTF-8", "C.utf8"}
+    for name, _allow, provider, collate, ctype, _enc, _version in inventory["databases"]:
+        if provider == "i" or collate not in safe or ctype not in safe:
+            problems.append(reason("pg-collation", f"Database {name} uses locale {collate}/{ctype} (provider {provider}); "
+                                                   "its text indexes need a reviewed REINDEX after the glibc/ICU upgrade."))
+    for name, used in inventory["collations"].items():
+        if used:
+            problems.append(reason("pg-collation", f"Database {name} has columns with collations {', '.join(used)}."))
+    return problems + inventory["closed"]
+
+
+# ---------------------------------------------------------------------------------------------
+# Python virtual environments
+
+
+def elf_needed(path):
+    """DT_NEEDED entries of a little-endian ELF64 file, or None when it is not one."""
+    with open(path, "rb") as stream:
+        header = stream.read(64)
+        if len(header) < 64 or header[:4] != b"\x7fELF" or header[4] != 2 or header[5] != 1:
+            return None
+        phoff, = struct.unpack_from("<Q", header, 32)
+        phentsize, phnum = struct.unpack_from("<HH", header, 54)
+        segments = []
+        for index in range(phnum):
+            stream.seek(phoff + index * phentsize)
+            kind, _flags, offset, vaddr, _paddr, filesz = struct.unpack("<IIQQQQ", stream.read(40))
+            segments.append((kind, offset, vaddr, filesz))
+        dynamic = next((s for s in segments if s[0] == 2), None)
+        if dynamic is None:
+            return []
+        stream.seek(dynamic[1])
+        entries = []
+        for _ in range(dynamic[3] // 16):
+            tag, value = struct.unpack("<qQ", stream.read(16))
+            if tag == 0:
+                break
+            entries.append((tag, value))
+        strtab = next((v for t, v in entries if t == 5), None)
+        if strtab is None:
+            return []
+        load = next((s for s in segments if s[0] == 1 and s[2] <= strtab < s[2] + s[3]), None)
+        if load is None:
+            return []
+        names = []
+        for tag, value in entries:
+            if tag == 1:
+                stream.seek(load[1] + strtab - load[2] + value)
+                raw = stream.read(256)
+                names.append(raw.split(b"\0", 1)[0].decode(errors="replace"))
+        return names
+
+
+def find_venvs(roots=VENV_ROOTS, depth=VENV_DEPTH):
+    found = []
+    for root in roots:
+        if not os.path.isdir(root) or os.path.islink(root):
+            continue
+        device = os.lstat(root).st_dev
+        base = root.rstrip("/").count("/")
+        for current, dirs, files in os.walk(root):
+            if "pyvenv.cfg" in files:
+                found.append(current)
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if d not in PRUNE and not os.path.islink(os.path.join(current, d))
+                       and os.lstat(os.path.join(current, d)).st_dev == device]
+            if current.count("/") - base >= depth:
+                dirs[:] = []
+    return sorted(found)
+
+
+def read_pyvenv(venv):
+    values = {}
+    for line in Path(venv, "pyvenv.cfg").read_text(errors="replace").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip().lower()] = value.strip()
+    return values
+
+
+def classify_venv(venv, config):
+    """How a venv survives the Python 3.11 -> 3.13 move."""
+    home = config.get("home", "").rstrip("/")
+    version = config.get("version_info") or config.get("version") or ""
+    minor = ".".join(version.split(".")[:2])
+    if home not in ("/usr/bin", "/bin", "/usr/local/bin"):
+        return "independent", minor
+    if home == "/usr/local/bin":
+        return "unknown", minor
+    if minor == TARGET_PYTHON:
+        return "current", minor
+    if minor == SOURCE_PYTHON:
+        return "retain", minor
+    return "unknown", minor
+
+
+def venv_needed_sonames(venv, limit=50000):
+    """System libraries the venv's compiled modules load; libraries the venv bundles are excluded."""
+    bundled, needed, seen = set(), set(), 0
+    for current, dirs, files in os.walk(venv):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(current, d))]
+        for name in files:
+            if ".so" not in name:
+                continue
+            bundled.add(name)
+            path = os.path.join(current, name)
+            seen += 1
+            if seen > limit or os.path.islink(path):
+                continue
+            try:
+                names = elf_needed(path)
+            except (OSError, struct.error):
+                names = None
+            needed.update(names or ())
+    return sorted(needed - bundled)
+
+
+def elf_stack(path):
+    """(offset of the PT_GNU_STACK p_flags field, p_flags) of a little-endian ELF64 file; None when it
+    is not one or has no such header (the loader then assumes no executable stack on x86-64)."""
+    with open(path, "rb") as stream:
+        header = stream.read(64)
+        if len(header) < 64 or header[:4] != b"\x7fELF" or header[4] != 2 or header[5] != 1:
+            return None
+        phoff, = struct.unpack_from("<Q", header, 32)
+        phentsize, phnum = struct.unpack_from("<HH", header, 54)
+        for index in range(phnum):
+            stream.seek(phoff + index * phentsize)
+            kind, flags = struct.unpack("<II", stream.read(8))
+            if kind == PT_GNU_STACK:
+                return phoff + index * phentsize + 4, flags
+    return None
+
+
+def venv_execstack(venv, limit=50000):
+    """Paths, relative to the venv, of its shared objects that ask for an executable stack."""
+    found, seen = [], 0
+    for current, dirs, files in os.walk(venv):
+        dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(current, d)))
+        for name in sorted(files):
+            path = os.path.join(current, name)
+            if ".so" not in name or os.path.islink(path):
+                continue
+            seen += 1
+            if seen > limit:
+                return found + [None]
+            try:
+                stack = elf_stack(path)
+            except (OSError, struct.error):
+                continue
+            if stack and stack[1] & PF_X:
+                found.append(os.path.relpath(path, venv))
+    return found
+
+
+def venv_inventory():
+    venvs = []
+    for venv in find_venvs():
+        try:
+            config = read_pyvenv(venv)
+        except OSError:
+            continue
+        kind, minor = classify_venv(venv, config)
+        venvs.append({"path": venv, "kind": kind, "python": minor, "owner": os.lstat(venv).st_uid,
+                      "sonames": venv_needed_sonames(venv) if kind != "unknown" else [],
+                      "execstack": venv_execstack(venv) if kind != "unknown" else []})
+    return venvs
+
+
+def record_line(relative, digest, size):
+    """A wheel RECORD line: path, urlsafe base64 SHA-256 without padding, size."""
+    encoded = base64.urlsafe_b64encode(bytes.fromhex(digest)).rstrip(b"=").decode()
+    return f"{relative},sha256={encoded},{size}"
+
+
+def record_lines(text):
+    """A RECORD's lines without their LF or CRLF endings; any other line break stays in its line."""
+    return [line.rstrip("\r\n") for line in text.splitlines(keepends=True)]
+
+
+def cleared_digest(path, offset, flags):
+    """SHA-256 of path as it reads once PF_X is cleared in the p_flags word at offset."""
+    digest, position = hashlib.sha256(), 0
+    patch_bytes = struct.pack("<I", flags & ~PF_X)
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            start, end = offset - position, offset + 4 - position
+            if end > 0 and start < len(block):
+                block = bytearray(block)
+                for index in range(max(start, 0), min(end, len(block))):
+                    block[index] = patch_bytes[index - start]
+            digest.update(block)
+            position += len(block)
+    return digest.hexdigest()
+
+
+def safe_regular(path, root):
+    """path is a regular file reached from root without a symlink in any component."""
+    return (os.path.realpath(path) == os.path.normpath(path) and os.path.normpath(path).startswith(root.rstrip("/") + "/")
+            and stat.S_ISREG(os.lstat(path).st_mode))
+
+
+def execstack_fix(venv, relative):
+    """The planned fix for one stock file, or a reason it is not the stock file."""
+    known = EXECSTACK_STOCK.get((venv["path"], relative))
+    path = os.path.join(venv["path"], relative)
+    detail = f"{path} asks for an executable stack, which Debian 13's glibc refuses on import"
+    if known is None:
+        return None, reason("venv-execstack", detail + "; it is not a stock file this upgrade can fix.")
+    record = os.path.join(venv["path"], known["record"])
+    entry = os.path.relpath(path, os.path.dirname(os.path.dirname(record)))
+    try:
+        info = os.lstat(path)
+        stack = elf_stack(path)
+        stock = (venv["kind"] == "retain" and safe_regular(path, venv["path"]) and safe_regular(record, venv["path"])
+                 and info.st_uid == venv["owner"] and os.lstat(record).st_uid == venv["owner"] and info.st_size == known["bytes"] and stack and stack[1] & PF_X
+                 and sha256_file(path) == known["sha256"])
+        lines = record_lines(Path(record).read_bytes().decode()) if stock else []
+    except (OSError, UnicodeDecodeError, struct.error):
+        stock, lines = False, []
+    old = record_line(entry, known["sha256"], known["bytes"])
+    differs = reason("venv-execstack", detail + "; it, its owner or its wheel RECORD differs from the stock "
+                                                "build and is left alone.")
+    if not stock or lines.count(old) != 1:
+        return None, differs
+    patched = cleared_digest(path, *stack)
+    fix = {"venv": venv["path"], "path": path, "record": record, "offset": stack[0], "flags": stack[1],
+           "sha256": known["sha256"], "patched_sha256": patched, "bytes": known["bytes"],
+           "record_old": old, "record_new": record_line(entry, patched, known["bytes"]),
+           "module": known["module"], "packages": list(known["packages"]), "owner": venv["owner"]}
+    # The same check the transaction applies before it writes either file.
+    return (fix, None) if execstack_state(fix) == ("stock", "stock") else (None, differs)
+
+
+def configured_whisper_model(home=WHISPER_HOME):
+    """The converted model LocalWhisper's config.yaml selects, resolved as faster-whisper does: a
+    directory (relative to LocalWhisper, where start.sh runs it), else the snapshot refs/main names of
+    that size or repo downloaded into model_cache_dir. None when it is not on disk."""
+    try:
+        real = os.path.realpath(os.path.join(home, "config.yaml"))
+        if not real.startswith(os.path.realpath(home) + "/") or not os.path.isfile(real):
+            return None
+        values = dict(re.findall(r"^[ \t]+(model|model_cache_dir):[ \t]*[\"']?([^\"'#\s]+)",
+                                 Path(real).read_text(errors="replace"), re.M))
+    except OSError:
+        return None
+    model, cache = values.get("model"), values.get("model_cache_dir")
+    if not model:
+        return None
+    candidates = [os.path.join(home, model)]
+    try:
+        names = (["models--" + model.replace("/", "--")] if "/" in model else
+                 sorted(n for n in os.listdir(cache) if n.startswith("models--")
+                        and n.endswith("--faster-whisper-" + model))) if cache else []
+    except OSError:
+        names = []
+    for name in names:
+        try:
+            revision = Path(cache, name, "refs", "main").read_text().strip()
+        except OSError:
+            continue
+        if re.fullmatch(r"[0-9a-f]{40}", revision):
+            candidates.append(os.path.join(cache, name, "snapshots", revision))
+    for candidate in candidates:
+        if all(os.path.isfile(os.path.join(candidate, n)) for n in ("model.bin", "config.json")):
+            return os.path.normpath(candidate)
+    return None
+
+
+def whisper_models(roots=WHISPER_MODEL_ROOTS, depth=6, home=WHISPER_HOME):
+    """Converted Whisper models (model.bin beside a config.json): the one LocalWhisper is configured
+    to run first, then its own models directory before the Hugging Face cache, smallest first within
+    each."""
+    configured = configured_whisper_model(home)
+    found = []
+    for rank, root in enumerate(roots):
+        if not os.path.isdir(root):
+            continue
+        base = root.rstrip("/").count("/")
+        for current, dirs, files in os.walk(root):
+            if current.count("/") - base >= depth:
+                dirs[:] = []
+            if "model.bin" in files and "config.json" in files:
+                try:
+                    found.append((rank, os.stat(os.path.join(current, "model.bin")).st_size, current))
+                except OSError:
+                    pass
+    others = [os.path.normpath(path) for _rank, _size, path in sorted(found)]
+    return ([configured] if configured else []) + [path for path in others if path != configured]
+
+
+def execstack_probe(fix, site=""):
+    """Import the module under the venv's own Python as its owner, exercise it and, when a Whisper
+    model is present, run its encoder and a decoder step. site: a probe copy to import first.
+    Returns (level, problem)."""
+    models = whisper_models()[:1]
+    try:
+        probe = subprocess.run(["/usr/sbin/runuser", "-u", str(pwd_name(fix["owner"])), "--",
+                                os.path.join(fix["venv"], "bin", "python"), "-I", "-c", EXECSTACK_PROBE,
+                                site, fix["module"], *models], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               cwd="/", timeout=EXECSTACK_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {EXECSTACK_PROBE_TIMEOUT} s"
+    level = probe.stdout.decode(errors="replace").strip().splitlines()[-1:] or [""]
+    if probe.returncode or level[0] not in ("import", "speech"):
+        error = probe.stderr.decode(errors="replace").strip()[-400:]
+        return None, f"exited {probe.returncode}: {error or 'no output'}"
+    return level[0], None
+
+
+def write_cleared(fix, source, target):
+    """Write source to target (created anew, the source's owner and mode) with PF_X cleared."""
+    info = os.stat(source)
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    # target was created here (O_EXCL), so a failed write removes only that file.
+    try:
+        with os.fdopen(fd, "wb") as stream, open(source, "rb") as original:
+            shutil.copyfileobj(original, stream, 1024 * 1024)
+            stream.seek(fix["offset"])
+            stream.write(struct.pack("<I", fix["flags"] & ~PF_X))
+            stream.flush()
+            os.fchown(stream.fileno(), info.st_uid, info.st_gid)
+            os.fchmod(stream.fileno(), stat.S_IMODE(info.st_mode))
+            os.fsync(stream.fileno())
+    except BaseException:
+        os.unlink(target)
+        raise
+
+
+def rehearse_execstack(venvs):
+    """Plan the stock fixes and prove each one on a probe copy before anything is written. Every
+    other shared object asking for an executable stack defers."""
+    fixes, problems = [], []
+    for venv in venvs:
+        for relative in venv.get("execstack", []):
+            if relative is None:
+                problems.append(reason("venv-execstack", f"{venv['path']} holds more shared objects than can be "
+                                                         "checked for an executable stack."))
+                continue
+            fix, problem = execstack_fix(venv, relative)
+            if problem:
+                problems.append(problem)
+            else:
+                fixes.append(fix)
+    if problems:
+        return [], problems
+    for fix in fixes:
+        scratch = Path(tempfile.mkdtemp(prefix="ddistro-trixie-execstack-", dir="/var/tmp"))
+        try:
+            site = scratch / "site"
+            packages = os.path.dirname(os.path.dirname(fix["path"]))
+            for name in fix["packages"]:
+                shutil.copytree(os.path.join(packages, name), site / name, symlinks=True,
+                                ignore=shutil.ignore_patterns("__pycache__"))
+            copy = site / os.path.relpath(fix["path"], packages)
+            copy.unlink()
+            write_cleared(fix, fix["path"], copy)
+            if sha256_file(copy) != fix["patched_sha256"] or elf_stack(copy)[1] & PF_X:
+                raise ValueError(f"The probe copy of {fix['path']} did not come out as planned")
+            for path in [scratch, *scratch.rglob("*")]:
+                os.lchown(path, fix["owner"], -1)
+            level, problem = execstack_probe(fix, str(site))
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        if problem:
+            problems.append(reason("venv-execstack", f"{fix['path']} with its executable-stack request cleared did not "
+                                                     f"import and run under {fix['venv']}/bin/python: {problem}"))
+        fix["probed"] = level
+    return ([], problems) if problems else (fixes, [])
+
+
+def execstack_state(fix):
+    """(library, RECORD line) of one fix, each "stock", "cleared" or None (anything else). Both are read
+    only while both are regular files inside the venv, reached through no symlink and held by its owner;
+    otherwise both are None."""
+    try:
+        paths = (fix["path"], fix["record"])
+        if not all(safe_regular(p, fix["venv"]) and os.lstat(p).st_uid == fix["owner"] for p in paths):
+            return None, None
+        library = {fix["sha256"]: "stock", fix["patched_sha256"]: "cleared"}.get(sha256_file(fix["path"]))
+        lines = record_lines(Path(fix["record"]).read_bytes().decode())
+    except (OSError, UnicodeDecodeError):
+        return None, None
+    counts = (lines.count(fix["record_old"]), lines.count(fix["record_new"]))
+    return library, {(1, 0): "stock", (0, 1): "cleared"}.get(counts)
+
+
+def execstack_drift(fixes):
+    """Fixes whose file or RECORD line is no longer the planned stock state."""
+    return [fix["path"] for fix in fixes if execstack_state(fix) != ("stock", "stock")]
+
+
+def apply_execstack(fixes):
+    """Clear PF_X in the stock files and their RECORD lines. Repeatable: the library and its RECORD are
+    both checked before either is written; a library or line already in its planned form is kept, and
+    any other state stops with both untouched. Only the temporary file this call creates is ever removed;
+    one an interrupted run left behind is kept for review."""
+    for fix in fixes:
+        path, record = Path(fix["path"]), Path(fix["record"])
+        changed = f"{path} or its RECORD changed since preflight; restore the recovery copy or review it"
+        current = execstack_state(fix)
+        if current == ("cleared", "cleared"):
+            continue
+        if current not in (("stock", "stock"), ("cleared", "stock")):
+            raise ValueError(changed)
+        for leftover in sorted(path.parent.glob(path.name + ".trixie-*")):
+            note(f"Kept {leftover}, left by an interrupted run, for review")
+        if current[0] == "stock":
+            temporary = path.with_name(path.name + ".trixie-" + uuid.uuid4().hex)
+            write_cleared(fix, path, temporary)
+            replaced = False
+            try:
+                if sha256_file(temporary) != fix["patched_sha256"]:
+                    raise ValueError(f"Clearing the executable-stack request of {path} did not give the planned file")
+                if execstack_state(fix) != ("stock", "stock"):
+                    raise ValueError(changed)
+                os.replace(temporary, path)
+                replaced = True
+            finally:
+                if not replaced:
+                    temporary.unlink(missing_ok=True)
+            sync_dir(path.parent)
+        if execstack_state(fix) != ("cleared", "stock"):
+            raise ValueError(changed)
+        text = record.read_bytes().decode()
+        lines, index = text.splitlines(keepends=True), record_lines(text).index(fix["record_old"])
+        lines[index] = fix["record_new"] + lines[index][len(fix["record_old"]):]
+        atomic(record, "".join(lines).encode(), stat.S_IMODE(os.stat(record).st_mode), like=record)
+
+
+def execstack_problems(fixes):
+    """After the upgrade: each fixed file is in its planned form and imports on Debian 13."""
+    problems = []
+    for fix in fixes:
+        if execstack_state(fix) != ("cleared", "cleared"):
+            problems.append(reason("venv-execstack", f"{fix['path']} or its RECORD line is not in its planned form."))
+            continue
+        level, problem = execstack_probe(fix)
+        if problem:
+            problems.append(reason("venv-execstack", f"{fix['module']} does not import and run under "
+                                                     f"{fix['venv']}/bin/python: {problem}"))
+        elif level != fix.get("probed", level):
+            problems.append(reason("venv-execstack", f"{fix['module']} under {fix['venv']} passed preflight with a "
+                                                     f"{fix['probed']} probe but only an {level} probe now."))
+    return problems
+
+
+def system_soname_owners(packages):
+    """soname -> packages shipping it in a library directory, from the dpkg file lists."""
+    owners = {}
+    for name, info in packages.items():
+        for path in package_files(name, info["arch"]):
+            if path.startswith(LIB_DIRS) and ".so" in os.path.basename(path):
+                owners.setdefault(os.path.basename(path), set()).add(name)
+    return owners
+
+
+# ---------------------------------------------------------------------------------------------
+# PHP
+
+
+def php_inventory(packages):
+    """Map installed PHP 8.2 packages to their PHP 8.4 counterparts; anything else is a blocker."""
+    problems, mapping = [], {}
+    for name, info in sorted(packages.items()):
+        if info["status"] != "ii":
+            # Removed packages whose configuration remains (rc) are left as they are.
+            if info["status"] != "rc" and (name.startswith(f"php{SOURCE_PHP}") or name == f"libapache2-mod-php{SOURCE_PHP}"):
+                problems.append(reason("php-state", f"{name} is in dpkg state {info['status']}."))
+            continue
+        if re.match(r"^php[0-9]+\.[0-9]+(-|$)", name) or re.match(r"^libapache2-mod-php[0-9]", name):
+            branch = re.search(r"php([0-9]+\.[0-9]+)", name).group(1)
+            if branch == SOURCE_PHP:
+                mapping[name] = name.replace(f"php{SOURCE_PHP}", f"php{TARGET_PHP}", 1)
+            elif branch != TARGET_PHP:
+                problems.append(reason("php-branch", f"{name} belongs to PHP {branch}, which this upgrade does not move."))
+    api = Path("/usr/lib/php")
+    owned = set()
+    for name in mapping:
+        owned.update(p for p in package_files(name, packages[name]["arch"]) if p.endswith(".so"))
+    if api.is_dir():
+        for directory in api.iterdir():
+            if re.fullmatch(r"20[0-9]{6}", directory.name) and directory.is_dir():
+                for module in directory.glob("*.so"):
+                    if str(module) not in owned and not dpkg_owned(module):
+                        problems.append(reason("php-unpackaged-extension",
+                                               f"{module} was not installed by a package; it has no PHP {TARGET_PHP} build."))
+    return mapping, problems
+
+
+def dpkg_owned(path):
+    return subprocess.run(["dpkg-query", "-S", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+INI_DUMP = "echo json_encode(ini_get_all(null, false));"
+
+
+def php_effective(branch, sapi, extra_dir=None):
+    root = Path(f"/etc/php/{branch}/{sapi}")
+    if not (root / "php.ini").is_file():
+        return None
+    scan = str(root / "conf.d") + (":" + str(extra_dir) if extra_dir else "")
+    env = {"PATH": "/usr/bin:/bin", "PHP_INI_SCAN_DIR": scan}
+    result = subprocess.run([f"/usr/bin/php{branch}", "-c", str(root / "php.ini"), "-r", INI_DUMP],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    if result.returncode:
+        raise ValueError(f"PHP {branch} could not read its {sapi} configuration")
+    return {"values": json.loads(result.stdout.decode()), "startup": result.stderr.decode(errors="replace")}
+
+
+def explicit_ini_keys(branch, sapi):
+    """Directives the user's php.ini or their own conf.d files set (package module links are excluded)."""
+    root = Path(f"/etc/php/{branch}/{sapi}")
+    files = [root / "php.ini"]
+    conf = root / "conf.d"
+    if conf.is_dir():
+        files += [p for p in sorted(conf.glob("*.ini"))
+                  if not (p.is_symlink() and os.readlink(p).startswith(f"/etc/php/{branch}/mods-available/"))]
+    keys = set()
+    for path in files:
+        for line in path.read_text(errors="replace").splitlines():
+            match = re.match(r"^\s*([A-Za-z0-9_.]+)\s*=", line)
+            if match and match.group(1) not in ("extension", "zend_extension"):
+                keys.add(match.group(1))
+    return keys
+
+
+def php_snapshot():
+    """Explicit PHP 8.2 settings and loaded modules per SAPI, taken while PHP 8.2 is still installed."""
+    snapshot = {}
+    for sapi in PHP_SAPIS:
+        effective = php_effective(SOURCE_PHP, sapi)
+        if effective is None:
+            continue
+        keys = explicit_ini_keys(SOURCE_PHP, sapi)
+        snapshot[sapi] = {"settings": {k: effective["values"][k] for k in sorted(keys) if k in effective["values"]},
+                          "modules": php_modules(SOURCE_PHP, sapi)}
+    return snapshot
+
+
+def php_modules(branch, sapi):
+    root = Path(f"/etc/php/{branch}/{sapi}")
+    env = {"PATH": "/usr/bin:/bin", "PHP_INI_SCAN_DIR": str(root / "conf.d")}
+    text = subprocess.run([f"/usr/bin/php{branch}", "-c", str(root / "php.ini"), "-m"], stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, env=env).stdout.decode(errors="replace")
+    return sorted({line.strip().lower() for line in text.splitlines() if line.strip() and not line.startswith("[")})
+
+
+def carried_settings(previous, current):
+    """Settings to carry to PHP 8.4: explicitly set on 8.2, known to 8.4, not deprecated, and different."""
+    carried, dropped = {}, []
+    for key, value in previous.items():
+        if key in PHP_NOT_CARRIED or key not in current:
+            dropped.append(key)
+        elif current[key] != value:
+            carried[key] = value
+    return carried, dropped
+
+
+def ini_quote(value):
+    if value is None:
+        return '""'
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+CARRIED_INI = "99-dwemerdistro-from-php8.2.ini"
+
+
+def carry_php_settings(snapshot):
+    results = {}
+    for sapi, saved in snapshot.items():
+        conf = Path(f"/etc/php/{TARGET_PHP}/{sapi}/conf.d")
+        if not conf.is_dir() or not (conf.parent / "php.ini").is_file():
+            results[sapi] = {"status": "no-target-sapi"}
+            continue
+        target = conf / CARRIED_INI
+        if target.exists():
+            target.unlink()
+        current = php_effective(TARGET_PHP, sapi)["values"]
+        carried, dropped = carried_settings(saved["settings"], current)
+        for _attempt in range(3):
+            body = "; Settings carried from PHP 8.2 by ddistro_trixie_maintenance. Edit freely.\n" + \
+                "".join(f"{k} = {ini_quote(v)}\n" for k, v in sorted(carried.items()))
+            atomic(target, body, 0o644)
+            startup = php_effective(TARGET_PHP, sapi)["startup"]
+            rejected = {k for k in carried if k in startup}
+            if not rejected:
+                break
+            for key in rejected:
+                carried.pop(key)
+                dropped.append(key)
+        else:
+            raise ValueError(f"PHP {TARGET_PHP} {sapi} still reports startup problems with the carried settings")
+        results[sapi] = {"status": "carried", "carried": sorted(carried), "not_carried": sorted(dropped)}
+    return results
+
+
+# ---------------------------------------------------------------------------------------------
+# The private APT environment and the solver rehearsal
+
+
+def debian_components(entries):
+    components = {"main"}
+    for entry in entries:
+        if entry["kind"] in ("debian", "stock-testing"):
+            components.update(entry["components"])
+    order = ["main", "contrib", "non-free", "non-free-firmware"]
+    return [c for c in order if c in components]
+
+
+def pgdg_key(scratch):
+    """The PGDG signing key, from postgresql-common or HTTPS, accepted only with the pinned fingerprint."""
+    key = scratch / "pgdg.asc"
+    if PGDG_KEY_LOCAL.is_file():
+        shutil.copyfile(PGDG_KEY_LOCAL, key)
+    else:
+        run("curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https", "--retry", "3",
+            PGDG_KEY_URL, "-o", key)
+    if key_fingerprint(key) != PGDG_FINGERPRINT:
+        raise ValueError("PostgreSQL repository key fingerprint mismatch")
+    key.chmod(0o644)
+    return key
+
+
+def key_fingerprints(path):
+    """The primary fingerprints of the OpenPGP public keys a file holds, in order, else None."""
+    lines = output("gpg", "--batch", "--with-colons", "--show-keys", path, check=False).splitlines()
+    primaries = [lines[i + 1].split(":")[9] for i, line in enumerate(lines)
+                 if line.startswith("pub:") and i + 1 < len(lines) and lines[i + 1].startswith("fpr:")]
+    return primaries if primaries and len(primaries) == sum(line.startswith("pub:") for line in lines) else None
+
+
+def key_fingerprint(path):
+    """The primary fingerprint of a file holding exactly one OpenPGP public key, else None."""
+    fingerprints = key_fingerprints(path)
+    return fingerprints[0] if fingerprints and len(fingerprints) == 1 else None
+
+
+def agnostic_feeds(entries, packages):
+    """name -> Signed-By keyring of each recognised distribution-independent source one of whose
+    packages is installed; a source whose packages are all absent stays out of the upgrade.
+    agnostic_key checks the keyring again when it is copied."""
+    feeds = {}
+    for entry in entries:
+        uri = entry["uris"][0].rstrip("/") if entry["kind"] == "agnostic" else None
+        name = next((n for n, spec in AGNOSTIC_SOURCES.items() if uri == spec["uri"]), None)
+        if name and any(info["status"] == "ii" and re.match(AGNOSTIC_SOURCES[name]["packages"], p)
+                        for p, info in packages.items()):
+            feeds.setdefault(name, plain_options(entry))
+    return feeds
+
+
+def agnostic_key(name, keyring, scratch):
+    """A byte-for-byte copy in scratch of the installed keyring of a distribution-independent
+    source, as the system's APT reads it, accepted only with the keys its source identity allows."""
+    fingerprints = AGNOSTIC_SOURCES[name]["fingerprints"]
+    key = scratch / f"{name}{Path(keyring).suffix}"
+    shutil.copyfile(keyring, key)
+    if not signed_with(str(key), fingerprints[0], fingerprints[1:]):
+        raise ValueError(f"The {name} repository keyring {keyring} holds keys other than the published ones")
+    key.chmod(0o644)
+    return key
+
+
+def vendor_key(vendor, scratch):
+    """The vendor's Debian 13 signing key over HTTPS, accepted only with its pinned fingerprint, as a
+    binary keyring in scratch."""
+    spec = VENDORS[vendor]
+    download, key = scratch / f"{vendor}-debian13.key", scratch / vendor_keyring(vendor).name
+    run("curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https", "--retry", "3",
+        spec["key_url"], "-o", download)
+    if key_fingerprint(download) != spec["fingerprint"]:
+        raise ValueError(f"The {vendor} Debian 13 repository key fingerprint does not match")
+    key.unlink(missing_ok=True)
+    if download.read_bytes().lstrip().startswith(b"-----BEGIN PGP"):
+        run("gpg", "--batch", "--yes", "--dearmor", "-o", key, download)
+    else:
+        shutil.copyfile(download, key)
+    if key_fingerprint(key) != spec["fingerprint"]:
+        raise ValueError(f"The {vendor} Debian 13 repository key fingerprint does not match")
+    key.chmod(0o644)
+    return key
+
+
+def prepare_apt_dir(entries, packages):
+    """Isolated sources, pins, lists and caches. The system's own APT configuration is not read or
+    changed; only the keyring of a recognised distribution-independent source is copied."""
+    for sub in ("lists/partial", "archives/partial", "cache"):
+        (APT_DIR / sub).mkdir(parents=True, exist_ok=True)
+    APT_DIR.chmod(0o755)
+    components = " ".join(debian_components(entries))
+    key = pgdg_key(APT_DIR)
+    sources = [
+        f"deb [signed-by={DEBIAN_KEYRING}] https://deb.debian.org/debian {TARGET} {components}",
+        f"deb [signed-by={DEBIAN_KEYRING}] https://deb.debian.org/debian {TARGET}-updates {components}",
+        f"deb [signed-by={DEBIAN_KEYRING}] https://deb.debian.org/debian-security {TARGET}-security {components}",
+        f"deb [signed-by={key}] https://apt.postgresql.org/pub/repos/apt {TARGET}-pgdg main",
+    ]
+    # The Debian 13 feeds of the recognised vendor entries, as the cutover will configure them.
+    vendors = vendor_keys(entries)
+    for vendor in vendors:
+        uri, suite, vendor_components = VENDORS[vendor]["target"]
+        sources.append(f"deb [signed-by={vendor_key(vendor, APT_DIR)}] {uri}/ {' '.join((suite, *vendor_components))}")
+    # A distribution-independent source joins only to upgrade the installed packages it supplied,
+    # with the keys of its installed keyring; one whose packages are absent never adds them.
+    agnostic = agnostic_feeds(entries, packages)
+    for name, keyring in sorted(agnostic.items()):
+        spec = AGNOSTIC_SOURCES[name]
+        sources.append(f"deb [signed-by={agnostic_key(name, keyring, APT_DIR)}] {spec['uri']} "
+                       f"{' '.join((spec['suite'], *spec['components']))}")
+    atomic(APT_DIR / "sources.list", "\n".join(sources) + "\n", 0o644)
+    # PostgreSQL packages follow PGDG, whose Trixie builds are never older than the installed PGDG
+    # Bookworm builds; nothing else is taken from PGDG. Vendor pins come first, as on the system;
+    # the pins of a distribution-independent source exist only here, never in the system's pins.
+    preferences = vendor_pins(vendors) + vendor_pins(agnostic, AGNOSTIC_SOURCES) + (
+        "Package: postgresql postgresql-* libpq5 libpq-dev pgdg-keyring\n"
+        "Pin: origin apt.postgresql.org\nPin-Priority: 600\n\n"
+        "Package: *\nPin: origin apt.postgresql.org\nPin-Priority: 100\n"
+    )
+    atomic(APT_DIR / "preferences", preferences, 0o644)
+
+
+def apt_options():
+    return [
+        "-o", f"Dir::Etc::sourcelist={APT_DIR / 'sources.list'}", "-o", "Dir::Etc::sourceparts=-",
+        "-o", f"Dir::Etc::preferences={APT_DIR / 'preferences'}", "-o", "Dir::Etc::preferencesparts=-",
+        "-o", f"Dir::State::lists={APT_DIR / 'lists'}", "-o", f"Dir::Cache={APT_DIR / 'cache'}",
+        "-o", f"Dir::Cache::archives={APT_DIR / 'archives'}", "-o", "Acquire::Retries=3",
+        "-o", "APT::Install-Recommends=false",
+        "-o", "Dpkg::Options::=--force-confold", "-o", "Dpkg::Options::=--force-confdef",
+        "-o", "DPkg::Lock::Timeout=300",
+    ]
+
+
+def apt_command(*args):
+    return ["apt-get", *apt_options(), *args]
+
+
+def simulate(args):
+    """apt-get -s full-upgrade with the private lists -> (exit status, output)."""
+    result = subprocess.run(apt_command("-s", "full-upgrade", *args), env=apt_env(), stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT)
+    return result.returncode, result.stdout.decode(errors="replace")
+
+
+def apt_env():
+    return dict(os.environ, DEBIAN_FRONTEND="noninteractive", DEBIAN_PRIORITY="critical", APT_LISTCHANGES_FRONTEND="none",
+                NEEDRESTART_MODE="l", UCF_FORCE_CONFFOLD="1", LC_ALL="C", PATH="/usr/sbin:/usr/bin:/sbin:/bin")
+
+
+def apt_update():
+    result = subprocess.run(apt_command("update", "--error-on=any"), env=apt_env(), stdout=log, stderr=subprocess.PIPE)
+    if result.returncode:
+        message = result.stderr.decode(errors="replace")
+        log.write(result.stderr)
+        if "NO_PUBKEY" in message or "not signed" in message or "EXPKEYSIG" in message:
+            raise Deferred([reason("apt-signature", "The Trixie suites could not be verified with the installed "
+                                                    "debian-archive-keyring, or a vendor feed with its pinned key; update "
+                                                    "Debian 12 first. " + message.strip()[-300:])])
+        raise ValueError("Refreshing the signed Trixie package lists failed; retry when the network is available")
+
+
+def requested_changes(php_map, packages):
+    """Package arguments for one full-upgrade: PHP 8.4 counterparts in, PHP 8.2 packages out."""
+    args = sorted(php_map.values())
+    if REIGN.exists() and "libicu76" not in packages:
+        args.append("libicu76")
+    args += sorted(f"{name}-" for name in php_map)
+    return args
+
+
+def parse_plan(text):
+    plan = {"upgrade": {}, "install": {}, "remove": {}, "kept_back": [], "download": 0, "growth": 0}
+    kept = False
+    for line in text.splitlines():
+        match = re.match(r"^Inst (\S+) (?:\[(\S+)\] )?\((\S+) (.*)\)", line)
+        if match:
+            name, old, new, where = match.groups()
+            entry = {"from": old, "to": new, "origin": where}
+            (plan["upgrade"] if old else plan["install"])[name.split(":")[0]] = entry
+            kept = False
+            continue
+        match = re.match(r"^Remv (\S+)(?: \[(\S+)\])?", line)
+        if match:
+            plan["remove"][match.group(1).split(":")[0]] = match.group(2) or ""
+            kept = False
+            continue
+        if line.startswith("The following packages have been kept back"):
+            kept = True
+            continue
+        if kept and line.startswith("  "):
+            plan["kept_back"] += [word for word in line.split() if not word.startswith("(")]
+            continue
+        kept = False
+    return plan
+
+
+def parse_policy(text):
+    """apt-cache policy output -> name -> {installed, candidate, target}: target is True when the
+    candidate comes from a Trixie source rather than only from the dpkg status."""
+    result, name, table, current = {}, None, False, None
+    for line in text.splitlines():
+        if line and not line.startswith(" ") and line.endswith(":"):
+            name = line[:-1].split(":")[0]
+            result[name] = {"installed": None, "candidate": None, "sources": {}}
+            table = False
+            continue
+        if name is None:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("Installed:"):
+            result[name]["installed"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Candidate:"):
+            result[name]["candidate"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Version table:"):
+            table = True
+        elif table:
+            match = re.match(r"^(\*\*\* )?(\S+) (-?\d+)$", stripped)
+            if match:
+                current = match.group(2)
+                result[name]["sources"].setdefault(current, [])
+            elif current:
+                result[name]["sources"][current].append(stripped)
+    def trixie(origin):
+        return TARGET in origin and vendor_feed(origin) is None
+
+    for package, info in result.items():
+        candidate = info["candidate"]
+        origins = info["sources"].get(candidate, [])
+        info["target"] = any(map(trixie, origins))
+        info["in_target"] = any(trixie(origin) for lines in info["sources"].values() for origin in lines)
+        # Vendor feeds are checked by their own rules: pinned out packages keep their installed build.
+        info["vendor"] = any(vendor_feed(origin, package) for lines in info["sources"].values() for origin in lines)
+    return result
+
+
+def vendor_feed(origin, name=None):
+    """The vendor whose Debian 13 feed, or the distribution-independent source whose feed, an
+    apt-cache policy origin line names, or None. Given a package name, a distribution-independent
+    source counts only for the packages it may supply."""
+    words = origin.split()
+    uri = words[1].rstrip("/") if len(words) > 1 else ""
+    vendor = next((vendor for vendor, spec in VENDORS.items() if uri == spec["target"][0]), None)
+    return vendor or next((source for source, spec in AGNOSTIC_SOURCES.items() if uri == spec["uri"]
+                           and (name is None or re.match(spec["packages"], name))), None)
+
+
+def obsolete_packages(policy):
+    """Installed packages that Trixie does not ship at all; they stay installed."""
+    return sorted(name for name, info in policy.items()
+                  if info["installed"] not in (None, "(none)") and not info["in_target"] and not info.get("vendor"))
+
+
+def ahead_packages(policy):
+    """Installed packages newer than every Trixie build of the same name (typically from testing).
+    APT never downgrades them, so they would stay foreign builds on Debian 13."""
+    return sorted(name for name, info in policy.items()
+                  if info.get("installed") not in (None, "(none)") and info.get("in_target") and not info.get("target")
+                  and not info.get("vendor"))
+
+
+def parse_relations(text):
+    """dpkg-deb -f DEB Replaces Provides -> {"replaces": names, "provides": names}."""
+    fields, key = {"replaces": set(), "provides": set()}, None
+    for line in text.splitlines():
+        if line[:1] not in (" ", "\t") and ":" in line:
+            key, line = line.split(":", 1)
+            key = key.strip().lower()
+        if key in fields:
+            for item in line.split(","):
+                name = re.split(r"[\s(:]", item.strip(), maxsplit=1)[0]
+                if name:
+                    fields[key].add(name)
+    return fields
+
+
+def find_transitions(plan, files, relations, old_files):
+    """Removed package -> the newly installed package that takes it over (t64 and other renames).
+
+    Evidence comes from the downloaded, signed packages: the successor must declare Replaces on the
+    old name and either Provides it or ship every shared library name the old package shipped. An
+    upgraded package can be the successor too (libncurses-dev taking over libtinfo-dev), when its
+    relations were read; newly installed packages are preferred. A DOC_ONLY_SUCCESSORS pair needs
+    Provides alone, and only while the old package installed nothing outside /usr/share/doc."""
+    found = {}
+    for old in sorted(plan["remove"]):
+        sonames = {os.path.basename(p) for p in old_files.get(old, ())
+                   if p.startswith(LIB_DIRS) and ".so" in os.path.basename(p)}
+        for new in sorted(plan["install"]) + sorted(n for n in plan["upgrade"] if n in relations):
+            rel = relations.get(new, {"replaces": set(), "provides": set()})
+            shipped = {os.path.basename(p) for p in files.get(new, ())}
+            replaced = old in rel["replaces"] or DOC_ONLY_SUCCESSORS.get(old) == new and old in rel["provides"] \
+                and doc_only(old_files.get(old, ()))
+            if replaced and (old in rel["provides"] or sonames and sonames <= shipped):
+                found[old] = new
+                break
+    return found
+
+
+def doc_only(paths):
+    """dpkg -L of a package that installs files under /usr/share/doc and nothing else."""
+    parents = {"/.", "/", "/usr", "/usr/share", "/usr/share/doc"}
+    return any(p.startswith("/usr/share/doc/") for p in paths) \
+        and all(p in parents or p.startswith("/usr/share/doc/") for p in paths)
+
+
+def dropped_packages(plan, manual, policy):
+    """Manually installed packages the solution removes because Debian 13 dropped them."""
+    return sorted(name for name in plan["remove"] if name in manual and name in DROPPED_IN_TRIXIE
+                  and name in policy and not policy[name].get("in_target")
+                  and DROPPED_NEEDS.get(name) not in plan["remove"])
+
+
+def series(text):
+    return tuple(int(part) for part in text.split("."))
+
+
+def debian_origin(origin):
+    """The first archive of a plan line comes from the Debian archive or its security archive."""
+    label = origin.split(", ")[0].rsplit(":", 1)[0]
+    return label in ("Debian", "Debian-Security")
+
+
+def superseded_cuda(plan, packages, manual, policy):
+    """Manually installed stock CUDA profiling libraries -> the same library of a newer CUDA series
+    from Debian in this plan. Unpackaged users of the old sonames are checked separately."""
+    found = {}
+    for old in sorted(plan["remove"]):
+        match = CUDA_PROFILING.match(old)
+        if not match or old not in manual or packages.get(old, {}).get("source") != CUDA_SOURCE \
+                or policy.get(old, {}).get("in_target", True):
+            continue
+        for new, change in sorted(list(plan["install"].items()) + list(plan["upgrade"].items())):
+            successor = CUDA_PROFILING.match(new)
+            if successor and successor.group(1) == match.group(1) and series(successor.group(2)) > series(match.group(2)) \
+                    and debian_origin(change["origin"]):
+                found[old] = new
+                break
+    return found
+
+
+def unpackaged_users(sonames, roots=UNPACKAGED_ROOTS, limit=UNPACKAGED_LIMIT):
+    """ELF files under roots (one filesystem each, links not followed) that load one of sonames
+    -> (paths, complete). complete is False when more than limit files would have to be read."""
+    users, seen = [], 0
+    for root in roots:
+        if not os.path.isdir(root) or os.path.islink(root):
+            continue
+        device = os.lstat(root).st_dev
+        for current, dirs, files in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(current, d))
+                             and os.lstat(os.path.join(current, d)).st_dev == device)
+            for name in sorted(files):
+                path = os.path.join(current, name)
+                try:
+                    if not stat.S_ISREG(os.lstat(path).st_mode):
+                        continue
+                    seen += 1
+                    if seen > limit:
+                        return users, False
+                    needed = elf_needed(path) or ()
+                except (OSError, struct.error):
+                    continue
+                if set(needed) & set(sonames):
+                    users.append(path)
+    return users, True
+
+
+def vendor_series(name):
+    """The CUDA series (12-8, or the major 12 of a config package) or .NET version of a vendor
+    package name; None for unversioned ones."""
+    match = re.fullmatch(r"cuda-toolkit-([0-9]+(?:-[0-9]+)?)-config-common", name) \
+        or re.search(r"-([0-9]+-[0-9]+|[0-9]+\.[0-9]+)$", name)
+    return match.group(1) if match else None
+
+
+def plan_feeds(plan, policy):
+    """Installed or upgraded plan package -> the vendor whose Debian 13 feed carries the version the
+    plan takes, from the private apt-cache policy (labels in the plan can be set by any feed)."""
+    feeds = {}
+    for name, change in list(plan["install"].items()) + list(plan["upgrade"].items()):
+        lines = policy.get(name, {}).get("sources", {}).get(change["to"], [])
+        vendor = next((v for v in map(vendor_feed, lines) if v), None)
+        if vendor:
+            feeds[name] = vendor
+    return feeds
+
+
+def vendor_problems(plan, packages, feeds):
+    """A vendor feed may supply only its pinned user-space packages, of a CUDA series or .NET version
+    already installed (the upgrade adds no new major and no driver), and no installed vendor
+    component (cuda-cudart-12-8 and the like, manual or not) may be removed. A distribution-independent
+    source may only upgrade the installed packages it may supply, never add one."""
+    problems = []
+    for name, vendor in sorted(feeds.items()):
+        agnostic = vendor in AGNOSTIC_SOURCES
+        pattern = (AGNOSTIC_SOURCES if agnostic else VENDORS)[vendor]["packages"]
+        installed = {vendor_series(n) for n, info in packages.items() if info["status"] == "ii" and re.match(pattern, n)}
+        installed |= {s.split("-")[0] for s in installed if s}
+        if not re.match(pattern, name):
+            problems.append(reason("vendor-package", f"{name} would come from the {vendor} feed, which supplies only "
+                                   + ("installed packages it may supply." if agnostic else "versioned user-space components.")))
+        elif agnostic and packages.get(name, {}).get("status") != "ii":
+            problems.append(reason("vendor-package", f"{name} would be added from the {vendor} feed, which only "
+                                                     "upgrades installed packages."))
+        elif vendor_series(name) not in installed | {None}:
+            problems.append(reason("vendor-series", f"{name} would add {vendor} series {vendor_series(name)}, "
+                                                    "which is not installed."))
+    for name in sorted(plan["remove"]):
+        if packages.get(name, {}).get("status") == "ii" \
+                and any(re.match(v["packages"], name) for v in (*VENDORS.values(), *AGNOSTIC_SOURCES.values())):
+            problems.append(reason("vendor-component-removed", f"The solution removes the installed component {name}."))
+    return problems
+
+
+def origin_problems(plan, feeds=None):
+    """Every installed or upgraded package comes from Debian, or from PGDG for the PostgreSQL
+    packages the private policy pins there; feeds names those that vendor_problems checks instead."""
+    problems = []
+    for name, change in sorted(list(plan["install"].items()) + list(plan["upgrade"].items())):
+        if feeds and name in feeds:
+            continue
+        archive = change["origin"].split(", ")[0].split(" [")[0].rsplit(":", 1)[-1].rsplit("/", 1)[-1]
+        if debian_origin(change["origin"]) or archive == f"{TARGET}-pgdg" and PGDG_PINNED.match(name):
+            continue
+        problems.append(reason("apt-origin", f"{name} {change['to']} would come from {change['origin']}."))
+    return problems
+
+
+def has_mta(text):
+    """dpkg-query ${db:Status-Abbrev}\\t${Package}\\t${Provides} -> an installed mail transport."""
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0].strip() == "ii" and "mail-transport-agent" in \
+                {re.split(r"[\s(]", item.strip(), maxsplit=1)[0] for item in parts[2].split(",")}:
+            return True
+    return False
+
+
+def cuda_successors(plan, packages, manual, available):
+    """For each installed, manually installed stock CUDA profiling library the plan removes without
+    a successor: the one Trixie package of the same library and a newer series from
+    nvidia-cuda-toolkit (available: name -> source package). None, or several, adds nothing, so the
+    removal still defers. The removal checks, unpackaged users of the old soname included, apply
+    to the new solution."""
+    added = []
+    present = set(plan["install"]) | set(plan["upgrade"])
+    for old in sorted(plan["remove"]):
+        match = CUDA_PROFILING.match(old)
+        info = packages.get(old, {})
+        if not match or old not in manual or info.get("status") != "ii" or info.get("source") != CUDA_SOURCE:
+            continue
+
+        def newer(name, match=match):
+            successor = CUDA_PROFILING.match(name)
+            return bool(successor) and successor.group(1) == match.group(1) and series(successor.group(2)) > series(match.group(2))
+
+        if any(map(newer, present)):
+            continue
+        candidates = sorted(name for name, source in available.items() if source == CUDA_SOURCE and newer(name))
+        if len(candidates) == 1:
+            added.append(candidates[0])
+    return added
+
+
+def adjust_request(args, plan, packages, mta_installed, manual=frozenset(), available=None):
+    """Packages to add to the request after a rehearsal, or []. Bounded: a relay instead of a new
+    mail server when no transport is installed, stock CUDA packages APT kept back, and the Trixie
+    successors of removed manually installed CUDA profiling libraries."""
+    added = []
+    if not mta_installed and MTA_DAEMONS & set(plan["install"]) and RELAY_MTA not in args:
+        added.append(RELAY_MTA)
+    added += sorted(name for name in plan["kept_back"] if name not in args
+                    and packages.get(name, {}).get("source") == CUDA_SOURCE)
+    if available:
+        added += [name for name in cuda_successors(plan, packages, manual, available) if name not in args + added]
+    return added
+
+
+def wsl_kernel():
+    """The running kernel's release when it is a stock WSL2 kernel and the host's GPU libraries are
+    passed through, else None. A custom kernel (any other release name) is never treated as WSL's."""
+    try:
+        release = KERNEL_RELEASE.read_text().strip()
+    except OSError:
+        return None
+    return release if WSL_KERNEL.match(release) and WSL_LIB.is_dir() else None
+
+
+def dkms_override(module, version, kernel):
+    """The DKMS override that skips one module version on one kernel: its path and exact content.
+    The content names all three, so a file with exactly this content is this helper's own."""
+    path = DKMS_CONF / f"{module}-{version}-{kernel}.conf"
+    text = ("# Written by DwemerDistro's ddistro_trixie_maintenance for the Debian 13 upgrade, and kept.\n"
+            f"# The WSL2 kernel {kernel} loads no NVIDIA module (the GPU is reached through\n"
+            f"# /usr/lib/wsl/lib), so DKMS skips {module} {version} for this kernel only (exit 77).\n"
+            "# Every other kernel builds it as before.\n"
+            'BUILD_EXCLUSIVE_KERNEL="^$"\n')
+    return path, text
+
+
+def dkms_later_overrides(module, version, kernel):
+    """Override files dkms 3.2 reads after <module>-<version>-<kernel>.conf, which would decide instead."""
+    return [DKMS_CONF / f"{module}-{version}-{kernel}-{DKMS_ARCH}.conf", DKMS_CONF / f"{module}--{kernel}.conf",
+            DKMS_CONF / f"{module}--{kernel}-{DKMS_ARCH}.conf"]
+
+
+def dkms_override_blockers(module, version, kernel):
+    """Why the override cannot be relied on; [] when it is absent and may be created, or is already
+    this helper's own. /etc/dkms must be a real directory (or absent), the override path absent or a
+    regular file with exactly its content, and no override read after it may exist. Overrides read
+    before it (<module>.conf, <module>-<version>.conf) are left alone: this file only narrows the
+    build further, for this kernel."""
+    path, text = dkms_override(module, version, kernel)
+    if DKMS_CONF.is_symlink() or DKMS_CONF.exists() and not DKMS_CONF.is_dir():
+        return [f"{DKMS_CONF} is not a directory"]
+    blockers = []
+    if path.is_symlink() or path.exists() and not (path.is_file() and path.read_bytes() == text.encode()):
+        blockers.append(f"{path} already exists with other settings")
+    blockers += [f"{later} would take precedence" for later in dkms_later_overrides(module, version, kernel)
+                 if later.exists() or later.is_symlink()]
+    return blockers
+
+
+def dkms_identity(deb):
+    """(DKMS_NAME, DKMS_VERSION) that the package's postinst passes to Debian's common.postinst, when
+    the package ships /usr/src/<name>-<version>/dkms.conf; else None."""
+    script = output("dpkg-deb", "--info", deb, "postinst", check=False)
+    found = [re.findall(rf"(?m)^{key}=(\S+)$", script) for key in ("DKMS_NAME", "DKMS_VERSION")]
+    if any(len(values) != 1 or not DKMS_NAME.match(values[0]) for values in found):
+        return None
+    name, version = found[0][0], found[1][0]
+    return (name, version) if f"/usr/src/{name}-{version}/dkms.conf" in deb_paths(deb) else None
+
+
+def module_override(plan):
+    """On a stock WSL2 kernel, when the plan upgrades or installs the NVIDIA kernel module: the
+    override to write ({module, version, kernel}) or None, and problems that defer. The package, its
+    manual mark and the modules DKMS builds for every other kernel stay as they are."""
+    kernel = wsl_kernel()
+    change = plan["upgrade"].get(NVIDIA_MODULE) or plan["install"].get(NVIDIA_MODULE)
+    if kernel is None or change is None:
+        return None, []
+    deb = downloaded_deb(NVIDIA_MODULE, change["to"])
+    identity = dkms_identity(deb) if deb else None
+    if identity is None:
+        return None, [reason("nvidia-kernel-module", f"The DKMS module {NVIDIA_MODULE} {change['to']} builds could not be "
+                                                     "read from the downloaded package.")]
+    blockers = dkms_override_blockers(*identity, kernel)
+    if blockers:
+        return None, [reason("nvidia-kernel-module", f"{identity[0]} {identity[1]} cannot be skipped for the WSL kernel "
+                                                     f"{kernel}: {'; '.join(blockers)}.")]
+    return {"module": identity[0], "version": identity[1], "kernel": kernel}, []
+
+
+def write_dkms_override(override):
+    """Create the planned override durably, or keep it when it is already this helper's own.
+    Repeatable; anything else at its path, or an override read after it, raises."""
+    blockers = dkms_override_blockers(**override)
+    if blockers:
+        raise ValueError("The DKMS override for the WSL kernel cannot be relied on: " + "; ".join(blockers))
+    path, text = dkms_override(**override)
+    if not path.exists():
+        DKMS_CONF.mkdir(mode=0o755, exist_ok=True)
+        atomic(path, text, 0o644)
+
+
+def remove_dkms_override(override):
+    """Remove the override only while it has exactly this helper's content (a cancelled upgrade)."""
+    path, text = dkms_override(**override)
+    if not path.is_symlink() and path.is_file() and path.read_bytes() == text.encode():
+        path.unlink()
+        sync_dir(path.parent)
+
+
+def parse_package_sources(text):
+    """apt-cache show stanzas -> package -> its source package (the package itself when unnamed)."""
+    found = {}
+    for block in re.split(r"\n\s*\n", text):
+        name = re.search(r"(?m)^Package: (\S+)", block)
+        if name:
+            source = re.search(r"(?m)^Source: (\S+)", block)
+            found[name.group(1)] = source.group(1) if source else name.group(1)
+    return found
+
+
+def cuda_profiling_candidates():
+    """Candidate stock CUDA profiling packages in the private Trixie lists -> source package."""
+    names = set()
+    for prefix in ("libcupti", "libcuinj64-", "libaccinj64-"):
+        names.update(n for n in output("apt-cache", *apt_options(), "pkgnames", prefix, env=apt_env()).split()
+                     if CUDA_PROFILING.match(n))
+    if not names:
+        return {}
+    return parse_package_sources(output("apt-cache", *apt_options(), "show", "--no-all-versions", *sorted(names),
+                                        env=apt_env(), check=False))
+
+
+def validate_plan(plan, packages, manual, php_map, venvs, policy, owners=None, new_sonames=(), transitions=None):
+    """Reasons the rehearsed transaction is unsafe; an empty list means it may run."""
+    problems = []
+    requested_out = set(php_map)
+    accepted = set(transitions or ()) | set(dropped_packages(plan, manual, policy))
+    for name in plan["remove"]:
+        if name in requested_out:
+            continue
+        if PROTECTED.match(name):
+            problems.append(reason("apt-removes-protected", f"The solution removes {name}."))
+        elif name in manual and name not in accepted:
+            problems.append(reason("apt-removes-manual", f"The solution removes the manually installed package {name}."))
+    ahead = ahead_packages(policy)
+    if ahead:
+        problems.append(reason("apt-ahead-of-trixie", "Installed versions are newer than Debian 13's and would stay "
+                                                      "foreign builds (typically from testing): " + ", ".join(ahead[:20])))
+    for name, change in plan["upgrade"].items():
+        if change["from"] and version_lt(change["to"], change["from"]):
+            problems.append(reason("apt-downgrade", f"{name} would go from {change['from']} to {change['to']}."))
+    if plan["kept_back"]:
+        problems.append(reason("apt-kept-back", "Not resolvable: " + ", ".join(sorted(plan["kept_back"]))))
+    for name in php_map.values():
+        if name not in plan["install"] and name not in packages:
+            problems.append(reason("php-counterpart", f"{name} has no installable Trixie package."))
+    for name, info in packages.items():
+        if not PG_PACKAGE.match(name) or info["status"] != "ii":
+            continue
+        final = plan["upgrade"].get(name, {}).get("to")
+        if name in plan["remove"]:
+            continue
+        if final is None and not policy.get(name, {}).get("target"):
+            problems.append(reason("pg-not-rebuilt", f"{name} {info['version']} has no Trixie build that is not older."))
+    retain = [v for v in venvs if v["kind"] == "retain"]
+    for venv in venvs:
+        if venv["kind"] == "unknown":
+            problems.append(reason("venv-unknown", f"{venv['path']} uses Python {venv['python'] or '?'} from an "
+                                                   "interpreter this upgrade does not retain."))
+    if retain:
+        for name in (f"python{SOURCE_PYTHON}", f"python{SOURCE_PYTHON}-minimal", f"libpython{SOURCE_PYTHON}-stdlib"):
+            if name in plan["remove"]:
+                problems.append(reason("venv-interpreter", f"The solution removes {name}, which "
+                                                           f"{len(retain)} virtual environments use."))
+    if owners is not None:
+        removed = set(plan["remove"])
+        for venv in venvs:
+            for soname in venv["sonames"]:
+                providers = owners.get(soname, set())
+                if providers and providers <= removed and soname not in new_sonames:
+                    problems.append(reason("venv-library", f"{venv['path']} loads {soname}, which the solution removes "
+                                                           f"with {', '.join(sorted(providers))}."))
+    return problems
+
+
+def deb_paths(deb):
+    return parse_deb_listing(output("dpkg-deb", "-c", deb))
+
+
+def parse_deb_listing(listing):
+    """Paths from dpkg-deb -c (mode owner size date time path [-> target])."""
+    paths = []
+    for line in listing.splitlines():
+        fields = line.split(None, 5)
+        if len(fields) == 6:
+            paths.append(fields[5].split(" -> ", 1)[0].lstrip("."))
+    return paths
+
+
+def downloaded_deb(name, version):
+    stem = f"{name}_{version.replace(':', '%3a')}_"
+    return next((p for p in (APT_DIR / "archives").glob(stem + "*.deb")), None)
+
+
+def new_package_files(plan):
+    """Files of newly installed packages and of upgraded PostgreSQL packages, from the downloaded debs."""
+    files = {}
+    for name, change in list(plan["install"].items()) + [(n, c) for n, c in plan["upgrade"].items() if PG_PACKAGE.match(n)]:
+        deb = downloaded_deb(name, change["to"])
+        if deb is None:
+            raise ValueError(f"The downloaded package for {name} {change['to']} is missing")
+        files[name] = deb_paths(deb)
+    return files
+
+
+def package_relations(changes):
+    """Replaces and Provides of the given installed or upgraded packages, from the downloaded debs."""
+    return {name: parse_relations(output("dpkg-deb", "-f", downloaded_deb(name, change["to"]), "Replaces", "Provides"))
+            for name, change in changes.items()}
+
+
+def new_service_problems(plan, files, php_map):
+    """Newly installed packages may not bring a service, except the PHP 8.4 counterpart of an
+    installed PHP 8.2 package (php8.4-fpm replaces php8.2-fpm, which the fence already stops)."""
+    problems = []
+    for name in sorted(plan["install"]):
+        services = service_files(files.get(name, []))
+        if services and name not in php_map.values():
+            problems.append(reason("new-service", f"The solution newly installs {name}, which ships {', '.join(services)}."))
+    return problems
+
+
+def service_files(paths):
+    return [p for p in paths if p.startswith("/etc/init.d/") or re.match(r"^/(usr/)?lib/systemd/system/.+\.(service|socket)$", p)]
+
+
+def extension_problems(inventory, plan, files):
+    """Every installed extension version must stay available after the PostgreSQL packages change."""
+    problems = []
+    provided = set()
+    for name, paths in files.items():
+        provided.update(p for p in paths if p.startswith("/usr/share/postgresql/17/extension/"))
+    changed = set(plan["upgrade"]) | set(plan["install"])
+    for db, rows in inventory["extensions"].items():
+        for ext, version, available in rows:
+            script = f"/usr/share/postgresql/17/extension/{ext}--{version}.sql"
+            owner = next((n for n in changed if any(p == f"/usr/share/postgresql/17/extension/{ext}.control"
+                                                    for p in files.get(n, ()))), None)
+            if owner is not None and script not in provided and not any(
+                    re.fullmatch(rf"/usr/share/postgresql/17/extension/{re.escape(ext)}--[^-]+--{re.escape(version)}\.sql", p)
+                    for p in provided):
+                problems.append(reason("pg-extension-version", f"{db}: extension {ext} {version} has no script in the "
+                                                               f"new {owner} package (a downgrade)."))
+            elif owner is None and not available:
+                problems.append(reason("pg-extension-version", f"{db}: extension {ext} {version} is not available."))
+    return problems
+
+
+def free_bytes(path):
+    info = os.statvfs(path)
+    return info.f_bavail * info.f_frsize
+
+
+def plan_space(text, total=False):
+    """(download, growth) from APT's summary. APT prints "Need to get A/B" when part of the archives
+    are cached already: the download is A, or B (every archive of the plan) with total=True."""
+    need = re.search(r"Need to get ([0-9.,]+) ([kMG]?B)(?:/([0-9.,]+) ([kMG]?B))?", text)
+    grow = re.search(r"After this operation, ([0-9.,]+) ([kMG]?B) of additional disk space", text)
+    units = {"B": 1, "kB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3}
+
+    def size(number, unit):
+        return int(float(number.replace(",", "")) * units[unit])
+
+    download = 0
+    if need:
+        download = size(need.group(3), need.group(4)) if total and need.group(3) else size(need.group(1), need.group(2))
+    return download, size(grow.group(1), grow.group(2)) if grow else 0
+
+
+def upgrade_bytes(text):
+    """Conservative working space of the upgrade inside the distro: every archive of the plan in the
+    private cache (counted even when already downloaded), APT's net growth when positive, and the
+    2 GiB margin for dpkg's unpack copies, logs and the private lists. Always above zero."""
+    download, growth = plan_space(text, total=True)
+    return download + max(growth, 0) + SPACE_MARGIN
+
+
+# ---------------------------------------------------------------------------------------------
+# Checks shared by preflight and upgrade
+
+
+def static_problems(packages, entries):
+    """Fast, local blockers: release, architecture, layout, sources, pins, dpkg health, PG17 and the fence guard."""
+    problems = []
+    release = os_release()
+    if release.get("ID") != "debian" or release.get("VERSION_ID") != "12":
+        problems.append(reason("release", f"This upgrade starts from Debian 12; found {release.get('PRETTY_NAME', 'unknown')}."))
+    if output("dpkg", "--print-architecture").strip() != "amd64" or output("dpkg", "--print-foreign-architectures").strip():
+        problems.append(reason("architecture", "Only a plain amd64 system without foreign architectures is supported."))
+    audit = output("dpkg", "--audit", check=False).strip()
+    if audit or any(info["status"] not in ("ii", "rc") for info in packages.values()):
+        problems.append(reason("dpkg-state", "Some packages are not fully installed; repair them first."))
+    holds = apt_mark("showhold")
+    if holds:
+        problems.append(reason("apt-holds", "Held packages: " + ", ".join(sorted(holds))))
+    problems += stock_preferences()[1]
+    if not any(e["kind"] == "debian" and SOURCE in " ".join(e["suites"]) for e in entries):
+        problems.append(reason("apt-sources", "No Debian 12 source is configured."))
+    for entry in entries:
+        # A vendor feed already in its Debian 13 form on Debian 12 was not written by this helper.
+        if entry["kind"] in ("other", "vendor-target"):
+            problems.append(reason("apt-third-party", f"{entry['file']}: {entry['uris'][0]} {' '.join(entry['suites'])} "
+                                                      "has unknown Debian 13 compatibility."))
+    if WSL_CONF.is_file():
+        problems += wsl_boot_problems(WSL_CONF.read_text(errors="replace"))
+    if POLICY.exists() or POLICY.is_symlink():
+        problems.append(reason("policy-rc.d", f"{POLICY} already exists; another tool controls service starts."))
+    if not START_ENV.is_file() or FENCE_GUARD not in START_ENV.read_text(errors="replace"):
+        problems.append(reason("core-outdated", "The installed start_env does not honour the upgrade fence. Update Distro first."))
+    _journal, journal_problems = pg17_journal()
+    problems += journal_problems
+    problems += pg_layout()
+    return problems
+
+
+def check_space(text):
+    download, growth = plan_space(text)
+    needed = download + max(growth, 0) + SPACE_MARGIN
+    available = min(free_bytes("/"), free_bytes("/var"))
+    if available < needed:
+        return [reason("disk-space", f"{needed // 1024 ** 2} MiB needed on / and /var, {available // 1024 ** 2} MiB free.")]
+    return []
+
+
+def rehearse(packages, entries, inventory):
+    """Refresh the signed Trixie lists, solve the whole transaction, download it and check it."""
+    php_map, php_problems = php_inventory(packages)
+    venvs = venv_inventory()
+    # Proven on a probe copy before the solver runs; nothing in the venv is written here.
+    execstack, execstack_rejected = rehearse_execstack(venvs)
+    if execstack_rejected:
+        raise Deferred(execstack_rejected)
+    prepare_apt_dir(entries, packages)
+    apt_update()
+    args = requested_changes(php_map, packages)
+    manual = apt_mark("showmanual")
+    mta_installed = has_mta(output("dpkg-query", "-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Provides}\n"))
+    available = cuda_profiling_candidates() if any(
+        CUDA_PROFILING.match(n) and n in manual and info["source"] == CUDA_SOURCE for n, info in packages.items()) else {}
+    # Each round only adds names from a finite set (the relay, installed stock CUDA packages and one
+    # successor for each), so it ends.
+    while True:
+        returncode, text = simulate(args)
+        (APT_DIR / "simulation.txt").write_text(text)
+        if returncode:
+            raise Deferred([reason("apt-solver", "APT could not solve the upgrade: " + text.strip()[-500:])])
+        plan = parse_plan(text)
+        added = adjust_request(args, plan, packages, mta_installed, manual, available)
+        if not added:
+            break
+        note(f"rehearsing again with {' '.join(added)}")
+        args = [a for a in args + added if not a.endswith("-")] + [a for a in args + added if a.endswith("-")]
+    # Requested only to satisfy dependencies: after the upgrade they keep the automatic mark they
+    # had (or, for the relay, would have had).
+    auto_marks = sorted(name for name in args if name == RELAY_MTA or name in packages and name not in manual
+                        and packages[name]["source"] == CUDA_SOURCE)
+    policy_text = subprocess.run(["apt-cache", *apt_options(), "policy", *sorted(packages)], env=apt_env(),
+                                 stdout=subprocess.PIPE, stderr=log).stdout.decode(errors="replace")
+    policy = parse_policy(policy_text)
+    feeds = {}
+    if vendor_keys(entries) or agnostic_feeds(entries, packages):
+        changed = sorted(set(plan["install"]) | set(plan["upgrade"]))
+        feeds = plan_feeds(plan, parse_policy(subprocess.run(
+            ["apt-cache", *apt_options(), "policy", *changed], env=apt_env(), stdout=subprocess.PIPE,
+            stderr=log).stdout.decode(errors="replace"))) if changed else {}
+    problems = php_problems + check_space(text)
+    download = subprocess.run(apt_command("-y", "--download-only", "full-upgrade", *args), env=apt_env(),
+                              stdout=log, stderr=log)
+    if download.returncode:
+        raise ValueError("Downloading the Trixie packages failed; retry preflight when the network is available")
+    # Read from the downloaded package; written only by the upgrade, after the recovery copy.
+    dkms, module_problems = module_override(plan)
+    problems += module_problems
+    files = new_package_files(plan)
+    new_sonames = {os.path.basename(p) for paths in files.values() for p in paths if p.startswith(LIB_DIRS)}
+    owners = system_soname_owners(packages)
+    old_files = {name: package_files(name, packages[name]["arch"]) for name in plan["remove"] if name in packages}
+    relations = package_relations(plan["install"])
+    transitions = find_transitions(plan, files, relations, old_files)
+    cuda = superseded_cuda(plan, packages, manual, policy)
+    explained = set(transitions) | set(cuda) | set(dropped_packages(plan, manual, policy)) | set(php_map)
+    if any(name in manual and name not in explained for name in plan["remove"]):
+        # Only then are the upgraded packages read, for a successor that took over a removed name.
+        relations.update(package_relations(plan["upgrade"]))
+        transitions = find_transitions(plan, files, relations, old_files)
+    if cuda:
+        sonames = {os.path.basename(p) for old in cuda for p in old_files.get(old, ())
+                   if p.startswith(LIB_DIRS) and ".so" in os.path.basename(p)}
+        users, complete = unpackaged_users(sonames)
+        if users or not complete:
+            problems.append(reason("cuda-library-users", f"Unpackaged files load the CUDA libraries the upgrade replaces "
+                                                         f"({', '.join(sorted(cuda))}): "
+                                   + (", ".join(users[:10]) if users else f"more than {UNPACKAGED_LIMIT} files under "
+                                      f"{' and '.join(UNPACKAGED_ROOTS)} could not all be inspected") + "."))
+        transitions = dict(transitions, **{old: new for old, new in cuda.items() if old not in transitions})
+    problems += validate_plan(plan, packages, manual, php_map, venvs, policy, owners, new_sonames, transitions)
+    problems += new_service_problems(plan, files, php_map)
+    problems += origin_problems(plan, feeds)
+    problems += vendor_problems(plan, packages, feeds)
+    problems += extension_problems(inventory, plan, files)
+    return {"args": args, "plan": plan, "php_map": php_map, "venvs": venvs, "auto_marks": auto_marks,
+            "vendors": vendor_keys(entries), "execstack": execstack,
+            "obsolete": obsolete_packages(policy), "problems": problems, "dkms_override": dkms,
+            # Manually installed packages whose successor inherits the manual mark after the upgrade.
+            "transitions": {old: new for old, new in transitions.items() if old in manual},
+            "dropped": dropped_packages(plan, manual, policy), "upgrade_bytes": upgrade_bytes(text),
+            "plan_digest": hashlib.sha256(json.dumps([args, sorted(plan["remove"])]).encode()).hexdigest()}
+
+
+# ---------------------------------------------------------------------------------------------
+# Commands
+
+
+def status_report():
+    """Pure read of the release, the journals and the PG17 control file. Creates, locks and starts nothing."""
+    report = {"schema": SCHEMA, "action": "status", "instance_id": instance_id()}
+    try:
+        release = os_release()
+        report["release"], report["codename"] = release.get("VERSION_ID", ""), release.get("VERSION_CODENAME", "")
+    except OSError:
+        report["release"], report["codename"] = "", ""
+    state = None
+    try:
+        state = load_state()
+    except (OSError, ValueError):
+        report.update(state="failed", reasons=[reason("journal", f"{STATE} is unreadable.")])
+        return report
+    report["fence"] = FENCE.exists()
+    if state:
+        report["phase"] = state.get("phase")
+        report["plan_id"] = state.get("plan_id")
+        mapping = {"fencing": ("fence-incomplete", "Run upgrade --cancel, then preflight again."),
+                   "fenced":("fenced", "Terminate the distro, export and verify a recovery copy, then run upgrade."),
+                   "upgrading": ("interrupted", "Run upgrade again with the same capture token to resume."),
+                   "upgraded": ("upgraded", "Restart the distro, then run verify."),
+                   "verified": ("verified", "Record that automatic rollback is no longer allowed, then run release."),
+                   "current": ("current", ""), "cancelled": (None, "")}
+        known = mapping.get(state.get("phase"))
+        if known is None:
+            report.update(state="failed", reasons=[reason("journal", f"Unknown phase {state.get('phase')!r}.")])
+            return report
+        if restore_pending(state):
+            report["restore_pending"] = True
+        if known[0]:
+            report.update(state=known[0], next=known[1])
+            if state.get("error"):
+                report["last_error"] = state["error"]
+            return report
+    if report["release"] == "13":
+        report.update(state="not-needed")
+        return report
+    if report["release"] != "12":
+        report.update(state="unsupported", reasons=[reason("release", "Only Debian 12 can be upgraded.")])
+        return report
+    reasons = []
+    try:
+        journal, reasons = pg17_journal()
+        # Read from the files alone: the journal is trusted only for the cluster now on disk.
+        reasons = reasons or pg17_identity_problems(journal)
+    except (OSError, ValueError):
+        reasons = [reason("pg17-not-current", "The PG17 journal is unreadable.")]
+    report.update(state="deferred" if reasons else "needed", reasons=reasons,
+                  next="" if reasons else "Run preflight with the games idle.")
+    return report
+
+
+def preflight():
+    packages = installed_packages()
+    entries = apt_sources()
+    problems = static_problems(packages, entries)
+    if problems:
+        raise Deferred(problems)
+    inventory = pg17_inventory(pg17_journal()[0])
+    problems = collation_problems(inventory)
+    if problems:
+        raise Deferred(problems)
+    result = rehearse(packages, entries, inventory)
+    if result["problems"]:
+        raise Deferred(result["problems"])
+    plan = {
+        "schema": SCHEMA, "created": int(time.time()), "dpkg_status": dpkg_status_digest(), "args": result["args"],
+        "plan_digest": result["plan_digest"], "php_map": result["php_map"], "venvs": result["venvs"],
+        "obsolete": result["obsolete"], "transitions": result["transitions"], "dropped": result["dropped"],
+        "auto_marks": result["auto_marks"], "dkms_override": result["dkms_override"], "execstack": result["execstack"],
+        "counts": {k: len(result["plan"][k]) for k in ("upgrade", "install", "remove")},
+        "removals": sorted(result["plan"]["remove"]), "installs": sorted(result["plan"]["install"]),
+    }
+    plan["plan_id"] = hashlib.sha256(json.dumps([plan["dpkg_status"], plan["plan_digest"], plan["dkms_override"]]
+                                                + ([plan["execstack"]] if plan["execstack"] else []))
+                                     .encode()).hexdigest()[:32]
+    atomic(PLAN, json.dumps(plan, indent=1, sort_keys=True), 0o600)
+    # Measured last, so the downloaded archives and plan.json are part of the export size.
+    return {"result": "ready", "plan_id": plan["plan_id"], "counts": plan["counts"], "removals": plan["removals"],
+            "installs": plan["installs"], "php": plan["php_map"], "obsolete_kept": plan["obsolete"],
+            "transitions": plan["transitions"], "dropped": plan["dropped"], "vendor_feeds": result["vendors"],
+            "used_bytes": rootfs_used_bytes("/"), "upgrade_bytes": result["upgrade_bytes"],
+            "retained_databases": inventory["retained"], "dkms_override": result["dkms_override"],
+            "venv_execstack": [{k: f[k] for k in ("path", "sha256", "patched_sha256", "probed")} for f in plan["execstack"]],
+            "venvs": [{k: v[k] for k in ("path", "kind", "python")} for v in plan["venvs"]]}
+
+
+def service_running(name):
+    if not Path(f"/etc/init.d/{name}").exists():
+        return False
+    return subprocess.run(["service", name, "status"], stdout=log, stderr=log).returncode == 0
+
+
+CONFFILE_QUERY = ("dpkg-query", "-W", "-f", "${binary:Package} ${Version}\n${Conffiles}\n")
+GUARDED_ROOTS = (PG_CONF, Path("/etc/dwemer"), Path("/etc/sudoers.d"), Path("/etc/apache2/sites-available"))
+
+
+def conffile_records(text):
+    """dpkg-query CONFFILE_QUERY -> {path: [(package, version, md5, flags)]}. Conffile lines start with
+    whitespace and an absolute path; any other non-empty line names the package the following lines belong to."""
+    records, package = {}, (None, None)
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0].startswith("/"):
+            if len(parts) >= 2:
+                records.setdefault(parts[0], []).append((*package, parts[1], tuple(parts[2:])))
+        else:
+            package = (parts[0], parts[1] if len(parts) == 2 else None)
+    return records
+
+
+def plain_conffile(path):
+    """The bytes of path when it is a regular file reached through no symlink, else None."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or os.path.realpath(path) != path:
+        return None
+    return Path(path).read_bytes()
+
+
+def dpkg_record(path, records):
+    """The one well-formed, unflagged dpkg record of a conffile, or None. Several records (a conffile moving
+    between packages), an obsolete or remove-on-upgrade flag, an unknown flag, a package without a version or
+    an md5 other than 32 hex digits ("newconffile" while unconfigured) all count as unrecognised."""
+    rows = records.get(path, [])
+    if len(rows) != 1:
+        return None
+    package, version, md5, flags = rows[0]
+    if not package or not version or flags or not re.fullmatch(r"[0-9a-f]{32}", md5):
+        return None
+    return package, version, md5
+
+
+def stock_conffile(path, records):
+    """A vendor conffile dpkg installed and nobody edited: {package, version, md5, sha256}, else None."""
+    record, data = dpkg_record(path, records), plain_conffile(path)
+    if record is None or data is None or hashlib.md5(data).hexdigest() != record[2]:
+        return None
+    return {"package": record[0], "version": record[1], "md5": record[2], "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def link_digest(path):
+    """A symlink by its target and, when that is a file, the content it resolves to."""
+    target = os.readlink(path)
+    return f"symlink:{target}:{sha256_file(path) if os.path.isfile(path) else ''}"
+
+
+def guarded_digests():
+    """Private configuration that packages must not change: user-modified conffiles and Core's own files.
+    Values are sha256 digests, symlink digests, or {"conffile": ...} for an unedited vendor conffile in a
+    guarded directory, which only a dpkg upgrade of the same package may replace by its new vendor version."""
+    digests = {}
+    records = conffile_records(output(*CONFFILE_QUERY))
+    for path, rows in records.items():
+        if (any(not {"obsolete", "remove-on-upgrade"} & set(flags) for *_, flags in rows) and os.path.isfile(path)
+                and not path.startswith(("/etc/apt/sources.list", "/etc/apt/preferences"))):
+            if any(hashlib.md5(Path(path).read_bytes()).hexdigest() != md5 for _, _, md5, flags in rows
+                   if not {"obsolete", "remove-on-upgrade"} & set(flags)):
+                digests[path] = sha256_file(path)
+    for root in GUARDED_ROOTS:
+        if root.is_dir():
+            for path in root.rglob("*"):
+                if path == FENCE or path.name == "start.conf":
+                    continue
+                if path.is_symlink():
+                    digests[str(path)] = link_digest(path)
+                elif path.is_file() and str(path) not in digests:
+                    stock = stock_conffile(str(path), records)
+                    digests[str(path)] = {"conffile": stock} if stock else sha256_file(path)
+    for path in (Path("/etc/dwemerdistro_services.conf"), Path("/etc/start_env"), PG17_STATE, WSL_CONF,
+                 Path("/var/lib/dwemerdistro/cuda-selection.env")):
+        if path.is_file():
+            digests[str(path)] = sha256_file(path)
+    return digests
+
+
+def vendor_update(path, stock, records):
+    """True when an unedited vendor conffile is unchanged, or dpkg replaced it with the conffile of a newer
+    version of the same package, unedited since. Missing, renamed, re-owned or symlinked files fail."""
+    data = plain_conffile(path)
+    if data is None:
+        return False
+    if hashlib.sha256(data).hexdigest() == stock["sha256"]:
+        return True
+    record = dpkg_record(path, records)
+    return (record is not None and record[0] == stock["package"] and record[1] != stock["version"]
+            and record[2] != stock["md5"] and hashlib.md5(data).hexdigest() == record[2])
+
+
+def guarded_changes(guarded):
+    records = None
+    changed = []
+    for path, digest in sorted(guarded.items()):
+        if isinstance(digest, dict):
+            if records is None:
+                records = conffile_records(output(*CONFFILE_QUERY))
+            same = "conffile" in digest and vendor_update(path, digest["conffile"], records)
+        elif not isinstance(digest, str):
+            same = False
+        elif digest.startswith("symlink:"):
+            same = os.path.islink(path) and link_digest(path) == digest
+        else:
+            same = os.path.isfile(path) and sha256_file(path) == digest
+        if not same:
+            changed.append(path)
+    return changed
+
+
+def prepare(plan_id):
+    plan = json.loads(PLAN.read_text()) if PLAN.is_file() else None
+    if plan is None or plan["plan_id"] != plan_id:
+        raise Deferred([reason("plan", "No matching preflight plan; run preflight again.")])
+    if time.time() - plan["created"] > PLAN_MAX_AGE or plan["dpkg_status"] != dpkg_status_digest():
+        raise Deferred([reason("plan", "Packages changed or the plan is stale; run preflight again.")])
+    state = load_state()
+    if state and state.get("phase") not in ("cancelled", "current"):
+        raise Deferred([reason("journal", f"An upgrade is already {state.get('phase')}.")])
+    entries = apt_sources()
+    problems = static_problems(installed_packages(), entries)
+    if problems:
+        raise Deferred(problems)
+    if execstack_drift(plan.get("execstack", [])):
+        raise Deferred([reason("plan", "A venv file preflight planned to fix changed; run preflight again.")])
+    pg17, _ = pg17_journal()
+    # A stopped PG17 is proven offline here and inspected privately after the fence below.
+    socket = pg17_application_socket(pg17)
+    if socket is not None:
+        problems = collation_problems(pg_inventory(socket))
+        if problems:
+            raise Deferred(problems)
+    state = {
+        "schema": SCHEMA, "plan_id": plan_id, "token": secrets.token_hex(32), "args": plan["args"],
+        "plan_digest": plan["plan_digest"], "php_map": plan["php_map"], "venvs": plan["venvs"],
+        "transitions": plan.get("transitions", {}), "auto_marks": plan.get("auto_marks", []),
+        "dkms_override": plan.get("dkms_override"), "execstack": plan.get("execstack", []),
+        "dpkg_status": plan["dpkg_status"], "preferences": bool(stock_preferences()[0]),
+        "pg15_id": controldata(15, OLD_DATA)["Database system identifier"], "pg17_donor_id": pg17.get("donor_id"),
+        "pg17_candidate_id": pg17.get("candidate_id"), "new_start": read_start(NEW_CONF),
+        "php": php_snapshot(), "running": [name for name in WRITERS if service_running(name)],
+        "pg17_was_running": socket is not None, "vendors": vendor_keys(entries), "cuda_layout": cuda_layout(),
+    }
+    # Fence first, so a crash between the steps below still leaves start_env and update.sh refusing.
+    FENCE.parent.mkdir(mode=0o755, exist_ok=True)
+    atomic(FENCE, f"{FENCE_GUARD} {plan_id}\n", 0o644)
+    save_state(state, "fencing")
+    for name in state["running"]:
+        run("service", name, "stop")
+    atomic(NEW_CONF / "start.conf", "manual\n", 0o644)
+    if pg_running(17, NEW_DATA):
+        run("pg_ctlcluster", "--skip-systemctl-redirect", "--mode", "fast", "17", "dwemer", "stop")
+    if pg_running(17, NEW_DATA) or pg_running(15, OLD_DATA):
+        raise ValueError("PostgreSQL did not stop")
+    # The fence record, taken with no client left: roles, databases and, on the private socket
+    # only, the contents of the retained closed template.
+    socket = private_pg17("start")
+    try:
+        inventory = pg_inventory(socket, private=True)
+    finally:
+        private_pg17("stop")
+    problems = collation_problems(inventory) + retained_problems(inventory)
+    if problems:
+        unfence(state)
+        raise Deferred(problems)
+    state["inventory"], state["inventory_digest"] = inventory, inventory_digest(inventory)
+    state["seal"] = pg17_seal()
+    if state["seal"][-1] != "shut down":
+        raise ValueError("PG17 did not shut down cleanly")
+    state["guarded"] = guarded_digests()
+    save_state(state, "fenced")
+    os.sync()
+    return {"result": "fenced", "capture_token": state["token"], "journal": str(STATE)}
+
+
+def cancel():
+    state = load_state()
+    if state and state.get("phase") == "cancelled":
+        # Already cancelled: only a restore an earlier cancel left unfinished is completed.
+        return cancelled_result(restore_services(state) if restore_pending(state) else state.get("restore"))
+    if not state or not (state.get("phase") in ("fencing", "fenced")
+                         or state.get("phase") == "upgrading" and state.get("step") in (None, "lists")):
+        raise Deferred([reason("journal", "Only a fenced upgrade that changed no package can be cancelled.")])
+    if dpkg_status_digest() != state["dpkg_status"]:
+        raise ValueError("Packages changed while fenced; the fence stays. Review the log")
+    return cancelled_result(unfence(state))
+
+
+def cancelled_result(restore):
+    result = {"result": "cancelled", "next": "Start the distro normally.", "restore": restore}
+    if restore and restore.get("pending"):
+        result["next"] = ("Nothing was upgraded and the fence is gone. Run upgrade --cancel again to start what ran "
+                          "before the fence, or start the distro normally.")
+    return result
+
+
+def unfence(state):
+    """Undo a fence that changed no package, then start again what prepare stopped. A closed
+    database left open by an interrupted private inspection is closed first, so the fence never
+    lifts with it open. The restore is journaled with the phase change, so a crash or a failed
+    start is finished by running cancel again."""
+    stop_private_pg17()
+    if CLOSED_OPEN.is_file():
+        private_pg17("start")
+        private_pg17("stop")
+    if state.get("new_start"):
+        atomic(NEW_CONF / "start.conf", state["new_start"] + "\n", 0o644)
+    remove_policy()
+    if state.get("dkms_override"):
+        remove_dkms_override(state["dkms_override"])
+    FENCE.unlink(missing_ok=True)
+    state["restore"] = restore_plan(state, list(state.get("running", [])))
+    save_state(state, "cancelled")
+    return restore_services(state) if restore_pending(state) else state["restore"]
+
+
+# A recovery copy the Launcher imports only to prove it, and the failed disk it keeps after a
+# restore, are registered under the distro name with this mark; nothing is started there.
+RECOVERY_REGISTRATION_MARK = "-TrixieRecovery-"
+PG17_SERVICE = "postgresql@17-dwemer"
+
+
+def restore_plan(state, services):
+    """What ran when prepare fenced, journaled when the fence lifts: PG17 if it served, and the writers."""
+    return {"pending": bool(state.get("pg17_was_running") or services), "pg17": bool(state.get("pg17_was_running")),
+            "services": services, "running": [], "failed": [], "problems": []}
+
+
+def restore_pending(state):
+    return bool((state.get("restore") or {}).get("pending"))
+
+
+def restore_problems(state):
+    """Reasons not to start anything: a recovery copy registration, a PG17 that is not the
+    journaled, verified 17/dwemer recorded at the fence, a running or enabled PG15, another server
+    on the application socket, or a closed database that may still be open."""
+    if RECOVERY_REGISTRATION_MARK in os.environ.get("WSL_DISTRO_NAME", ""):
+        return [reason("recovery-copy", "This is a recovery copy registration; nothing is started on it.")]
+    journal, problems = pg17_journal()
+    if problems:
+        return problems
+    problems = pg17_identity_problems(journal)
+    if not problems and controldata(17, NEW_DATA)["Database system identifier"] != state.get("pg17_candidate_id"):
+        problems.append(reason("pg17-identity", "17/dwemer is not the cluster recorded at the fence."))
+    if read_start(OLD_CONF) != "disabled" or pg_running(15, OLD_DATA):
+        problems.append(reason("pg15-guard", "The retained PG15 cluster is running or not disabled."))
+    if problems:
+        return problems
+    stop_private_pg17()
+    if not pg_running(17, NEW_DATA):
+        if CLOSED_OPEN.is_file():
+            private_pg17("start")
+            private_pg17("stop")
+        if socket_serves():
+            problems.append(reason("pg17", "Another server answers on the application socket."))
+    if CLOSED_OPEN.is_file():
+        problems.append(reason("pg17", "A closed database may still be open."))
+    return problems
+
+
+def restore_services(state):
+    """Start what the journaled restore names and is stopped: 17/dwemer first, then the writers.
+    Nothing is stopped and PG15 is never started. Termination signals are ignored meanwhile, and a
+    failure only leaves the restore pending for a rerun: the fence has lifted, so this never fails
+    the command or suggests the recovery copy."""
+    restore = state["restore"]
+    handlers = {signum: signal.signal(signum, signal.SIG_IGN) for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    try:
+        try:
+            problems = restore_problems(state)
+        except Exception as error:
+            problems = [reason("restore", f"The restore could not be checked: {error}")]
+        running, failed = [], []
+        names = ([PG17_SERVICE] if restore["pg17"] else []) + restore["services"]
+        for name in [] if problems else names:
+            try:
+                if name == PG17_SERVICE:
+                    if not pg_running(17, NEW_DATA):
+                        run("pg_ctlcluster", "--skip-systemctl-redirect", "17", "dwemer", "start")
+                elif not service_running(name):
+                    run("service", name, "start")
+                running.append(name)
+            except Exception as error:
+                note(f"restore: {name} did not start: {error!r}")
+                failed.append(name)
+                if name == PG17_SERVICE:
+                    # The writers need the database; they wait for a rerun with it.
+                    failed += restore["services"]
+                    break
+        restore.update(pending=bool(problems or failed), running=running, failed=failed, problems=problems,
+                       attempted_at=int(time.time()))
+        save_state(state)
+    finally:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+    return restore
+
+
+def check_fence(state, token):
+    """The capture token binds the Launcher's recovery copy to this fence, and nothing may have written since."""
+    problems = []
+    if not secrets.compare_digest(state.get("token", ""), token):
+        problems.append(reason("capture-token", "The capture token does not match this fence."))
+    if not FENCE.is_file():
+        problems.append(reason("fence", f"{FENCE} is missing; writers may have run since the capture."))
+    if pg_running(17, NEW_DATA) or pg_running(15, OLD_DATA):
+        problems.append(reason("fence", "PostgreSQL is running; the recovery copy may be stale."))
+    elif pg17_seal() != state["seal"]:
+        problems.append(reason("fence", "PG17 changed since the capture."))
+    for name in WRITERS:
+        if service_running(name):
+            problems.append(reason("fence", f"{name} is running."))
+    if dpkg_status_digest() != state["dpkg_status"]:
+        problems.append(reason("fence", "Packages changed since the capture."))
+    return problems
+
+
+def install_policy():
+    if POLICY.exists() or POLICY.is_symlink():
+        if not POLICY_ASIDE.exists():
+            raise ValueError(f"{POLICY} appeared during the upgrade")
+        return
+    atomic(POLICY, "#!/bin/sh\n# ddistro_trixie_maintenance: no service starts or stops during the upgrade.\nexit 101\n",
+           0o755)
+    POLICY_ASIDE.write_text("installed\n")
+
+
+def remove_policy():
+    if POLICY_ASIDE.exists():
+        POLICY.unlink(missing_ok=True)
+        POLICY_ASIDE.unlink()
+
+
+def transaction(state):
+    """The package transaction. Re-entrant: an interrupted run resumes with dpkg --configure -a."""
+    entries = apt_sources() if state.get("step") != "dpkg" else None
+    install_policy()
+    if state.get("step") in (None, "lists"):
+        prepare_apt_dir(entries, installed_packages())
+        apt_update()
+        returncode, text = simulate(state["args"])
+        plan = parse_plan(text)
+        digest = hashlib.sha256(json.dumps([state["args"], sorted(plan["remove"])]).encode()).hexdigest()
+        changed = reason("plan-changed", "The refreshed Trixie solution differs from the preflight plan; "
+                                         "cancel and run preflight again.")
+        if returncode or digest != state["plan_digest"] or plan["kept_back"] or check_space(text):
+            raise Deferred([changed])
+        run(*apt_command("-y", "--download-only", "full-upgrade", *state["args"]), env=apt_env())
+        # The refreshed module package must still build the module version preflight planned to skip
+        # on the same WSL kernel, and no other override may have appeared since.
+        override, problems = module_override(plan)
+        if problems or override != state.get("dkms_override"):
+            raise Deferred([changed] + problems)
+        drift = execstack_drift(state.get("execstack", []))
+        if drift:
+            raise Deferred([reason("plan-changed", "Changed since preflight: " + ", ".join(drift)
+                                   + "; cancel and run preflight again.")])
+        if override:
+            write_dkms_override(override)
+        state["step"] = "dpkg"
+        save_state(state, "upgrading")
+    elif state.get("dkms_override"):
+        # A resumed transaction: the override must still be there before dpkg configures the module.
+        write_dkms_override(state["dkms_override"])
+    # From here dpkg changes the system. Termination signals are ignored by this process and by
+    # APT/dpkg, which inherit that, so closing the Launcher cannot stop dpkg midway.
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(signum, signal.SIG_IGN)
+    run("dpkg", "--configure", "-a", env=apt_env())
+    for attempt in (1, 2):
+        result = subprocess.run(apt_command("-y", "--no-download", "full-upgrade", *state["args"]), env=apt_env(),
+                                stdout=log, stderr=log)
+        if result.returncode == 0:
+            break
+        run("dpkg", "--configure", "-a", env=apt_env())
+    else:
+        raise ValueError("The package transaction failed twice; run upgrade again to resume, or restore the recovery copy")
+    if output("dpkg", "--audit", check=False).strip():
+        raise ValueError("dpkg reports unfinished packages after the transaction")
+    state["step"] = "post"
+    save_state(state, "upgrading")
+
+
+def switch_apache_php():
+    enabled = Path("/etc/apache2/mods-enabled")
+    if (enabled / f"php{SOURCE_PHP}.load").is_symlink() or (enabled / f"php{SOURCE_PHP}.load").exists():
+        run("a2dismod", "-f", f"php{SOURCE_PHP}", env=apt_env())
+    if Path(f"/etc/apache2/mods-available/php{TARGET_PHP}.load").is_file():
+        run("a2enmod", f"php{TARGET_PHP}", env=apt_env())
+    run("apache2ctl", "-t")
+
+
+def repoint_venvs(state):
+    """Point Python 3.11 venvs at the retained /usr/bin/python3.11 instead of /usr/bin/python3, now 3.13."""
+    changes = state.setdefault("venv_links", {})
+    interpreter = f"/usr/bin/python{SOURCE_PYTHON}"
+    if not any(v["kind"] == "retain" for v in state["venvs"]):
+        return
+    if not os.path.isfile(interpreter):
+        raise ValueError(f"{interpreter} is missing; the retained virtual environments cannot run")
+    # Autoremove must never take the interpreter these venvs run on.
+    run("apt-mark", "manual", f"python{SOURCE_PYTHON}", f"python{SOURCE_PYTHON}-minimal", f"libpython{SOURCE_PYTHON}-stdlib")
+    for venv in state["venvs"]:
+        if venv["kind"] != "retain":
+            continue
+        for name in ("python3", "python", f"python{SOURCE_PYTHON}"):
+            link = Path(venv["path"], "bin", name)
+            if not link.is_symlink():
+                continue
+            target = os.readlink(link)
+            if os.path.realpath(link) == os.path.realpath(interpreter):
+                continue
+            if target not in ("/usr/bin/python3", "python3", "/bin/python3", "/usr/bin/python"):
+                continue
+            # The replacement keeps the link's own owner and group, which can differ from the venv's.
+            info = os.lstat(link)
+            changes.setdefault(str(link), target)
+            temporary = link.with_name(link.name + ".trixie-" + uuid.uuid4().hex)
+            os.symlink(interpreter, temporary)
+            os.lchown(temporary, info.st_uid, info.st_gid)
+            os.replace(temporary, link)
+    save_state(state)
+
+
+def install_vendor_keys(vendors):
+    """Install the Debian 13 vendor keys the transaction's rehearsal fetched and verified, where the
+    migrated entries name them. Reruns keep a key that still has its pinned fingerprint."""
+    for vendor in vendors:
+        fingerprint, target = VENDORS[vendor]["fingerprint"], vendor_keyring(vendor)
+        if not target.is_symlink() and target.is_file() and key_fingerprint(target) == fingerprint:
+            continue
+        staged = APT_DIR / target.name
+        if key_fingerprint(staged) != fingerprint:
+            raise ValueError(f"The verified {vendor} Debian 13 key is missing; run upgrade again")
+        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".trixie-" + uuid.uuid4().hex)
+        shutil.copyfile(staged, temporary)
+        temporary.chmod(0o644)
+        os.replace(temporary, target)
+        sync_dir(target.parent)
+
+
+def persist_sources():
+    """Point the configured Debian and PGDG sources at Trixie and the recognised vendor entries at
+    their Debian 13 feeds, keeping a copy of every original file."""
+    files = [APT_SOURCES] if APT_SOURCES.is_file() else []
+    if APT_PARTS.is_dir():
+        files += sorted(p for p in APT_PARTS.iterdir() if p.suffix in (".list", ".sources"))
+    SOURCES_BACKUP.mkdir(mode=0o700, exist_ok=True)
+    changed = []
+    entries = apt_sources()
+    install_vendor_keys(vendor_keys(entries))
+    covered = main_archive_components(entries)
+    for path in files:
+        text = path.read_text()
+        updated = rewrite_suites(text, path.suffix == ".sources", covered)
+        if updated == text:
+            continue
+        backup = SOURCES_BACKUP / path.name
+        if not backup.exists():
+            shutil.copy2(path, backup)
+        atomic(path, updated, stat.S_IMODE(os.stat(path).st_mode), like=path)
+        changed.append(str(path))
+    return changed
+
+
+def keep_manual_marks(state):
+    """A manually installed package that a successor took over passes its manual mark on. Packages
+    requested only to satisfy dependencies (the relay, kept-back CUDA packages) stay automatic."""
+    installed = installed_packages()
+    successors = sorted(new for new in state.get("transitions", {}).values() if installed.get(new, {}).get("status") == "ii")
+    if successors:
+        run("apt-mark", "manual", *successors)
+    automatic = sorted(name for name in state.get("auto_marks", []) if installed.get(name, {}).get("status") == "ii")
+    if automatic:
+        run("apt-mark", "auto", *automatic)
+
+
+def persist_preferences(state):
+    """Replace the installer's Bookworm pin file by its Trixie form, keeping the original. Reruns
+    change nothing; any other preference is left for verify to report."""
+    path = APT_PREFERENCES[1] / STOCK_PREFERENCES
+    if not state.get("preferences") or path.is_symlink() or not path.is_file():
+        return []
+    if path.read_text(errors="replace") == TRIXIE_PREFERENCES:
+        return [str(path)]
+    if stock_preferences()[0] != path:
+        return []
+    PREFERENCES_BACKUP.mkdir(mode=0o700, exist_ok=True)
+    backup = PREFERENCES_BACKUP / path.name
+    if not backup.exists():
+        shutil.copy2(path, backup)
+    atomic(path, TRIXIE_PREFERENCES, stat.S_IMODE(os.stat(path).st_mode), like=path)
+    return [str(path)]
+
+
+def persist_vendor_preferences(state):
+    """Pin the migrated vendor feeds to their user-space components. Written after the stock pin file
+    (which must still be alone while it is recognised) and before the sources name the feeds."""
+    vendors = state.get("vendors") or []
+    if not vendors:
+        return []
+    path, text = APT_PREFERENCES[1] / VENDOR_PINS_NAME, vendor_pin_file(vendors)
+    if path.is_symlink() or not path.is_file() or path.read_text(errors="replace") != text:
+        path.parent.mkdir(mode=0o755, exist_ok=True)
+        atomic(path, text, 0o644)
+    return [str(path)]
+
+
+def cuda_layout(parent=CUDA_PARENT):
+    """/usr/local/cuda* -> [link, resolved path] for links, "dir" for directories."""
+    layout = {}
+    if parent.is_dir():
+        for path in sorted(parent.glob("cuda*")):
+            if path.is_symlink():
+                layout[str(path)] = [os.readlink(path), os.path.realpath(path)]
+            elif path.is_dir():
+                layout[str(path)] = "dir"
+    return layout
+
+
+def post_upgrade(state):
+    switch_apache_php()
+    state["php_carried"] = carry_php_settings(state["php"])
+    repoint_venvs(state)
+    apply_execstack(state.get("execstack", []))
+    keep_manual_marks(state)
+    # Pins first, so no system APT run ever sees a migrated vendor feed without them.
+    state["preferences_changed"] = persist_preferences(state) + persist_vendor_preferences(state)
+    state["sources_changed"] = persist_sources()
+    refreshed = subprocess.run(["apt-get", "update", "-o", "Acquire::Retries=3"], env=apt_env(), stdout=log, stderr=log)
+    state["system_lists_refreshed"] = refreshed.returncode == 0
+    remove_policy()
+    save_state(state, "upgraded")
+    os.sync()
+
+
+def upgrade(token, recovery_sha256, recovery_bytes):
+    state = load_state()
+    if state and state.get("phase") in ("verified", "current"):
+        raise Deferred([reason("journal", f"The upgrade is already {state['phase']}.")])
+    if not state or state.get("phase") not in ("fenced", "upgrading", "upgraded"):
+        raise Deferred([reason("journal", "Run upgrade --prepare first.")])
+    if state["phase"] == "upgraded":
+        return {"result": "upgraded", "next": "Restart the distro, then run verify."}
+    if state["phase"] == "fenced":
+        problems = check_fence(state, token)
+        if problems:
+            raise Deferred(problems)
+        state["recovery"] = {"sha256": recovery_sha256, "bytes": recovery_bytes, "attested_at": int(time.time())}
+        state["step"] = "lists"
+        save_state(state, "upgrading")
+    elif not secrets.compare_digest(state.get("token", ""), token):
+        raise Deferred([reason("capture-token", "The capture token does not match this upgrade.")])
+    try:
+        if state.get("step") != "post":
+            transaction(state)
+        post_upgrade(state)
+    except Deferred:
+        # Nothing was installed yet: return to the fenced state so the Launcher can cancel or retry.
+        remove_policy()
+        if state.get("dkms_override"):
+            remove_dkms_override(state["dkms_override"])
+        state["step"] = None
+        save_state(state, "fenced")
+        raise
+    except BaseException as error:
+        state["error"] = str(error)[:500]
+        save_state(state)
+        raise
+    return {"result": "upgraded", "next": "Terminate and restart the distro, then run verify.",
+            "php": state["php_carried"], "sources": state["sources_changed"]}
+
+
+def stale_processes():
+    """Processes, other than this one, that still map files the upgrade replaced."""
+    stale = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) in (os.getpid(), os.getppid()):
+            continue
+        try:
+            with open(f"/proc/{entry}/maps") as maps:
+                if any(line.rstrip().endswith("(deleted)") and " /usr/" in line for line in maps):
+                    stale.append(int(entry))
+        except OSError:
+            continue
+    return stale
+
+
+PRIVATE_SOCKET = PG_DATA / ".trixie-verify"
+
+
+def private_pg17(action):
+    """Run PG17 only on a private peer socket without TCP, so verification exposes nothing. Before
+    the server answers anything else, databases an interrupted inspection left open are closed."""
+    socket = PRIVATE_SOCKET
+    if action == "start":
+        if socket.is_symlink():
+            raise ValueError(f"{socket} is a link")
+        socket.mkdir(mode=0o700, exist_ok=True)
+        shutil.chown(socket, "postgres", "postgres")
+        # Peer authentication for postgres only, whatever the cluster's own pg_hba.conf allows.
+        hba = socket / "hba"
+        hba.write_text("local all postgres peer\n")
+        shutil.chown(hba, "postgres", "postgres")
+        options = (f"-c config_file={NEW_CONF}/postgresql.conf -c listen_addresses='' -c unix_socket_directories={socket} "
+                   f"-c port=5432 -c hba_file={hba} -c autovacuum=off -c max_logical_replication_workers=0")
+        run("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/lib/postgresql/17/bin/pg_ctl", "-D", NEW_DATA, "-o",
+            options, "-l", PG_DATA / "trixie-verify.log", "-w", "start")
+        try:
+            reclose_databases(socket)
+        except BaseException:
+            private_pg17("stop")
+            raise
+    else:
+        run("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/lib/postgresql/17/bin/pg_ctl", "-D", NEW_DATA,
+            "-m", "fast", "-w", "stop")
+    return socket
+
+
+def private_pg17_running(pid_file=None):
+    """True when PG17 runs and its postmaster.pid names the private socket (line 5)."""
+    pid_file = pid_file or NEW_DATA / "postmaster.pid"
+    try:
+        lines = pid_file.read_text().splitlines()
+    except OSError:
+        return False
+    return len(lines) >= 5 and lines[4].strip() == str(PRIVATE_SOCKET)
+
+
+def stop_private_pg17():
+    """Stop a private server an interrupted helper left running in this boot."""
+    if private_pg17_running() and pg_running(17, NEW_DATA):
+        private_pg17("stop")
+
+
+def source_problems(entries):
+    """After the upgrade no active Debian or PGDG entry may still name Bookworm or a rolling suite,
+    and no vendor entry its Debian 12 feed."""
+    problems = []
+    for entry in entries:
+        old = sorted(s for s in entry["suites"] if s in ROLLING_SUITES or s.split("-")[0] == SOURCE)
+        if entry["kind"] == "vendor":
+            problems.append(reason("apt-sources", f"{entry['file']} still uses {entry['uris'][0]}."))
+        elif old and entry["kind"] != "agnostic":
+            problems.append(reason("apt-sources", f"{entry['file']} still uses {', '.join(old)}."))
+    return problems
+
+
+VERIFIED_NEXT = "Record that automatic rollback is no longer allowed, then run release."
+
+
+def verify():
+    state = load_state()
+    if not state or state.get("phase") not in ("upgraded", "verified", "current"):
+        raise Deferred([reason("journal", "No completed upgrade to verify.")])
+    if state["phase"] == "current":
+        return {"result": "current", "next": ""}
+    # From verified it runs again in full, still fenced, and records a fresh verification.
+    problems = source_problems(apt_sources()) + trixie_preference_problems(state.get("vendors", []))
+    if state.get("cuda_layout") is not None and cuda_layout() != state["cuda_layout"]:
+        problems.append(reason("cuda-layout", "The CUDA homes or links under /usr/local changed."))
+    stop_private_pg17()
+    release = os_release()
+    if release.get("ID") != "debian" or release.get("VERSION_ID") != "13":
+        problems.append(reason("release", f"Found {release.get('PRETTY_NAME')}, not Debian 13."))
+    if output("dpkg", "--audit", check=False).strip():
+        problems.append(reason("dpkg-state", "dpkg reports unfinished packages."))
+    # Kept, so reconfiguring or reinstalling the module package keeps skipping the WSL kernel.
+    override = state.get("dkms_override")
+    if override and (dkms_override_blockers(**override) or not dkms_override(**override)[0].is_file()):
+        problems.append(reason("nvidia-kernel-module", "The DKMS override for the WSL kernel is missing, changed or "
+                                                       "overridden."))
+    stale = stale_processes()
+    if stale:
+        raise RestartRequired(f"Processes {stale[:10]} still run replaced code; terminate and restart the distro")
+    php = subprocess.run([PHP_SECURITY, "--check", "--json"], stdout=subprocess.PIPE, stderr=log)
+    if php.returncode != 0:
+        problems.append(reason("php-security", f"ensure_php_security --check exited {php.returncode}."))
+    for sapi, saved in state["php"].items():
+        if Path(f"/etc/php/{TARGET_PHP}/{sapi}/php.ini").is_file():
+            missing = sorted(set(saved["modules"]) - set(php_modules(TARGET_PHP, sapi)))
+            if missing:
+                problems.append(reason("php-modules", f"PHP {TARGET_PHP} {sapi} lacks modules: {', '.join(missing)}."))
+    if subprocess.run(["apache2ctl", "-t"], stdout=log, stderr=log).returncode:
+        problems.append(reason("apache", "apache2ctl -t failed."))
+    # PostgreSQL: the PG15 rollback guard, both cluster identities and the PG17 contents.
+    if read_start(OLD_CONF) != "disabled" or pg_running(15, OLD_DATA):
+        problems.append(reason("pg15-guard", "The retained PG15 cluster is not stopped and disabled."))
+    if controldata(15, OLD_DATA)["Database system identifier"] != state["pg15_id"]:
+        problems.append(reason("pg15-guard", "The PG15 cluster identity changed."))
+    if controldata(17, NEW_DATA)["Database system identifier"] != state["seal"][0]:
+        problems.append(reason("pg17", "The PG17 cluster identity changed."))
+    changed = guarded_changes(state["guarded"])
+    if changed:
+        problems.append(reason("private-config", "Changed by the upgrade: " + ", ".join(changed[:20])))
+    for venv in state["venvs"]:
+        if venv["kind"] != "retain":
+            continue
+        probe = subprocess.run(["/usr/sbin/runuser", "-u", str(pwd_name(venv["owner"])), "--",
+                                f"{venv['path']}/bin/python", "-I", "-c",
+                                "import sys; print('%d.%d' % sys.version_info[:2])"],
+                               stdout=subprocess.PIPE, stderr=log)
+        if probe.stdout.decode().strip() != venv["python"]:
+            problems.append(reason("venv", f"{venv['path']} does not start Python {venv['python']}."))
+    problems += execstack_problems(state.get("execstack", []))
+    if not pg_running(17, NEW_DATA):
+        socket = private_pg17("start")
+        try:
+            inventory = pg_inventory(socket, private=True)
+            problems += retained_problems(inventory)
+            if inventory_digest(inventory) != state["inventory_digest"]:
+                problems.append(reason("pg17-contents", "Roles, role settings, database identities or extensions changed."))
+            for db, rows in inventory["extensions"].items():
+                for ext, version, available in rows:
+                    if not available:
+                        problems.append(reason("pg-extension-version", f"{db}: {ext} {version} is unavailable."))
+                    elif ext == "vector":
+                        psql(socket, "select '[1,2]'::vector", db=db)
+            if not problems:
+                # Every database is C/POSIX/C.UTF-8 (checked in preflight), whose order glibc 2.41 keeps.
+                # This catalog update needs no connection to the database, so closed ones stay closed.
+                for name, _allow, provider, collate, *_ in inventory["databases"]:
+                    if provider == "c" and collate not in C_LOCALES:
+                        psql(socket, f"ALTER DATABASE {quote_ident(name)} REFRESH COLLATION VERSION", readonly=False)
+        finally:
+            private_pg17("stop")
+    else:
+        problems.append(reason("fence", "PG17 is running outside verification."))
+    if not FENCE.is_file():
+        problems.append(reason("fence", f"{FENCE} is missing; writers may have run since the upgrade."))
+    if problems:
+        state["verify_problems"] = problems
+        save_state(state)
+        raise Deferred(problems)
+    # Verified, still fenced: no application may write until release, which the Launcher runs only
+    # after it durably recorded that it will not roll this upgrade back automatically.
+    state.pop("verify_problems", None)
+    state["verified"] = {"at": int(time.time()), "dpkg_status": dpkg_status_digest(), "seal": pg17_seal()}
+    save_state(state, "verified")
+    os.sync()
+    return {"result": "verified", "next": VERIFIED_NEXT}
+
+
+def post_upgrade_service(name):
+    return name.replace(f"php{SOURCE_PHP}-fpm", f"php{TARGET_PHP}-fpm")
+
+
+def release():
+    """Open the verified system for writes. Each step is idempotent and the phase changes last, so
+    a crash at any point is completed by running release again."""
+    state = load_state()
+    if not state or state.get("phase") not in ("verified", "current"):
+        raise Deferred([reason("journal", "Only a verified upgrade can be released; run verify first.")])
+    if state["phase"] == "verified":
+        # While the fence stands, nothing may have changed since verify. Once it is gone (a crash
+        # inside an earlier release) writes were already admitted, so release only completes.
+        if FENCE.is_file():
+            problems = []
+            if CLOSED_OPEN.is_file():
+                problems.append(reason("pg17", "A closed database may still be open; run verify again."))
+            if dpkg_status_digest() != state["verified"]["dpkg_status"]:
+                problems.append(reason("fence", "Packages changed since verify; run verify again."))
+            if pg_running(17, NEW_DATA) or pg17_seal() != state["verified"]["seal"]:
+                problems.append(reason("fence", "PG17 ran or changed since verify; run verify again."))
+            if problems:
+                raise Deferred(problems)
+        if state.get("new_start") and read_start(NEW_CONF) != state["new_start"]:
+            atomic(NEW_CONF / "start.conf", state["new_start"] + "\n", 0o644)
+        if FENCE.exists():
+            FENCE.unlink()
+            sync_dir(FENCE.parent)
+        state["released_at"] = int(time.time())
+        state["restore"] = restore_plan(state, [post_upgrade_service(name) for name in state.get("running", [])])
+        save_state(state, "current")
+    # Past the fence writes may already have been admitted: a rerun only starts what is still stopped.
+    restore = restore_services(state) if restore_pending(state) else state.get("restore")
+    result = {"result": "current", "next": "Start the distro normally; PG17 serves on port 5432.",
+              "restart_services": [post_upgrade_service(name) for name in state["running"]], "restore": restore,
+              "php": state.get("php_carried"), "system_lists_refreshed": state.get("system_lists_refreshed")}
+    if restore and restore.get("pending"):
+        result["next"] = ("The upgrade is released and stays. Run release again to start what ran before the fence, "
+                          "or start the distro normally.")
+    return result
+
+
+def pwd_name(uid):
+    import pwd
+    return pwd.getpwuid(uid).pw_name
+
+
+# ---------------------------------------------------------------------------------------------
+# Locks and entry point
+
+
+def take_locks(stack):
+    """This helper's lock, Core's distro maintenance lock, the PG17 and the PHP security locks, all exclusive."""
+    import fcntl
+    paths = [ROOT / "lock", Path(DISTRO_LOCK), PG17_ROOT / "lock", Path(PHP_LOCK)]
+    for path in paths:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1:
+            os.close(fd)
+            raise ValueError(f"Invalid lock file {path}")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise Busy(f"Another maintenance operation holds {path}") from None
+        stack.append(fd)
+
+
+def emit(result, as_json):
+    if as_json:
+        print(json.dumps({"schema": SCHEMA, **result}, sort_keys=True))
+    else:
+        for key, value in result.items():
+            print(f"{key}: {value if isinstance(value, str) else json.dumps(value)}")
+
+
+def main(argv=None):
+    global log
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("action", choices=["status", "preflight", "upgrade", "verify", "release"])
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--prepare", action="store_true")
+    parser.add_argument("--cancel", action="store_true")
+    parser.add_argument("--plan-id")
+    parser.add_argument("--capture-token")
+    parser.add_argument("--recovery-sha256")
+    parser.add_argument("--recovery-bytes", type=int)
+    args = parser.parse_args(argv)
+    if args.action != "upgrade" and (args.prepare or args.cancel or args.plan_id or args.capture_token
+                                     or args.recovery_sha256 or args.recovery_bytes is not None):
+        parser.error("upgrade options apply only to upgrade")
+    if args.action == "upgrade":
+        modes = [bool(args.prepare), bool(args.cancel), bool(args.capture_token)]
+        if sum(modes) != 1:
+            parser.error("upgrade takes exactly one of --prepare, --cancel or --capture-token")
+        if args.prepare and not (args.plan_id and re.fullmatch(r"[0-9a-f]{32}", args.plan_id)):
+            parser.error("--prepare needs the --plan-id that preflight printed")
+        if args.capture_token and not (
+                re.fullmatch(r"[0-9a-f]{64}", args.capture_token) and args.recovery_sha256
+                and re.fullmatch(r"[0-9a-f]{64}", args.recovery_sha256) and args.recovery_bytes and args.recovery_bytes > 0):
+            parser.error("--capture-token needs the 64-hex token, --recovery-sha256 of the verified copy and --recovery-bytes")
+    if os.geteuid() != 0:
+        parser.error("root required")
+    if args.action == "status":
+        emit(status_report(), args.json)
+        return 0
+    os.umask(0o022)
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ROOT.chmod(0o700)
+    locks = []
+    with LOG.open("ab") as log:
+        def interrupted(signum, frame):
+            raise KeyboardInterrupt("maintenance interrupted")
+
+        signal.signal(signal.SIGTERM, interrupted)
+        signal.signal(signal.SIGHUP, interrupted)
+        try:
+            take_locks(locks)
+            note(f"start {args.action}")
+            if args.action == "preflight":
+                result = preflight()
+            elif args.action == "verify":
+                result = verify()
+            elif args.action == "release":
+                result = release()
+            elif args.prepare:
+                result = prepare(args.plan_id)
+            elif args.cancel:
+                result = cancel()
+            else:
+                result = upgrade(args.capture_token, args.recovery_sha256, args.recovery_bytes)
+            note(f"done {args.action}: {result.get('result')}")
+            emit(result, args.json)
+            return 0
+        except Deferred as error:
+            note(f"deferred {args.action}: {error}")
+            emit({"result": "deferred", "reasons": error.reasons, "changed": False}, args.json)
+            return EXIT_DEFERRED
+        except RestartRequired as error:
+            emit({"result": "restart-required", "detail": str(error)}, args.json)
+            return EXIT_RESTART
+        except Busy as error:
+            print(f"Maintenance did not start and changed nothing: {error}. Retry after it finishes.", file=sys.stderr)
+            return EXIT_BUSY
+        except BaseException as error:
+            note(f"failed {args.action}: {error!r}")
+            print(f"Debian 13 maintenance stopped: {error}. See {LOG}", file=sys.stderr)
+            return 1
+        finally:
+            for fd in locks:
+                os.close(fd)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

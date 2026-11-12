@@ -218,10 +218,25 @@ if [ "${#missing_packages[@]}" -eq 0 ] && [ -x "$CUDA_HOME/bin/nvcc" ]; then
     exit 0
 fi
 
-if ! dpkg-query -W cuda-keyring >/dev/null 2>&1; then
+. /etc/os-release
+case "${ID:-} ${VERSION_ID:-}" in
+    "debian 12") cuda_feed="https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64" ;;
+    "debian 13") cuda_feed="https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64" ;;
+    *) echo "CUDA setup supports Debian 12 and 13."; exit 1 ;;
+esac
+apt_source_files=(/etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources)
+# A CUDA feed of another Debian release (an upgrade that did not migrate it) must not be used.
+if grep -qsF "developer.download.nvidia.com/compute/cuda/repos/" "${apt_source_files[@]}" &&
+   ! grep -qsF "$cuda_feed" "${apt_source_files[@]}"; then
+    echo "The configured NVIDIA CUDA feed is not the one for Debian $VERSION_ID ($cuda_feed); CUDA was not installed."
+    exit 1
+fi
+# The Debian 13 upgrade migrates the feed with its own key; cuda-keyring is installed only for a
+# release that has no CUDA feed yet.
+if ! grep -qsF "$cuda_feed" "${apt_source_files[@]}" && ! dpkg-query -W cuda-keyring >/dev/null 2>&1; then
     keyring_path="$(mktemp /tmp/cuda-keyring.XXXXXX.deb)"
     trap 'rm -f "$keyring_path"' EXIT
-    wget -qO "$keyring_path" https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+    wget -qO "$keyring_path" "$cuda_feed/cuda-keyring_1.1-1_all.deb"
     dpkg -i "$keyring_path"
 fi
 
