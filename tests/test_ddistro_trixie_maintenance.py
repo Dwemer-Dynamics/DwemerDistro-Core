@@ -730,7 +730,7 @@ class NvidiaModule(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         base = Path(temp.name)
         paths = {"KERNEL_RELEASE": base / "osrelease", "WSL_LIB": base / "wsl" / "lib", "DKMS_CONF": base / "etc" / "dkms",
-                 "APT_DIR": base / "apt"}
+                 "APT_DIR": base / "apt", "REIGN": base / "reign"}
         for key, value in paths.items():
             patcher = patch.object(m, key, value)
             patcher.start()
@@ -866,6 +866,12 @@ class NvidiaModule(unittest.TestCase):
         self.assertEqual(sorted(result["plan"]["upgrade"]), ["libcuda1", "nvidia-kernel-dkms", "nvidia-smi"])
         self.assertEqual((result["plan"]["remove"], result["dkms_override"]), ({}, OVERRIDE))
         self.assertEqual(list(m.DKMS_CONF.iterdir()), [])
+        # An installed Reign server requests libicu76 and still gets the same override.
+        m.REIGN.mkdir()
+        result, calls = self.rehearse(manual={"nvidia-kernel-dkms", "libcuda1", "nvidia-smi", "dkms"})
+        self.assertEqual((result["problems"], result["args"], calls), ([], ["libicu76"], [["libicu76"]]))
+        self.assertEqual(result["dkms_override"], OVERRIDE)
+        m.REIGN.rmdir()
         # A user's override that DKMS would read last defers before the recovery copy.
         later = m.dkms_later_overrides(**OVERRIDE)[0]
         later.write_text('BUILD_EXCLUSIVE_KERNEL=".*"\n')

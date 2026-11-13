@@ -63,25 +63,16 @@ if [ ! -d "/home/dwemer/dwemerdistro/etc" ]; then
     exit 1
 fi
 
-print_step "Checking Git credential helper configuration"
-DWEMER_GIT_CONFIG="/home/dwemer/.gitconfig"
-if [ -f "$DWEMER_GIT_CONFIG" ] && ! command -v git-credential-manager >/dev/null 2>&1; then
-    if git config --file "$DWEMER_GIT_CONFIG" --get-all credential.helper 2>/dev/null | grep -Fxq "manager"; then
-        if ! git config --file "$DWEMER_GIT_CONFIG" --unset-all credential.helper '^manager$'; then
-            print_error "Could not remove the unavailable Git credential helper."
-            exit 1
-        fi
-        chown dwemer:dwemer "$DWEMER_GIT_CONFIG" || exit 1
-        printf "${GREEN}[SUCCESS] Removed unavailable Git credential helper.${NC}\n"
-    fi
-fi
-
 # A fenced or unfinished Debian 13 upgrade owns the system until ddistro_trixie_maintenance release
 # lifts the fence after a successful verify. This update never starts, resumes or cancels that upgrade.
-if [ -e /etc/dwemer/trixie-upgrade.fence ]; then
-    print_error "A Debian 13 upgrade is in progress, so this update did not start. Continue it from the DwemerDistro Launcher."
-    exit 75
-fi
+# Checked before anything is written, and again once the shared lock below is held.
+refuse_if_trixie_fenced() {
+    if [ -e /etc/dwemer/trixie-upgrade.fence ]; then
+        print_error "A Debian 13 upgrade is in progress, so this update did not start. Continue it from the DwemerDistro Launcher."
+        exit 75
+    fi
+}
+refuse_if_trixie_fenced
 
 # An abrupt stop during PostgreSQL 17 maintenance can leave both clusters stopped, and this update
 # starts PostgreSQL and needs SQL below. Recover first: the helper takes the maintenance lock
@@ -131,6 +122,23 @@ acquire_maintenance_lock() {
 
 acquire_maintenance_lock
 trap 'core_status=$?; flock -u 7 2>/dev/null || true; report_unexplained_failure "$core_status"' EXIT
+
+# The Debian 13 helper fences and unfences only while it holds this lock exclusively, so a fence
+# written after the first check is seen here and cannot appear or lift while the shared lock is held.
+refuse_if_trixie_fenced
+
+print_step "Checking Git credential helper configuration"
+DWEMER_GIT_CONFIG="/home/dwemer/.gitconfig"
+if [ -f "$DWEMER_GIT_CONFIG" ] && ! command -v git-credential-manager >/dev/null 2>&1; then
+    if git config --file "$DWEMER_GIT_CONFIG" --get-all credential.helper 2>/dev/null | grep -Fxq "manager"; then
+        if ! git config --file "$DWEMER_GIT_CONFIG" --unset-all credential.helper '^manager$'; then
+            print_error "Could not remove the unavailable Git credential helper."
+            exit 1
+        fi
+        chown dwemer:dwemer "$DWEMER_GIT_CONFIG" || exit 1
+        printf "${GREEN}[SUCCESS] Removed unavailable Git credential helper.${NC}\n"
+    fi
+fi
 
 print_header "UPDATING SYSTEM FILES"
 
