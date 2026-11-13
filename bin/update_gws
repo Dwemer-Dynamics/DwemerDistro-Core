@@ -71,6 +71,13 @@ DIALECTIC_UPDATE_FAILED=0
 COMPONENT_UPDATE_FAILED=0
 FAILED_COMPONENTS=""
 CURRENT_SECTION="shared components"
+# DDISTRO_PRESERVE_LOCAL_CHANGES=1 selects the update the Launcher runs before OS maintenance:
+# nothing installed may be lost (see preserve_fast_forward). Any other value keeps the normal update.
+PRESERVE_LOCAL_CHANGES=0
+if [ "${DDISTRO_PRESERVE_LOCAL_CHANGES:-0}" = 1 ]; then
+    PRESERVE_LOCAL_CHANGES=1
+fi
+PRESERVED_COMPONENTS=""
 
 # Like run_privileged, but returns the command status instead of exiting, so the caller can report it.
 run_privileged_status() {
@@ -89,6 +96,17 @@ mark_component_failed() {
         *", $name, "*) ;;
         *) FAILED_COMPONENTS="${FAILED_COMPONENTS:+$FAILED_COMPONENTS, }$name" ;;
     esac
+}
+
+# Record a component left exactly as installed to keep local changes. This is not a failure.
+mark_component_preserved() {
+    local name="$1"
+    local reason="$2"
+    case ", $PRESERVED_COMPONENTS, " in
+        *", $name, "*) ;;
+        *) PRESERVED_COMPONENTS="${PRESERVED_COMPONENTS:+$PRESERVED_COMPONENTS, }$name" ;;
+    esac
+    print_warning "$name was left as installed: $reason"
 }
 
 # Helper function for section headers
@@ -641,6 +659,9 @@ ensure_managed_remote \
 
 # Main title
 printf "${BOLD}Shared components update${NC}\n"
+if [ "$PRESERVE_LOCAL_CHANGES" -eq 1 ]; then
+    printf "Keeping local changes: components are only fast-forwarded when nothing installed would be lost.\n"
+fi
 
 # Server updates are install-state aware. Missing products are never installed by
 # the general updater; users install them explicitly from the launcher.
@@ -680,6 +701,10 @@ update_installed_server() {
         dev|unstable) branch_choice="dev" ;;
     esac
     if { [ "$product" = reign ] || [ "$product" = lorkhan ]; } && [ "$current_branch" = unstable ]; then branch_choice="unstable"; fi
+    if [ "$PRESERVE_LOCAL_CHANGES" -eq 1 ] && ! preserve_server_ready "$root" "$branch_choice" "$status_json"; then
+        mark_component_preserved "$product" "$PRESERVE_DETAIL"
+        return 0
+    fi
 
     if printf '%s' "$status_json" | grep -q '"state":"needs-repair"' \
         && printf '%s' "$status_json" | grep -q '"repository_state":"legacy"'; then
@@ -718,6 +743,348 @@ update_installed_server() {
     return 1
 }
 
+# Preserve explicit legacy ports before service repositories gain dedicated
+# port support. Fresh clones have no venv and therefore receive no marker;
+# their installers will select the dedicated port.
+preserve_legacy_tts_port() {
+    local service_root="$1"
+    local installed_path="$2"
+    local port_file="$service_root/.dwemerdistro-port"
+
+    # Preserve mode never writes through a link or over anything already at that path.
+    if [ "$PRESERVE_LOCAL_CHANGES" -eq 1 ] && { [ -e "$port_file" ] || [ -L "$port_file" ]; }; then
+        return 0
+    fi
+    if [ -e "$installed_path" ] && [ ! -f "$port_file" ]; then
+        run_privileged bash -c 'printf "8020\n" > "$1"' _ "$port_file"
+        run_privileged chown dwemer:dwemer "$port_file"
+        run_privileged chmod 600 "$port_file"
+        print_success "Preserved legacy port 8020 for $(basename "$service_root")."
+    fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# Preserve-local-changes mode (DDISTRO_PRESERVE_LOCAL_CHANGES=1).
+# A checkout is only moved forward on its own branch when Git proves nothing is lost: no tracked
+# content edits or local commits, nothing on disk where the update adds a path, and no change to a
+# file the component's installer handles. Mode-only differences (core.filemode=false), such as the
+# chmod -R 755 of a normal update, are not edits. No reset, installer, pip run or recursive chown or
+# chmod happens, so untracked and ignored settings, models and voices are never written. Anything
+# that cannot be proven safe is left exactly as installed and reported; that is not a failure.
+
+preserve_git() {
+    git -c core.filemode=false -c safe.directory="$PRESERVE_REPO" -C "$PRESERVE_REPO" "$@"
+}
+
+# Check that moving PRESERVE_REPO from commit $1 to $2 loses nothing; further arguments are paths
+# whose change needs the component installer. Fills PRESERVE_CHANGED (path -> "status old new mode").
+# Returns 0 when safe, 2 when already current and 3 otherwise, with the reason in PRESERVE_DETAIL.
+PRESERVE_DETAIL=""
+declare -A PRESERVE_CHANGED=()
+preserve_check() {
+    local old="$1" new="$2" meta="" path="" om="" nm="" st="" prefix=""
+    shift 2
+    PRESERVE_CHANGED=()
+
+    # Staged, unstaged and unmerged edits, and edits Git was told to hide, all count.
+    if ! preserve_git diff --quiet HEAD -- || preserve_git ls-files -v | grep -q '^[[:lower:]S]'; then
+        PRESERVE_DETAIL="it has local edits to tracked files"
+        return 3
+    fi
+    [ "$old" != "$new" ] || return 2
+    if ! preserve_git merge-base --is-ancestor "$old" "$new"; then
+        PRESERVE_DETAIL="it has local commits that are not on origin"
+        return 3
+    fi
+    while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+        read -r om nm _ _ st <<<"${meta#:}"
+        PRESERVE_CHANGED[$path]="$st $om $nm"
+        case " $* " in
+            *" $path "*) PRESERVE_DETAIL="the update changes $path, which needs its installer"; return 3 ;;
+        esac
+        case "$om $nm" in
+            *160000*) PRESERVE_DETAIL="it uses Git submodules"; return 3 ;;
+        esac
+        [ "$st" = A ] || continue
+        # Git silently replaces ignored files, so anything already where a new path goes blocks it,
+        # unless the update itself removes that tracked file (paths arrive sorted, parents first).
+        prefix=$path
+        while :; do
+            if { [ -L "$PRESERVE_REPO/$prefix" ] || { [ -e "$PRESERVE_REPO/$prefix" ] \
+                    && { [ "$prefix" = "$path" ] || [ ! -d "$PRESERVE_REPO/$prefix" ]; }; }; } \
+                && [ "${PRESERVE_CHANGED[$prefix]%% *}" != D ]; then
+                PRESERVE_DETAIL="the update adds $path, but a local $prefix is already there"
+                return 3
+            fi
+            [ "$prefix" != "${prefix%/*}" ] || break
+            prefix=${prefix%/*}
+        done
+    done < <(preserve_git diff --raw -z --no-renames --no-abbrev "$old" "$new" --)
+    return 0
+}
+
+# Fast-forward one installed checkout: preserve_fast_forward REPO "INSTALLER PATHS" ORIGIN [LEGACY...].
+# Returns 0 when updated, 2 when already current, 3 when left as installed and 1 on an error.
+preserve_fast_forward() {
+    local PRESERVE_REPO="$1" installer_paths="$2"
+    local gitdir="" branch="" merge="" old="" new="" path="" parent="" st="" om="" nm="" mode="" owner="" result=0
+    local -A saved=()
+    shift 2
+
+    if ! ensure_managed_remote "$PRESERVE_REPO" "$@"; then
+        PRESERVE_DETAIL="it is not a Git checkout of a recognised Dwemer repository"
+        return 3
+    fi
+    if ! branch=$(preserve_git symbolic-ref -q --short HEAD) \
+        || [ "$(preserve_git config --get "branch.$branch.remote")" != origin ] \
+        || ! merge=$(preserve_git config --get "branch.$branch.merge"); then
+        PRESERVE_DETAIL="it is not on a branch that tracks origin"
+        return 3
+    fi
+    # A fast-forward that cannot write Git's metadata could stop halfway.
+    gitdir=$(preserve_git rev-parse --absolute-git-dir) || return 1
+    if [ -n "$(find "$gitdir" -type d ! -writable -print -quit 2>/dev/null)" ] \
+        || { [ -e "$gitdir/index" ] && [ ! -w "$gitdir/index" ]; }; then
+        PRESERVE_DETAIL="its Git metadata is not writable by $(id -un)"
+        return 3
+    fi
+
+    printf ">> Fetching %s...\n" "${merge#refs/heads/}"
+    if ! preserve_git fetch --quiet origin "$merge" \
+        || ! old=$(preserve_git rev-parse --verify -q 'HEAD^{commit}') \
+        || ! new=$(preserve_git rev-parse --verify -q 'FETCH_HEAD^{commit}'); then
+        PRESERVE_DETAIL="fetching origin failed"
+        return 1
+    fi
+    # shellcheck disable=SC2086 # A space-separated list of plain repository paths.
+    preserve_check "$old" "$new" $installer_paths
+    result=$?
+    [ "$result" -eq 0 ] || return "$result"
+
+    for path in "${!PRESERVE_CHANGED[@]}"; do
+        read -r st _ <<<"${PRESERVE_CHANGED[$path]}"
+        # The nearest existing folder must accept the change, or Git could stop halfway.
+        parent=$path
+        while [ "$parent" != . ]; do
+            case "$parent" in */*) parent=${parent%/*} ;; *) parent=. ;; esac
+            [ ! -d "$PRESERVE_REPO/$parent" ] || break
+        done
+        if [ ! -w "$PRESERVE_REPO/$parent" ] || [ ! -x "$PRESERVE_REPO/$parent" ]; then
+            PRESERVE_DETAIL="$parent is not writable by $(id -un)"
+            return 3
+        fi
+        if [ "$st" != A ] && [ "$st" != D ] && [ -f "$PRESERVE_REPO/$path" ] && [ ! -L "$PRESERVE_REPO/$path" ]; then
+            saved[$path]=$(stat -c '%a %u:%g' -- "$PRESERVE_REPO/$path") || return 1
+        fi
+    done
+
+    printf ">> Fast-forwarding %s...\n" "$branch"
+    if ! preserve_git merge --ff-only --quiet "$new"; then
+        if [ "$(preserve_git rev-parse -q --verify HEAD)" = "$old" ]; then
+            PRESERVE_DETAIL="Git refused the fast-forward to protect local files"
+            return 3
+        fi
+        PRESERVE_DETAIL="the fast-forward stopped partway"
+        return 1
+    fi
+
+    # Git rewrites an updated file with its default owner and mode. Put back the local ones (owner
+    # first, as chown clears set-ID bits), plus an executable change the update itself makes.
+    for path in "${!saved[@]}"; do
+        [ -f "$PRESERVE_REPO/$path" ] && [ ! -L "$PRESERVE_REPO/$path" ] || continue
+        read -r mode owner <<<"${saved[$path]}"
+        read -r _ om nm <<<"${PRESERVE_CHANGED[$path]}"
+        mode=$((8#$mode))
+        case "$om>$nm" in
+            "100644>100755") mode=$(( mode | ((mode & 0444) >> 2) )) ;;
+            "100755>100644") mode=$(( mode & ~0111 )) ;;
+        esac
+        mode=$(printf '%o' "$mode")
+        if [ "$(stat -c '%u:%g' -- "$PRESERVE_REPO/$path")" != "$owner" ]; then
+            chown -- "$owner" "$PRESERVE_REPO/$path" 2>/dev/null \
+                || run_privileged_status chown -- "$owner" "$PRESERVE_REPO/$path" || result=1
+        fi
+        chmod -- "$mode" "$PRESERVE_REPO/$path" 2>/dev/null \
+            || run_privileged_status chmod -- "$mode" "$PRESERVE_REPO/$path" || result=1
+    done
+    if [ "$result" -ne 0 ]; then
+        PRESERVE_DETAIL="it was updated, but some owners or modes could not be restored"
+        return 1
+    fi
+    return 0
+}
+
+# Update one installed component: preserve_component LABEL REPO "INSTALLER PATHS" ORIGIN [LEGACY...].
+preserve_component() {
+    local label="$1" result=0
+    shift
+
+    if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+        printf "[SKIP] %s is not installed.\n" "$label"
+        return 3
+    fi
+    print_header "UPDATING $label" "$(git -C "$1" branch --show-current 2>/dev/null)"
+    preserve_fast_forward "$@"
+    result=$?
+    case "$result" in
+        0) print_success "$label updated; local files and modes were kept" ;;
+        2) print_success "$label is already current" ;;
+        3) mark_component_preserved "$label" "$PRESERVE_DETAIL" ;;
+        *)
+            mark_component_failed "$label"
+            print_warning "$label update failed${PRESERVE_DETAIL:+: $PRESERVE_DETAIL}."
+            ;;
+    esac
+    return "$result"
+}
+
+# A server is only handed to ddistro_server update, which resets it to origin and re-applies its
+# managed permissions, when that cannot lose local work: preserve_server_ready ROOT BRANCH STATUS_JSON.
+preserve_server_ready() {
+    local PRESERVE_REPO="$1" branch="$2" status_json="$3" current="" old="" new=""
+
+    PRESERVE_DETAIL=""
+    if printf '%s' "$status_json" | grep -q '"state":"needs-repair"'; then
+        PRESERVE_DETAIL="it needs Repair from the launcher, which this update does not run"
+        return 1
+    fi
+    printf '%s' "$status_json" | grep -q '"state":"installed"' || return 0
+    [ "$branch" != main ] \
+        || branch=$(printf '%s' "$status_json" | sed -n 's/.*"production_branch":"\([^"]*\)".*/\1/p')
+    current=$(preserve_git symbolic-ref -q --short HEAD)
+    if [ "$current" != "$branch" ]; then
+        PRESERVE_DETAIL="it is on ${current:-a detached HEAD}, and the server update would switch it to $branch"
+        return 1
+    fi
+    case "$(preserve_git remote get-url origin 2>/dev/null)" in
+        https://github.com/Dwemer-Dynamics/*|git@github.com:Dwemer-Dynamics/*) ;;
+        *) PRESERVE_DETAIL="its origin is not a Dwemer-Dynamics repository"; return 1 ;;
+    esac
+    # The same fetch ddistro_server update makes as root.
+    if ! run_privileged_status git -c safe.directory="$PRESERVE_REPO" -C "$PRESERVE_REPO" fetch --quiet origin \
+            "+refs/heads/$branch:refs/remotes/origin/$branch" \
+        || ! old=$(preserve_git rev-parse --verify -q 'HEAD^{commit}') \
+        || ! new=$(preserve_git rev-parse --verify -q "refs/remotes/origin/$branch^{commit}"); then
+        PRESERVE_DETAIL="its origin could not be checked"
+        return 1
+    fi
+    preserve_check "$old" "$new"
+    [ "$?" -ne 3 ]
+}
+
+# A missing component is a new install, so it gets the normal initial owner and mode.
+preserve_fresh_clone() {
+    local label="$1" dir="$2" url="$3" owner="$4" mode="$5" branch="${6:-}"
+
+    print_header "INSTALLING $label"
+    if git clone ${branch:+-b "$branch"} "$url" "$dir" \
+        && run_privileged_status chown -R "$owner" "$dir" \
+        && run_privileged_status chmod -R "$mode" "$dir"; then
+        print_success "$label installed"
+        return 0
+    fi
+    mark_component_failed "$label"
+    print_warning "$label install failed."
+    return 1
+}
+
+run_preserved_updates() {
+    local dashboard=/var/www/html/Dwemer-Dashboard
+
+    if [ "$PHP_SECURITY_READY" -ne 1 ]; then
+        print_warning "Dwemer Dashboard update skipped until the PHP security update succeeds."
+    elif [ ! -e "$dashboard" ] && [ ! -L "$dashboard" ]; then
+        preserve_fresh_clone "DWEMER DASHBOARD" "$dashboard" https://github.com/Dwemer-Dynamics/Dwemer-Dashboard.git dwemer:www-data 775
+    else
+        preserve_component "DWEMER DASHBOARD" "$dashboard" "" https://github.com/Dwemer-Dynamics/Dwemer-Dashboard.git
+    fi
+
+    # pip only runs in a normal update; an update that changes the requirements is left for it.
+    preserve_component "MINI-ME & TXT2VEC" /home/dwemer/minime-t5 requirements.txt \
+        https://github.com/Dwemer-Dynamics/minime-t5.git https://github.com/abeiro/minime-t5.git
+    preserve_component "MELO-TTS" /home/dwemer/MeloTTS "" \
+        https://github.com/Dwemer-Dynamics/MeloTTS.git https://github.com/abeiro/MeloTTS.git
+    preserve_component "LOCALWHISPER" /home/dwemer/remote-faster-whisper "" \
+        https://github.com/Dwemer-Dynamics/remote-faster-whisper.git https://github.com/abeiro/remote-faster-whisper.git
+
+    if [ ! -e /home/dwemer/piper ] && [ ! -L /home/dwemer/piper ]; then
+        preserve_fresh_clone "PIPER TTS" /home/dwemer/piper https://github.com/Dwemer-Dynamics/Piper-TTS-CHIM.git dwemer:dwemer 755 main
+    else
+        preserve_component "PIPER TTS" /home/dwemer/piper "" https://github.com/Dwemer-Dynamics/Piper-TTS-CHIM.git
+    fi
+
+    if [ -d /home/dwemer/xtts-api-server/.git ]; then
+        preserve_component "CHIM XTTS" /home/dwemer/xtts-api-server "" \
+            https://github.com/Dwemer-Dynamics/xtts-api-server.git https://github.com/abeiro/xtts-api-server.git
+    else
+        printf "[SKIP] CHIM XTTS repository not installed; skipping update.\n"
+    fi
+
+    if [ ! -e /home/dwemer/parakeet-api-server ] && [ ! -L /home/dwemer/parakeet-api-server ]; then
+        preserve_fresh_clone "PARAKEET" /home/dwemer/parakeet-api-server https://github.com/Dwemer-Dynamics/parakeet-api-server dwemer:dwemer 755
+    else
+        preserve_component "PARAKEET" /home/dwemer/parakeet-api-server "" https://github.com/Dwemer-Dynamics/parakeet-api-server
+    fi
+
+    preserve_legacy_tts_port /home/dwemer/chatterbox /home/dwemer/chatterbox/venv
+    preserve_legacy_tts_port /home/dwemer/pocket-tts /home/dwemer/pocket-tts/venv
+
+    if [ ! -e /home/dwemer/chatterbox ] && [ ! -L /home/dwemer/chatterbox ]; then
+        preserve_fresh_clone "CHATTERBOX" /home/dwemer/chatterbox https://github.com/Dwemer-Dynamics/chatterbox dwemer:dwemer 755
+    else
+        preserve_component "CHATTERBOX" /home/dwemer/chatterbox "" https://github.com/Dwemer-Dynamics/chatterbox
+    fi
+
+    if [ -d /home/dwemer/audio.cpp/.git ]; then
+        preserve_component "audio.cpp" /home/dwemer/audio.cpp "" \
+            https://github.com/Dwemer-Dynamics/audio.cpp.git https://github.com/abeiro/audio.cpp.git
+    fi
+
+    if [ ! -e /home/dwemer/pocket-tts ] && [ ! -L /home/dwemer/pocket-tts ]; then
+        preserve_fresh_clone "pocket-tts" /home/dwemer/pocket-tts https://github.com/Dwemer-Dynamics/pocket-tts dwemer:dwemer 755
+    else
+        preserve_component "pocket-tts" /home/dwemer/pocket-tts "" https://github.com/Dwemer-Dynamics/pocket-tts
+    fi
+
+    # With its venv present, the normal update's installer run (dependencies and doctor skipped) only
+    # repeats setup the install already did: folders, chmod -R of voices, models and config.json, and
+    # the web link. Skipping it keeps those as they are. A missing venv, or an update that changes the
+    # installer, is left for DwemerDistro Installed Components.
+    if [ ! -d /home/dwemer/omnivoice-tts ]; then
+        printf "[SKIP] OmniVoice TTS not installed; install it from DwemerDistro Installed Components.\n"
+    elif [ ! -d /home/dwemer/omnivoice-tts/venv ]; then
+        mark_component_preserved "OmniVoice TTS" "its setup is incomplete; finish it from DwemerDistro Installed Components"
+    else
+        preserve_component "OmniVoice TTS" /home/dwemer/omnivoice-tts ddistro_install.sh https://github.com/Dwemer-Dynamics/omnivoice-tts
+    fi
+
+    # update_perms chowns and chmods all of /var/www/html, which this mode must not do.
+    print_warning "System permission updates (update_perms) skipped to keep installed owners and modes."
+
+    if ! command -v nc >/dev/null 2>&1; then
+        if ! { run_privileged_status apt-get update && run_privileged_status apt-get -y install netcat-openbsd; }; then
+            mark_component_failed "netcat"
+            print_warning "netcat installation failed."
+        fi
+    fi
+}
+
+finish_update() {
+    if [ "$DIALECTIC_UPDATE_FAILED" -ne 0 ]; then
+        mark_component_failed "DialecticServer"
+    fi
+    if [ -n "$PRESERVED_COMPONENTS" ]; then
+        printf "${BOLD}Left as installed to keep local changes: %s${NC}\n" "$PRESERVED_COMPONENTS"
+    fi
+    if [ "$COMPONENT_UPDATE_FAILED" -ne 0 ]; then
+        printf "${BOLD}${RED}[ERROR] Shared components update finished with errors: %s${NC}\n" "$FAILED_COMPONENTS"
+        exit 1
+    fi
+
+    printf "${BOLD}${GREEN}Shared components updated.${NC}\n"
+    exit 0
+}
+
 # Server and Dashboard updates deploy PHP code, so the shared PHP runtime must be fixed first.
 # After update.sh this is a quick check without APT or network use.
 PHP_SECURITY_READY=0
@@ -742,6 +1109,11 @@ if [ "$PHP_SECURITY_READY" -eq 1 ]; then
     if ! update_installed_server dialectic "$UPDATE_DIALECTIC" /var/www/html/DialecticServer; then
         DIALECTIC_UPDATE_FAILED=1
     fi
+fi
+
+if [ "$PRESERVE_LOCAL_CHANGES" -eq 1 ]; then
+    run_preserved_updates
+    finish_update
 fi
 
 # Dwemer Dashboard update/install. Propagate failures without discarding local files.
@@ -1013,22 +1385,6 @@ run_privileged chown -R dwemer:dwemer /home/dwemer/parakeet-api-server
 run_privileged chmod -R 755 /home/dwemer/parakeet-api-server
 printf "${GREEN}[SUCCESS] Parakeet updated successfully${NC}\n"
 
-# Preserve explicit legacy ports before service repositories gain dedicated
-# port support. Fresh clones have no venv and therefore receive no marker;
-# their installers will select the dedicated port.
-preserve_legacy_tts_port() {
-    local service_root="$1"
-    local installed_path="$2"
-    local port_file="$service_root/.dwemerdistro-port"
-
-    if [ -e "$installed_path" ] && [ ! -f "$port_file" ]; then
-        run_privileged bash -c 'printf "8020\n" > "$1"' _ "$port_file"
-        run_privileged chown dwemer:dwemer "$port_file"
-        run_privileged chmod 600 "$port_file"
-        print_success "Preserved legacy port 8020 for $(basename "$service_root")."
-    fi
-}
-
 preserve_legacy_tts_port /home/dwemer/chatterbox /home/dwemer/chatterbox/venv
 preserve_legacy_tts_port /home/dwemer/pocket-tts /home/dwemer/pocket-tts/venv
 
@@ -1176,12 +1532,4 @@ if ! command -v nc >/dev/null 2>&1; then
 fi
 
 # Final message
-if [ "$DIALECTIC_UPDATE_FAILED" -ne 0 ]; then
-    mark_component_failed "DialecticServer"
-fi
-if [ "$COMPONENT_UPDATE_FAILED" -ne 0 ]; then
-    printf "${BOLD}${RED}[ERROR] Shared components update finished with errors: %s${NC}\n" "$FAILED_COMPONENTS"
-    exit 1
-fi
-
-printf "${BOLD}${GREEN}Shared components updated.${NC}\n"
+finish_update

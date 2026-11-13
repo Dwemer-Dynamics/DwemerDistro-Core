@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Verify that the shared PHP 8.2 runtime has the Debian 12 security fix for
-# CVE-2026-109618 and CVE-2026-109619, and apply only that update when it is missing.
+# Verify that the shared PHP runtime of the Debian release (PHP 8.2 on Debian 12, PHP 8.4 on
+# Debian 13) has the security fix for CVE-2026-109618 and CVE-2026-109619, and apply only that
+# update when it is missing.
 #
 # Usage: ensure_php_security [--check] [--json]
 #
-# Default (root): when the installed official PHP 8.2 packages are older than the fixed
-# version, upgrade exactly those packages to one bookworm-security version. Extension
+# Default (root): when the installed official packages of that PHP branch are older than the
+# fixed version, upgrade exactly those packages to one version from the release's security
+# suite (bookworm-security or trixie-security). Extension
 # packages built separately (for example php8.2-mcrypt) are kept, nothing is removed or
 # newly installed, and PHP/Apache configuration is kept byte-for-byte. Maintainer scripts
 # may not start or stop services. Afterwards, only services that were already running and
@@ -16,22 +18,30 @@
 # --check  Read-only verification (as root; other users cannot inspect every process).
 # --json   Also print one evidence line to stdout: DDISTRO_PHP_SECURITY {...}
 #
-# Exit codes: 0 fixed and no process runs the old PHP code; 1 failed or unsupported runtime;
+# Exit codes: 0 fixed and no process runs the old PHP code; 1 failed or unverified runtime;
 # 3 update required (--check); 4 restart required: a process still runs the old PHP code;
-# 5 incomplete: not every process could be inspected; 64 usage.
+# 5 incomplete: not every process could be inspected; 6 blocked: the base system, installed
+# PHP branch, Apache PHP module or APT sources are not the ones this Debian release supports
+# with security fixes (for example PHP 8.2 left from Debian 12 on Debian 13), and nothing was
+# changed; 64 usage.
 
 set -u
 
-PHP_SOURCE=php8.2
-PHP_BINARY=/usr/bin/php8.2
-PHP_CONFIG_ROOT=/etc/php/8.2
-MOD_PHP_PACKAGE=libapache2-mod-php8.2
-MOD_PHP_LIBRARY=/usr/lib/apache2/modules/libphp8.2.so
-FPM_PACKAGE=php8.2-fpm
-FPM_BINARY=/usr/sbin/php-fpm8.2
-FIXED_VERSION='8.2.35-1~deb12u1'
-FIXED_RUNTIME='8.2.35'
-SECURITY_SUITE=bookworm-security
+# Each Debian release supports one PHP branch. Fixed versions: DLA-4848-1 (Debian 12) and
+# DSA-6574-1 (Debian 13). Any other base system is blocked in check_base.
+BASE_SYSTEM="$(. /etc/os-release 2>/dev/null && printf '%s %s' "${ID:-}" "${VERSION_ID:-}")"
+case "$BASE_SYSTEM" in
+    "debian 12") PHP_BRANCH=8.2; FIXED_VERSION='8.2.35-1~deb12u1'; FIXED_RUNTIME='8.2.35'; SECURITY_SUITE=bookworm-security ;;
+    "debian 13") PHP_BRANCH=8.4; FIXED_VERSION='8.4.27-1~deb13u1'; FIXED_RUNTIME='8.4.27'; SECURITY_SUITE=trixie-security ;;
+    *) PHP_BRANCH=""; FIXED_VERSION=""; FIXED_RUNTIME=""; SECURITY_SUITE="" ;;
+esac
+PHP_SOURCE="php$PHP_BRANCH"
+PHP_BINARY="/usr/bin/php$PHP_BRANCH"
+PHP_CONFIG_ROOT="/etc/php/$PHP_BRANCH"
+MOD_PHP_PACKAGE="libapache2-mod-php$PHP_BRANCH"
+MOD_PHP_LIBRARY="/usr/lib/apache2/modules/libphp$PHP_BRANCH.so"
+FPM_PACKAGE="php$PHP_BRANCH-fpm"
+FPM_BINARY="/usr/sbin/php-fpm$PHP_BRANCH"
 LOCK_FILE=/run/lock/dwemerdistro-php-security.lock
 # The lock is held on FD 9. Commands that may start daemons (service, CHIM4, APT maintainer
 # scripts) run with 9>&- so a restarted daemon cannot keep the lock after this helper exits.
@@ -45,14 +55,15 @@ APACHE_SERVER_ROOT=/etc/apache2
 # Restarted only when already running; the LORKHAN worker is optional.
 MANAGED_SERVICES=(apache2 "$FPM_PACKAGE" lorkhanserver-worker)
 APACHE_PID_FILE=/run/apache2/apache2.pid
-FPM_PID_FILE=/run/php/php8.2-fpm.pid
+FPM_PID_FILE="/run/php/php$PHP_BRANCH-fpm.pid"
 # Optional CHIM4: each component runs under a supervisor that leads its own process group and
 # records "pid start-time" in /run/chim4/<component>.pid. Its isolated Apache is not apache2.
 CHIM4_INIT=/etc/init.d/chim4
 CHIM4_RUN=/run/chim4
 # An upgrade of an installed package: "Inst name [old] (new origin [arch])".
 PLAN_UPGRADE_PATTERN='^Inst ([^ ]+) \[[^]]+\] \(([^ ]+) '
-STALE_PATTERN=' (/usr/lib/apache2/modules/libphp8\.2\.so|/usr/bin/php8\.2|/usr/sbin/php-fpm8\.2|/usr/lib/php/[0-9]+/[^ ]+\.so) \(deleted\)$'
+BRANCH_PATTERN="${PHP_BRANCH//./\\.}"
+STALE_PATTERN=" (/usr/lib/apache2/modules/libphp$BRANCH_PATTERN\\.so|/usr/bin/php$BRANCH_PATTERN|/usr/sbin/php-fpm$BRANCH_PATTERN|/usr/lib/php/[0-9]+/[^ ]+\\.so) \\(deleted\\)\$"
 
 MODE=ensure
 JSON_OUTPUT=0
@@ -85,6 +96,14 @@ fail() {
     exit 1
 }
 
+# A package support blocker is not repaired here: changing the Debian release, the PHP branch or
+# the APT sources is a separate, deliberate migration.
+blocked() {
+    emit_json blocked
+    printf '[BLOCKED] %s Nothing was changed.\n' "$1" >&2
+    exit 6
+}
+
 info() {
     printf '[INFO] %s\n' "$1" >&2
 }
@@ -94,7 +113,7 @@ ok() {
 }
 
 usage() {
-    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 cleanup() {
@@ -117,7 +136,7 @@ version_ge() {
 # The fixed upstream release on the supported branch; any other branch is not assumed safe.
 runtime_fixed() {
     case "$1" in
-        8.2.*) version_ge "$1" "$FIXED_RUNTIME" ;;
+        "$PHP_BRANCH".*) version_ge "$1" "$FIXED_RUNTIME" ;;
         *) return 1 ;;
     esac
 }
@@ -128,9 +147,8 @@ embedded_version() {
 }
 
 check_base() {
-    local base
-    base="$(. /etc/os-release 2>/dev/null && printf '%s %s' "${ID:-}" "${VERSION_ID:-}")"
-    [ "$base" = "debian 12" ] || fail "Unsupported base system '${base:-unknown}'; this update supports Debian 12 PHP 8.2 only."
+    [ -n "$PHP_BRANCH" ] \
+        || blocked "Unsupported base system '${BASE_SYSTEM:-unknown}'; this update supports Debian 12 (PHP 8.2) and Debian 13 (PHP 8.4) only."
     for command_name in apt-cache apt-get dpkg dpkg-query flock grep sha256sum; do
         command -v "$command_name" >/dev/null 2>&1 || fail "Required command is missing: $command_name"
     done
@@ -168,9 +186,10 @@ inspect_packages() {
         fi
     done < <(dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\t${Version}\t${source:Package}\n' 2>/dev/null)
 
-    [ -z "$unsupported" ] || fail "Unsupported PHP branch packages are installed ($unsupported). Only PHP 8.2 is verified."
-    [ -n "${OFFICIAL_VERSION[php8.2-cli]+set}" ] && [ -n "${OFFICIAL_VERSION[php8.2-common]+set}" ] \
-        || fail "The official PHP 8.2 CLI packages are not installed."
+    [ -z "$unsupported" ] \
+        || blocked "PHP packages of another branch are installed ($unsupported). $BASE_SYSTEM supports only PHP $PHP_BRANCH with security fixes; moving shared PHP to PHP $PHP_BRANCH is a separate migration."
+    [ -n "${OFFICIAL_VERSION[$PHP_SOURCE-cli]+set}" ] && [ -n "${OFFICIAL_VERSION[$PHP_SOURCE-common]+set}" ] \
+        || blocked "The official PHP $PHP_BRANCH CLI packages that $BASE_SYSTEM supports ($PHP_SOURCE-cli, $PHP_SOURCE-common) are not installed."
 }
 
 inspect_runtime() {
@@ -182,8 +201,8 @@ inspect_runtime() {
 
     php_path="$(command -v php 2>/dev/null || true)"
     [ -n "$php_path" ] && [ "$(readlink -f "$php_path")" = "$PHP_BINARY" ] \
-        || fail "The php command does not run $PHP_BINARY; only PHP 8.2 is verified."
-    CLI_VERSION="$("$PHP_BINARY" -n -r 'echo PHP_VERSION;' 2>/dev/null)" || fail "PHP 8.2 CLI could not run."
+        || blocked "The php command does not run $PHP_BINARY; only PHP $PHP_BRANCH is verified on $BASE_SYSTEM."
+    CLI_VERSION="$("$PHP_BINARY" -n -r 'echo PHP_VERSION;' 2>/dev/null)" || fail "PHP $PHP_BRANCH CLI could not run."
     if [ -n "${OFFICIAL_VERSION[$MOD_PHP_PACKAGE]+set}" ]; then
         MOD_PACKAGE_VERSION="${OFFICIAL_VERSION[$MOD_PHP_PACKAGE]}"
         MOD_RUNTIME_VERSION="$(embedded_version "$MOD_PHP_LIBRARY")"
@@ -216,6 +235,10 @@ verify_apache_handler() {
                 *'$'*|'') resolved="" ;;
                 *) resolved="$(readlink -f -- "$APACHE_SERVER_ROOT/$path" 2>/dev/null || true)" ;;
             esac
+            # A packaged module of another branch (libphp8.2.so left on Debian 13) is a support blocker.
+            if [ "$resolved" != "$MOD_PHP_LIBRARY" ] && [[ "$resolved" =~ ^/usr/lib/apache2/modules/libphp[0-9]+\.[0-9]+\.so$ ]]; then
+                blocked "Apache loads $resolved (from $file), a PHP branch $BASE_SYSTEM does not support with security fixes. Switching Apache to $MOD_PHP_LIBRARY is a separate migration."
+            fi
             [ -n "$MOD_PACKAGE_VERSION" ] && [ "$resolved" = "$MOD_PHP_LIBRARY" ] \
                 || fail "Apache loads an unverified PHP handler ($module from $path in $file). Only $MOD_PHP_LIBRARY from $MOD_PHP_PACKAGE is verified; the Apache configuration was not changed."
             APACHE_PHP_MODULE="$resolved"
@@ -569,7 +592,7 @@ select_deb822_sources() {
         END { flush() }' "$1"
 }
 
-# Refresh only the configured bookworm-security entries; other suites and repositories are
+# Refresh only the configured security suite entries; other suites and repositories are
 # neither contacted nor allowed to fail this update. Their lists and the existing package
 # caches are kept as they are.
 refresh_security_lists() {
@@ -591,7 +614,7 @@ refresh_security_lists() {
         [ -s "$selection" ] || rm -f -- "$selection"
     done
     [ -n "$(find "$parts" -type f -print -quit)" ] \
-        || fail "No $SECURITY_SUITE APT source is configured; the PHP security update cannot be installed."
+        || blocked "No $SECURITY_SUITE APT source is configured, so the PHP security update cannot be installed. APT sources are not changed here."
 
     info "Refreshing the Debian security package lists."
     apt-get update --error-on=any -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 \
@@ -613,8 +636,8 @@ select_target_version() {
         if [ -z "$target" ] || version_ge "$candidate" "$target"; then
             target="$candidate"
         fi
-    done < <(security_versions php8.2-common)
-    [ -n "$target" ] && version_ge "$target" "$FIXED_VERSION" && [[ "$target" == 8.2.* ]] \
+    done < <(security_versions "$PHP_SOURCE-common")
+    [ -n "$target" ] && version_ge "$target" "$FIXED_VERSION" && [[ "$target" == "$PHP_BRANCH".* ]] \
         || fail "The fixed PHP version $FIXED_VERSION is not available from $SECURITY_SUITE."
     for name in "${OFFICIAL[@]}"; do
         security_versions "$name" | grep -Fxq "$target" \
@@ -623,7 +646,7 @@ select_target_version() {
     printf '%s\n' "$target"
 }
 
-# Accept only upgrades of installed official PHP 8.2 packages to the selected version.
+# Accept only upgrades of installed official packages of the PHP branch to the selected version.
 validate_plan() {
     local target="$1" plan="$2" line name count=0
     while IFS= read -r line; do

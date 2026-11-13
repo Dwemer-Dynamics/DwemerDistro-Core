@@ -17,6 +17,12 @@ NC='\033[0m' # No Color
 CURRENT_STEP="starting the core update"
 CORE_ERROR_REPORTED=0
 
+# The Launcher passes DDISTRO_PRESERVE_LOCAL_CHANGES=1 when it updates an existing install: the
+# locale selection, a site-specific Dashboard keys sudoers policy and unrelated /usr/local/bin files
+# are then kept. Without it this update behaves as before.
+PRESERVE_LOCAL_CHANGES=0
+[ "${DDISTRO_PRESERVE_LOCAL_CHANGES:-}" != 1 ] || PRESERVE_LOCAL_CHANGES=1
+
 # Print a compact section header; it also names the step reported if a command fails silently.
 print_header() {
     CURRENT_STEP="$1"
@@ -57,18 +63,16 @@ if [ ! -d "/home/dwemer/dwemerdistro/etc" ]; then
     exit 1
 fi
 
-print_step "Checking Git credential helper configuration"
-DWEMER_GIT_CONFIG="/home/dwemer/.gitconfig"
-if [ -f "$DWEMER_GIT_CONFIG" ] && ! command -v git-credential-manager >/dev/null 2>&1; then
-    if git config --file "$DWEMER_GIT_CONFIG" --get-all credential.helper 2>/dev/null | grep -Fxq "manager"; then
-        if ! git config --file "$DWEMER_GIT_CONFIG" --unset-all credential.helper '^manager$'; then
-            print_error "Could not remove the unavailable Git credential helper."
-            exit 1
-        fi
-        chown dwemer:dwemer "$DWEMER_GIT_CONFIG" || exit 1
-        printf "${GREEN}[SUCCESS] Removed unavailable Git credential helper.${NC}\n"
+# A fenced or unfinished Debian 13 upgrade owns the system until ddistro_trixie_maintenance release
+# lifts the fence after a successful verify. This update never starts, resumes or cancels that upgrade.
+# Checked before anything is written, and again once the shared lock below is held.
+refuse_if_trixie_fenced() {
+    if [ -e /etc/dwemer/trixie-upgrade.fence ]; then
+        print_error "A Debian 13 upgrade is in progress, so this update did not start. Continue it from the DwemerDistro Launcher."
+        exit 75
     fi
-fi
+}
+refuse_if_trixie_fenced
 
 # An abrupt stop during PostgreSQL 17 maintenance can leave both clusters stopped, and this update
 # starts PostgreSQL and needs SQL below. Recover first: the helper takes the maintenance lock
@@ -119,15 +123,43 @@ acquire_maintenance_lock() {
 acquire_maintenance_lock
 trap 'core_status=$?; flock -u 7 2>/dev/null || true; report_unexplained_failure "$core_status"' EXIT
 
+# The Debian 13 helper fences and unfences only while it holds this lock exclusively, so a fence
+# written after the first check is seen here and cannot appear or lift while the shared lock is held.
+refuse_if_trixie_fenced
+
+print_step "Checking Git credential helper configuration"
+DWEMER_GIT_CONFIG="/home/dwemer/.gitconfig"
+if [ -f "$DWEMER_GIT_CONFIG" ] && ! command -v git-credential-manager >/dev/null 2>&1; then
+    if git config --file "$DWEMER_GIT_CONFIG" --get-all credential.helper 2>/dev/null | grep -Fxq "manager"; then
+        if ! git config --file "$DWEMER_GIT_CONFIG" --unset-all credential.helper '^manager$'; then
+            print_error "Could not remove the unavailable Git credential helper."
+            exit 1
+        fi
+        chown dwemer:dwemer "$DWEMER_GIT_CONFIG" || exit 1
+        printf "${GREEN}[SUCCESS] Removed unavailable Git credential helper.${NC}\n"
+    fi
+fi
+
 print_header "UPDATING SYSTEM FILES"
 
 print_step "Copying scripts to /usr/local/bin"
 cp /home/dwemer/dwemerdistro/bin/* /usr/local/bin/ 2>/dev/null
 if [ $? -eq 0 ]; then
-    # Set executable permissions for all scripts
-    chmod +x /usr/local/bin/* 2>/dev/null
+    # Set executable permissions for all scripts; when preserving, only for the ones just copied.
+    if [ "$PRESERVE_LOCAL_CHANGES" -eq 1 ]; then
+        for script in /home/dwemer/dwemerdistro/bin/*; do
+            target="/usr/local/bin/${script##*/}"
+            if [ -f "$script" ] && [ -f "$target" ] && [ ! -L "$target" ]; then
+                chmod +x "$target" 2>/dev/null
+            fi
+        done
+    else
+        chmod +x /usr/local/bin/* 2>/dev/null
+    fi
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_pg17_maintenance /usr/local/bin/ddistro_pg17_maintenance || exit 1
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_stage_pg17 /usr/local/bin/ddistro_stage_pg17 || exit 1
+    # Root-only Debian 13 upgrade helper. Installed here, run only by the Launcher's OS maintenance.
+    install -o root -g root -m 700 /home/dwemer/dwemerdistro/bin/ddistro_trixie_maintenance /usr/local/bin/ddistro_trixie_maintenance || exit 1
     # LM Studio runs as dwemer, so do not inherit root-only modes or the updater's umask.
     install -o root -g root -m 755 /home/dwemer/dwemerdistro/bin/ddistro_lmstudio /usr/local/bin/ddistro_lmstudio || exit 1
     # The launcher reads custom mod status as dwemer, so the manager must stay world-readable.
@@ -160,10 +192,26 @@ if [ $? -eq 0 ]; then
     dashboard_keys_rule=$(mktemp) || exit 1
     printf '%s\n' 'www-data ALL=(root) NOPASSWD: /usr/local/bin/ddistro_dashboard_keys status, /usr/local/bin/ddistro_dashboard_keys edit, /usr/local/bin/ddistro_dashboard_keys create, /usr/local/bin/ddistro_dashboard_keys test' > "$dashboard_keys_rule"
     CURRENT_STEP="validating and installing the dashboard keys sudoers rule"
-    if ! visudo -cqf "$dashboard_keys_rule" || ! install -o root -g root -m 440 "$dashboard_keys_rule" /etc/sudoers.d/dwemerdistro-dashboard-keys; then
-        rm -f "$dashboard_keys_rule"; exit 1
+    DASHBOARD_KEYS_SUDOERS=/etc/sudoers.d/dwemerdistro-dashboard-keys
+    if [ "$PRESERVE_LOCAL_CHANGES" -eq 1 ] && { [ -e "$DASHBOARD_KEYS_SUDOERS" ] || [ -L "$DASHBOARD_KEYS_SUDOERS" ]; } \
+        && ! cmp -s "$dashboard_keys_rule" "$DASHBOARD_KEYS_SUDOERS"; then
+        # Only one rule was ever shipped, so a different file is a site-specific policy. Keep it only
+        # while sudo would trust and parse it; otherwise stop before anything replaces it.
+        rm -f "$dashboard_keys_rule"
+        if [ -L "$DASHBOARD_KEYS_SUDOERS" ] || [ ! -f "$DASHBOARD_KEYS_SUDOERS" ] \
+            || [ "$(stat -c '%u' "$DASHBOARD_KEYS_SUDOERS")" != 0 ] \
+            || [ $(( 0$(stat -c '%a' "$DASHBOARD_KEYS_SUDOERS") & 022 )) -ne 0 ] \
+            || ! visudo -cqf "$DASHBOARD_KEYS_SUDOERS"; then
+            print_error "$DASHBOARD_KEYS_SUDOERS is customized but is not a valid root-owned sudoers file that only root can change. It was not changed; fix or remove it, then retry the update."
+            exit 1
+        fi
+        printf ">> Keeping site-specific %s (the Dashboard API Keys rail needs: status, edit, create, test)\n" "$DASHBOARD_KEYS_SUDOERS"
+    else
+        if ! visudo -cqf "$dashboard_keys_rule" || ! install -o root -g root -m 440 "$dashboard_keys_rule" "$DASHBOARD_KEYS_SUDOERS"; then
+            rm -f "$dashboard_keys_rule"; exit 1
+        fi
+        rm -f "$dashboard_keys_rule"
     fi
-    rm -f "$dashboard_keys_rule"
     install -d -o root -g root -m 755 /usr/local/lib/dwemerdistro || exit 1
     install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_keys.php /usr/local/lib/dwemerdistro/keys.php || exit 1
     install -o root -g root -m 644 /home/dwemer/dwemerdistro/bin/ddistro_native_keys.php /usr/local/lib/dwemerdistro/native_keys.php || exit 1
@@ -192,8 +240,46 @@ fi
 print_step "Checking installed server repository origins"
 /usr/local/bin/ddistro_server migrate-remotes all || exit 1
 
+# Classify /etc/default/locale: 0 a selection to keep (every LANG and LC_* value an installed UTF-8
+# locale), 1 no selection, 2 a selection this update must neither keep nor replace.
+LOCALE_ASSIGNMENT=$'^(LANG|LANGUAGE|LC_[A-Z]+)=("[^"]*"|\'[^\']*\'|[^"\'[:space:]]*)[[:space:]]*$'
+check_locale_selection() {
+    local file=/etc/default/locale line name value codeset found=0 installed
+    [ -e "$file" ] || [ -L "$file" ] || return 1
+    { [ -f "$file" ] && [ ! -L "$file" ]; } || return 2
+    installed="$(locale -a 2>/dev/null)" || return 2
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in ''|'#'*) continue ;; esac
+        [[ "$line" =~ $LOCALE_ASSIGNMENT ]] || return 2
+        name="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        value="${value#[\"\']}"
+        value="${value%[\"\']}"
+        # LANGUAGE is a message-language list, not a locale.
+        [ "$name" != LANGUAGE ] && [ -n "$value" ] || continue
+        # locale -a lists codesets normalized (en_US.UTF-8 as en_US.utf8).
+        [[ "$value" =~ ^([^.@]+)\.([^@]+)(@.*)?$ ]] || return 2
+        codeset="${BASH_REMATCH[2],,}"
+        codeset="${codeset//-/}"
+        [ "$codeset" = utf8 ] || return 2
+        grep -Fxq "${BASH_REMATCH[1]}.utf8${BASH_REMATCH[3]}" <<< "$installed" || return 2
+        found=1
+    done < "$file"
+    [ "$found" -eq 1 ] || return 1
+}
+
 print_step "Ensuring UTF-8 is the PostgreSQL default"
-update-locale LANG=C.UTF-8 LC_ALL=C.UTF-8
+locale_status=1
+[ "$PRESERVE_LOCAL_CHANGES" -ne 1 ] || { check_locale_selection; locale_status=$?; }
+if [ "$locale_status" -eq 2 ]; then
+    print_error "/etc/default/locale selects a locale that is not an installed UTF-8 locale. It was not changed; select one (for example: update-locale LANG=C.UTF-8 LC_ALL=C.UTF-8), then retry the update."
+    exit 1
+elif [ "$locale_status" -eq 0 ]; then
+    : # The existing UTF-8 locale selection is kept.
+else
+    update-locale LANG=C.UTF-8 LC_ALL=C.UTF-8
+fi
 CURRENT_STEP="starting PostgreSQL"
 service postgresql start >/dev/null 7<&- || exit 1
 CURRENT_STEP="ensuring UTF-8 is the PostgreSQL default"
@@ -276,10 +362,15 @@ CURRENT_STEP="initializing a fresh distro"
 /usr/local/bin/initialize_fresh_distro || exit 1
 
 # Existing PHP settings belong to the user; only a missing Apache php.ini gets the distro default.
+# The branch is the one ensure_php_security verified above: PHP 8.2 on Debian 12, 8.4 on Debian 13.
 print_step "Checking PHP Apache configuration"
-PHP_APACHE_INI=/etc/php/8.2/apache2/php.ini
+PHP_BRANCH="$(php -n -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;')" || exit 1
+PHP_APACHE_INI="/etc/php/$PHP_BRANCH/apache2/php.ini"
 if [ -e "$PHP_APACHE_INI" ] || [ -L "$PHP_APACHE_INI" ]; then
     : # The user's existing PHP configuration is kept; nothing to report.
+elif [ "$PHP_BRANCH" != 8.2 ]; then
+    # The distro default is written for PHP 8.2 (later branches deprecate some of its settings).
+    printf ">> No %s; the PHP 8.2 default was not installed for PHP %s.\n" "$PHP_APACHE_INI" "$PHP_BRANCH"
 elif install -o root -g root -m 644 /home/dwemer/dwemerdistro/etc/php.ini "$PHP_APACHE_INI"; then
     printf "${GREEN}[SUCCESS] Default PHP configuration installed${NC}\n"
 else

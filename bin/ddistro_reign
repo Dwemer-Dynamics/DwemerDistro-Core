@@ -116,8 +116,14 @@ EOF
         [ ! -L "$root" ] && [ ! -L "$data" ] || { echo 'Redirected runtime roots are not supported.' >&2; exit 1; }
         install -d -m 755 "$root" "$root/versions"
         install -d -o dwemer -g dwemer -m 700 "$data"
+        . /etc/os-release
+        case "$ID ${VERSION_ID:-}" in
+            "debian 12") icu=libicu72 ;;
+            "debian 13") icu=libicu76 ;;
+            *) echo 'Reign currently supports Debian 12 and 13.' >&2; exit 1 ;;
+        esac
         apt-get update -qq
-        apt-get install -y --no-install-recommends python3-venv libicu72 libgssapi-krb5-2 ca-certificates curl acl
+        apt-get install -y --no-install-recommends python3-venv "$icu" libgssapi-krb5-2 ca-certificates curl acl
         repair_permissions
         requirements="$source_root/services/vector-worker/requirements-linux.txt"
         scripts="$source_root/scripts"
@@ -141,11 +147,44 @@ EOF
     build)
         if ! command -v dotnet >/dev/null 2>&1 || ! dotnet --list-sdks | grep -q '^10\.'; then
             . /etc/os-release
-            [ "$ID" = debian ] && [ "$VERSION_ID" = 12 ] || { echo 'Reign currently supports Debian 12.' >&2; exit 1; }
-            feed=$(mktemp /tmp/reign-microsoft-feed-XXXXXX.deb)
-            curl --fail --location --proto '=https' https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb --output "$feed"
-            dpkg -i "$feed"
-            rm -f "$feed"
+            case "$ID ${VERSION_ID:-}" in
+                "debian 12"|"debian 13") microsoft_feed="https://packages.microsoft.com/debian/$VERSION_ID/prod" ;;
+                *) echo 'The .NET 10 SDK is missing; automatic SDK setup supports Debian 12 and 13, so Reign was not built.' >&2; exit 1 ;;
+            esac
+            # Only active entries count: a commented-out feed line configures nothing.
+            active_sources() {
+                grep -hsv '^[[:space:]]*#' /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources || true
+            }
+            if active_sources | grep -F "$microsoft_feed" >/dev/null; then
+                : # Configured by Microsoft's package, or migrated by the Debian 13 upgrade with its pinned key.
+            elif active_sources | grep -F 'packages.microsoft.com/debian/' >/dev/null; then
+                echo "The .NET 10 SDK is missing and the configured Microsoft feed is not the one for Debian $VERSION_ID; Reign was not built." >&2
+                exit 1
+            else
+                # Microsoft's documented feed setup: its packages-microsoft-prod configuration package.
+                feed_dir=$(mktemp -d /tmp/reign-microsoft-feed-XXXXXX)
+                trap 'rm -rf "$feed_dir"' EXIT
+                feed="$feed_dir/packages-microsoft-prod.deb"
+                curl --fail --location --proto '=https' "https://packages.microsoft.com/config/debian/$VERSION_ID/packages-microsoft-prod.deb" --output "$feed"
+                if [ "$VERSION_ID" = 13 ]; then
+                    # Install it only when it is that package, every key it ships is Microsoft's pinned
+                    # Debian 13 signing key (the one the Debian 13 upgrade pins), and it configures the feed.
+                    command -v gpg >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y --no-install-recommends gpg; }
+                    [ "$(dpkg-deb -f "$feed" Package)" = packages-microsoft-prod ] || { echo 'The downloaded Microsoft feed package is not packages-microsoft-prod; Reign was not built.' >&2; exit 1; }
+                    dpkg-deb -x "$feed" "$feed_dir/root"
+                    keys=$(find "$feed_dir/root/usr/share/keyrings" "$feed_dir/root/etc/apt/keyrings" "$feed_dir/root/etc/apt/trusted.gpg.d" -type f 2>/dev/null || true)
+                    fingerprints=$(for key in $keys; do { gpg --batch --homedir "$feed_dir" --with-colons --show-keys "$key" 2>/dev/null || true; } | awk -F: '$1 == "pub" { primary = 1; next } $1 == "fpr" && primary { print $10; primary = 0 }'; done | sort -u)
+                    sources=$(find "$feed_dir/root/etc/apt/sources.list.d" -type f \( -name '*.list' -o -name '*.sources' \) -exec cat {} + 2>/dev/null || true)
+                    if [ -z "$keys" ] || [ "$fingerprints" != AA86F75E427A19DD33346403EE4D7792F748182B ] || ! printf '%s\n' "$sources" | grep -v '^[[:space:]]*#' | grep -F "$microsoft_feed" >/dev/null; then
+                        echo 'The downloaded Microsoft Debian 13 feed package does not ship only the pinned Microsoft key and the Debian 13 feed; Reign was not built.' >&2
+                        exit 1
+                    fi
+                fi
+                dpkg -i "$feed"
+                rm -rf "$feed_dir"
+                trap - EXIT
+                active_sources | grep -F "$microsoft_feed" >/dev/null || { echo "The Microsoft feed for Debian $VERSION_ID is still not configured; Reign was not built." >&2; exit 1; }
+            fi
             apt-get update -qq
             apt-get install -y --no-install-recommends dotnet-sdk-10.0
         fi
