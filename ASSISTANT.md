@@ -151,7 +151,7 @@ a tracked change already makes it `blocked`; at most 20 paths of each kind are l
 
 Only allowlisted files under each target's declared folder are read (see `products` or
 `capabilities.log_targets`); there is no path argument and no directory scan beyond the
-PostgreSQL folder's `postgresql-<version>-main.log` name match. Symlinked or redirected
+PostgreSQL folder's `postgresql-<version>-main.log` and `postgresql-<version>-dwemer.log` name matches. Symlinked or redirected
 folders, symlinked files, and non-regular files are refused. The tail is bounded to 400
 lines and 256 KiB, with each line clipped to 4096 characters. URL credentials and query
 strings, authorization headers, keys, tokens, and passwords are redacted, and control
@@ -272,9 +272,11 @@ that is an explicit `install_assistant_runtime` run as root.
 
 ## Model assignments
 
-`models herika` (aliases `chim`, `skyrim`; other products are `unsupported`, 69) reports the
-CHIM connector assigned to each role of each configured profile. These are configured profile
-assignments, not necessarily the profile an NPC is using.
+`models herika` (aliases `chim`, `skyrim`; also available for `lorkhan`, `stobe`, and `dialectic`) reports the
+server connector assigned to each role of each configured profile. These are configured profile
+assignments, not necessarily the profile an NPC is using. STOBE uses its own connector names and roles.
+`models reign` reads configured model fields from ReignServer settings. During distro maintenance,
+model reads report `distro_maintenance` and health explains why service checks are paused.
 
 ```json
 {"product": "herika", "available": true, "scope": "configured_profiles",
