@@ -1,5 +1,38 @@
 #!/bin/bash
 
+# Take the same outer lock as the launcher, then the database maintenance lock.
+# Keep both until startup finishes, including when another launcher owns the restore.
+update_lock=/home/dwemer/.dwemerdistro-launcher-update.lock
+if [ ! -e "$update_lock" ]; then
+    runuser -u dwemer -- touch -- "$update_lock" || exit 1
+fi
+exec 8<"$update_lock" || exit 1
+if ! flock -sn 8; then
+    echo "Waiting for the distro update before starting the server."
+    flock -s 8 || exit 1
+fi
+maintenance=/var/lib/dwemerdistro/pg17-maintenance
+mkdir -p -m 700 "$maintenance" || exit 1
+exec 9>>"$maintenance/lock" || exit 1
+if ! flock -sn 9; then
+    echo "Waiting for database maintenance before starting the server."
+    flock -s 9 || exit 1
+fi
+
+# Hide the descriptors from services that keep running after startup.
+{
+if [ -e "$maintenance/state.json" ]; then
+    python3 - "$maintenance/state.json" <<'PY' || exit 1
+import json
+import sys
+
+with open(sys.argv[1]) as journal:
+    state = json.load(journal)
+if state["phase"] != "active" and not (state["phase"] == "rolled-back" and not state.get("retry_auto")):
+    sys.exit("Database maintenance did not finish successfully. Retry the update or choose Roll back before starting.")
+PY
+fi
+
 # DWEMERDISTRO_TRIXIE_FENCE: while a Debian 13 upgrade is fenced, in progress or awaiting its
 # verification and release, no service may start or write. ddistro_trixie_maintenance release
 # removes the fence.
@@ -833,31 +866,19 @@ export PGPASSWORD=dwemer
 if [ -d "/var/www/html/HerikaServer" ]; then
   # Wait for PostgreSQL to be fully ready before writing CHIM network settings.
   sleep 2
-  psql_result=$(psql -h localhost -U dwemer -d dwemer -t -c "SELECT 1;" 2>/dev/null | tr -d ' \n')
-  if [ "$psql_result" = "1" ]; then
-    # Create conf_opts table if it doesn't exist
-    psql -h localhost -U dwemer -d dwemer -c "
-    CREATE TABLE IF NOT EXISTS conf_opts (
-        id VARCHAR(255) PRIMARY KEY,
-        value TEXT
-    );" &>/dev/null
-    
-    # Insert/Update WSL IP
-    psql -h localhost -U dwemer -d dwemer -c "
-    INSERT INTO conf_opts (id, value) 
-    VALUES ('Network/WSL_IP', '$wsl_ip') 
-    ON CONFLICT (id) 
-    DO UPDATE SET value = EXCLUDED.value;" &>/dev/null
-    
-    # Insert/Update Windows Host IP  
-    psql -h localhost -U dwemer -d dwemer -c "
-    INSERT INTO conf_opts (id, value) 
-    VALUES ('Network/HOST_IP', '$host_ip') 
-    ON CONFLICT (id) 
-    DO UPDATE SET value = EXCLUDED.value;" &>/dev/null
-    
-      echo "Network IPs saved to HerikaServer database successfully."
+  if ! psql -X -v ON_ERROR_STOP=1 -h localhost -U dwemer -d dwemer <<SQL
+BEGIN;
+CREATE TABLE IF NOT EXISTS conf_opts (id VARCHAR(255) PRIMARY KEY, value TEXT);
+INSERT INTO conf_opts (id, value)
+VALUES ('Network/WSL_IP', '$wsl_ip'), ('Network/HOST_IP', '$host_ip')
+ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value;
+COMMIT;
+SQL
+  then
+    echo "Server startup failed: CHIM could not save its database settings."
+    exit 1
   fi
+  echo "Network IPs saved to HerikaServer database successfully."
 fi
 
 unset PGPASSWORD
@@ -933,6 +954,9 @@ else
 	echo "Opening Dwemer Dashboard in the default browser."
 	explorer.exe http://$ipaddress:8081/Dwemer-Dashboard/index.php &>/dev/null&
 fi
+
+} 8>&- 9>&-
+exec 9>&- 8>&-
 
 echo "Press Enter to shutdown DwemerDistro"
 read
