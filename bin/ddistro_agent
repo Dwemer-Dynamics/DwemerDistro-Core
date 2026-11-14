@@ -243,7 +243,7 @@ TOOL_SPEC = {
     "description": "Read-only DwemerDistro diagnostics captured now on this machine: inventory (installed presence of "
                    "servers, ext entries, custom mods, and every component in the distro component catalog; components "
                    "get presence plus, where listed in checks, port/http health only, and are not product targets), "
-                   "status (managed servers), models (configured CHIM model assignments), logs (redacted tail of an "
+                   "status (managed servers), models (configured server model assignments), logs (redacted tail of an "
                    "allowlisted log), health (bounded local checks), performance (bounded local timings, host load, and "
                    "recent Herika request stage timings; not provider latency or time to first token), model_options "
                    "(CHIM profiles with each role's connector id, and the existing LLM connectors), update_check (local "
@@ -258,7 +258,7 @@ TOOL_SPEC = {
         "operation": {"type": "string", "enum": list(TOOL_OPERATIONS)},
         "product": {"type": "string", "enum": list(TOOL_PRODUCTS),
                     "description": "a server only. status/health/performance/update_check: optional (omit for all); "
-                                   "models/model_options: herika; logs: that server's logs (or use log_source instead)"},
+                                   "models: any server; model_options: herika; logs: that server's logs (or use log_source instead)"},
         "log_source": {"type": "string", "enum": list(TOOL_LOG_SOURCES),
                        "description": "logs only, instead of product: the shared Apache or PostgreSQL logs"},
         "log": {"type": "string", "enum": sorted({name for names in TOOL_LOGS.values() for name in names}),
@@ -2741,10 +2741,15 @@ def tool_argv(arguments):
         if product not in TOOL_PRODUCTS:
             raise PolicyError(-32602, "product must be one of " + ", ".join(TOOL_PRODUCTS))
         return [command, product]
-    if operation in ("models", "model_options"):
+    if operation == "models":
+        product = arguments.get("product", "herika")
+        if product not in TOOL_PRODUCTS:
+            raise PolicyError(-32602, "product must be one of " + ", ".join(TOOL_PRODUCTS))
+        return ["models", product]
+    if operation == "model_options":
         if arguments.get("product", "herika") != "herika":
             raise PolicyError(-32602, "%s supports only herika" % operation)
-        return ["models", "herika"] if operation == "models" else ["models", "options", "herika"]
+        return ["models", "options", "herika"]
     if "log_source" in arguments:
         if "product" in arguments:
             raise PolicyError(-32602, "logs takes product or log_source, not both")
@@ -3078,7 +3083,7 @@ def run_ddistro(argv, registry=None):
         document = None
     expected = (" ".join(argv[:2]) if argv[0] in ("memory", "service", "access", "files", "config", "db", "changes",
                                                   "operations")
-                or argv[0] == "models" and argv[1] != "herika"
+                or argv[0] == "models" and argv[1] not in TOOL_PRODUCTS
                 else argv[0])
     if (not isinstance(document, dict) or document.get("schema_version") != 1 or document.get("command") != expected
             or document.get("ok") not in (True, False)):
@@ -6357,7 +6362,9 @@ class Broker:
                                                            or not isinstance(data.get("catalog"), dict)
                                                            or data["catalog"].get("available") is not True or any(
                               isinstance(section, dict) and section.get("truncated") is True for section in sections)))
-            if operation == "logs" and data.get("available") is False:
+            if data.get("reason") == "distro_maintenance":
+                result = "skipped"
+            elif operation == "logs" and data.get("available") is False:
                 result = "skipped"
             elif operation == "models" and data.get("available") is not True:
                 result = "failed"

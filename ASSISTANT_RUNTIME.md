@@ -387,8 +387,8 @@ The broker answers `item/tool/call` itself and never forwards it, so a client ca
 answer the request. It checks that the call is for `ddistro_read` with no namespace, from one
 of this task's threads, and that the arguments match exactly: `inventory` takes nothing;
 `status`/`health`/`performance`/`update_check` take an optional server product (`apache` or
-`postgres` there is refused with a message pointing to `logs` with `log_source`); `models` and
-`model_options` (`ddistro models options herika`) take only `herika`; `logs`
+`postgres` there is refused with a message pointing to `logs` with `log_source`); `models` takes any managed server and defaults to `herika`.
+`model_options` (`ddistro models options herika`) takes only `herika`; `logs`
 needs a server product or a `log_source` (not both; the older `product` `apache`/`postgres` form
 is still accepted), an optional log name from that target's
 `ddistro logs` allowlist, `lines` (default 50), and the optional `query` (one line of plain text,
