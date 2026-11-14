@@ -8,6 +8,7 @@ only the trusted root-owned helpers below, always with explicit argument vectors
 import calendar
 import errno
 import fcntl
+import grp
 import hashlib
 import hmac
 import json
@@ -99,7 +100,7 @@ LOG_SOURCES = {
                "dialectic_error.log"]),
     "postgres": ("/var/log/postgresql", ["main"]),  # newest postgresql-<version>-main.log
 }
-POSTGRES_LOG = re.compile(r"^postgresql-([0-9]{1,3})-main\.log\Z")
+POSTGRES_LOG = re.compile(r"^postgresql-([0-9]{1,3})-(main|dwemer)\.log\Z")
 
 STATUS_STRINGS = ("product", "state", "repository_state", "root", "database", "branch", "version",
                   "production_branch", "development_branch")
@@ -119,7 +120,7 @@ USAGE = """Usage: ddistro <command> [arguments] [--json] [--request-id ID]
   changes apply TASK --manifest-sha256 HASH                     (root)
   agent status | agent probe                                    (probe: root)
   agent home-config | agent home-config-repair --sha256 HASH    (root; account-home config status or quarantine)
-  models herika                 (root; configured CHIM profile model assignments, read-only)
+  models PRODUCT                (root; configured model assignments, read-only)
   models options herika         (root; read-only: profiles with their role connectors, and the existing LLM connectors)
   models preview herika --profile ID --role ROLE --connector ID   (root; no database write: a receipt with the exact diff)
   models apply herika --receipt ID --plan-sha256 HASH             (root; one previewed change, compare-and-swap)
@@ -470,7 +471,7 @@ def cmd_capabilities(opts, ctx):
             {"name": "agent home-config-repair", "flags": ["--sha256"], "mutates": True, "requires_root": True},
             {"name": "agent serve", "flags": ["--task"], "mutates": False, "requires_root": True,
              "transport": "jsonl"},
-            {"name": "models", "arguments": ["herika"], "mutates": False, "requires_root": True},
+            {"name": "models", "arguments": list(PRODUCTS), "mutates": False, "requires_root": True},
             {"name": "models options", "arguments": ["herika"], "mutates": False, "requires_root": True},
             {"name": "models preview", "arguments": ["herika"], "flags": ["--profile", "--role", "--connector", "--task", "--thread"],
              "mutates": False, "requires_root": True},
@@ -647,7 +648,9 @@ def cmd_capabilities(opts, ctx):
                                          "pidfile": "/run/", "ports": [1024, 65535], "max_ports": 8}},
         "agent": {"provider": "codex", "readiness_command": "agent status", "ready_when": ["installed", "probe_passed"]},
         # Configured profile assignments only; which profile an NPC is using is not reported.
-        "models": {"products": ["herika"], "scope": "configured_profiles", "roles": [role for role, _ in MODELS_ROLES],
+        "models": {"products": list(PRODUCTS), "scope": "configured_profiles", "roles": [role for role, _ in MODELS_ROLES],
+                   "server_scopes": {"reign": "server_settings"},
+                   "server_roles": {"reign": list(REIGN_MODEL_ROLES), "stobe": [role for role, _ in STOBE_ROLES]},
                    "max_assignments": MODELS_MAX, "string_chars": MODELS_STRING_CHARS},
         "inventory": {"scope": "presence_only", "extension_products": list(INVENTORY_EXTENSION_ROOTS),
                       # Legacy ids of the inventory components section, kept for older clients. They come from the
@@ -707,6 +710,9 @@ def cmd_products(opts, ctx):
 
 
 def cmd_status(opts, ctx):
+    if distro_maintenance_active():
+        return {"user": current_user(), "is_root": os.geteuid() == 0, "servers": [],
+                "reason": "distro_maintenance", "message": MAINTENANCE_MESSAGE}, MAINTENANCE_MESSAGE
     records = helper_status(opts.get("product"))
     servers = [{key: record[key] for key in ("product", "state", "repository_state", "database_present",
                                               "branch", "version")} for record in records]
@@ -721,13 +727,19 @@ def cmd_server_status(opts, ctx):
 
 def postgres_log_name(root):
     try:
-        versions = [int(match.group(1)) for match in map(POSTGRES_LOG.match, os.listdir(root)) if match]
+        candidates = []
+        for name in os.listdir(root):
+            match = POSTGRES_LOG.fullmatch(name)
+            if match:
+                version, cluster = match.groups()
+                online = os.path.isfile(f"/var/lib/postgresql/{version}/{cluster}/postmaster.pid")
+                candidates.append((online, int(version), cluster == "dwemer", name))
     except FileNotFoundError:
         return None
     except PermissionError:
         raise CliError("permission_denied", "The PostgreSQL log folder is not readable by this user.",
                        {"path": root, "read_as": current_user()})
-    return f"postgresql-{max(versions)}-main.log" if versions else None
+    return max(candidates)[-1] if candidates else None
 
 
 # logs --query and --since filter the same bounded tail; nothing older than it is ever read. A query is literal text,
@@ -1508,7 +1520,7 @@ def check_system_binary(path):
     check_helper(path)
 
 
-def models_psql(sql, keep, timeout=MODELS_TIMEOUT, appname="ddistro-models", port=None):
+def models_psql(sql, keep, timeout=MODELS_TIMEOUT, appname="ddistro-models", port=None, database=MODELS_DATABASE):
     """Run one fixed read-only query; returns (exit code, stdout bytes). stderr is never returned.
     Without port, the port is DDISTRO_POSTGRES_PORT when valid (the read-only models listing), else 5432."""
     if port is None:
@@ -1519,7 +1531,7 @@ def models_psql(sql, keep, timeout=MODELS_TIMEOUT, appname="ddistro-models", por
            "PGOPTIONS": "-c default_transaction_read_only=on -c statement_timeout=10000 -c lock_timeout=2000 "
                         "-c idle_in_transaction_session_timeout=10000 -c search_path=pg_catalog"}
     args = ["-u", "postgres", "--", MODELS_PSQL, "-X", "-A", "-t", "-q", "--no-password", "-v", "ON_ERROR_STOP=1",
-            "-h", MODELS_SOCKET, "-p", port, "-d", MODELS_DATABASE, "-1",
+            "-h", MODELS_SOCKET, "-p", port, "-d", database, "-1",
             "-c", "SET TRANSACTION READ ONLY", "-c", sql]
     code, out, _ = run_helper(args, timeout, keep + 1, helper=MODELS_RUNUSER, env=env)
     if code == 0 and out.total > keep:
@@ -1527,15 +1539,15 @@ def models_psql(sql, keep, timeout=MODELS_TIMEOUT, appname="ddistro-models", por
     return code, bytes(out.data)
 
 
-def models_columns():
-    names = ", ".join(f"'{name.split('.')[1]}'" for name in sorted(MODELS_COLUMNS))
+def models_columns(database=MODELS_DATABASE, allowed=MODELS_COLUMNS):
+    names = ", ".join(f"'{name.split('.')[1]}'" for name in sorted(allowed))
     code, raw = models_psql("SELECT table_name || '.' || column_name FROM information_schema.columns "
                             "WHERE table_schema = 'public' AND table_name IN ('core_profiles', 'core_llm_connector') "
-                            f"AND column_name IN ({names})", 64 * 1024)
+                            f"AND column_name IN ({names})", 64 * 1024, database=database)
     if code != 0:
         return code, None
     # Intersected with the allowlist, so only our own constants are ever put into SQL.
-    return 0, MODELS_COLUMNS & set(raw.decode("utf-8", "replace").split("\n"))
+    return 0, allowed & set(raw.decode("utf-8", "replace").split("\n"))
 
 
 def models_text(value):
@@ -1560,32 +1572,83 @@ def models_rows(raw, roles):
     return rows
 
 
-def models_query():
+STOBE_ROLES = MODELS_ROLES[:4] + tuple((role, role + "_connector") for role in
+    ("response", "diary", "autochat", "middleterm", "backgroundlife", "dynamic", "relationship"))
+REIGN_MODEL_ROLES = ("dialogue", "characterConstruction", "diplomacy", "events", "fast", "memory", "relationship",
+                     "correspondence", "strategy", "selector", "actionPlanner", "actionRouter")
+MAINTENANCE_FENCE = "/etc/dwemer/trixie-upgrade.fence"
+MAINTENANCE_MESSAGE = "DwemerDistro is in maintenance. Wait for the upgrade or recovery to finish, then check again."
+
+
+def distro_maintenance_active():
+    """A persistent upgrade fence or an exclusive updater lock pauses diagnostic service probes."""
+    if os.path.exists(MAINTENANCE_FENCE):
+        return True
+    try:
+        fd = os.open(MAINTENANCE_LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_nlink != 1:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+    finally:
+        os.close(fd)
+
+
+def models_query(product="herika"):
     """Returns (assignments, truncated, reason); reason is empty only when the read succeeded."""
     if os.geteuid() != 0:
         return [], False, "requires_root"
+    if distro_maintenance_active():
+        return [], False, "distro_maintenance"
+    if product == "reign":
+        try:
+            web_group = grp.getgrnam("www-data").gr_gid
+        except KeyError:
+            return [], False, "settings_unavailable"
+        raw = health_read_small("/var/www/html/ReignServer/data/settings.json", health_owners(True),
+                                limit=256 * 1024, writable_group=web_group)
+        try:
+            settings = json.loads(raw.lstrip("\ufeff")) if raw else None
+        except ValueError:
+            settings = None
+        if not isinstance(settings, dict):
+            return [], False, "settings_unavailable"
+        return [{"role": role, "model": models_text(settings[role + "Model"])}
+                for role in REIGN_MODEL_ROLES if isinstance(settings.get(role + "Model"), str)
+                and settings[role + "Model"].strip()], False, ""
+    database = MODELS_DATABASE if product == "herika" else product
+    role_fields = STOBE_ROLES if product == "stobe" else MODELS_ROLES
+    fields = ("name", "model", None, "connector_type") if product == "stobe" else ("label", "model", "provider", "driver")
+    required = {"core_profiles.id", "core_profiles.label", "core_llm_connector.id"} | {
+        "core_llm_connector." + field for field in fields if field}
     try:
         check_system_binary(MODELS_PSQL)
         pwd.getpwnam("postgres")
     except (CliError, KeyError, OSError):
         return [], False, "helper_unavailable"
     try:
-        code, columns = models_columns()
-        if code == 0 and not MODELS_REQUIRED <= columns:
+        code, columns = models_columns(database, required | {"core_profiles." + f for _, f in role_fields})
+        if code == 0 and not required <= columns:
             return [], False, "schema_missing"
-        roles = [(order, role, field) for order, (role, field) in enumerate(MODELS_ROLES)
+        roles = [(order, role, field) for order, (role, field) in enumerate(role_fields)
                  if "core_profiles." + field in (columns or ())]
         if code == 0 and not roles:
             return [], False, "schema_missing"
         if code == 0:
             values = ", ".join(f"({order}, '{role}', p.{field})" for order, role, field in roles)
-            text = ", ".join(f"left({column}::text, {MODELS_FIELD_CHARS})"
-                             for column in ("c.label", "c.model", "c.provider", "c.driver"))
+            text = ", ".join(f"left(c.{field}::text, {MODELS_FIELD_CHARS})" if field else "NULL" for field in fields)
             code, raw = models_psql(
                 f"SELECT json_build_array(p.id, left(p.label::text, {MODELS_FIELD_CHARS}), r.role, c.id, {text}) "
                 f"FROM public.core_profiles AS p CROSS JOIN LATERAL (VALUES {values}) AS r(ord, role, connector_id) "
                 "JOIN public.core_llm_connector AS c ON c.id = r.connector_id "
-                f"ORDER BY p.id, r.ord LIMIT {MODELS_MAX + 1}", MODELS_STDOUT_LIMIT)
+                f"ORDER BY p.id, r.ord LIMIT {MODELS_MAX + 1}", MODELS_STDOUT_LIMIT, database=database)
     except CliError as error:
         if error.code == "cancelled":
             raise
@@ -1603,16 +1666,17 @@ def models_query():
 
 def cmd_models(opts, ctx):
     product = opts["product"]
-    if product != "herika":
-        raise CliError("unsupported", "ddistro models currently supports only herika (chim, skyrim).",
-                       {"product": product})
     captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    assignments, truncated, reason = models_query()
-    data = {"product": product, "available": not reason, "scope": "configured_profiles", "captured_at": captured_at,
+    assignments, truncated, reason = models_query(product)
+    data = {"product": product, "available": not reason, "scope": "server_settings" if product == "reign" else "configured_profiles", "captured_at": captured_at,
             "assignments": assignments, "truncated": truncated, "reason": reason}
     if reason:
-        return data, f"herika model assignments unavailable: {reason}"
-    lines = ["Configured CHIM profile model assignments (not necessarily the active NPC profile):"]
+        if reason == "distro_maintenance":
+            data["message"] = MAINTENANCE_MESSAGE
+        return data, data.get("message", f"{product} model assignments unavailable: {reason}")
+    if product == "reign":
+        return data, "\n".join(["Configured Reign models:"] + [f"  {a['role']}: {a['model']}" for a in assignments])
+    lines = [f"Configured {PRODUCTS[product]['name']} profile model assignments:"]
     lines += [f"  {a['profile_id']:>4} {a['profile'] or '-':<24} {a['role']:<12} {a['model'] or '-'} "
               f"({a['provider'] or '-'}/{a['driver'] or '-'}, connector {a['connector_id']} {a['connector'] or '-'})"
               for a in assignments] or ["  (none)"]
@@ -1666,6 +1730,8 @@ def model_untrusted(what):
 
 
 def model_settings_ready():
+    if os.path.exists(MAINTENANCE_FENCE):
+        raise CliError("busy", MAINTENANCE_MESSAGE, {"reason": "distro_maintenance"})
     if os.geteuid() != 0:
         raise CliError("permission_denied", "ddistro model changes must run as root. ddistro never elevates by itself.")
     try:
@@ -2073,6 +2139,8 @@ def model_stamp(epoch):
 
 
 def cmd_models_options(opts, ctx):
+    if distro_maintenance_active():
+        raise CliError("busy", MAINTENANCE_MESSAGE)
     model_settings_ready()
     roles = model_fields()
     if not roles:
@@ -2433,7 +2501,10 @@ def update_check_product(record):
     try:
         for path, wanted in ((root, stat.S_ISDIR), (root + "/.git", stat.S_ISDIR), (root + "/.git/config", stat.S_ISREG)):
             st = os.lstat(path)
-            if not wanted(st.st_mode) or st.st_mode & 0o022 and path.endswith("config"):
+            if path.endswith("/config") and stat.S_ISREG(st.st_mode) and st.st_mode & 0o022:
+                result["reasons"].append("repository_config_group_or_world_writable")
+                return result
+            if not wanted(st.st_mode):
                 result["reasons"].append("unexpected_repository_layout")
                 return result
         # A linked worktree's commondir would take the config and objects from another repository.
@@ -3131,7 +3202,7 @@ def health_owners(dwemer):
         return (0,)
 
 
-def health_read_small(path, owners):
+def health_read_small(path, owners, limit=HEALTH_READ_LIMIT, writable_group=None):
     """Up to HEALTH_READ_LIMIT bytes of a fixed small config file; None when absent, unsafe, or too large.
 
     The path is walked from / one name at a time without following a link (as inventory does); "/", every
@@ -3143,7 +3214,8 @@ def health_read_small(path, owners):
                   | getattr(os, "O_CLOEXEC", 0))
 
     def trusted(info):
-        return info.st_uid in owners and not info.st_mode & 0o022
+        return (info.st_uid in owners and not info.st_mode & 0o002
+                and (not info.st_mode & 0o020 or info.st_gid == writable_group))
     fd = fd_file = None
     try:
         fd = os.open("/", INVENTORY_DIR_FLAGS)
@@ -3156,15 +3228,15 @@ def health_read_small(path, owners):
         if not trusted(os.fstat(fd)):
             return None
         before = os.stat(name, dir_fd=fd, follow_symlinks=False)
-        if not stat.S_ISREG(before.st_mode) or before.st_size > HEALTH_READ_LIMIT:
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
             return None
         fd_file = os.open(name, file_flags, dir_fd=fd)
         info = os.fstat(fd_file)
         if ((info.st_dev, info.st_ino) != (before.st_dev, before.st_ino) or not stat.S_ISREG(info.st_mode)
-                or info.st_size > HEALTH_READ_LIMIT or not trusted(info)):
+                or info.st_size > limit or not trusted(info) or info.st_nlink != 1):
             return None
-        data = os.read(fd_file, HEALTH_READ_LIMIT + 1)
-        return None if len(data) > HEALTH_READ_LIMIT else data.decode("utf-8", "replace")
+        data = os.read(fd_file, limit + 1)
+        return None if len(data) > limit else data.decode("utf-8", "replace")
     except OSError:
         return None
     finally:
@@ -3303,63 +3375,66 @@ def cmd_health(opts, ctx):
             return "skipped", "no provider field", "service did not identify itself; older releases predate provider_info"
         return judge
 
-    try:
-        records = helper_status(product, timeout=HEALTH_STATUS_TIMEOUT)
-    except CliError as error:
-        if error.code == "cancelled":
-            raise
-        records = None
-        add("servers.status", "ddistro_server", "failed", "ddistro_server status: " + error.code)
-    for record in records or []:
-        name, state = record["product"], record["state"]
-        if state == "not-installed":
-            add(f"server.{name}.installed", name, "skipped", "state not-installed", "not installed")
-            continue
-        add(f"server.{name}.installed", name, "passed" if state == "installed" else "failed",
-            f"state {state}, repository {record['repository_state']}")
-        if port_check(f"server.{name}.port", name, record["port"], "ddistro_server status"):
-            path, service = HEALTH_SERVER_HTTP.get(name, (None, None))
-            http_check(f"server.{name}.http", name, record["port"], path, server_health(service))
-        present = record["database_present"]
-        add(f"server.{name}.database", name, {True: "passed", False: "failed", None: "skipped"}[present],
-            f"database {DATABASE_WORDS[present]}", None if present is not None else "PostgreSQL not ready for status")
-    pg_port = health_port_value(os.environ.get("DDISTRO_POSTGRES_PORT", "")) or 5432
-    port_check("postgres.port", "postgres", pg_port, "DDISTRO_POSTGRES_PORT" if pg_port != 5432 else "default")
-    if product is None:
-        conf = health_services_conf()
-        loaded, reason, _ = catalog_load()
-        if loaded is None:
-            add("component.catalog", "components", "skipped", "component catalog unavailable", reason)
-        for item in loaded["items"] if loaded else []:
-            if not item["startup"]:
-                # No startup marker means no known local port contract; installed presence is reported as evidence.
-                installed, why = catalog_installed(item["installed"])
-                add(f"component.{item['id']}.port", item["id"], "skipped",
-                    f"installed {installed}" + (f" ({why})" if why else ""), "no known local port contract")
+    if distro_maintenance_active():
+        add("distro.maintenance", "distro", "skipped", MAINTENANCE_MESSAGE, "distro_maintenance")
+    else:
+        try:
+            records = helper_status(product, timeout=HEALTH_STATUS_TIMEOUT)
+        except CliError as error:
+            if error.code == "cancelled":
+                raise
+            records = None
+            add("servers.status", "ddistro_server", "failed", "ddistro_server status: " + error.code)
+        for record in records or []:
+            name, state = record["product"], record["state"]
+            if state == "not-installed":
+                add(f"server.{name}.installed", name, "skipped", "state not-installed", "not installed")
                 continue
-            mode, leaves = item["startup"]
-            component_id = (item["aliases"] or [item["id"]])[0]
-            state = inventory_component(component_id, item["name"], item["role"], mode,
-                                        [path for _, path in leaves])["state"]
-            if state != "present":
-                add(f"component.{component_id}.port", component_id, "skipped", f"startup marker {state}",
-                    "startup not configured" if state == "absent" else "marker could not be checked")
-                continue
-            if component_id not in HEALTH_COMPONENT_PORTS:
-                add(f"component.{component_id}.port", component_id, "skipped", "startup marker present",
-                    "no known local port contract")
-                continue
-            key, port, port_file = HEALTH_COMPONENT_PORTS[component_id]
-            source = "default"
-            if key and key in conf:
-                port, source = conf[key], HEALTH_SERVICES_CONF
-            saved = health_port_value(health_read_small(port_file, health_owners(True)) or "") if port_file else None
-            if saved:
-                port, source = saved, port_file
-            if port_check(f"component.{component_id}.port", component_id, port, source):
-                judge = omnivoice_health if component_id == "omnivoice" else provider_identity(component_id)
-                http_check(f"component.{component_id}.http", component_id, port, HEALTH_COMPONENT_HTTP.get(component_id),
-                           judge)
+            add(f"server.{name}.installed", name, "passed" if state == "installed" else "failed",
+                f"state {state}, repository {record['repository_state']}")
+            if port_check(f"server.{name}.port", name, record["port"], "ddistro_server status"):
+                path, service = HEALTH_SERVER_HTTP.get(name, (None, None))
+                http_check(f"server.{name}.http", name, record["port"], path, server_health(service))
+            present = record["database_present"]
+            add(f"server.{name}.database", name, {True: "passed", False: "failed", None: "skipped"}[present],
+                f"database {DATABASE_WORDS[present]}", None if present is not None else "PostgreSQL not ready for status")
+        pg_port = health_port_value(os.environ.get("DDISTRO_POSTGRES_PORT", "")) or 5432
+        port_check("postgres.port", "postgres", pg_port, "DDISTRO_POSTGRES_PORT" if pg_port != 5432 else "default")
+        if product is None:
+            conf = health_services_conf()
+            loaded, reason, _ = catalog_load()
+            if loaded is None:
+                add("component.catalog", "components", "skipped", "component catalog unavailable", reason)
+            for item in loaded["items"] if loaded else []:
+                if not item["startup"]:
+                    # No startup marker means no known local port contract; installed presence is reported as evidence.
+                    installed, why = catalog_installed(item["installed"])
+                    add(f"component.{item['id']}.port", item["id"], "skipped",
+                        f"installed {installed}" + (f" ({why})" if why else ""), "no known local port contract")
+                    continue
+                mode, leaves = item["startup"]
+                component_id = (item["aliases"] or [item["id"]])[0]
+                state = inventory_component(component_id, item["name"], item["role"], mode,
+                                            [path for _, path in leaves])["state"]
+                if state != "present":
+                    add(f"component.{component_id}.port", component_id, "skipped", f"startup marker {state}",
+                        "startup not configured" if state == "absent" else "marker could not be checked")
+                    continue
+                if component_id not in HEALTH_COMPONENT_PORTS:
+                    add(f"component.{component_id}.port", component_id, "skipped", "startup marker present",
+                        "no known local port contract")
+                    continue
+                key, port, port_file = HEALTH_COMPONENT_PORTS[component_id]
+                source = "default"
+                if key and key in conf:
+                    port, source = conf[key], HEALTH_SERVICES_CONF
+                saved = health_port_value(health_read_small(port_file, health_owners(True)) or "") if port_file else None
+                if saved:
+                    port, source = saved, port_file
+                if port_check(f"component.{component_id}.port", component_id, port, source):
+                    judge = omnivoice_health if component_id == "omnivoice" else provider_identity(component_id)
+                    http_check(f"component.{component_id}.http", component_id, port, HEALTH_COMPONENT_HTTP.get(component_id),
+                               judge)
     for path in ("/", "/var/lib/postgresql", "/home/dwemer"):
         try:
             usage = shutil.disk_usage(path)
@@ -3583,7 +3658,7 @@ def performance_host():
     return results
 
 
-def performance_postgres(timeout):
+def performance_postgres(timeout, database):
     """(result, duration ms, reason) of one read-only SELECT 1 through the models psql path."""
     if os.geteuid() != 0:
         return "skipped", None, "requires_root"
@@ -3594,7 +3669,7 @@ def performance_postgres(timeout):
         return "skipped", None, "helper_unavailable"
     started = time.monotonic()
     try:
-        code, raw = models_psql("SELECT 1", 64, timeout=timeout, appname="ddistro-performance")
+        code, raw = models_psql("SELECT 1", 64, timeout=timeout, appname="ddistro-performance", database=database)
     except CliError as error:
         if error.code == "cancelled":
             raise
@@ -3631,7 +3706,10 @@ def cmd_performance(opts, ctx):
 
     records = None
     remaining = left(1)
-    if remaining is not None:
+    maintenance = distro_maintenance_active()
+    if maintenance:
+        add("distro.maintenance", "distro", "skipped", reason=MAINTENANCE_MESSAGE)
+    elif remaining is not None:
         try:
             records = helper_status(product, timeout=max(1, min(HEALTH_STATUS_TIMEOUT, int(remaining))))
         except CliError as error:
@@ -3663,10 +3741,13 @@ def cmd_performance(opts, ctx):
             {"http_status": status, "service_matched": health_server_matches(document, service),
              "status_ok": status == 200 and health_word(document, "status") == "ok"})
     timeout = left(2)
-    if timeout is None:
+    if maintenance:
+        add("postgres.select1", "postgres", "skipped", reason="distro_maintenance")
+    elif timeout is None:
         add("postgres.select1", "postgres", "skipped", reason="deadline reached")
     else:
-        result, elapsed, reason = performance_postgres(max(1, min(PERFORMANCE_PSQL_TIMEOUT, int(timeout))))
+        result, elapsed, reason = performance_postgres(max(1, min(PERFORMANCE_PSQL_TIMEOUT, int(timeout))),
+                                                     MODELS_DATABASE if product == "herika" else product or "postgres")
         add("postgres.select1", "postgres", result, elapsed, {"client_setup_included": True}, reason)
     for measurement_id, result, values, reason in performance_host():
         add(measurement_id, "host", result, values=values, reason=reason)
