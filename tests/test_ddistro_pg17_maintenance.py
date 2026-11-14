@@ -774,5 +774,322 @@ class Fingerprint(unittest.TestCase):
         self.assertEqual(stream.largest, 1024 * 1024)
 
 
+def manifest(*tables, fmt="chim_selected_tables_v2"):
+    return json.dumps({"format": fmt, "tables": list(tables)})
+
+
+# HerikaServer data/database_default.sql: audit_request(request text, result text, created_at timestamp, rowid bigint).
+LOG_SHAPE = (("request", "text"), ("result", "text"), ("created_at", "timestamp without time zone"),
+             ("rowid", "bigint"))
+
+
+class RequestLogs(unittest.TestCase):
+    """CHIM request logs are cleared only in public and verified saves, after a matching preview. No SQL runs."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name)
+        for key, value in (("ROOT", base), ("STATE", base / "state.json"), ("DATA", base)):
+            patcher = patch.object(m, key, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        m.log = None
+        self.statements = []
+        self.rows = [
+            dict(schema_name="public", relid=10, filenode=10, relkind="r", manifest=None, registered=False,
+                 saves=[], bytes=6000, rows_estimate=40),
+            dict(schema_name="chim_profile_hero", relid=11, filenode=11, relkind="r",
+                 manifest=manifest("audit_request", "eventlog"), registered=True, saves=["Hero"], bytes=3000,
+                 rows_estimate=-1),
+            dict(schema_name="chim_profile_stray", relid=12, filenode=12, relkind="r",
+                 manifest=manifest("audit_request"), registered=False, saves=[], bytes=900, rows_estimate=1),
+            dict(schema_name="chim_profile_upgrade_1_2", relid=13, filenode=13, relkind="r",
+                 manifest=manifest("audit_request"), registered=True, saves=["Stage"], bytes=800, rows_estimate=1),
+            dict(schema_name="chim_profile_legacy", relid=14, filenode=14, relkind="r", manifest=None,
+                 registered=True, saves=["Old"], bytes=700, rows_estimate=1),
+            dict(schema_name="chim_profile_future", relid=15, filenode=15, relkind="r",
+                 manifest=manifest("audit_request", fmt="other"), registered=True, saves=["New"], bytes=600,
+                 rows_estimate=1),
+            dict(schema_name="chim_profile_slim", relid=16, filenode=16, relkind="r", manifest=manifest("eventlog"),
+                 registered=True, saves=["Slim"], bytes=500, rows_estimate=1),
+            dict(schema_name="chim_profile_split", relid=17, filenode=17, relkind="p",
+                 manifest=manifest("audit_request"), registered=True, saves=["Split"], bytes=0, rows_estimate=0),
+            dict(schema_name="games", relid=18, filenode=18, relkind="r", manifest=manifest("audit_request"),
+                 registered=True, saves=["Odd"], bytes=400, rows_estimate=1),
+            dict(schema_name="chim_profile_hooked", relid=19, filenode=19, relkind="r",
+                 manifest=manifest("audit_request"), registered=True, saves=["Hooked"], bytes=300, rows_estimate=1,
+                 clear_triggers=True),
+        ]
+        for row in self.rows:
+            row.setdefault("clear_triggers", False)
+            row.setdefault("columns", [list(column) for column in LOG_SHAPE])
+        self.token = "c" * 64
+        self.after = "100"
+        self.clear_reply = "9000"
+        self.served = f"15|{m.OLD_DATA}|7001"
+        self.real_query_db = m.query_db
+        for name, fake in (("query_db", self.fake_query_db), ("socket_serves", lambda: True),
+                           ("cluster_id", lambda version, directory: "7001")):
+            patcher = patch.object(m, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        disk = patch.object(m.shutil, "disk_usage", side_effect=[types.SimpleNamespace(free=50),
+                                                                  types.SimpleNamespace(free=8050)] * 4)
+        disk.start()
+        self.addCleanup(disk.stop)
+
+    def fake_query_db(self, database, statement):
+        self.statements.append((database, statement))
+        if statement.startswith("do $clear$"):
+            if isinstance(self.clear_reply, Exception):
+                raise self.clear_reply
+            return self.clear_reply
+        if "json_build_object('state'" in statement:
+            return json.dumps({"state": self.token, "rows": self.rows})
+        if "from pg_database where datname" in statement:
+            return "1"
+        if statement.startswith("select concat_ws('|', current_setting('server_version_num')"):
+            self.assertEqual(database, "postgres")
+            return self.served
+        if "to_regclass('chim_meta.playthrough_profiles')" in statement:
+            return "t"
+        if statement.startswith("select coalesce(sum(pg_total_relation_size(oid))"):
+            return self.after
+        raise AssertionError(statement)
+
+    def test_preview_lists_only_public_and_verified_saves_and_changes_nothing(self):
+        preview = m.request_logs_preview()
+        self.assertEqual(preview["token"], self.token)
+        self.assertEqual([(t["schema"], t["kind"], t["saves"]) for t in preview["tables"]],
+                         [("public", "live", []), ("chim_profile_hero", "save", ["Hero"])])
+        self.assertEqual(preview["total_bytes"], 9000)
+        self.assertIsNone(preview["tables"][1]["rows_estimate"])
+        self.assertFalse(any("relid" in table for table in preview["tables"]))
+        self.assertEqual({s["schema"]: s["reason"] for s in preview["skipped"]}, {
+            "chim_profile_stray": "not registered in Playthrough Saves",
+            "chim_profile_upgrade_1_2": "not a CHIM save schema",
+            "chim_profile_legacy": "no readable save manifest",
+            "chim_profile_future": "no recognised save manifest",
+            "chim_profile_slim": "its manifest does not list request logs",
+            "chim_profile_split": "not a plain table",
+            "games": "not a CHIM save schema",
+            "chim_profile_hooked": "has an enabled TRUNCATE trigger",
+        })
+        self.assertTrue(all(db == "dwemer" or db == "postgres" for db, _ in self.statements))
+        self.assertFalse(any(word in sql.lower() for _, sql in self.statements for word in ("truncate only", "truncate table", "delete from", "drop ")))
+
+    def test_clear_truncates_only_previewed_tables_in_one_guarded_transaction(self):
+        result = m.request_logs_clear(self.token)
+        clears = [sql for _, sql in self.statements if sql.startswith("do $clear$")]
+        self.assertEqual(len(clears), 1)
+        sql = clears[0]
+        self.assertIn("pg_try_advisory_xact_lock(hashtext('chim_playthrough_retention'))", sql)
+        self.assertIn("set_config('lock_timeout', '5s', true)", sql)
+        # ONLY binds to each name, so every table carries its own.
+        self.assertIn('lock table only "public".audit_request, only "chim_profile_hero".audit_request in access exclusive mode', sql)
+        self.assertIn('truncate only "public".audit_request, only "chim_profile_hero".audit_request restrict;', sql)
+        self.assertIn("lock table only chim_meta.playthrough_profiles in share mode", sql)
+        self.assertNotIn("cascade", sql.lower())
+        self.assertNotIn("stray", sql)
+        self.assertNotIn("hooked", sql)
+        # The digest covers each table's triggers, and the locked tables are checked again for enabled
+        # TRUNCATE triggers before the truncate.
+        self.assertIn("clear_triggers), E'\\n' order by schema_name) from candidates", sql)
+        trigger_check = ("if exists(select 1 from pg_trigger t where t.tgrelid = any(array[10,11]::oid[])"
+                         " and t.tgtype::int & 32 <> 0 and t.tgenabled <> 'D') then"
+                         " raise exception 'A request log has an enabled TRUNCATE trigger; nothing was cleared';")
+        self.assertIn(trigger_check, sql)
+        # The digest is recomputed after the locks, then the trigger check, then the truncate.
+        self.assertLess(sql.index("lock table only"), sql.index(f"is distinct from '{self.token}'"))
+        self.assertLess(sql.index(f"is distinct from '{self.token}'"), sql.index(trigger_check))
+        self.assertLess(sql.index(trigger_check), sql.index("truncate only"))
+        self.assertEqual(result, {"cleared_tables": 2, "before_bytes": 9000, "after_bytes": 100,
+                                  "reclaimed_bytes": 8900, "filesystem_freed_bytes": 8000})
+
+    def test_clear_refuses_a_stale_preview_unfinished_maintenance_or_a_stopped_server(self):
+        with self.assertRaisesRegex(ValueError, "changed since the preview; nothing was cleared"):
+            m.request_logs_clear("d" * 64)
+        self.assertFalse(any(sql.startswith("do $clear$") for _, sql in self.statements))
+        for phase in ("staging", "publishing", "checking"):
+            m.STATE.write_text(json.dumps({"phase": phase}))
+            self.statements.clear()
+            with self.subTest(phase=phase), self.assertRaisesRegex(ValueError, "unfinished"):
+                m.request_logs_clear(self.token)
+            self.assertEqual(self.statements, [])
+        m.STATE.unlink()
+        with patch.object(m, "socket_serves", return_value=False), self.assertRaisesRegex(ValueError, "not running"):
+            m.request_logs_preview()
+        self.rows = [dict(row, relkind="p") for row in self.rows]
+        with self.assertRaisesRegex(ValueError, "no CHIM request logs"):
+            m.request_logs_clear(self.token)
+
+    def test_only_tables_shaped_like_chim_request_logs_count(self):
+        shapes = {
+            "missing": [list(column) for column in LOG_SHAPE[:3]],
+            "retyped": [["request", "text"], ["result", "text"], ["created_at", "timestamp with time zone"],
+                        ["rowid", "bigint"]],
+            # Under search_path=pg_catalog, format_type qualifies a same-named type from another schema.
+            "shadowed": [["request", "public.text"], ["result", "text"],
+                         ["created_at", "timestamp without time zone"], ["rowid", "bigint"]],
+            "extended": [list(column) for column in LOG_SHAPE] + [["model", "text"]],
+        }
+        public, hero = self.rows[0], self.rows[1]
+        for name, columns in shapes.items():
+            with self.subTest(shape=name):
+                self.rows[0] = dict(public, columns=columns)
+                self.rows[1] = dict(hero, columns=columns)
+                plan = m.request_log_plan()
+                if name == "extended":
+                    self.assertEqual([t["schema"] for t in plan["tables"]], ["public", "chim_profile_hero"])
+                else:
+                    self.assertEqual(plan["tables"], [])
+                    skipped = {s["schema"]: s["reason"] for s in plan["skipped"]}
+                    self.assertEqual(skipped["public"], "not shaped like CHIM's request log")
+                    self.assertEqual(skipped["chim_profile_hero"], "not shaped like CHIM's request log")
+        sql = m.request_log_sql(True, "{state}")
+        self.assertIn("format_type(a.atttypid, a.atttypmod)", sql)
+        self.assertIn("not a.attisdropped", sql)
+        self.assertIn("md5(columns::text)", sql)
+
+    def test_manifest_tables_must_be_a_list_of_names(self):
+        hero = self.rows[1]
+        for tables, reason in (("xaudit_requestx", "no recognised save manifest"),
+                               ({"audit_request": True}, "no recognised save manifest"),
+                               (["audit_request", 1], "no recognised save manifest"),
+                               (None, "no recognised save manifest"),
+                               (["audit_requests"], "its manifest does not list request logs")):
+            with self.subTest(tables=tables):
+                text = json.dumps({"format": "chim_selected_tables_v2", "tables": tables})
+                self.rows[1] = dict(hero, manifest=text)
+                skipped = {s["schema"]: s["reason"] for s in m.request_log_plan()["skipped"]}
+                self.assertEqual(skipped["chim_profile_hero"], reason)
+
+    def test_the_digest_pins_the_serving_cluster(self):
+        sql = m.request_log_sql(True, "{state}")
+        self.assertIn("(select system_identifier from pg_control_system()), current_setting('server_version_num')::int"
+                      " / 10000, current_setting('data_directory'))", sql)
+        m.request_logs_clear(self.token)
+        clear = next(sql for _, sql in self.statements if sql.startswith("do $clear$"))
+        self.assertIn("select system_identifier from pg_control_system()", clear)
+        self.assertLess(clear.index("lock table only"), clear.index("pg_control_system()"))
+
+    def test_clear_refuses_any_cluster_but_the_distro_one(self):
+        ids = {}
+        local = patch.object(m, "cluster_id", lambda version, directory: ids[(version, str(directory))])
+        local.start()
+        self.addCleanup(local.stop)
+        cases = [
+            # No journal: an ordinary PG15 distro serves 15/main.
+            (None, {(15, str(m.OLD_DATA)): "7001"}, f"15|{m.OLD_DATA}|7001", True),
+            (None, {(15, str(m.OLD_DATA)): "7001"}, f"15|{m.OLD_DATA}|9999", False),
+            (None, {(15, str(m.OLD_DATA)): "7001"}, f"17|{m.NEW_DATA}|7001", False),
+            (None, {(15, str(m.OLD_DATA)): "7001"}, "15|/srv/other|7001", False),
+            # Upgraded: the journaled candidate in 17/dwemer.
+            ({"phase": "active", "candidate_id": "8001"}, {(17, str(m.NEW_DATA)): "8001"},
+             f"17|{m.NEW_DATA}|8001", True),
+            ({"phase": "active", "candidate_id": "8001"}, {(17, str(m.NEW_DATA)): "8002"},
+             f"17|{m.NEW_DATA}|8002", False),
+            ({"phase": "active", "candidate_id": "8001"}, {(17, str(m.NEW_DATA)): "8001"},
+             f"15|{m.OLD_DATA}|8001", False),
+            # Rolled back: the journaled donor in 15/main.
+            ({"phase": "rolled-back", "donor_id": "7001"}, {(15, str(m.OLD_DATA)): "7001"},
+             f"15|{m.OLD_DATA}|7001", True),
+            ({"phase": "rolled-back", "donor_id": "7001"}, {(15, str(m.OLD_DATA)): "7002"},
+             f"15|{m.OLD_DATA}|7002", False),
+            # A journal missing its recorded identity fails closed instead of skipping the comparison.
+            ({"phase": "active"}, {(17, str(m.NEW_DATA)): "8001"}, f"17|{m.NEW_DATA}|8001", False),
+            ({"phase": "active", "candidate_id": ""}, {(17, str(m.NEW_DATA)): "8001"}, f"17|{m.NEW_DATA}|8001", False),
+            ({"phase": "active", "candidate_id": None}, {(17, str(m.NEW_DATA)): "8001"}, f"17|{m.NEW_DATA}|8001", False),
+            ({"phase": "rolled-back"}, {(15, str(m.OLD_DATA)): "7001"}, f"15|{m.OLD_DATA}|7001", False),
+            ({"phase": "rolled-back", "donor_id": ""}, {(15, str(m.OLD_DATA)): "7001"}, f"15|{m.OLD_DATA}|7001", False),
+            # The local PGDATA cannot be read.
+            (None, {}, f"15|{m.OLD_DATA}|7001", False),
+        ]
+        for state, local_ids, served, allowed in cases:
+            with self.subTest(state=state, served=served, local=local_ids):
+                if state is None:
+                    m.STATE.unlink(missing_ok=True)
+                else:
+                    m.STATE.write_text(json.dumps(state))
+                ids.clear()
+                ids.update(local_ids)
+                self.served = served
+                self.statements.clear()
+                if allowed:
+                    m.request_logs_clear(self.token)
+                    self.assertTrue(any(sql.startswith("do $clear$") for _, sql in self.statements))
+                else:
+                    with self.assertRaisesRegex(ValueError, "does not serve the distro's PostgreSQL"):
+                        m.request_logs_clear(self.token)
+                    self.assertFalse(any(db == "dwemer" for db, _ in self.statements))
+        m.STATE.write_text(json.dumps({"phase": "mystery"}))
+        self.statements.clear()
+        with self.assertRaisesRegex(ValueError, "Unknown migration state"):
+            m.request_logs_preview()
+        self.assertEqual(self.statements, [])
+
+    def test_clear_refuses_a_malformed_token_before_any_sql(self):
+        for token in ("", "C" * 64, "c" * 63, "c" * 63 + "'"):
+            with self.subTest(token=token), self.assertRaisesRegex(ValueError, "malformed"):
+                m.request_logs_clear(token)
+        self.assertEqual(self.statements, [])
+
+    def test_clear_surfaces_lock_timeouts_and_database_refusals(self):
+        self.clear_reply = ValueError("canceling statement due to lock timeout")
+        with self.assertRaisesRegex(ValueError, "still writing to its request logs; nothing was cleared"):
+            m.request_logs_clear(self.token)
+        self.clear_reply = ValueError("A CHIM Playthrough Save, switch, import or cleanup is running; nothing was cleared")
+        with self.assertRaisesRegex(ValueError, "Playthrough Save, switch"):
+            m.request_logs_clear(self.token)
+
+    def test_space_report_names_the_shortage_and_largest_consumers(self):
+        databases = [{"name": "dwemer", "bytes": 9 * 1024 ** 3, "open": True},
+                     {"name": "closed", "bytes": 1024 ** 3, "open": False}]
+        tables = [{"schema": "public", "name": "audit_request", "bytes": 6 * 1024 ** 3, "toast_bytes": 5 * 1024 ** 3},
+                  {"schema": "chim_profile_hero", "name": "audit_request", "bytes": 2 * 1024 ** 3, "toast_bytes": 0}]
+        real = self.fake_query_db
+
+        def sizes(database, statement):
+            if statement == m.SPACE_DATABASES:
+                return json.dumps(databases)
+            if statement == m.SPACE_RELATIONS:
+                self.assertEqual(database, "dwemer")
+                return json.dumps(tables)
+            return real(database, statement)
+
+        with patch.object(m, "query_db", sizes):
+            report = m.space_report(10 * 1024 ** 3, 25 * 1024 ** 3)
+        self.assertTrue(report.startswith(
+            "needs 40.0 GB free (four times the 10.0 GB PostgreSQL 15 data), 25.0 GB is available, short by 15.0 GB"))
+        self.assertIn("Largest databases: dwemer 9.0 GB, closed 1.0 GB", report)
+        self.assertIn("Largest schemas: dwemer.public 6.0 GB, dwemer.chim_profile_hero 2.0 GB", report)
+        self.assertIn("dwemer public.audit_request 6.0 GB (TOAST 5.0 GB)", report)
+        self.assertIn("CHIM request log tables occupy 8.8 KB across the live data and 1 save", report)
+        self.assertIn("frees up to that, less the small allocation each emptied table keeps, and reports the actual amount",
+                      report)
+        self.assertNotIn("\n", report)
+        with patch.object(m, "query_db", side_effect=ValueError("down")):
+            self.assertIn("short by 15.0 GB. The databases could not be sized", m.space_report(10 * 1024 ** 3, 25 * 1024 ** 3))
+
+    def test_queries_resolve_functions_from_pg_catalog_only(self):
+        # setUp replaces query_db with a fake; call the real one with psql itself stubbed out.
+        query_db = self.real_query_db
+        run = types.SimpleNamespace(returncode=0, stdout=b"1\n", stderr=b"")
+        with patch.object(m.subprocess, "run", return_value=run) as called:
+            self.assertEqual(query_db("dwemer", "select 1"), "1")
+        env = called.call_args.kwargs["env"]
+        self.assertEqual(env["PGDATABASE"], "dwemer")
+        self.assertEqual(env["PGOPTIONS"], "-c role=none -c search_path=pg_catalog")
+
+    def test_cli_requires_the_preview_token_to_clear(self):
+        script = str(Path(__file__).resolve().parents[1] / "bin" / "ddistro_pg17_maintenance")
+        for args in (["request-logs-clear"], ["request-logs-clear", "--confirm-preview", "A" * 64],
+                     ["request-logs-preview", "--confirm-preview", "a" * 64]):
+            run = subprocess.run([sys.executable, script, *args], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, args)
+            self.assertIn("--confirm-preview", run.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

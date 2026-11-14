@@ -557,8 +557,9 @@ def upgrade(automatic=False):
     ):
         raise ValueError("Review ALTER SYSTEM settings before upgrading")
     source_size = int(run("du", "-sb", OLD_DATA, stdout=subprocess.PIPE).stdout.split()[0])
-    if shutil.disk_usage(DATA).free < source_size * 4:
-        raise ValueError("Insufficient space for the staging copies")
+    available = shutil.disk_usage(DATA).free
+    if available < source_size * 4:
+        raise ValueError("Insufficient space for the staging copies: " + space_report(source_size, available))
     work = DATA / ("dwemer-stage-" + uuid.uuid4().hex)
     # The stopped donor and its disabled configuration stay in place as the recovery copy; no external
     # backup is written. Journals without "backup" are also refused by older releases' donor removal.
@@ -978,6 +979,353 @@ def cleanup_pg15(confirm=None):
     raise ValueError(f"{reason}; nothing was removed")
 
 
+def human(size):
+    """Bytes as the launcher shows them: 1024-based, one decimal above bytes."""
+    value, unit = float(size), "B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            break
+        value /= 1024
+    return f"{int(size)} B" if unit == "B" else f"{value:.1f} {unit}"
+
+
+def note(text):
+    """A line for the private maintenance log, which is not open when a test calls in."""
+    stream = globals().get("log")
+    if stream is not None:
+        stream.write((text.rstrip("\n") + "\n").encode())
+        stream.flush()
+
+
+def query_db(database, statement):
+    """Run one statement as postgres in a named database on the application socket. A failure is
+    logged and raised with PostgreSQL's own error text, so the caller can surface it."""
+    client = PG / "psql" if (PG / "psql").exists() else Path("/usr/lib/postgresql/15/bin/psql")
+    env = postgres_env(APP_SOCKET, database)
+    # These superuser statements read schemas the web role owns. Resolving functions and operators from
+    # pg_catalog only keeps a same-named public overload (pg_total_relation_size(oid), say) from running.
+    env["PGOPTIONS"] += " -c search_path=pg_catalog"
+    result = subprocess.run(
+        ("/usr/sbin/runuser", "-u", "postgres", "--", client, "-XqAt", "-v", "ON_ERROR_STOP=1", "-c", statement),
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    error = result.stderr.decode(errors="replace")
+    if error:
+        note(error)
+    if result.returncode:
+        lines = [line.split("ERROR:", 1)[1].strip() for line in error.splitlines() if "ERROR:" in line]
+        raise ValueError(lines[-1] if lines else f"psql exited with {result.returncode}")
+    return result.stdout.decode().strip()
+
+
+SPACE_DATABASES = (
+    "select coalesce(json_agg(json_build_object('name', datname, 'bytes', pg_database_size(oid), 'open', datallowconn)"
+    " order by pg_database_size(oid) desc), '[]') from pg_database where not datistemplate"
+)
+# Each user relation's whole footprint (heap, TOAST and indexes), with its TOAST share shown separately.
+SPACE_RELATIONS = (
+    "select coalesce(json_agg(t), '[]') from (select n.nspname as schema, c.relname as name,"
+    " pg_total_relation_size(c.oid) as bytes,"
+    " coalesce(pg_total_relation_size(nullif(c.reltoastrelid, 0::oid)), 0) as toast_bytes"
+    " from pg_class c join pg_namespace n on n.oid = c.relnamespace"
+    " where c.relkind in ('r', 'm') and n.nspname <> 'information_schema' and n.nspname !~ '^pg_') t"
+)
+
+
+def space_inventory():
+    """Database, schema and table sizes of the serving cluster, largest first. Reads only."""
+    databases = json.loads(query_db("postgres", SPACE_DATABASES))
+    relations = []
+    for database in databases:
+        if not database["open"]:
+            continue
+        try:
+            rows = json.loads(query_db(database["name"], SPACE_RELATIONS))
+        except ValueError as error:
+            note(f"Could not size the tables of {database['name']}: {error}")
+            continue
+        relations.extend(dict(row, database=database["name"]) for row in rows)
+    schemas = {}
+    for row in relations:
+        key = (row["database"], row["schema"])
+        schemas[key] = schemas.get(key, 0) + row["bytes"]
+    relations.sort(key=lambda row: row["bytes"], reverse=True)
+    return databases, sorted(schemas.items(), key=lambda item: item[1], reverse=True), relations
+
+
+def describe_table(row):
+    toast = f" (TOAST {human(row['toast_bytes'])})" if row["toast_bytes"] else ""
+    return f"{row['database']} {row['schema']}.{row['name']} {human(row['bytes'])}{toast}"
+
+
+def space_report(source_size, available):
+    """Why the staging copies do not fit and where the space went. The full report goes to the log; the
+    returned single line names the largest consumers. Failing to size them never hides the shortage."""
+    required = source_size * 4
+    summary = (
+        f"needs {human(required)} free (four times the {human(source_size)} PostgreSQL 15 data), "
+        f"{human(available)} is available, short by {human(required - available)}"
+    )
+    note(f"Space preflight: required {required} bytes, available {available} bytes, deficit {required - available} bytes")
+    try:
+        databases, schemas, relations = space_inventory()
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        note(f"Could not size the databases: {error}")
+        return summary + ". The databases could not be sized; see the maintenance log"
+    for database in databases[:10]:
+        note(f"  database {database['name']}: {database['bytes']} bytes" + ("" if database["open"] else " (closed)"))
+    for (database, schema), size in schemas[:10]:
+        note(f"  schema {database}.{schema}: {size} bytes")
+    for row in relations[:20]:
+        note(f"  table {row['database']} {row['schema']}.{row['name']}: {row['bytes']} bytes, "
+             f"TOAST {row['toast_bytes']} bytes")
+    parts = [summary]
+    if databases:
+        parts.append("Largest databases: " + ", ".join(f"{d['name']} {human(d['bytes'])}" for d in databases[:3]))
+    if schemas:
+        parts.append("Largest schemas: " + ", ".join(f"{d}.{s} {human(size)}" for (d, s), size in schemas[:3]))
+    if relations:
+        parts.append("Largest tables: " + ", ".join(describe_table(row) for row in relations[:5]))
+    plan = None
+    if any(d["name"] == CHIM_DATABASE and d["open"] for d in databases):
+        try:
+            plan = request_log_plan()
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            note(f"Could not size the CHIM request logs: {error}")
+    if plan and plan["tables"]:
+        saves = sum(1 for table in plan["tables"] if table["kind"] == "save")
+        note(f"  CHIM request logs: {plan['total_bytes']} bytes in {len(plan['tables'])} tables")
+        parts.append(
+            f"CHIM request log tables occupy {human(plan['total_bytes'])} across the live data and {saves} "
+            f"save{'' if saves == 1 else 's'}; Clear request logs in Settings > Database Maintenance frees up to that, "
+            "less the small allocation each emptied table keeps, and reports the actual amount"
+        )
+    return ". ".join(parts)
+
+
+CHIM_DATABASE = "dwemer"
+# HerikaServer's Playthrough Save lock (ptr_lock in lib/playthrough_retention.php). Saves, switches, imports,
+# deletions and log cleanup hold it, so a clear never runs beside one of them.
+CHIM_SAVE_LOCK = "hashtext('chim_playthrough_retention')"
+SAVE_SCHEMA = r"chim_profile_[a-z0-9_]+"
+SAVE_FORMATS = ("chim_selected_tables_v1", "chim_selected_tables_v2")
+LOG_TABLE = "audit_request"
+# The columns HerikaServer's data/database_default.sql creates audit_request with. CHIM may add columns,
+# but a table without all of these, with these types, is some other table that happens to share the name.
+LOG_COLUMNS = (("request", "text"), ("result", "text"), ("created_at", "timestamp without time zone"),
+               ("rowid", "bigint"))
+REGISTRY = "chim_meta.playthrough_profiles"
+# TRUNCATE triggers are enabled unless tgenabled is 'D'; TRIGGER_TYPE_TRUNCATE is bit 5 of tgtype.
+TRUNCATE_TRIGGERS = "select 1 from pg_trigger t where t.tgrelid = {relid} and t.tgtype::int & 32 <> 0 and t.tgenabled <> 'D'"
+
+
+def request_log_sql(registered, select):
+    """CHIM's request-log tables in public and every save-like or registered schema. Preview and clear
+    digest every column the safety decision reads, plus the serving cluster's and the registry's identity,
+    so new log rows never make a preview stale, but another cluster or a replaced or reshaped table,
+    schema, manifest, registration, registry or an enabled TRUNCATE trigger does. Column types are
+    named by format_type under search_path=pg_catalog, so a same-named type in another schema is
+    schema-qualified and never matches."""
+    registry = (
+        "select to_jsonb(p)->>'schema_name' as schema_name, coalesce(to_jsonb(p)->>'name', '') as save_name"
+        " from chim_meta.playthrough_profiles p where coalesce(to_jsonb(p)->>'storage_type', 'dump') = 'schema'"
+        if registered else "select null::text as schema_name, null::text as save_name where false"
+    )
+    state = (
+        "encode(sha256(convert_to(concat_ws('|', (select system_identifier from pg_control_system()),"
+        " current_setting('server_version_num')::int / 10000, current_setting('data_directory'))"
+        " || ':' || current_database() || ':' || (select oid from pg_database"
+        " where datname = current_database()) || ':' || coalesce((select concat_ws('|', oid, relkind) from pg_class"
+        f" where oid = to_regclass('{REGISTRY}')), '') || ':' || coalesce((select string_agg(concat_ws('|',"
+        " schema_name, relid, filenode, relkind, md5(columns::text), md5(coalesce(manifest, '')), manifest is null,"
+        " registered, clear_triggers), E'\\n' order by schema_name) from candidates), ''), 'UTF8')), 'hex')"
+    )
+    return (
+        f"with registry as ({registry}), candidates as ("
+        "select n.nspname::text as schema_name, c.oid::bigint as relid, c.relfilenode::bigint as filenode,"
+        " c.relkind::text as relkind, obj_description(n.oid, 'pg_namespace') as manifest,"
+        " coalesce((select json_agg(json_build_array(a.attname, format_type(a.atttypid, a.atttypmod))"
+        " order by a.attnum) from pg_attribute a where a.attrelid = c.oid and a.attnum > 0"
+        " and not a.attisdropped), '[]'::json) as columns,"
+        " exists(select 1 from registry r where r.schema_name = n.nspname) as registered,"
+        " coalesce((select json_agg(r.save_name order by r.save_name) from registry r"
+        " where r.schema_name = n.nspname), '[]'::json) as saves,"
+        f" exists({TRUNCATE_TRIGGERS.format(relid='c.oid')}) as clear_triggers,"
+        " pg_total_relation_size(c.oid) as bytes, c.reltuples::bigint as rows_estimate"
+        " from pg_class c join pg_namespace n on n.oid = c.relnamespace"
+        f" where c.relname = '{LOG_TABLE}' and (n.nspname = 'public' or n.nspname ~ '^chim_profile_'"
+        " or n.nspname in (select schema_name from registry))) select " + select.replace("{state}", state)
+    )
+
+
+def save_refusal(row):
+    """Why a candidate is not CHIM's live or verified saved request log, or None when it is one."""
+    if row["relkind"] != "r":
+        return "not a plain table"
+    if not set(LOG_COLUMNS) <= {tuple(column) for column in row["columns"]}:
+        return "not shaped like CHIM's request log"
+    if row["clear_triggers"]:
+        # The clear runs as the superuser, so it never fires a trigger the web role could have written.
+        return "has an enabled TRUNCATE trigger"
+    if row["schema_name"] == "public":
+        return None
+    if not re.fullmatch(SAVE_SCHEMA, row["schema_name"]) or row["schema_name"].startswith("chim_profile_upgrade_"):
+        return "not a CHIM save schema"
+    if not row["registered"]:
+        return "not registered in Playthrough Saves"
+    try:
+        manifest = json.loads(row["manifest"] or "")
+    except ValueError:
+        return "no readable save manifest"
+    if not isinstance(manifest, dict) or manifest.get("format") not in SAVE_FORMATS:
+        return "no recognised save manifest"
+    tables = manifest.get("tables")
+    # A string would match by substring, so only a list of table names counts.
+    if not isinstance(tables, list) or not all(isinstance(name, str) for name in tables):
+        return "no recognised save manifest"
+    if LOG_TABLE not in tables:
+        return "its manifest does not list request logs"
+    return None
+
+
+def request_log_guard():
+    """Refuse while a cluster migration is unfinished, nothing serves CHIM, or the application socket
+    serves any cluster but the distro's own; both locks are already held. The served cluster must run
+    from the expected PGDATA with that directory's pg_control identity: the journaled PG17 candidate
+    after an upgrade, the journaled PG15 donor after a rollback, or 15/main when nothing was journaled.
+    The request-log digest repeats this identity, so the locked recheck pins the same cluster."""
+    state = json.loads(STATE.read_text()) if STATE.exists() else None
+    if state is not None and state.get("phase") in ("staging", "publishing", "checking"):
+        raise ValueError("A PostgreSQL 17 upgrade or rollback is unfinished. Run Update Distro first")
+    if state is None:
+        major, data, expected = 15, OLD_DATA, None
+    elif state.get("phase") == "active":
+        major, data, expected = 17, NEW_DATA, state.get("candidate_id")
+    elif state.get("phase") == "rolled-back":
+        major, data, expected = 15, OLD_DATA, state.get("donor_id")
+    else:
+        raise ValueError("Unknown migration state; nothing was changed")
+    if not socket_serves():
+        raise ValueError("PostgreSQL is not running. Start the distro's server, then try again")
+    served = query_db("postgres", (
+        "select concat_ws('|', current_setting('server_version_num')::int / 10000, current_setting('data_directory'),"
+        " system_identifier) from pg_control_system()"))
+    try:
+        local = cluster_id(major, data)
+    except (OSError, subprocess.CalledProcessError, KeyError):
+        local = None
+    # A journal that lost its recorded identity matches nothing, rather than skipping the comparison.
+    if local is None or served != f"{major}|{data}|{local}" or (state is not None and (not expected or local != expected)):
+        raise ValueError(f"The application socket does not serve the distro's PostgreSQL {major} cluster; "
+                         "nothing was changed")
+    found = query_db("postgres", f"select count(*) from pg_database where datname = '{CHIM_DATABASE}' and datallowconn")
+    if found != "1":
+        raise ValueError("CHIM's database is not installed")
+
+
+def request_log_plan():
+    """Read-only inventory of CHIM's request logs in public and in verified save schemas."""
+    # Only a plain registry table is read; a view could run web-owned functions as the superuser.
+    registered = query_db(CHIM_DATABASE, (
+        f"select exists(select 1 from pg_class where oid = to_regclass('{REGISTRY}') and relkind = 'r')")) == "t"
+    found = json.loads(query_db(CHIM_DATABASE, request_log_sql(registered, (
+        "json_build_object('state', {state}, 'rows', (select coalesce(json_agg(c order by c.schema_name), '[]')"
+        " from candidates c))"))))
+    tables, skipped = [], []
+    for row in found["rows"]:
+        reason = save_refusal(row)
+        if reason:
+            skipped.append({"schema": row["schema_name"], "reason": reason, "bytes": row["bytes"]})
+            continue
+        tables.append({
+            "schema": row["schema_name"], "kind": "live" if row["schema_name"] == "public" else "save",
+            "saves": row["saves"], "relid": row["relid"], "bytes": row["bytes"],
+            "rows_estimate": row["rows_estimate"] if row["rows_estimate"] >= 0 else None,
+        })
+    return {"token": found["state"], "registered": registered, "tables": tables, "skipped": skipped,
+            "total_bytes": sum(table["bytes"] for table in tables)}
+
+
+def request_logs_preview():
+    """What a clear would empty, with a token pinning that exact set of tables. Changes nothing."""
+    request_log_guard()
+    plan = request_log_plan()
+    note(f"Request log preview: {plan['total_bytes']} bytes in {len(plan['tables'])} tables, "
+         f"{len(plan['skipped'])} skipped")
+    tables = [{key: value for key, value in table.items() if key != "relid"} for table in plan["tables"]]
+    return {"database": CHIM_DATABASE, "token": plan["token"], "total_bytes": plan["total_bytes"],
+            "tables": tables, "skipped": plan["skipped"]}
+
+
+def request_logs_clear(token):
+    """Empty the previewed request-log tables in one transaction with TRUNCATE ONLY on each table and
+    never CASCADE, after rechecking under CHIM's save lock, the tables' own locks and a share lock on the
+    registry that nothing changed since the preview and no table has an enabled TRUNCATE trigger.
+    Reports the bytes the tables actually released."""
+    # The token is written into the SQL below, so it must be the digest's own shape.
+    if not re.fullmatch(r"[0-9a-f]{64}", token or ""):
+        raise ValueError("The preview token is malformed; nothing was cleared")
+    request_log_guard()
+    plan = request_log_plan()
+    if plan["token"] != token:
+        raise ValueError("The request logs changed since the preview; nothing was cleared. Preview again")
+    if not plan["tables"]:
+        raise ValueError("There are no CHIM request logs to clear")
+    for table in plan["tables"]:
+        if table["schema"] != "public" and not re.fullmatch(SAVE_SCHEMA, table["schema"]):
+            raise ValueError("Unexpected request log schema; nothing was cleared")
+    names = ", ".join(f'"{table["schema"]}".{LOG_TABLE}' for table in plan["tables"])
+    # ONLY binds to one relation in a list, so each table carries its own; no inheritor is locked or emptied.
+    only_names = ", ".join(f'only "{table["schema"]}".{LOG_TABLE}' for table in plan["tables"])
+    relids = ",".join(str(int(table["relid"])) for table in plan["tables"])
+    # The registry decides which saves count, so hold it still and check it is still a plain table.
+    registry = (
+        f" lock table only {REGISTRY} in share mode;"
+        f" if (select relkind from pg_class where oid = to_regclass('{REGISTRY}')) is distinct from 'r' then"
+        " raise exception 'The Playthrough Saves registry changed since the preview; nothing was cleared. Preview again';"
+        " end if;"
+        if plan["registered"] else ""
+    )
+    free_before = shutil.disk_usage(DATA).free
+    # The locks come before the digest is recomputed, so the checked tables are the ones truncated, and
+    # no trigger can be created or enabled on them before the truncate.
+    statement = (
+        "do $clear$ declare state text; before bigint; begin"
+        " perform set_config('lock_timeout', '5s', true);"
+        f" if not pg_try_advisory_xact_lock({CHIM_SAVE_LOCK}) then"
+        " raise exception 'A CHIM Playthrough Save, switch, import or cleanup is running; nothing was cleared';"
+        " end if;"
+        f" lock table {only_names} in access exclusive mode;"
+        f"{registry}"
+        f" {request_log_sql(plan['registered'], '{state} into state')};"
+        f" if state is distinct from '{token}' then"
+        " raise exception 'The request logs changed since the preview; nothing was cleared. Preview again';"
+        " end if;"
+        f" if exists({TRUNCATE_TRIGGERS.format(relid=f'any(array[{relids}]::oid[])')}) then"
+        " raise exception 'A request log has an enabled TRUNCATE trigger; nothing was cleared';"
+        " end if;"
+        " select coalesce(sum(pg_total_relation_size(oid)), 0) into before from pg_class"
+        f" where oid = any(array[{relids}]::oid[]);"
+        f" truncate {only_names} restrict;"
+        " perform set_config('ddistro.request_logs_before', before::text, true);"
+        " end $clear$; select current_setting('ddistro.request_logs_before')"
+    )
+    try:
+        before = int(query_db(CHIM_DATABASE, statement))
+    except ValueError as error:
+        if "lock timeout" in str(error):
+            raise ValueError("CHIM is still writing to its request logs; nothing was cleared. Try again shortly") from None
+        raise
+    after = int(query_db(CHIM_DATABASE, (
+        f"select coalesce(sum(pg_total_relation_size(oid)), 0) from pg_class where oid = any(array[{relids}]::oid[])")))
+    reclaimed = max(0, before - after)
+    freed = max(0, shutil.disk_usage(DATA).free - free_before)
+    note(f"Request logs cleared in {len(plan['tables'])} tables ({names}): {before} -> {after} bytes, "
+         f"{freed} bytes free on disk")
+    return {"cleared_tables": len(plan["tables"]), "before_bytes": before, "after_bytes": after,
+            "reclaimed_bytes": reclaimed, "filesystem_freed_bytes": freed}
+
+
 def lock_distro():
     # Share Core's existing Unix maintenance lock with update.sh and lifecycle operations.
     path = "/run/lock/dwemerdistro-maintenance.lock"
@@ -1010,7 +1358,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "action",
         choices=["status", "auto", "upgrade", "cleanup-staging", "rollback", "recover", "cleanup-preview",
-                 "cleanup-pg15"],
+                 "cleanup-pg15", "request-logs-preview", "request-logs-clear"],
     )
     # Earlier launchers passed a Windows backup folder to auto and upgrade. It is accepted so they keep
     # working, and never read, checked or written.
@@ -1019,9 +1367,13 @@ if __name__ == "__main__":
     parser.add_argument("--confirm-preview", metavar="TOKEN", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.confirm_preview is not None and (
-        args.action != "cleanup-pg15" or not re.fullmatch(r"[0-9a-f]{64}", args.confirm_preview)
+        args.action not in ("cleanup-pg15", "request-logs-clear") or not re.fullmatch(r"[0-9a-f]{64}", args.confirm_preview)
     ):
-        parser.error("--confirm-preview takes the 64-character lowercase token from cleanup-preview, for cleanup-pg15")
+        parser.error("--confirm-preview takes the 64-character lowercase token from cleanup-preview, for cleanup-pg15, "
+                     "or from request-logs-preview, for request-logs-clear")
+    # Clearing request logs is never implied: it needs the token of the preview the user confirmed.
+    if args.action == "request-logs-clear" and args.confirm_preview is None:
+        parser.error("request-logs-clear requires --confirm-preview with the token from request-logs-preview")
     if os.geteuid() != 0:
         parser.error("root required")
     os.umask(0o077)
@@ -1048,7 +1400,8 @@ if __name__ == "__main__":
             except BlockingIOError:
                 raise Busy("Another PostgreSQL maintenance operation is running") from None
             with lock_distro():
-                if args.action not in ("status", "cleanup-preview", "cleanup-pg15"):
+                if args.action not in ("status", "cleanup-preview", "cleanup-pg15", "request-logs-preview",
+                                       "request-logs-clear"):
                     discard_temporaries()
                 if args.action == "status":
                     print(automatic_status())
@@ -1064,6 +1417,10 @@ if __name__ == "__main__":
                     print(json.dumps({"eligible": False, "bytes": 0, "reason": cleanup_preview()}))
                 elif args.action == "cleanup-pg15":
                     print(json.dumps({"freed_bytes": cleanup_pg15(args.confirm_preview)}))
+                elif args.action == "request-logs-preview":
+                    print(json.dumps(request_logs_preview()))
+                elif args.action == "request-logs-clear":
+                    print(json.dumps(request_logs_clear(args.confirm_preview)))
                 else:
                     rollback()
                     state = json.loads(STATE.read_text())
