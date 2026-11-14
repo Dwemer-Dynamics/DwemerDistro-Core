@@ -1001,9 +1001,13 @@ def query_db(database, statement):
     """Run one statement as postgres in a named database on the application socket. A failure is
     logged and raised with PostgreSQL's own error text, so the caller can surface it."""
     client = PG / "psql" if (PG / "psql").exists() else Path("/usr/lib/postgresql/15/bin/psql")
+    env = postgres_env(APP_SOCKET, database)
+    # These superuser statements read schemas the web role owns. Resolving functions and operators from
+    # pg_catalog only keeps a same-named public overload (pg_total_relation_size(oid), say) from running.
+    env["PGOPTIONS"] += " -c search_path=pg_catalog"
     result = subprocess.run(
         ("/usr/sbin/runuser", "-u", "postgres", "--", client, "-XqAt", "-v", "ON_ERROR_STOP=1", "-c", statement),
-        env=postgres_env(APP_SOCKET, database), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     error = result.stderr.decode(errors="replace")
     if error:
@@ -1092,8 +1096,9 @@ def space_report(source_size, available):
         saves = sum(1 for table in plan["tables"] if table["kind"] == "save")
         note(f"  CHIM request logs: {plan['total_bytes']} bytes in {len(plan['tables'])} tables")
         parts.append(
-            f"CHIM request logs use {human(plan['total_bytes'])} across the live data and {saves} "
-            f"save{'' if saves == 1 else 's'}; Clear CHIM request logs in Settings > Database Maintenance frees it"
+            f"CHIM request log tables occupy {human(plan['total_bytes'])} across the live data and {saves} "
+            f"save{'' if saves == 1 else 's'}; Clear request logs in Settings > Database Maintenance frees up to that, "
+            "less the small allocation each emptied table keeps, and reports the actual amount"
         )
     return ". ".join(parts)
 
@@ -1105,6 +1110,10 @@ CHIM_SAVE_LOCK = "hashtext('chim_playthrough_retention')"
 SAVE_SCHEMA = r"chim_profile_[a-z0-9_]+"
 SAVE_FORMATS = ("chim_selected_tables_v1", "chim_selected_tables_v2")
 LOG_TABLE = "audit_request"
+# The columns HerikaServer's data/database_default.sql creates audit_request with. CHIM may add columns,
+# but a table without all of these, with these types, is some other table that happens to share the name.
+LOG_COLUMNS = (("request", "text"), ("result", "text"), ("created_at", "timestamp without time zone"),
+               ("rowid", "bigint"))
 REGISTRY = "chim_meta.playthrough_profiles"
 # TRUNCATE triggers are enabled unless tgenabled is 'D'; TRIGGER_TYPE_TRUNCATE is bit 5 of tgtype.
 TRUNCATE_TRIGGERS = "select 1 from pg_trigger t where t.tgrelid = {relid} and t.tgtype::int & 32 <> 0 and t.tgenabled <> 'D'"
@@ -1112,25 +1121,32 @@ TRUNCATE_TRIGGERS = "select 1 from pg_trigger t where t.tgrelid = {relid} and t.
 
 def request_log_sql(registered, select):
     """CHIM's request-log tables in public and every save-like or registered schema. Preview and clear
-    digest every column the safety decision reads, plus the registry's identity, so new log rows never
-    make a preview stale, but a replaced table, schema, manifest, registration, registry or an enabled
-    TRUNCATE trigger does."""
+    digest every column the safety decision reads, plus the serving cluster's and the registry's identity,
+    so new log rows never make a preview stale, but another cluster or a replaced or reshaped table,
+    schema, manifest, registration, registry or an enabled TRUNCATE trigger does. Column types are
+    named by format_type under search_path=pg_catalog, so a same-named type in another schema is
+    schema-qualified and never matches."""
     registry = (
         "select to_jsonb(p)->>'schema_name' as schema_name, coalesce(to_jsonb(p)->>'name', '') as save_name"
         " from chim_meta.playthrough_profiles p where coalesce(to_jsonb(p)->>'storage_type', 'dump') = 'schema'"
         if registered else "select null::text as schema_name, null::text as save_name where false"
     )
     state = (
-        "encode(sha256(convert_to(current_database() || ':' || (select oid from pg_database"
+        "encode(sha256(convert_to(concat_ws('|', (select system_identifier from pg_control_system()),"
+        " current_setting('server_version_num')::int / 10000, current_setting('data_directory'))"
+        " || ':' || current_database() || ':' || (select oid from pg_database"
         " where datname = current_database()) || ':' || coalesce((select concat_ws('|', oid, relkind) from pg_class"
         f" where oid = to_regclass('{REGISTRY}')), '') || ':' || coalesce((select string_agg(concat_ws('|',"
-        " schema_name, relid, filenode, relkind, md5(coalesce(manifest, '')), manifest is null, registered,"
-        " clear_triggers), E'\\n' order by schema_name) from candidates), ''), 'UTF8')), 'hex')"
+        " schema_name, relid, filenode, relkind, md5(columns::text), md5(coalesce(manifest, '')), manifest is null,"
+        " registered, clear_triggers), E'\\n' order by schema_name) from candidates), ''), 'UTF8')), 'hex')"
     )
     return (
         f"with registry as ({registry}), candidates as ("
         "select n.nspname::text as schema_name, c.oid::bigint as relid, c.relfilenode::bigint as filenode,"
         " c.relkind::text as relkind, obj_description(n.oid, 'pg_namespace') as manifest,"
+        " coalesce((select json_agg(json_build_array(a.attname, format_type(a.atttypid, a.atttypmod))"
+        " order by a.attnum) from pg_attribute a where a.attrelid = c.oid and a.attnum > 0"
+        " and not a.attisdropped), '[]'::json) as columns,"
         " exists(select 1 from registry r where r.schema_name = n.nspname) as registered,"
         " coalesce((select json_agg(r.save_name order by r.save_name) from registry r"
         " where r.schema_name = n.nspname), '[]'::json) as saves,"
@@ -1146,6 +1162,8 @@ def save_refusal(row):
     """Why a candidate is not CHIM's live or verified saved request log, or None when it is one."""
     if row["relkind"] != "r":
         return "not a plain table"
+    if not set(LOG_COLUMNS) <= {tuple(column) for column in row["columns"]}:
+        return "not shaped like CHIM's request log"
     if row["clear_triggers"]:
         # The clear runs as the superuser, so it never fires a trigger the web role could have written.
         return "has an enabled TRUNCATE trigger"
@@ -1161,17 +1179,45 @@ def save_refusal(row):
         return "no readable save manifest"
     if not isinstance(manifest, dict) or manifest.get("format") not in SAVE_FORMATS:
         return "no recognised save manifest"
-    if LOG_TABLE not in (manifest.get("tables") or []):
+    tables = manifest.get("tables")
+    # A string would match by substring, so only a list of table names counts.
+    if not isinstance(tables, list) or not all(isinstance(name, str) for name in tables):
+        return "no recognised save manifest"
+    if LOG_TABLE not in tables:
         return "its manifest does not list request logs"
     return None
 
 
 def request_log_guard():
-    """Refuse while a cluster migration is unfinished or nothing serves CHIM; both locks are already held."""
-    if STATE.exists() and json.loads(STATE.read_text()).get("phase") in ("staging", "publishing", "checking"):
+    """Refuse while a cluster migration is unfinished, nothing serves CHIM, or the application socket
+    serves any cluster but the distro's own; both locks are already held. The served cluster must run
+    from the expected PGDATA with that directory's pg_control identity: the journaled PG17 candidate
+    after an upgrade, the journaled PG15 donor after a rollback, or 15/main when nothing was journaled.
+    The request-log digest repeats this identity, so the locked recheck pins the same cluster."""
+    state = json.loads(STATE.read_text()) if STATE.exists() else None
+    if state is not None and state.get("phase") in ("staging", "publishing", "checking"):
         raise ValueError("A PostgreSQL 17 upgrade or rollback is unfinished. Run Update Distro first")
+    if state is None:
+        major, data, expected = 15, OLD_DATA, None
+    elif state.get("phase") == "active":
+        major, data, expected = 17, NEW_DATA, state.get("candidate_id")
+    elif state.get("phase") == "rolled-back":
+        major, data, expected = 15, OLD_DATA, state.get("donor_id")
+    else:
+        raise ValueError("Unknown migration state; nothing was changed")
     if not socket_serves():
         raise ValueError("PostgreSQL is not running. Start the distro's server, then try again")
+    served = query_db("postgres", (
+        "select concat_ws('|', current_setting('server_version_num')::int / 10000, current_setting('data_directory'),"
+        " system_identifier) from pg_control_system()"))
+    try:
+        local = cluster_id(major, data)
+    except (OSError, subprocess.CalledProcessError, KeyError):
+        local = None
+    # A journal that lost its recorded identity matches nothing, rather than skipping the comparison.
+    if local is None or served != f"{major}|{data}|{local}" or (state is not None and (not expected or local != expected)):
+        raise ValueError(f"The application socket does not serve the distro's PostgreSQL {major} cluster; "
+                         "nothing was changed")
     found = query_db("postgres", f"select count(*) from pg_database where datname = '{CHIM_DATABASE}' and datallowconn")
     if found != "1":
         raise ValueError("CHIM's database is not installed")
@@ -1216,6 +1262,9 @@ def request_logs_clear(token):
     never CASCADE, after rechecking under CHIM's save lock, the tables' own locks and a share lock on the
     registry that nothing changed since the preview and no table has an enabled TRUNCATE trigger.
     Reports the bytes the tables actually released."""
+    # The token is written into the SQL below, so it must be the digest's own shape.
+    if not re.fullmatch(r"[0-9a-f]{64}", token or ""):
+        raise ValueError("The preview token is malformed; nothing was cleared")
     request_log_guard()
     plan = request_log_plan()
     if plan["token"] != token:
