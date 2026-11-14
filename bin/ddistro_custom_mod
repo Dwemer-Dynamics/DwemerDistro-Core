@@ -935,9 +935,15 @@ def create_direct_root(folder):
         os.close(fd)
 
 
+SOULKILLER_ROOTS = ("EdgerunnerAIFrameworkServer", "SoulkillerServer")
+SOULKILLER_ID = "edgerunner-ai-framework"
+
+
 def server_folder_claims(name, mod_id):
     """Why name cannot become mod_id's direct root (an entry, another registry claim, any letter case), or None."""
     lower = name.lower()
+    if mod_id != SOULKILLER_ID and lower in (folder.lower() for folder in SOULKILLER_ROOTS):
+        return f"Server folder {name} is reserved for SOULKILLER."
     try:
         existing = os.listdir(WEB_ROOT)
     except FileNotFoundError:
@@ -1280,7 +1286,25 @@ def root_deny_rules(roots, alias_ids):
     return deny_rules(dirs, urls) + (rf"^/var/www/html/({dirs})/(.+/)?\.git(/|$)", rf"^/+({urls})/+(.*/)?\.git(/|$)")
 
 
-def web_site_text(port, protected=(), roots=(), aliases=()):
+def soulkiller_aliases(entry, strict=False):
+    """Map available historical names to the one registry-owned checkout."""
+    folder = entry.get("server_folder", "")
+    if entry["id"] != SOULKILLER_ID or folder not in ("", *SOULKILLER_ROOTS):
+        return []
+    routes = []
+    for name in SOULKILLER_ROOTS:
+        if name == folder:
+            continue
+        conflict = server_folder_claims(name, SOULKILLER_ID)
+        if conflict:
+            if strict:
+                raise ModError(conflict)
+            continue
+        routes.append((name, entry_folder(entry)))
+    return routes
+
+
+def web_site_text(port, protected=(), roots=(), aliases=(), named_aliases=()):
     """This manager's own Apache site: one loopback listener serving only the custom mod paths.
 
     The DirectoryMatch denials sit outside the virtual host, so they also apply on the other
@@ -1294,12 +1318,15 @@ def web_site_text(port, protected=(), roots=(), aliases=()):
         source_dir, project_dir, url = project_deny_rules(protected)
         outside = deny_dir_text(source_dir, project_dir)
         inside = f'\t<LocationMatch "{url}">\n\t\tRequire all denied\n\t</LocationMatch>\n'
+    roots = sorted(set(roots) | {validate_server_folder(name) for name, _ in named_aliases})
     if roots:
         source_dir, project_dir, url, git_dir, git_url = root_deny_rules(roots, [i for i, _ in aliases])
         outside += f'<DirectoryMatch "{git_dir}">\n\tRequire all denied\n</DirectoryMatch>\n' + \
             deny_dir_text(source_dir, project_dir)
         grant = "".join(f'\tAlias "/custom-mods/{validate_mod_id(i)}" "{WEB_ROOT}/{validate_server_folder(f)}"\n'
                         for i, f in aliases)
+        for alias, target in named_aliases:
+            grant += f'\tAlias "/{alias}" "{target}"\n'
         names = "|".join(re.escape(name) for name in roots)
         grant += f'\t<LocationMatch "^/({names})(/|$)">\n\t\tRequire all granted\n\t</LocationMatch>\n'
         inside += "".join(f'\t<LocationMatch "{pattern}">\n\t\tRequire all denied\n\t</LocationMatch>\n'
@@ -1437,7 +1464,11 @@ def setup_web():
         if not previous.startswith(WEB_MARKER):
             raise ModError(f"{site} was not written by this manager. Nothing was changed.")
     was_enabled = os.path.lexists(link)
-    text = web_site_text(port, read_protected_projects(), *web_locations())
+    try:
+        named_aliases = soulkiller_aliases(read_entry(SOULKILLER_ID, include_unregistered=True))
+    except ModError:
+        named_aliases = []
+    text = web_site_text(port, read_protected_projects(), *web_locations(), named_aliases=named_aliases)
     conflict = apache_conflict(port, site)
     retry = f"Choose another CUSTOM_MODS_PORT ({CUSTOM_PORT_MIN}-{CUSTOM_PORT_MAX}) in {SERVICES_CONF}, then run " \
             "ddistro_custom_mod setup-web again. Nothing was changed."
@@ -1546,6 +1577,7 @@ def command_install(args):
     if state == "conflict":
         raise ModError(f"A removed custom mod with id {mod_id} came from a different repository. Its folder "
                        "and database were kept and are not adopted.")
+    soulkiller_aliases(previous if state == "restorable" else manifest, strict=True)
     if state == "restorable":
         # The kept checkout stays on its own branch; a newer commit is only reported for that branch.
         same_branch = previous.get("branch") == branch
@@ -1804,6 +1836,7 @@ def incoming_collisions(folder, new_paths):
 
 def update_checkout(entry, folder, source, local, branch, progress, expect_commit=None, switching=False):
     """Update fast-forwards the installed branch (to expect_commit when pinned); only a switch may diverge."""
+    soulkiller_aliases(entry, strict=True)
     if switching and not expect_commit:
         raise ModError("A branch switch needs the reviewed commit. Nothing was changed.")
     # Custom mods never discard edits: there is no force option here.
