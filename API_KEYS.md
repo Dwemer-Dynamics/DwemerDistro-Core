@@ -27,6 +27,32 @@ The older native and advanced connection/import operations remain available for 
 
 `etc/shared-key-runtime.json` pins the ChimServer runtime bundle by source commit and SHA-256; `update.sh` installs it with `install_shared_keys --install-runtime` (runtime only). Afterwards run full setup once, from the launcher API Keys tab or `sudo /usr/local/bin/install_shared_keys`, to apply the schema and runtime permissions. There is no conversion step: the shared migration changes the schema only, existing encrypted keys stay encrypted and readable, and only newly saved or replaced keys are stored as plain text. Keep the existing encryption key while encrypted keys or older backups exist.
 
+## SOULKILLER saved connectors
+
+After upgrading the server through migration 049, run `sudo ddistro_keys prepare-soulkiller`.
+Check the returned warnings. This root-only operation reads the installed server's database and
+folder from Core's custom-mod registry, preserves all other consumer entries, and grants `CONNECT`,
+schema `USAGE`, and column `SELECT` on
+`id`, `kind`, `driver`, `enabled` and `shared_key_id` on `public.ex_saved_connectors` to the shared
+metadata role. It creates no server schema and copies no credentials. `prepare-legacy` also
+includes this preparation; an absent or incomplete optional server produces a warning rather
+than stopping legacy setup. An untrusted registry or changed registered database is refused.
+
+The shared bridge advertises `stt` and `saved_connector_binding`. STT accepts keys explicitly
+registered as `openai`, `deepgram`, `inworld` or `custom_openai`. These providers share the same
+credential across supported APIs. The bridge authorizes that capability before asking the pinned
+manager to check the stored provider kind, exact origin and current status. Other providers are
+refused, with no label inference or retry under another kind. Existing LLM/TTS behavior and
+sealed legacy keys are preserved; no key conversion is needed. PostgreSQL 17 also requires a
+compatible pinned shared-key runtime; the older PostgreSQL 15-only bundle refuses it.
+
+Saved-reference writes hold the manager's shared key-row lock until the server write commits.
+They require an idle caller connection and the registered public table; a shadowing search path
+is refused. Guard readability is checked before writing. Deletion counts disabled references too,
+preserves connector UUIDs, and refuses when any registered consumer is unreadable. Detach a
+reference before deleting its key. A vanished installation never implicitly removes its registry
+entry: recover that database or inspect and repair its references before changing registration.
+
 ## Quick checks
 
 The small Test button checks the saved global key with one read-only GET. It is disabled for unsaved replacement input; save first. The server compares the saved revision before checking. Check results are temporary UI state and never change key records or assignments.

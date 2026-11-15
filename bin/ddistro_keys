@@ -27,10 +27,30 @@ LEGACY_SQL = Path('/usr/local/lib/dwemerdistro/legacy_keys.sql')
 LOCK = Path('/run/lock/ddistro-shared-keys.lock')
 TABLES = ('core_api_badge', 'core_llm_connector', 'core_tts_connector')
 PRODUCTS = {'herika': 'CHIM legacy', 'stobe': 'STOBE', 'dialectic': 'Dialectic'}
+CUSTOM_MOD = '/usr/local/bin/ddistro_custom_mod'
+SOULKILLER = 'edgerunner-ai-framework'
+# SOULKILLER migration 049 owns this table; preparation only checks it and grants these reference columns.
+SAVED_CONNECTOR_SQL = """DO $check$ BEGIN
+    IF to_regclass('public.ex_schema_migrations') IS NULL OR to_regclass('public.ex_saved_connectors') IS NULL
+        OR NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = to_regclass('public.ex_saved_connectors') AND relkind = 'r')
+        OR (SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'ex_saved_connectors'
+            AND (column_name, data_type) IN (('id','uuid'),('kind','text'),('driver','text'),('enabled','boolean'),('shared_key_id','uuid'))) <> 5
+        OR NOT EXISTS (SELECT 1 FROM public.ex_schema_migrations WHERE version = '049_saved_connectors') THEN
+        RAISE EXCEPTION 'Unsupported SOULKILLER saved connector schema';
+    END IF;
+END $check$;
+GRANT CONNECT ON DATABASE __DATABASE__ TO __ROLE__;
+GRANT USAGE ON SCHEMA public TO __ROLE__;
+GRANT SELECT(id, kind, driver, enabled, shared_key_id) ON public.ex_saved_connectors TO __ROLE__;
+"""
 
 
 class Refusal(Exception):
     pass
+
+
+class SoulkillerUnavailable(Refusal):
+    """An absent or incomplete optional installation must not stop legacy preparation."""
 
 
 def trusted_file(path):
@@ -116,7 +136,7 @@ def registered():
     return value['products']
 
 
-def prepare_legacy():
+def prepare_legacy(soulkiller_only=False):
     """Install nullable references and least-privilege CAS functions, then atomically register every participating DB."""
     ready = run('guard-ready', {})
     if not ready['ok']:
@@ -127,10 +147,11 @@ def prepare_legacy():
     role = env.get('CHIM_SHARED_DB_USER', '')
     if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,62}', role):
         raise Refusal('Shared database role is not configured')
-    trusted_file(LEGACY_SQL)
+    if not soulkiller_only:
+        trusted_file(LEGACY_SQL)
     entries = {p['id']: p for p in registered()}
     warnings = []
-    for product in products():
+    for product in ([] if soulkiller_only else products()):
         manifest = product['path'] / 'lib/core/shared_keys.json'
         if not manifest.is_file():
             warnings.append(PRODUCTS[product['id']] + ': update the shared-key adapter; existing keys remain unchanged')
@@ -145,6 +166,7 @@ def prepare_legacy():
         sql(product['database'], 'BEGIN; SET LOCAL lock_timeout=2000; SET LOCAL statement_timeout=10000;\n'
             + LEGACY_SQL.read_text().replace('__ROLE__', '"' + role + '"') + '\nCOMMIT;')
         entries[product['id']] = {'id': product['id'], 'database': product['database'], 'tables': tables}
+    soulkiller_prepared = prepare_soulkiller(role, entries, warnings)
     if not REGISTRY.parent.is_dir():
         REGISTRY.parent.mkdir(mode=0o755)
     for directory in (REGISTRY.parent, *REGISTRY.parent.parents):
@@ -169,7 +191,73 @@ def prepare_legacy():
     finally:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
-    return {'ok': True, 'outcome': 'prepared', 'warnings': warnings}
+    prepared = not soulkiller_only or bool(soulkiller_prepared)
+    return {'ok': prepared, 'outcome': 'prepared' if prepared else 'not_prepared', 'warnings': warnings}
+
+
+def soulkiller_database():
+    """SOULKILLER's database from Core's root-owned custom mod registry, or None when it is not registered."""
+    if not Path(CUSTOM_MOD).exists() and not Path(CUSTOM_MOD).is_symlink():
+        raise SoulkillerUnavailable('SOULKILLER registry helper is not installed')
+    trusted_file(CUSTOM_MOD)
+    spec = importlib.util.spec_from_loader('keys_custom_mod', importlib.machinery.SourceFileLoader('keys_custom_mod', CUSTOM_MOD))
+    mods = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mods)
+    path = Path(mods.registry_path(SOULKILLER))
+    if not path.exists() and not path.is_symlink():
+        return None
+    trusted_file(path)
+    for directory in path.parents:
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise Refusal('SOULKILLER registry is not trusted; existing keys and references are unchanged')
+    try:
+        entry = mods.read_entry(SOULKILLER, include_unregistered=True)
+        if entry.get('state') == mods.UNREGISTERED:
+            return None
+        folder = mods.checked_folder(entry)
+        # The app account owns the folder: read its manifest without following links and within the manifest limit.
+        fd = os.open(os.path.join(folder, mods.MANIFEST_NAME), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise SoulkillerUnavailable('SOULKILLER manifest is not a regular file')
+            manifest = mods.parse_manifest(handle.read(mods.MAX_MANIFEST_BYTES + 1))
+    except (mods.ModError, OSError):
+        raise SoulkillerUnavailable('SOULKILLER installation is not ready; existing keys and references are unchanged') from None
+    database = entry.get('database')
+    if (entry.get('state') != 'ready' or manifest['id'] != SOULKILLER or not isinstance(database, str)
+            or not re.fullmatch(r'custom_[a-z0-9_]{1,55}', database)):
+        raise SoulkillerUnavailable('SOULKILLER installation is not ready; existing keys and references are unchanged')
+    return database
+
+
+def prepare_soulkiller(role, entries, warnings):
+    """Grant the metadata role SOULKILLER's reference columns, then register its database. Never changes its schema."""
+    prior = entries.get('soulkiller')
+    try:
+        database = soulkiller_database()
+    except SoulkillerUnavailable as error:
+        warnings.append(str(error) + '; existing references stay protected' if prior else str(error))
+        return
+    if database is None:
+        if prior:
+            # Keep guarding references that may still exist; never unregister them implicitly.
+            warnings.append('SOULKILLER is not registered; its existing shared-key references stay protected')
+        return
+    if prior and prior['database'] != database:
+        raise Refusal('A registered server database changed; preserve and repair its existing references first')
+    try:
+        sql(database, 'BEGIN; SET LOCAL lock_timeout=2000; SET LOCAL statement_timeout=10000;\n'
+            + SAVED_CONNECTOR_SQL.replace('__DATABASE__', '"' + database + '"').replace('__ROLE__', '"' + role + '"') + '\nCOMMIT;')
+        if not run('guard-ready', {'database': database})['ok']:
+            raise Refusal('SOULKILLER metadata role cannot read saved connectors')
+    except Refusal:
+        # A registered database that can no longer be scanned keeps its entry, so deletion fails closed.
+        warnings.append('SOULKILLER saved connectors are unavailable; existing references stay protected' if prior
+                        else 'SOULKILLER: migration 049 and shared metadata access are required; existing keys remain unchanged')
+        return
+    entries['soulkiller'] = {'id': 'soulkiller', 'database': database, 'tables': ['ex_saved_connectors']}
+    return True
 
 
 def legacy_status():
@@ -398,9 +486,9 @@ def run(verb, payload):
     if verb == 'sync':
         # Older updater hooks remain valid. Shared references resolve at call time; copying is retired.
         return {'ok': True, 'outcome': 'references_only', 'warnings': []}
-    if verb == 'prepare-legacy':
+    if verb in ('prepare-legacy', 'prepare-soulkiller'):
         with migration_lock():
-            return prepare_legacy()
+            return prepare_legacy(soulkiller_only=verb == 'prepare-soulkiller')
     if verb not in OPERATIONS or not isinstance(payload, dict):
         raise Refusal('Unsupported operation; update the launcher')
     trusted_file(BRIDGE)
@@ -440,7 +528,7 @@ def main(argv):
     try:
         if os.geteuid() != 0 or len(argv) != 2:
             raise Refusal('Root-local operation required')
-        raw = sys.stdin.buffer.read(16385) if argv[1] not in ('status', 'native-status', 'global-status', 'sync', 'prepare-legacy') else b'{}'
+        raw = sys.stdin.buffer.read(16385) if argv[1] not in ('status', 'native-status', 'global-status', 'sync', 'prepare-legacy', 'prepare-soulkiller') else b'{}'
         if len(raw) > 16384:
             raise Refusal('Request too large')
         response = run(argv[1], json.loads(raw))

@@ -105,7 +105,7 @@ try {
         'delete' => ['key_id', 'revision'],
         'bind' => ['connection_id', 'revision', 'key_id'],
         'import-environment' => ['connection_id', 'provider'],
-        'guard-ready' => [],
+        'guard-ready' => ['database'],
         'save-connection' => ['connection_id','revision','secret'],
         'reveal-connection' => ['connection_id','revision'],
         'read-key' => ['key_id','reveal'],
@@ -188,7 +188,24 @@ try {
     } elseif ($operation === 'save-connection') {
         $result = saveConnectionKey($keys, $settings, $request);
     } elseif ($operation === 'guard-ready') {
-        $keys->externalUsage();
+        // Preparation repairs metadata grants; scanning before repair would prevent recovery.
+        $bridge = '/usr/local/lib/dwemerdistro/shared_keys.php';
+        $info = @lstat($bridge);
+        if ($info === false || ($info['mode'] & 0170000) !== 0100000 || $info['uid'] !== 0 || ($info['mode'] & 0022) !== 0) {
+            throw new RuntimeException('Shared key bridge is not trusted');
+        }
+        require_once $bridge;
+        if (!method_exists($keys, 'externalUsage') || !method_exists($keys, 'withBindableKey')) {
+            throw new RuntimeException('Shared key guard is not supported');
+        }
+        if (!defined('DistroSharedKeys::CAPABILITIES')
+            || !in_array('saved_connector_binding', DistroSharedKeys::CAPABILITIES, true)) {
+            throw new RuntimeException('Shared key bridge is not supported');
+        }
+        if (isset($request['database'])) {
+            if (!is_string($request['database'])) throw new InvalidArgumentException();
+            DistroSharedKeys::checkSavedConnectorDatabase($request['database']);
+        }
         $result = ['outcome' => 'guard_ready', 'data' => null];
     } elseif ($operation === 'status') {
         $result = $service->listKeys();
