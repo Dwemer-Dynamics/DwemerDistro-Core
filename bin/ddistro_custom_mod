@@ -1331,6 +1331,15 @@ def web_site_text(port, protected=(), roots=(), aliases=(), named_aliases=()):
         grant += f'\t<LocationMatch "^/({names})(/|$)">\n\t\tRequire all granted\n\t</LocationMatch>\n'
         inside += "".join(f'\t<LocationMatch "{pattern}">\n\t\tRequire all denied\n\t</LocationMatch>\n'
                           for pattern in (git_url, url))
+    # SOULKILLER's versioned API is internal source; other mods may serve their api/ publicly.
+    if SOULKILLER_ID in protected or any(name in SOULKILLER_ROOTS for name in roots):
+        source_dirs = "api|drivers|managers|core|workers|bin"
+        folders = "|".join(re.escape(name) for name in SOULKILLER_ROOTS)
+        legacy = re.escape(SOULKILLER_ID)
+        source_dir = rf"^/var/www/html/({folders}|custom-mods/{legacy})/({source_dirs})(/|$)"
+        source_url = rf"^/+({folders}|custom-mods/+{legacy})/+({source_dirs})(/|$)"
+        outside += f'<DirectoryMatch "{source_dir}">\n\tRequire all denied\n</DirectoryMatch>\n'
+        inside += f'\t<LocationMatch "{source_url}">\n\t\tRequire all denied\n\t</LocationMatch>\n'
     return f"""{WEB_MARKER} To change the port, set
 # CUSTOM_MODS_PORT ({CUSTOM_PORT_MIN}-{CUSTOM_PORT_MAX}) in {SERVICES_CONF}, then run:
 #   sudo ddistro_custom_mod setup-web
