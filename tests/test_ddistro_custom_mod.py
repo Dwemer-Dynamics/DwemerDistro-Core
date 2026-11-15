@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -246,6 +247,26 @@ class ManifestTests(unittest.TestCase):
         for bad in (["HerikaServer"], ["a|.*Server"], ["X)|(.*Server"]):
             with self.assertRaises(mod.ModError, msg=bad):
                 mod.web_site_text(19042, [], bad, [])
+
+    def test_soulkiller_internal_sources_do_not_hide_other_mod_apis(self):
+        # Cover direct roots, historical aliases and legacy installs without widening generic rules.
+        for protected, roots in (([], ["EdgerunnerAIFrameworkServer"]),
+                                 ([], ["SoulkillerServer"]), ([mod.SOULKILLER_ID], [])):
+            text = mod.web_site_text(19042, protected, roots)
+            directory = re.findall(r'<DirectoryMatch "([^"]+)">\n\tRequire all denied', text)
+            location = re.findall(r'<LocationMatch "([^"]+)">\n\t\tRequire all denied', text)
+            for root in ("EdgerunnerAIFrameworkServer", "SoulkillerServer", "custom-mods/edgerunner-ai-framework"):
+                for path in ("api/v1/decision.php", "drivers/tts/x.php", "managers/x.php",
+                             "core/x.php", "workers/x.php", "bin/x.php"):
+                    self.assertTrue(any(re.search(rule, "/var/www/html/" + root + "/" + path) for rule in directory))
+                    for url in ("/" + root + "/" + path, "//" + root.replace("/", "//") + "//" + path):
+                        self.assertTrue(any(re.search(rule, url) for rule in location), url)
+                for path in ("decision.php", "recipient_selection.php", "health.php", "ui/index.php", "apiary/x.php"):
+                    self.assertFalse(any(re.search(rule, "/" + root + "/" + path) for rule in location))
+            for root in ("OtherServer", "custom-mods/other-mod", "SoulkillerServerOther"):
+                self.assertFalse(any(re.search(rule, "/" + root + "/api/v1/x.php") for rule in location))
+            self.assertGreater(text.rfind('<LocationMatch "^/+(Edgerunner'), text.rfind("Require all granted"))
+        self.assertNotIn("api|drivers|managers|core|workers|bin", mod.web_site_text(19042, [], ["OtherServer"]))
 
     def test_rejects_bad_ids(self):
         for bad in ("ab", "Example", "-abc", "abc-", "a--b", "a_b", "../x", "herika", "stobe", "custom-mods",
