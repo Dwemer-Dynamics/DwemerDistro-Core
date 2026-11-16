@@ -6,6 +6,11 @@ REQUESTED_CUDA_VERSION="${1:-auto}"
 MODE="${2:-install}"
 STATE_FILE="/var/lib/dwemerdistro/cuda-selection.env"
 CUDA_CONFIG_FILE="/home/dwemer/.cuda_config"
+CUDA_FEED_PREFIX="developer.download.nvidia.com/compute/cuda/repos/"
+# CUDA 13.1 (driver branch R590, Linux driver 590.44.01 or newer) supports Turing and newer GPUs.
+# Only the compute capabilities of x86_64 GPUs it is known to build for are accepted.
+CUDA_13_1_MINIMUM_DRIVER="590.44"
+CUDA_13_1_CAPABILITIES="7.5 8.0 8.6 8.9 9.0 10.0 10.3 12.0"
 
 version_at_least() {
     local actual="$1"
@@ -32,6 +37,144 @@ read_configured_gpu_index() {
     return 0
 }
 
+# Sets CUDA_PACKAGE_SUFFIX, CUDA_HOME, minimum_driver and minimum_capability for a toolkit version.
+toolkit_settings() {
+    case "$1" in
+        12.8)
+            CUDA_PACKAGE_SUFFIX="12-8"
+            CUDA_HOME="/usr/local/cuda-12.8"
+            if capability_at_least "$GPU_COMPUTE_CAPABILITY" "10.0"; then
+                minimum_driver="570.65"
+            else
+                minimum_driver="528.33"
+            fi
+            minimum_capability="5.0"
+            ;;
+        13.0)
+            CUDA_PACKAGE_SUFFIX="13-0"
+            CUDA_HOME="/usr/local/cuda-13.0"
+            minimum_driver="580.00"
+            minimum_capability="7.5"
+            ;;
+        13.1)
+            CUDA_PACKAGE_SUFFIX="13-1"
+            CUDA_HOME="/usr/local/cuda-13.1"
+            minimum_driver="$CUDA_13_1_MINIMUM_DRIVER"
+            minimum_capability="7.5"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+set_toolkit_packages() {
+    CUDA_PACKAGES=(
+        "cuda-nvcc-$CUDA_PACKAGE_SUFFIX"
+        "cuda-cudart-dev-$CUDA_PACKAGE_SUFFIX"
+        "cuda-driver-dev-$CUDA_PACKAGE_SUFFIX"
+        "cuda-cccl-$CUDA_PACKAGE_SUFFIX"
+        "libcublas-dev-$CUDA_PACKAGE_SUFFIX"
+        "libcufft-dev-$CUDA_PACKAGE_SUFFIX"
+    )
+}
+
+# Collects the packages of the current CUDA_PACKAGES set that dpkg does not report as installed.
+find_missing_packages() {
+    local package
+
+    missing_packages=()
+    for package in "${CUDA_PACKAGES[@]}"; do
+        if [ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]; then
+            missing_packages+=("$package")
+        fi
+    done
+}
+
+# True when the complete package set of a toolkit version and its compiler are installed.
+toolkit_installed() {
+    toolkit_settings "$1" || return 1
+    set_toolkit_packages
+    find_missing_packages
+    [ "${#missing_packages[@]}" -eq 0 ] && [ -x "$CUDA_HOME/bin/nvcc" ]
+}
+
+# True when the selected GPU meets the driver and compute capability requirements of a toolkit version.
+gpu_supports_toolkit() {
+    toolkit_settings "$1" || return 1
+    version_at_least "$GPU_DRIVER_VERSION" "$minimum_driver" || return 1
+    capability_at_least "$GPU_COMPUTE_CAPABILITY" "$minimum_capability" || return 1
+    if [ "$1" = "13.1" ] && [[ " $CUDA_13_1_CAPABILITIES " != *" $GPU_COMPUTE_CAPABILITY "* ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Prints the toolkit version of the trusted selection state, or nothing when it is absent or untrusted.
+read_trusted_toolkit_version() {
+    local version
+    local home
+
+    [ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -r "$STATE_FILE" ] || return 0
+    [ "$(stat -c '%U:%G' "$STATE_FILE" 2>/dev/null)" = "root:root" ] || return 0
+    [ -z "$(find "$STATE_FILE" -perm /022 2>/dev/null)" ] || return 0
+    version="$(sed -n 's/^CUDA_TOOLKIT_VERSION=//p' "$STATE_FILE" | head -n 1)"
+    home="$(sed -n 's/^CUDA_HOME=//p' "$STATE_FILE" | head -n 1)"
+    case "$version:$home" in
+        12.8:/usr/local/cuda-12.8|13.0:/usr/local/cuda-13.0|13.1:/usr/local/cuda-13.1)
+            printf '%s\n' "$version"
+            ;;
+    esac
+    return 0
+}
+
+# Prints the CUDA feed URLs named by active APT source entries, without a trailing slash.
+configured_cuda_feeds() {
+    local source_file
+    local format
+
+    for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        [ -r "$source_file" ] || continue
+        case "$source_file" in *.sources) format=deb822 ;; *) format=list ;; esac
+        # One-line entries: only "deb" lines, after an optional [options] block.
+        # deb822 stanzas: only those whose Types include deb and that are not Enabled: no.
+        awk -v format="$format" '
+            function flush() {
+                if (is_deb && enabled && uris != "") print uris
+                is_deb = 0; enabled = 1; uris = ""; field = ""
+            }
+            BEGIN { enabled = 1 }
+            format == "list" {
+                sub(/#.*/, "")
+                if ($1 != "deb") next
+                i = 2
+                if ($i ~ /^\[/) { while (i <= NF && $i !~ /\]$/) i++; i++ }
+                if (i <= NF) print $i
+                next
+            }
+            /^[ \t]*#/ { next }
+            { sub(/#.*/, "") }
+            /^[ \t]*$/ { flush(); next }
+            /^[ \t]/ { value = $0 }
+            /^[^ \t]/ {
+                field = tolower($0); sub(/:.*/, "", field)
+                value = $0; sub(/^[^:]*:/, "", value)
+            }
+            {
+                n = split(value, words)
+                for (j = 1; j <= n; j++) {
+                    if (field == "types" && words[j] == "deb") is_deb = 1
+                    if (field == "enabled" && tolower(words[j]) ~ /^(no|false|off|without|disable)$/) enabled = 0
+                    if (field == "uris") uris = uris (uris == "" ? "" : "\n") words[j]
+                }
+            }
+            END { flush() }
+        ' "$source_file" |
+            grep -E "^https?://${CUDA_FEED_PREFIX//./\\.}" |
+            sed -e 's|/*$||' || true
+    done | sort -u
+}
+
 write_selection_state() {
     local state_dir
     local state_temp
@@ -53,6 +196,78 @@ EOF
     trap - EXIT
 }
 
+# The Debian 13 upgrade (ddistro_trixie_maintenance) pins the migrated NVIDIA feed to its user-space
+# packages. Its earlier pin files (sha256: NVIDIA only; combined vendor pins) did not admit libnvvm and
+# libnvptxcompiler, which CUDA 13 nvcc depends on; only those exact root-owned files are replaced by
+# their current form. Any other pin file is left as it is.
+VENDOR_PINS="/etc/apt/preferences.d/dwemerdistro-vendors"
+declare -A VENDOR_PINS_REFRESH=(
+    [a4420539f413f77f2a108ac2b1a4138ae4adb2e44d2fcb06828be42bf45572db]=9435d21349b38c7172c571a7ebd2f4e95db143422f03cef7b9bef645f4fee046
+    [db396bc1857e4f54fd5005ca7ae773bccc441b0d7921669f95bf25cfc6f09a87]=cbe69414cade17bb78f9187108f6b9a50e611be0260e6fad52528c9026154cf8
+)
+
+refresh_vendor_pins() {
+    local digest
+    local expected
+    local path
+    local pins_temp
+
+    if [ -L "$VENDOR_PINS" ] || { [ -e "$VENDOR_PINS" ] && [ ! -f "$VENDOR_PINS" ]; }; then
+        echo "$VENDOR_PINS is not a regular file; CUDA was not installed."
+        exit 1
+    fi
+    [ -f "$VENDOR_PINS" ] || return 0
+    digest="$(sha256sum "$VENDOR_PINS" | cut -d ' ' -f 1)"
+    expected="${VENDOR_PINS_REFRESH[$digest]:-}"
+    [ -n "$expected" ] || return 0
+    for path in /etc/apt /etc/apt/preferences.d; do
+        if [ -L "$path" ] || [ ! -d "$path" ] || [ "$(stat -c '%u:%g' "$path")" != "0:0" ] ||
+           [ -n "$(find "$path" -maxdepth 0 -perm /022)" ]; then
+            echo "$path is not a root-owned directory; the CUDA vendor pins were not refreshed and CUDA was not installed."
+            exit 1
+        fi
+    done
+    if [ "$(stat -c '%u:%g:%a:%h' "$VENDOR_PINS")" != "0:0:644:1" ]; then
+        echo "$VENDOR_PINS is not owned by root with mode 0644; it was not refreshed and CUDA was not installed."
+        exit 1
+    fi
+    pins_temp="$(mktemp /etc/apt/preferences.d/.dwemerdistro-vendors.XXXXXX)"
+    if ! { sed 's/|cufile)(-dev)/|cufile|nvvm|nvptxcompiler)(-dev)/' "$VENDOR_PINS" > "$pins_temp" &&
+           [ "$(sha256sum "$pins_temp" | cut -d ' ' -f 1)" = "$expected" ] &&
+           chown root:root "$pins_temp" && chmod 0644 "$pins_temp" && sync "$pins_temp" &&
+           mv -fT "$pins_temp" "$VENDOR_PINS" && sync /etc/apt/preferences.d; }; then
+        rm -f "$pins_temp"
+        echo "The CUDA vendor pins could not be refreshed; CUDA was not installed."
+        exit 1
+    fi
+    echo "Refreshed $VENDOR_PINS so the NVIDIA feed may supply the CUDA compiler libraries."
+}
+
+# Refuses before installing anything when APT cannot supply the complete package set.
+refuse_unavailable_packages() {
+    local package
+    local candidate
+    local simulation
+    local unavailable=()
+
+    for package in "${CUDA_PACKAGES[@]}"; do
+        candidate="$(apt-cache policy "$package" 2>/dev/null | sed -n 's/^[[:space:]]*Candidate:[[:space:]]*//p' | head -n 1)"
+        if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
+            unavailable+=("$package")
+        fi
+    done
+    if [ "${#unavailable[@]}" -gt 0 ]; then
+        echo "The configured CUDA feed does not offer these CUDA $CUDA_VERSION packages: ${unavailable[*]}."
+        echo "No CUDA packages were installed."
+        exit 1
+    fi
+    if ! simulation="$(apt-get install -s -y --no-install-recommends "${CUDA_PACKAGES[@]}" 2>&1)"; then
+        echo "APT cannot install the complete CUDA $CUDA_VERSION package set. No CUDA packages were installed."
+        printf '%s\n' "$simulation" | grep -E 'Depends:|^E:' | head -n 20 || true
+        exit 1
+    fi
+}
+
 case "$REQUESTED_CUDA_VERSION" in
     auto)
         ;;
@@ -62,8 +277,11 @@ case "$REQUESTED_CUDA_VERSION" in
     13|13.0|13-0)
         REQUESTED_CUDA_VERSION="13.0"
         ;;
+    13.1|13-1)
+        REQUESTED_CUDA_VERSION="13.1"
+        ;;
     *)
-        echo "Unsupported CUDA version '$REQUESTED_CUDA_VERSION'. Use auto, 12.8, or 13.0."
+        echo "Unsupported CUDA version '$REQUESTED_CUDA_VERSION'. Use auto, 12.8, 13.0, or 13.1."
         exit 1
         ;;
 esac
@@ -72,6 +290,8 @@ if [ "$MODE" != "install" ] && [ "$MODE" != "--detect-only" ]; then
     echo "Unsupported option '$MODE'. Use --detect-only to inspect the automatic selection without installing."
     exit 1
 fi
+
+OS_RELEASE="$(. /etc/os-release 2>/dev/null; printf '%s %s' "${ID:-}" "${VERSION_ID:-}")"
 
 NVIDIA_SMI="$(command -v nvidia-smi 2>/dev/null || true)"
 if [ -z "$NVIDIA_SMI" ] && [ -x /usr/lib/wsl/lib/nvidia-smi ]; then
@@ -127,7 +347,35 @@ if ! [[ "$GPU_DRIVER_VERSION" =~ ^[0-9]+([.][0-9]+)*$ ]] ||
     exit 2
 fi
 
-if [ "$REQUESTED_CUDA_VERSION" = "auto" ]; then
+if [ "$OS_RELEASE" = "debian 13" ]; then
+    # The Debian 13 CUDA feed offers CUDA 13.1 but not 12.8 or 13.0. An installed 12.8 or 13.0
+    # (kept from Debian 12) stays in use while it is the trusted selection, or when requested.
+    if [ "$REQUESTED_CUDA_VERSION" = "auto" ]; then
+        trusted_version="$(read_trusted_toolkit_version)"
+        if [ -n "$trusted_version" ] && [ "$trusted_version" != "13.1" ] &&
+           toolkit_installed "$trusted_version" && gpu_supports_toolkit "$trusted_version"; then
+            CUDA_VERSION="$trusted_version"
+            echo "Keeping the installed CUDA $CUDA_VERSION selected for this system."
+        elif gpu_supports_toolkit "13.1"; then
+            CUDA_VERSION="13.1"
+        else
+            echo "No compatible DwemerDistro CUDA configuration is available on Debian 13 for $GPU_NAME (driver $GPU_DRIVER_VERSION, compute capability $GPU_COMPUTE_CAPABILITY)."
+            echo "CUDA 13.1 requires NVIDIA driver $CUDA_13_1_MINIMUM_DRIVER or newer and one of these compute capabilities: $CUDA_13_1_CAPABILITIES."
+            echo "Use the AMD / CPU setup path instead, or update the Windows NVIDIA driver if it is older."
+            exit 2
+        fi
+    elif [ "$REQUESTED_CUDA_VERSION" = "13.1" ]; then
+        CUDA_VERSION="13.1"
+    elif toolkit_installed "$REQUESTED_CUDA_VERSION"; then
+        CUDA_VERSION="$REQUESTED_CUDA_VERSION"
+    else
+        echo "CUDA $REQUESTED_CUDA_VERSION is not available from the Debian 13 CUDA feed. Use auto or 13.1 instead."
+        exit 2
+    fi
+elif [ "$REQUESTED_CUDA_VERSION" = "13.1" ]; then
+    echo "CUDA 13.1 is used on Debian 13 only. Use auto, 12.8, or 13.0 on this system."
+    exit 1
+elif [ "$REQUESTED_CUDA_VERSION" = "auto" ]; then
     if capability_at_least "$GPU_COMPUTE_CAPABILITY" "10.0"; then
         if version_at_least "$GPU_DRIVER_VERSION" "580.00"; then
             CUDA_VERSION="13.0"
@@ -149,31 +397,16 @@ else
     CUDA_VERSION="$REQUESTED_CUDA_VERSION"
 fi
 
-case "$CUDA_VERSION" in
-    12.8)
-        CUDA_PACKAGE_SUFFIX="12-8"
-        CUDA_HOME="/usr/local/cuda-12.8"
-        if capability_at_least "$GPU_COMPUTE_CAPABILITY" "10.0"; then
-            minimum_driver="570.65"
-        else
-            minimum_driver="528.33"
-        fi
-        minimum_capability="5.0"
-        ;;
-    13.0)
-        CUDA_PACKAGE_SUFFIX="13-0"
-        CUDA_HOME="/usr/local/cuda-13.0"
-        minimum_driver="580.00"
-        minimum_capability="7.5"
-        ;;
-esac
-
-if ! version_at_least "$GPU_DRIVER_VERSION" "$minimum_driver" ||
-   ! capability_at_least "$GPU_COMPUTE_CAPABILITY" "$minimum_capability"; then
+if ! gpu_supports_toolkit "$CUDA_VERSION"; then
     echo "CUDA $CUDA_VERSION is not compatible with $GPU_NAME (driver $GPU_DRIVER_VERSION, compute capability $GPU_COMPUTE_CAPABILITY)."
     echo "CUDA $CUDA_VERSION requires driver $minimum_driver or newer and compute capability $minimum_capability or newer."
+    if [ "$CUDA_VERSION" = "13.1" ]; then
+        echo "Supported compute capabilities for CUDA 13.1: $CUDA_13_1_CAPABILITIES."
+    fi
     exit 2
 fi
+toolkit_settings "$CUDA_VERSION"
+set_toolkit_packages
 
 if capability_at_least "$GPU_COMPUTE_CAPABILITY" "7.5"; then
     CUDA_PYTORCH_SUPPORTED=1
@@ -195,21 +428,7 @@ if [ "$MODE" = "--detect-only" ]; then
     exit 0
 fi
 
-CUDA_PACKAGES=(
-    "cuda-nvcc-$CUDA_PACKAGE_SUFFIX"
-    "cuda-cudart-dev-$CUDA_PACKAGE_SUFFIX"
-    "cuda-driver-dev-$CUDA_PACKAGE_SUFFIX"
-    "cuda-cccl-$CUDA_PACKAGE_SUFFIX"
-    "libcublas-dev-$CUDA_PACKAGE_SUFFIX"
-    "libcufft-dev-$CUDA_PACKAGE_SUFFIX"
-)
-
-missing_packages=()
-for package in "${CUDA_PACKAGES[@]}"; do
-    if [ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]; then
-        missing_packages+=("$package")
-    fi
-done
+find_missing_packages
 
 if [ "${#missing_packages[@]}" -eq 0 ] && [ -x "$CUDA_HOME/bin/nvcc" ]; then
     write_selection_state
@@ -218,26 +437,29 @@ if [ "${#missing_packages[@]}" -eq 0 ] && [ -x "$CUDA_HOME/bin/nvcc" ]; then
     exit 0
 fi
 
-. /etc/os-release
-case "${ID:-} ${VERSION_ID:-}" in
+case "$OS_RELEASE" in
     "debian 12") cuda_feed="https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64" ;;
     "debian 13") cuda_feed="https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64" ;;
     *) echo "CUDA setup supports Debian 12 and 13."; exit 1 ;;
 esac
-apt_source_files=(/etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources)
-# A CUDA feed of another Debian release (an upgrade that did not migrate it) must not be used.
-if grep -qsF "developer.download.nvidia.com/compute/cuda/repos/" "${apt_source_files[@]}" &&
-   ! grep -qsF "$cuda_feed" "${apt_source_files[@]}"; then
-    echo "The configured NVIDIA CUDA feed is not the one for Debian $VERSION_ID ($cuda_feed); CUDA was not installed."
+# Only this release's CUDA feed may be configured: a feed of another Debian release (an upgrade
+# that did not migrate it), alone or next to this one, must not be used.
+configured_feeds="$(configured_cuda_feeds)"
+if [ -n "$configured_feeds" ] && [ "$configured_feeds" != "$cuda_feed" ]; then
+    echo "An NVIDIA CUDA feed other than the one for Debian ${OS_RELEASE#debian } ($cuda_feed) is configured; CUDA was not installed."
+    printf 'Configured CUDA feeds:\n%s\n' "$configured_feeds"
     exit 1
 fi
 # The Debian 13 upgrade migrates the feed with its own key; cuda-keyring is installed only for a
 # release that has no CUDA feed yet.
-if ! grep -qsF "$cuda_feed" "${apt_source_files[@]}" && ! dpkg-query -W cuda-keyring >/dev/null 2>&1; then
+if [ -z "$configured_feeds" ] && ! dpkg-query -W cuda-keyring >/dev/null 2>&1; then
     keyring_path="$(mktemp /tmp/cuda-keyring.XXXXXX.deb)"
     trap 'rm -f "$keyring_path"' EXIT
     wget -qO "$keyring_path" "$cuda_feed/cuda-keyring_1.1-1_all.deb"
     dpkg -i "$keyring_path"
+fi
+if [ "$OS_RELEASE" = "debian 13" ]; then
+    refresh_vendor_pins
 fi
 
 export DEBIAN_FRONTEND=noninteractive
@@ -250,6 +472,7 @@ echo "Installing minimal CUDA $CUDA_VERSION build and runtime dependencies..."
 dpkg --configure -a
 /usr/local/bin/repair_github_cli_keyring
 apt-get update
+refuse_unavailable_packages
 apt-get install -y --no-install-recommends "${CUDA_PACKAGES[@]}"
 apt-get clean
 find /var/lib/apt/lists/ -type f -delete

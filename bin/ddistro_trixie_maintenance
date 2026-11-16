@@ -172,8 +172,8 @@ VENDORS = {
         "origin": "developer.download.nvidia.com",
         "packages": r"^((cuda-(cudart|cudart-dev|driver-dev|cccl|nvcc|crt|nvvm|culibos-dev|nvrtc|nvrtc-dev|cupti|cupti-dev"
                     r"|nvtx|nvml-dev|profiler-api|sanitizer|cuobjdump|nvdisasm|nvprune|cuxxfilt|libraries|libraries-dev"
-                    r"|minimal-build)|lib(cublas|cufft|curand|cusolver|cusparse|nvjitlink|npp|nvjpeg|nvfatbin|cufile)(-dev)?)"
-                    r"-[0-9]+-[0-9]+|cuda-toolkit(-[0-9]+){0,2}-config-common)$",
+                    r"|minimal-build)|lib(cublas|cufft|curand|cusolver|cusparse|nvjitlink|npp|nvjpeg|nvfatbin|cufile"
+                    r"|nvvm|nvptxcompiler)(-dev)?)-[0-9]+-[0-9]+|cuda-toolkit(-[0-9]+){0,2}-config-common)$",
     },
     "microsoft": {
         "source": ("https://packages.microsoft.com/debian/12/prod", SOURCE, ("main",), "/usr/share/keyrings/microsoft-prod.gpg"),
@@ -186,6 +186,10 @@ VENDORS = {
                     r"|dotnet-host(-[0-9]+\.[0-9]+)?)$",
     },
 }
+# The CUDA pattern of earlier vendor pin files, before libnvvm and libnvptxcompiler (CUDA 13 nvcc
+# depends on both) were admitted. Such a file stays valid; install_cuda_dependencies refreshes it.
+PREVIOUS_VENDORS = {**VENDORS, "nvidia-cuda": {**VENDORS["nvidia-cuda"], "packages": VENDORS["nvidia-cuda"]["packages"]
+                                               .replace("|cufile|nvvm|nvptxcompiler)", "|cufile)")}}
 VENDOR_KEYRINGS = Path("/etc/apt/keyrings")
 # Read before preferences.d/stable, so its general pins win over the 900 Trixie release pin.
 VENDOR_PINS_NAME = "dwemerdistro-vendors"
@@ -722,9 +726,9 @@ def vendor_pins(vendors, specs=VENDORS):
                    f"Package: *\nPin: origin {specs[v]['origin']}\nPin-Priority: -1\n\n" for v in sorted(vendors))
 
 
-def vendor_pin_file(vendors):
+def vendor_pin_file(vendors, specs=VENDORS):
     return ("# Written by ddistro_trixie_maintenance: the migrated vendor feeds supply only versioned\n"
-            "# user-space components, never a GPU driver, compat library or kernel module.\n" + vendor_pins(vendors))
+            "# user-space components, never a GPU driver, compat library or kernel module.\n" + vendor_pins(vendors, specs))
 
 
 def trixie_preference_problems(vendors=()):
@@ -732,11 +736,12 @@ def trixie_preference_problems(vendors=()):
     when vendor feeds were migrated."""
     entries = preference_entries()
     stock = APT_PREFERENCES[1] / STOCK_PREFERENCES
-    expected = {stock: TRIXIE_PREFERENCES}
+    expected = {stock: {TRIXIE_PREFERENCES}}
     if vendors:
-        expected[APT_PREFERENCES[1] / VENDOR_PINS_NAME] = vendor_pin_file(vendors)
+        expected[APT_PREFERENCES[1] / VENDOR_PINS_NAME] = {vendor_pin_file(vendors),
+                                                           vendor_pin_file(vendors, PREVIOUS_VENDORS)}
     if all(path in expected and not path.is_symlink() and path.is_file()
-           and path.read_text(errors="replace") == expected[path] for path in entries) \
+           and path.read_text(errors="replace") in expected[path] for path in entries) \
             and (not vendors or APT_PREFERENCES[1] / VENDOR_PINS_NAME in entries):
         return []
     return [reason("apt-preferences", f"{', '.join(map(str, entries)) or 'Nothing'} pins other than the Debian 13 "
