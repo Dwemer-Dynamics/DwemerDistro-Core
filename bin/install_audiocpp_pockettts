@@ -24,7 +24,9 @@ read_selection_value() {
 }
 
 load_cuda_selection() {
-    if [ ! -r "$CUDA_SELECTION_FILE" ] || [ "$(stat -c '%U:%G' "$CUDA_SELECTION_FILE")" != "root:root" ]; then
+    if [ ! -f "$CUDA_SELECTION_FILE" ] || [ -L "$CUDA_SELECTION_FILE" ] || [ ! -r "$CUDA_SELECTION_FILE" ] ||
+       [ "$(stat -c '%U:%G' "$CUDA_SELECTION_FILE")" != "root:root" ] ||
+       [ -n "$(find "$CUDA_SELECTION_FILE" -perm /022)" ]; then
         echo "Trusted CUDA selection state is missing. Run $CUDA_INSTALLER and retry."
         exit 1
     fi
@@ -34,7 +36,7 @@ load_cuda_selection() {
     CUDA_COMPUTE_CAPABILITY="$(read_selection_value CUDA_COMPUTE_CAPABILITY)"
 
     case "$CUDA_VERSION:$CUDA_HOME" in
-        12.8:/usr/local/cuda-12.8|13.0:/usr/local/cuda-13.0)
+        12.8:/usr/local/cuda-12.8|13.0:/usr/local/cuda-13.0|13.1:/usr/local/cuda-13.1)
             ;;
         *)
             echo "Trusted CUDA selection state contains an unsupported toolkit path."
@@ -81,6 +83,8 @@ write_runtime_files() {
 JSON
     sed -i "s|__MODEL_PATH__|$model_path|" "$REPO_DIR/server.json"
 
+    local cuda_home_list="/usr/local/cuda-12.8|/usr/local/cuda-13.0|/usr/local/cuda-13.1"
+
     cat > "$REPO_DIR/start-audiocpp-pockettts.sh" <<'BASH'
 #!/bin/bash
 set -euo pipefail
@@ -91,16 +95,36 @@ if [ -f "/home/dwemer/.cuda_config" ]; then
     source /home/dwemer/.cuda_config
 fi
 
+# The runtime links against the CUDA toolkit it was built with; that toolkit is used first,
+# then the trusted CUDA selection, then the toolkits found on older installs.
+BUILD_CUDA_HOME="__BUILD_CUDA_HOME__"
 CUDA_SELECTION_FILE="/var/lib/dwemerdistro/cuda-selection.env"
 selected_cuda_home=""
-if [ -r "$CUDA_SELECTION_FILE" ] && [ "$(stat -c '%U:%G' "$CUDA_SELECTION_FILE")" = "root:root" ]; then
-    selected_cuda_home="$(sed -n 's|^CUDA_HOME=\(/usr/local/cuda-\(12\.8\|13\.0\)\)$|\1|p' "$CUDA_SELECTION_FILE" | head -n 1)"
+case "$BUILD_CUDA_HOME" in
+    __CUDA_HOME_LIST__)
+        selected_cuda_home="$BUILD_CUDA_HOME"
+        ;;
+esac
+if { [ -z "$selected_cuda_home" ] || [ ! -d "$selected_cuda_home" ]; } &&
+   [ -f "$CUDA_SELECTION_FILE" ] && [ ! -L "$CUDA_SELECTION_FILE" ] && [ -r "$CUDA_SELECTION_FILE" ] &&
+   [ "$(stat -c '%U:%G' "$CUDA_SELECTION_FILE")" = "root:root" ] &&
+   [ -z "$(find "$CUDA_SELECTION_FILE" -perm /022)" ]; then
+    selected_cuda_home="$(sed -n 's/^CUDA_HOME=//p' "$CUDA_SELECTION_FILE" | head -n 1)"
+    case "$selected_cuda_home" in
+        __CUDA_HOME_LIST__)
+            ;;
+        *)
+            selected_cuda_home=""
+            ;;
+    esac
 fi
 
 if [ -n "$selected_cuda_home" ] && [ -d "$selected_cuda_home" ]; then
     export CUDA_HOME="$selected_cuda_home"
 elif [ -d "/usr/local/cuda" ]; then
     export CUDA_HOME="/usr/local/cuda"
+elif [ -d "/usr/local/cuda-13.1" ]; then
+    export CUDA_HOME="/usr/local/cuda-13.1"
 elif [ -d "/usr/local/cuda-13.0" ]; then
     export CUDA_HOME="/usr/local/cuda-13.0"
 elif [ -d "/usr/local/cuda-12.8" ]; then
@@ -163,6 +187,9 @@ while true; do
     esac
 done
 BASH
+
+    sed -i -e "s#__BUILD_CUDA_HOME__#$CUDA_HOME#" -e "s#__CUDA_HOME_LIST__#$cuda_home_list#g" \
+        "$REPO_DIR/start-audiocpp-pockettts.sh"
 
     chmod +x "$REPO_DIR/start-audiocpp-pockettts.sh" "$REPO_DIR/conf.sh"
     chown -R dwemer:dwemer "$REPO_DIR"
