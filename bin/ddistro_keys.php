@@ -204,7 +204,11 @@ try {
         }
         if (isset($request['database'])) {
             if (!is_string($request['database'])) throw new InvalidArgumentException();
-            DistroSharedKeys::checkSavedConnectorDatabase($request['database']);
+            if ($request['database'] === 'synth') {
+                DistroSharedKeys::checkSynthDatabase();
+            } else {
+                DistroSharedKeys::checkSavedConnectorDatabase($request['database']);
+            }
         }
         $result = ['outcome' => 'guard_ready', 'data' => null];
     } elseif ($operation === 'status') {

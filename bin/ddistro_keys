@@ -29,6 +29,20 @@ TABLES = ('core_api_badge', 'core_llm_connector', 'core_tts_connector')
 PRODUCTS = {'herika': 'CHIM legacy', 'stobe': 'STOBE', 'dialectic': 'Dialectic'}
 CUSTOM_MOD = '/usr/local/bin/ddistro_custom_mod'
 SOULKILLER = 'edgerunner-ai-framework'
+# SYNTH (Fallout 4) is a native consumer: its migration Version20261116100000 owns this view, preparation only checks and grants it.
+SYNTH_DATABASE = 'synth'
+SYNTH_REFERENCES = 'synth_key_references'
+SYNTH_REFERENCE_SQL = """DO $check$ BEGIN
+    IF to_regclass('public.synth_key_references') IS NULL
+        OR (SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'synth_key_references'
+            AND (column_name, data_type) IN (('id','integer'),('kind','text'),('label','text'),('shared_key_id','uuid'))) <> 4 THEN
+        RAISE EXCEPTION 'Unsupported SYNTH key reference view';
+    END IF;
+END $check$;
+GRANT CONNECT ON DATABASE __DATABASE__ TO __ROLE__;
+GRANT USAGE ON SCHEMA public TO __ROLE__;
+GRANT SELECT ON public.synth_key_references TO __ROLE__;
+"""
 # SOULKILLER migration 049 owns this table; preparation only checks it and grants these reference columns.
 SAVED_CONNECTOR_SQL = """DO $check$ BEGIN
     IF to_regclass('public.ex_schema_migrations') IS NULL OR to_regclass('public.ex_saved_connectors') IS NULL
@@ -167,6 +181,7 @@ def prepare_legacy(soulkiller_only=False):
             + LEGACY_SQL.read_text().replace('__ROLE__', '"' + role + '"') + '\nCOMMIT;')
         entries[product['id']] = {'id': product['id'], 'database': product['database'], 'tables': tables}
     soulkiller_prepared = prepare_soulkiller(role, entries, warnings)
+    prepare_synth(role, entries, warnings)
     if not REGISTRY.parent.is_dir():
         REGISTRY.parent.mkdir(mode=0o755)
     for directory in (REGISTRY.parent, *REGISTRY.parent.parents):
@@ -258,6 +273,27 @@ def prepare_soulkiller(role, entries, warnings):
         return
     entries['soulkiller'] = {'id': 'soulkiller', 'database': database, 'tables': ['ex_saved_connectors']}
     return True
+
+
+def prepare_synth(role, entries, warnings):
+    """Grant the metadata role SYNTH's reference view, then register its database. Never changes its schema; absence is not an error."""
+    prior = entries.get('synth')
+    try:
+        # Check existence from a maintenance database: connecting to a missing database would fail like any other error.
+        if sql('template1', "SELECT 1 FROM pg_database WHERE datname = '" + SYNTH_DATABASE + "';") != '1':
+            if prior:
+                warnings.append('SYNTH is not installed; its existing shared-key references stay protected')
+            return
+        sql(SYNTH_DATABASE, 'BEGIN; SET LOCAL lock_timeout=2000; SET LOCAL statement_timeout=10000;\n'
+            + SYNTH_REFERENCE_SQL.replace('__DATABASE__', '"' + SYNTH_DATABASE + '"').replace('__ROLE__', '"' + role + '"') + '\nCOMMIT;')
+        if not run('guard-ready', {'database': SYNTH_DATABASE})['ok']:
+            raise Refusal('SYNTH metadata role cannot read key references')
+    except (Refusal, subprocess.TimeoutExpired):
+        # A registered database that can no longer be scanned keeps its entry, so deletion fails closed.
+        warnings.append('SYNTH key references are unavailable; existing references stay protected' if prior
+                        else 'SYNTH: update SYNTH and run its database migrations for shared-key support; existing keys remain unchanged')
+        return
+    entries['synth'] = {'id': 'synth', 'database': SYNTH_DATABASE, 'tables': [SYNTH_REFERENCES]}
 
 
 def legacy_status():
