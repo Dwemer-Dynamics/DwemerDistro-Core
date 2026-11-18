@@ -20,6 +20,9 @@ final class DistroSharedKeys {
     public const STT_PROVIDERS = ['openai', 'deepgram', 'inworld', 'custom_openai'];
     private const LEGACY = ['herika' => 'CHIM legacy', 'stobe' => 'STOBE', 'dialectic' => 'Dialectic'];
     private const SAVED_CONNECTORS = 'ex_saved_connectors';
+    /** SYNTH publishes the shared keys its connectors use through this view of its own database (migration Version20261116100000). */
+    private const SYNTH_REFERENCES = 'synth_key_references';
+    private const SYNTH_DATABASE = 'synth';
 
     /** Preparation checks actual metadata-role access before adding a database to the deletion registry. */
     public static function checkSavedConnectorDatabase(string $database): void {
@@ -31,6 +34,18 @@ final class DistroSharedKeys {
         try {
             self::boundedRows($connection, 'SELECT id, kind, driver, enabled, shared_key_id FROM public.'
                 . self::SAVED_CONNECTORS . ' WHERE shared_key_id IS NOT NULL LIMIT 129', null);
+        } finally {
+            pg_close($connection);
+        }
+    }
+
+    /** SYNTH readiness: the metadata role must read its reference view in the one fixed database; never touches other tables. */
+    public static function checkSynthDatabase(): void {
+        self::loadConfiguration();
+        $connection = self::connect(self::SYNTH_DATABASE);
+        try {
+            self::boundedRows($connection, 'SELECT id, kind, label, shared_key_id FROM public.' . self::SYNTH_REFERENCES
+                . ' WHERE shared_key_id IS NOT NULL LIMIT 129', null);
         } finally {
             pg_close($connection);
         }
@@ -55,6 +70,18 @@ final class DistroSharedKeys {
                         $usage[] = ['key_id' => $row['shared_key_id'], 'connection_id' => $row['id'],
                             'label' => 'SOULKILLER: ' . $row['driver'] . ' (' . $row['kind'] . ($enabled ? '' : ', disabled') . ')',
                             'status' => $enabled ? 'active' : 'disabled', 'product' => 'soulkiller', 'table' => self::SAVED_CONNECTORS];
+                    }
+                    continue;
+                }
+                if ($product['id'] === 'synth') {
+                    // One row per connector that references a shared key: model (LLM), voice (TTS), stt and itt.
+                    $query = 'SELECT id, kind, label, shared_key_id::text FROM public.' . self::SYNTH_REFERENCES
+                        . ' WHERE shared_key_id IS NOT NULL'
+                        . ($keyId === null ? '' : ' AND shared_key_id = $1::uuid') . ' ORDER BY kind, id LIMIT 129';
+                    foreach (self::boundedRows($connection, $query, $keyId) as $row) {
+                        $usage[] = ['key_id' => $row['shared_key_id'], 'connection_id' => (int)$row['id'],
+                            'label' => 'SYNTH: ' . $row['label'] . ' (' . $row['kind'] . ')', 'status' => 'active',
+                            'product' => 'synth', 'table' => self::SYNTH_REFERENCES];
                     }
                     continue;
                 }
@@ -189,16 +216,23 @@ final class DistroSharedKeys {
         }
         $products = [];
         foreach ($registry['products'] as $product) {
-            if (!is_array($product) || !in_array($product['id'] ?? null, [...array_keys(self::LEGACY), 'soulkiller'], true)
+            if (!is_array($product) || !in_array($product['id'] ?? null, [...array_keys(self::LEGACY), 'soulkiller', 'synth'], true)
                 || !is_string($product['database'] ?? null)
                 || preg_match('/^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/D', $product['database']) !== 1
                 || isset($products[$product['id']])) {
                 throw new RuntimeException('Shared key usage is unavailable');
             }
             $tables = $product['tables'] ?? ['core_api_badge'];
-            $allowed = $product['id'] === 'soulkiller' ? [self::SAVED_CONNECTORS] : ['core_api_badge', 'core_llm_connector', 'core_tts_connector'];
+            $allowed = match ($product['id']) {
+                'soulkiller' => [self::SAVED_CONNECTORS],
+                'synth' => [self::SYNTH_REFERENCES],
+                default => ['core_api_badge', 'core_llm_connector', 'core_tts_connector'],
+            };
             if (!is_array($tables) || count($tables) > 3 || count(array_unique($tables)) !== count($tables)
-                || array_diff($tables, $allowed) !== [] || ($product['id'] === 'soulkiller' && $tables !== $allowed)) {
+                || array_diff($tables, $allowed) !== [] || (in_array($product['id'], ['soulkiller', 'synth'], true) && $tables !== $allowed)) {
+                throw new RuntimeException('Shared key usage is unavailable');
+            }
+            if ($product['id'] === 'synth' && $product['database'] !== self::SYNTH_DATABASE) {
                 throw new RuntimeException('Shared key usage is unavailable');
             }
             $products[$product['id']] = ['id' => $product['id'], 'database' => $product['database'], 'tables' => $tables];

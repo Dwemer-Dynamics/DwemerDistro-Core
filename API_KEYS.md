@@ -38,6 +38,17 @@ metadata role. It creates no server schema and copies no credentials. `prepare-l
 includes this preparation; an absent or incomplete optional server produces a warning rather
 than stopping legacy setup. An untrusted registry or changed registered database is refused.
 
+## SYNTH (Fallout 4) references
+
+SYNTH is a native consumer. Its migration creates the view `public.synth_key_references`
+(`id`, `kind`, `label`, `shared_key_id`) in the `synth` database. `prepare-legacy` checks that view,
+grants the shared metadata role `CONNECT`, schema `USAGE` and `SELECT` on it, and registers `synth` in
+the consumer registry. It changes no SYNTH schema and copies no credentials. A missing database or view
+produces a warning only; an existing registration stays in place, so key deletion fails closed rather
+than stranding SYNTH connectors. The registry accepts `synth` only for the `synth` database and the
+`synth_key_references` table. SYNTH's own PHP reads `CHIM_SHARED_DB_*` itself; the Distro does not
+host SYNTH, so it exports nothing for it.
+
 The shared bridge advertises `stt` and `saved_connector_binding`. STT accepts keys explicitly
 registered as `openai`, `deepgram`, `inworld` or `custom_openai`. These providers share the same
 credential across supported APIs. The bridge authorizes that capability before asking the pinned
