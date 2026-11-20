@@ -245,7 +245,7 @@ WHISPER_HOME = "/home/dwemer/remote-faster-whisper"
 WHISPER_MODEL_ROOTS = (WHISPER_HOME + "/models", "/home/dwemer/.cache/huggingface/hub")
 EXECSTACK_PROBE_TIMEOUT = 900
 EXECSTACK_PROBE = r"""
-import os, sys
+import json, os, sys
 site, name, models = sys.argv[1], sys.argv[2], sys.argv[3:]
 if site:
     sys.path.insert(0, site)
@@ -266,9 +266,25 @@ if numpy.array(view).tolist() != [[0, 1, 2], [3, 4, 5]]:
     sys.exit("StorageView round trip failed")
 if models:
     model = module.models.Whisper(models[0], device="cpu", compute_type="int8" if "int8" in types else "default")
-    features = numpy.zeros((1, getattr(model, "n_mels", 80), 3000), dtype=numpy.float32)
-    if not model.detect_language(module.StorageView.from_array(features))[0]:
-        sys.exit("Whisper detected no language")
+    features = module.StorageView.from_array(numpy.zeros((1, getattr(model, "n_mels", 80), 3000),
+                                                         dtype=numpy.float32))
+    if model.is_multilingual:
+        if not model.detect_language(features)[0]:
+            sys.exit("Whisper detected no language")
+    else:
+        # An English-only model (such as numbat-base-skyrim-en) cannot detect a language, so it decodes
+        # a few steps from <|startoftranscript|><|notimestamps|>, read from the model's own vocabulary.
+        tokens = []
+        for vocabulary in ("vocabulary.json", "vocabulary.txt"):
+            path = os.path.join(models[0], vocabulary)
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8") as stream:
+                    tokens = json.load(stream) if path.endswith(".json") else stream.read().split("\n")
+                break
+        prompt = [tokens.index(t) if t in tokens else default
+                  for t, default in (("<|startoftranscript|>", 50257), ("<|notimestamps|>", 50362))]
+        if len(model.generate(features, [prompt], max_length=8)) != 1:
+            sys.exit("Whisper decoded no result")
     print("speech")
 else:
     print("import")
