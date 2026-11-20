@@ -1419,6 +1419,56 @@ class ExecutableStack(unittest.TestCase):
             with patch.object(m, "execstack_probe", return_value=result):
                 self.assertEqual([p["code"] for p in m.execstack_problems([fix])], ["venv-execstack"], result)
 
+    def test_the_speech_probe_decodes_english_only_models_instead_of_detecting_a_language(self):
+        # CTranslate2 raises on detect_language for English-only models (numbat-base-skyrim-en), which
+        # refused the upgrade although the cleared library worked. Fakes stand in for the venv's modules.
+        import io, sys, types
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        root = Path(scratch.name)
+        model_dir = root / "model"
+        model_dir.mkdir()
+        (model_dir / "vocabulary.txt").write_text("a\n<|startoftranscript|>\n<|notimestamps|>\n", encoding="utf-8")
+
+        class Whisper:
+            def __init__(self, path, device, compute_type):
+                self.n_mels, self.prompts = 80, []
+                self.is_multilingual = multilingual
+                created.append(self)
+
+            def detect_language(self, features):
+                if not self.is_multilingual:
+                    raise RuntimeError("detect_language can only be called on multilingual models")
+                return [[("<|en|>", 1.0)]]
+
+            def generate(self, features, prompts, max_length):
+                self.prompts.extend(prompts)
+                return [object()]
+
+        fake = types.ModuleType("fake_ct2")
+        fake.__file__ = str(root / "fake_ct2" / "__init__.py")
+        fake.get_supported_compute_types = lambda device: {"int8", "float32"}
+        fake.StorageView = types.SimpleNamespace(from_array=lambda array: array)
+        fake.models = types.SimpleNamespace(Whisper=Whisper)
+        numpy = types.ModuleType("numpy")
+        numpy.float32 = "float32"
+        numpy.zeros = lambda shape, dtype=None: shape
+        numpy.arange = lambda n, dtype=None: types.SimpleNamespace(reshape=lambda *shape: shape)
+        numpy.array = lambda view: types.SimpleNamespace(tolist=lambda: [[0, 1, 2], [3, 4, 5]])
+        maps = "7f00-7f01 r-xp 0 0:0 0 %s/fake_ct2.libs/lib.so\n7ffe-7fff rw-p 0 0:0 0 [stack]\n" % root
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            return io.StringIO(maps) if path == "/proc/self/maps" else real_open(path, *args, **kwargs)
+
+        for multilingual, expected in ((False, [[1, 2]]), (True, [])):
+            created, out = [], io.StringIO()
+            with patch.dict(sys.modules, {"fake_ct2": fake, "numpy": numpy}), \
+                    patch.object(sys, "argv", ["probe", "", "fake_ct2", str(model_dir)]), \
+                    contextlib.redirect_stdout(out):
+                exec(m.EXECSTACK_PROBE, {"__name__": "__main__", "open": fake_open})
+            self.assertEqual((out.getvalue().strip(), created[0].prompts), ("speech", expected), multilingual)
+
 
 class Journal(unittest.TestCase):
     def setUp(self):
