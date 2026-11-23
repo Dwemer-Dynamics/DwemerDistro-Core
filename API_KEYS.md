@@ -49,6 +49,51 @@ than stranding SYNTH connectors. The registry accepts `synth` only for the `synt
 `synth_key_references` table. SYNTH's own PHP reads `CHIM_SHARED_DB_*` itself; the Distro does not
 host SYNTH, so it exports nothing for it.
 
+## CHEVO (CHIM Evolution) badge references
+
+CHEVO keeps its connectors' `api_badge_id`; a badge refers to a global key through a nullable
+`core_api_badge.shared_key_id uuid`. CHEVO's own migration adds that column and the plain view
+`CREATE VIEW public.chevo_key_references AS SELECT id, label, shared_key_id FROM public.core_api_badge`,
+exactly that: no alias, filter, expression, join or view option, so it lists every badge with or without a
+reference. Core changes no CHEVO schema.
+
+CHEVO's database name is installation configuration, so enrollment is explicit and root only:
+`echo '{"database":"<name>"}' | sudo ddistro_keys prepare-chevo`. The name must be lower-case and must
+not be a maintenance database, `synth`, a `custom_*` database, the shared store or any database of
+another Core product or registered consumer. In that database `doctrine_migration_versions` must
+record `Chevo\Migrations\Version20261027132500`, `core_api_badge` must be a plain table without row
+security that has `id`, `label` and nullable `shared_key_id`, and the server's deparsed view definition
+(`pg_get_viewdef` with `search_path` `pg_catalog`) must equal that exact projection in its PostgreSQL 15
+or 16+ form; naming only the three columns is not enough. The shared metadata role must not be able to
+read `api_key`, write either relation or use their owner role. Core then grants the role `CONNECT`, schema
+`USAGE` and `SELECT` on the view only, re-checks those limits, checks that it can read the view and
+registers `chevo`. A changed database is refused. `prepare-legacy` only re-grants an enrolled database; it
+never enrolls one, and an unavailable database keeps its entry so deletion fails closed.
+
+Deletion counts every badge holding the key, used by a connector or not. CHEVO checks `CAPABILITIES` for
+`chevo_badge_binding`, then sets a reference only through
+`DistroSharedKeys::bindChevoBadge($pdo, $keyId, $provider, $kind, $endpoint, $write)`. `$pdo` is CHEVO's
+own Doctrine `pdo_pgsql` connection (`getConnection()->getNativeConnection()`); Core opens no second
+connection as CHEVO's writer. It must be idle (pdo_pgsql reports the server's transaction status), on the
+registered server and database, and resolve `core_api_badge` and the view to `public` unqualified. Work
+`$write` leaves open is rolled back before the key lock is released. `$provider` is the provider CHEVO's
+driver policy requires for the connector, and `$kind`/`$endpoint` are its kind and saved URL. Before the
+pinned manager is called, `$provider` must be able to serve `$kind` and the key's immutable stored
+provider must equal it exactly, at the endpoint's exact origin; the locked row is checked again. Refusals
+are the saved-connector outcomes below plus `provider_mismatch`. `$write` runs one autocommitted statement
+and returns the badge's integer id. `bound` is returned only after the guard's own connection reads the
+committed reference while the key lock is held. `unknown`, or an exception once `$write` may have run,
+means the write may have completed: reload, never retry. Clearing a reference needs no lock.
+
+CHEVO resolves at dispatch only with `DistroSharedKeys::resolveChevo($keyId, $provider, $kind, $savedUrl)`,
+with the same exact provider, capability and origin rules; `resolve()` keeps its existing semantics and
+never accepts `itt`. `DistroSharedKeys::chevoKeyCatalog()` lists the active global keys for CHEVO's key
+picker as `key_id`, `provider`, `label` and `origin` only: no secret, masked preview or diagnostic.
+
+For `llm` and `tts` the provider's stored kind must match. `stt` uses the STT providers below. `itt` (CHEVO
+only) accepts `openrouter`, `openai` or `custom_openai`, the keys for CHEVO's chat-completions vision
+drivers `openrouter`, `openai` and `local`.
+
 The shared bridge advertises `stt` and `saved_connector_binding`. STT accepts keys explicitly
 registered as `openai`, `deepgram`, `inworld` or `custom_openai`. These providers share the same
 credential across supported APIs. The bridge authorizes that capability before asking the pinned

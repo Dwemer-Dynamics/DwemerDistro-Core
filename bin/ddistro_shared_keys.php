@@ -11,18 +11,30 @@ use ChimServer\Core\SettingsManager\SettingsRegistry;
 
 final class DistroSharedKeys {
     public const REGISTRY = '/etc/dwemer/shared-key-consumers.json';
-    /** Callers check this before relying on STT resolution or guarded saved-connector binding. */
-    public const CAPABILITIES = ['stt', 'saved_connector_binding'];
+    /**
+     * Callers check this before relying on STT resolution or guarded saved-connector binding. chevo_badge_binding is
+     * CHEVO's whole contract: bindChevoBadge, resolveChevo (including itt) and chevoKeyCatalog.
+     */
+    public const CAPABILITIES = ['stt', 'saved_connector_binding', 'chevo_badge_binding'];
     /**
      * Providers whose key may also serve speech-to-text, at the key's own exact origin. The manager keeps one immutable
      * kind per provider; STT reuses that stored kind only for these providers, never by retrying llm/tts or by label.
      */
     public const STT_PROVIDERS = ['openai', 'deepgram', 'inworld', 'custom_openai'];
+    /**
+     * CHEVO only: providers whose key may serve image-to-text, for CHEVO's chat-completions vision drivers openrouter,
+     * openai and local (an OpenAI-compatible service registered as custom_openai). Same stored-kind and exact-origin
+     * rules as STT; resolve() and bindSavedConnector() never accept itt.
+     */
+    public const ITT_PROVIDERS = ['openrouter', 'openai', 'custom_openai'];
     private const LEGACY = ['herika' => 'CHIM legacy', 'stobe' => 'STOBE', 'dialectic' => 'Dialectic'];
     private const SAVED_CONNECTORS = 'ex_saved_connectors';
     /** SYNTH publishes the shared keys its connectors use through this view of its own database (migration Version20261116100000). */
     private const SYNTH_REFERENCES = 'synth_key_references';
     private const SYNTH_DATABASE = 'synth';
+    /** CHEVO's own migration publishes its badge references here (id, label, shared_key_id of core_api_badge only). */
+    private const CHEVO_REFERENCES = 'chevo_key_references';
+    private const CHEVO_BADGES = 'core_api_badge';
 
     /** Preparation checks actual metadata-role access before adding a database to the deletion registry. */
     public static function checkSavedConnectorDatabase(string $database): void {
@@ -45,6 +57,21 @@ final class DistroSharedKeys {
         $connection = self::connect(self::SYNTH_DATABASE);
         try {
             self::boundedRows($connection, 'SELECT id, kind, label, shared_key_id FROM public.' . self::SYNTH_REFERENCES
+                . ' WHERE shared_key_id IS NOT NULL LIMIT 129', null);
+        } finally {
+            pg_close($connection);
+        }
+    }
+
+    /** CHEVO readiness: the metadata role must read the badge reference view of the one database being enrolled. */
+    public static function checkChevoDatabase(string $database): void {
+        self::loadConfiguration();
+        if (preg_match('/^[a-z_][a-z0-9_]{0,62}$/D', $database) !== 1) {
+            throw new RuntimeException('Invalid CHEVO database');
+        }
+        $connection = self::connect($database);
+        try {
+            self::boundedRows($connection, 'SELECT id, label, shared_key_id FROM public.' . self::CHEVO_REFERENCES
                 . ' WHERE shared_key_id IS NOT NULL LIMIT 129', null);
         } finally {
             pg_close($connection);
@@ -85,6 +112,18 @@ final class DistroSharedKeys {
                     }
                     continue;
                 }
+                if ($product['id'] === 'chevo') {
+                    // Badges have no enabled state: every badge holding a reference counts, used by a connector or not.
+                    $query = 'SELECT id, label, shared_key_id::text FROM public.' . self::CHEVO_REFERENCES
+                        . ' WHERE shared_key_id IS NOT NULL'
+                        . ($keyId === null ? '' : ' AND shared_key_id = $1::uuid') . ' ORDER BY id LIMIT 129';
+                    foreach (self::boundedRows($connection, $query, $keyId) as $row) {
+                        $usage[] = ['key_id' => $row['shared_key_id'], 'connection_id' => (int)$row['id'],
+                            'label' => 'CHEVO: ' . $row['label'] . ' (key)', 'status' => 'active',
+                            'product' => 'chevo', 'table' => self::CHEVO_REFERENCES];
+                    }
+                    continue;
+                }
                 foreach ($product['tables'] as $table) {
                     $displayColumn = $product['id'] === 'stobe' && $table !== 'core_api_badge' ? 'name' : 'label';
                     $query = 'SELECT id, ' . $displayColumn . ' AS label, shared_key_id::text FROM public.' . $table
@@ -108,6 +147,9 @@ final class DistroSharedKeys {
     /** Resolve for the actual outbound endpoint, refusing every failure without reading a legacy copied value. */
     public static function resolve(string $keyId, string $kind, string $endpoint): string {
         try {
+            if (!in_array($kind, ['llm', 'tts', 'stt'], true)) {
+                throw new RuntimeException();
+            }
             [$keys, $origin] = self::manager($kind, $endpoint);
             $storedKind = self::storedKind($keys, $keyId, $kind);
             $result = $storedKind === null ? null : $keys->resolveSecret($keyId, $storedKind, $origin);
@@ -132,44 +174,169 @@ final class DistroSharedKeys {
      */
     public static function bindSavedConnector(\PgSql\Connection $db, string $keyId, string $kind, string $endpoint, callable $write): array {
         try {
+            if (!in_array($kind, ['llm', 'tts', 'stt'], true)) {
+                throw new RuntimeException();
+            }
             [$keys, $origin] = self::manager($kind, $endpoint);
-            if (pg_transaction_status($db) !== PGSQL_TRANSACTION_IDLE) {
+            $authorize = static function () use ($keys, $keyId, $kind): array {
+                $storedKind = self::storedKind($keys, $keyId, $kind);
+                if ($storedKind !== null) {
+                    return ['authorized', $storedKind];
+                }
+                $found = $keys->getKey($keyId)['outcome'];
+                return [$found === 'found' ? 'unsupported' : $found, null];
+            };
+            return self::bindReference('soulkiller', [self::SAVED_CONNECTORS], $db, $keys, $keyId, $origin, null, $authorize, $write);
+        } catch (Throwable) {
+            throw new RuntimeException('Shared API key binding unavailable');
+        }
+    }
+
+    /**
+     * CHEVO badges: the bindSavedConnector contract for one core_api_badge row of the registered CHEVO database, on
+     * CHEVO's own Doctrine pdo_pgsql connection ($entityManager->getConnection()->getNativeConnection()); no second
+     * writer connection is opened. $provider is the provider CHEVO's driver policy requires for the connector the badge
+     * is chosen for, and $kind (llm, tts, stt or itt) and $endpoint are that connector's kind and saved URL; the key's
+     * stored provider must equal $provider exactly, may serve $kind and must be bound to $endpoint's exact origin.
+     * $write must run one autocommitted statement on $db that sets that badge's shared_key_id to $keyId and return its
+     * integer id (null when nothing was written). $db must be idle, on the registered database and server, and resolve
+     * core_api_badge and the reference view to public. Work $write leaves open is rolled back. Returns 'bound' only once
+     * the guard's own connection reads the committed reference while the key lock is still held; 'unknown' (or an
+     * exception once $write may have run) means the write may have completed: reload, never retry. Other outcomes are
+     * the bindSavedConnector refusals plus provider_mismatch, all with nothing written. Never performs HTTP.
+     */
+    public static function bindChevoBadge(\PDO $db, string $keyId, string $provider, string $kind, string $endpoint, callable $write): array {
+        try {
+            if ($db->getAttribute(\PDO::ATTR_DRIVER_NAME) !== 'pgsql') {
+                throw new RuntimeException();
+            }
+            [$keys, $origin] = self::manager($kind, $endpoint);
+            $authorize = static fn (): array => self::chevoAuthorize($keys, $keyId, $provider, $kind, $origin);
+            return self::bindReference('chevo', [self::CHEVO_REFERENCES, self::CHEVO_BADGES], $db, $keys, $keyId, $origin,
+                $provider, $authorize, $write);
+        } catch (Throwable) {
+            throw new RuntimeException('Shared API key binding unavailable');
+        }
+    }
+
+    /**
+     * CHEVO dispatch: the secret of $keyId for $kind at $endpoint, only when the key's stored provider is exactly the
+     * $provider CHEVO's driver policy requires for that connector. Same refusals and redaction as resolve().
+     */
+    public static function resolveChevo(string $keyId, string $provider, string $kind, string $endpoint): string {
+        try {
+            [$keys, $origin] = self::manager($kind, $endpoint);
+            [$outcome, $storedKind] = self::chevoAuthorize($keys, $keyId, $provider, $kind, $origin);
+            $result = $outcome === 'authorized' ? $keys->resolveSecret($keyId, $storedKind, $origin) : null;
+            if ($result === null || $result['outcome'] !== 'resolved') {
+                throw new RuntimeException();
+            }
+            return $result['secret'];
+        } catch (Throwable) {
+            throw new RuntimeException('Shared API key unavailable for this provider endpoint');
+        }
+    }
+
+    /**
+     * CHEVO key picker: metadata of the active global keys, each key_id, provider, label and origin only. Never reads a
+     * secret, a masked preview or any diagnostic; any failure throws one fixed message. Never performs HTTP.
+     */
+    public static function chevoKeyCatalog(): array {
+        try {
+            self::loadRuntime();
+            $listed = ApiKeyManager::fromEnvironment()->listKeys();
+            if ($listed['outcome'] !== 'listed') {
+                throw new RuntimeException();
+            }
+            $keys = [];
+            foreach ($listed['data']['keys'] as $key) {
+                $keys[] = ['key_id' => (string)$key['key_id'], 'provider' => (string)$key['provider'],
+                    'label' => (string)$key['label'], 'origin' => (string)$key['origin']];
+            }
+            return $keys;
+        } catch (Throwable) {
+            throw new RuntimeException('Shared API keys unavailable');
+        }
+    }
+
+    /**
+     * Shared guarded write for one registered product. $relations must resolve identically for the caller and the guard.
+     * $authorize returns ['authorized', stored kind] or [refusal outcome, null] from immutable key metadata, before the
+     * pinned manager locks the key; a non-null $provider is checked again against the locked row.
+     */
+    private static function bindReference(string $productId, array $relations, \PgSql\Connection|\PDO $db, ApiKeyManager $keys,
+        string $keyId, string $origin, ?string $provider, callable $authorize, callable $write): array {
+        try {
+            if (!self::idle($db)) {
                 return ['outcome' => 'transaction_open', 'id' => null];
             }
             $identity = self::storeIdentity();
             $product = null;
             foreach (self::registeredProducts($identity) as $candidate) {
-                $product = $candidate['id'] === 'soulkiller' ? $candidate : $product;
+                $product = $candidate['id'] === $productId ? $candidate : $product;
             }
             // The caller's connection must be the exact registered database the deletion guard scans.
-            if ($product === null || self::databaseIdentity($db) !== self::guardIdentity($product['database'])) {
+            if ($product === null || self::databaseIdentity($db, $relations) !== self::guardIdentity($product['database'], $relations)) {
                 return ['outcome' => 'not_prepared', 'id' => null];
             }
-            $storedKind = self::storedKind($keys, $keyId, $kind);
-            if ($storedKind === null) {
-                $found = $keys->getKey($keyId)['outcome'];
-                return ['outcome' => $found === 'found' ? 'unsupported' : $found, 'id' => null];
+            [$outcome, $storedKind] = $authorize();
+            if ($outcome !== 'authorized') {
+                return ['outcome' => $outcome, 'id' => null];
             }
-            $locked = $keys->withBindableKey($keyId, $storedKind, $origin, static function () use ($db, $keyId, $identity, $write): array {
+            $database = $product['database'];
+            $locked = $keys->withBindableKey($keyId, $storedKind, $origin, static function (array $row) use ($db, $keyId, $identity, $write, $productId, $database, $provider): array {
+                if ($provider !== null && ($row['provider'] ?? null) !== $provider) {
+                    return ['outcome' => 'provider_mismatch', 'id' => null];
+                }
                 // The guard must be able to read every registered consumer before anything is written.
                 self::consumerUsage($keyId, $identity);
-                $id = $write();
-                if (pg_transaction_status($db) !== PGSQL_TRANSACTION_IDLE) {
+                try {
+                    $id = $write();
+                } finally {
                     // A contract-violating callback must not commit later, after the key lock is gone.
-                    @pg_query($db, 'ROLLBACK');
+                    $open = !self::idle($db);
+                    if ($open) {
+                        self::rollback($db);
+                    }
+                }
+                if ($open) {
                     throw new RuntimeException();
                 }
                 if ($id === null) {
                     return ['outcome' => 'conflict', 'id' => null];
                 }
-                if (!is_string($id)) {
+                if ($productId !== 'chevo') {
+                    if (!is_string($id)) {
+                        throw new RuntimeException();
+                    }
+                    return ['outcome' => 'bound', 'id' => $id];
+                }
+                if (!is_int($id) || $id < 1) {
                     throw new RuntimeException();
                 }
-                return ['outcome' => 'bound', 'id' => $id];
+                // A concurrent delete scans with its own connection after this lock is released: prove it will see this row.
+                return self::chevoReferenceVisible($database, $id, $keyId)
+                    ? ['outcome' => 'bound', 'id' => $id] : ['outcome' => 'unknown', 'id' => null];
             });
             return $locked['outcome'] === 'locked' ? $locked['result'] : ['outcome' => $locked['outcome'], 'id' => null];
         } catch (Throwable) {
             throw new RuntimeException('Shared API key binding unavailable');
+        }
+    }
+
+    /** Whether the guard's metadata connection reads badge $id referencing $keyId in the registered CHEVO database. */
+    private static function chevoReferenceVisible(string $database, int $id, string $keyId): bool {
+        try {
+            $connection = self::connect($database);
+        } catch (Throwable) {
+            return false;
+        }
+        try {
+            $result = @pg_query_params($connection, 'SELECT 1 FROM public.' . self::CHEVO_REFERENCES
+                . ' WHERE id = $1::integer AND shared_key_id = $2::uuid', [$id, $keyId]);
+            return $result !== false && pg_num_rows($result) === 1;
+        } finally {
+            pg_close($connection);
         }
     }
 
@@ -185,13 +352,65 @@ final class DistroSharedKeys {
         return in_array($provider, self::STT_PROVIDERS, true) ? (ApiKeyManager::PROVIDERS[$provider]['kind'] ?? null) : null;
     }
 
+    /**
+     * CHEVO: ['authorized', stored kind] when $provider may serve $kind and the key's immutable metadata names exactly
+     * $provider at $origin; otherwise [unsupported|missing|revoked|provider_mismatch|origin_mismatch, null]. The pinned
+     * manager still re-checks the stored kind, exact origin and active status when it resolves or locks the key.
+     */
+    private static function chevoAuthorize(ApiKeyManager $keys, string $keyId, string $provider, string $kind, string $origin): array {
+        $capable = match ($kind) {
+            'stt' => in_array($provider, self::STT_PROVIDERS, true),
+            'itt' => in_array($provider, self::ITT_PROVIDERS, true),
+            'llm', 'tts' => (ApiKeyManager::PROVIDERS[$provider]['kind'] ?? null) === $kind,
+            default => false,
+        };
+        $storedKind = ApiKeyManager::PROVIDERS[$provider]['kind'] ?? null;
+        if (!$capable || !is_string($storedKind)) {
+            return ['unsupported', null];
+        }
+        $found = $keys->getKey($keyId);
+        if ($found['outcome'] !== 'found') {
+            return [$found['outcome'] === 'revoked' ? 'revoked' : 'missing', null];
+        }
+        if ($found['data']['provider'] !== $provider) {
+            return ['provider_mismatch', null];
+        }
+        if ($found['data']['origin'] !== $origin) {
+            return ['origin_mismatch', null];
+        }
+        return ['authorized', $storedKind];
+    }
+
+    /** Whether the caller's connection has no transaction open (pdo_pgsql reports the server's transaction status). */
+    private static function idle(\PgSql\Connection|\PDO $db): bool {
+        if ($db instanceof \PDO) {
+            return !$db->inTransaction();
+        }
+        return pg_transaction_status($db) === PGSQL_TRANSACTION_IDLE;
+    }
+
+    /** Best-effort rollback of work a callback left open on the caller's connection. */
+    private static function rollback(\PgSql\Connection|\PDO $db): void {
+        if (!($db instanceof \PDO)) {
+            @pg_query($db, 'ROLLBACK');
+            return;
+        }
+        try {
+            $db->rollBack();
+        } catch (Throwable) {
+        }
+        try {
+            if ($db->inTransaction()) {
+                @$db->exec('ROLLBACK');
+            }
+        } catch (Throwable) {
+        }
+    }
+
     /** The pinned manager and the canonical origin of $endpoint, for a supported kind only. */
     private static function manager(string $kind, string $endpoint): array {
-        self::loadConfiguration();
-        $runtime = is_file('/opt/dwemerdistro-keys/Config/Autoloader.php') ? '/opt/dwemerdistro-keys' : '/opt/ChimServer';
-        require_once $runtime . '/Config/Autoloader.php';
-        Autoloader::register();
-        if (!in_array($kind, ['llm', 'tts', 'stt'], true) || !ProviderEndpoint::isValid($endpoint)) {
+        self::loadRuntime();
+        if (!in_array($kind, ['llm', 'tts', 'stt', 'itt'], true) || !ProviderEndpoint::isValid($endpoint)) {
             throw new RuntimeException();
         }
         $origin = SettingsRegistry::endpointOrigin($endpoint);
@@ -199,6 +418,14 @@ final class DistroSharedKeys {
             throw new RuntimeException();
         }
         return [ApiKeyManager::fromEnvironment(), $origin];
+    }
+
+    /** The fixed shared-store configuration and the pinned manager runtime. */
+    private static function loadRuntime(): void {
+        self::loadConfiguration();
+        $runtime = is_file('/opt/dwemerdistro-keys/Config/Autoloader.php') ? '/opt/dwemerdistro-keys' : '/opt/ChimServer';
+        require_once $runtime . '/Config/Autoloader.php';
+        Autoloader::register();
     }
 
     /** The validated root-owned registry entries for the configured shared store; any doubt refuses. */
@@ -216,7 +443,7 @@ final class DistroSharedKeys {
         }
         $products = [];
         foreach ($registry['products'] as $product) {
-            if (!is_array($product) || !in_array($product['id'] ?? null, [...array_keys(self::LEGACY), 'soulkiller', 'synth'], true)
+            if (!is_array($product) || !in_array($product['id'] ?? null, [...array_keys(self::LEGACY), 'soulkiller', 'synth', 'chevo'], true)
                 || !is_string($product['database'] ?? null)
                 || preg_match('/^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/D', $product['database']) !== 1
                 || isset($products[$product['id']])) {
@@ -226,16 +453,26 @@ final class DistroSharedKeys {
             $allowed = match ($product['id']) {
                 'soulkiller' => [self::SAVED_CONNECTORS],
                 'synth' => [self::SYNTH_REFERENCES],
+                'chevo' => [self::CHEVO_REFERENCES],
                 default => ['core_api_badge', 'core_llm_connector', 'core_tts_connector'],
             };
             if (!is_array($tables) || count($tables) > 3 || count(array_unique($tables)) !== count($tables)
-                || array_diff($tables, $allowed) !== [] || (in_array($product['id'], ['soulkiller', 'synth'], true) && $tables !== $allowed)) {
+                || array_diff($tables, $allowed) !== [] || (in_array($product['id'], ['soulkiller', 'synth', 'chevo'], true) && $tables !== $allowed)) {
                 throw new RuntimeException('Shared key usage is unavailable');
             }
             if ($product['id'] === 'synth' && $product['database'] !== self::SYNTH_DATABASE) {
                 throw new RuntimeException('Shared key usage is unavailable');
             }
+            // CHEVO's database is configurable: enrollment validates it, and it may never alias another consumer or the store.
+            if ($product['id'] === 'chevo' && (preg_match('/^[a-z_][a-z0-9_]{0,62}$/D', $product['database']) !== 1
+                || in_array($product['database'], ['postgres', 'template0', 'template1', self::SYNTH_DATABASE, $storeIdentity['database']], true)
+                || str_starts_with($product['database'], 'custom_'))) {
+                throw new RuntimeException('Shared key usage is unavailable');
+            }
             $products[$product['id']] = ['id' => $product['id'], 'database' => $product['database'], 'tables' => $tables];
+        }
+        if (isset($products['chevo']) && count(array_keys(array_column($products, 'database'), $products['chevo']['database'], true)) !== 1) {
+            throw new RuntimeException('Shared key usage is unavailable');
         }
         return array_values($products);
     }
@@ -272,23 +509,44 @@ final class DistroSharedKeys {
         return pg_fetch_all($result);
     }
 
-    /** Server start time, port, database OID/name and saved-connector table OID as seen by one connection. */
-    private static function databaseIdentity($connection): array {
-        $result = @pg_query($connection, "SELECT pg_postmaster_start_time()::text AS started, current_setting('port') AS port,"
-            . " current_database() AS database, (SELECT oid::text FROM pg_database WHERE datname = current_database()) AS oid,"
-            . " to_regclass('public." . self::SAVED_CONNECTORS . "')::oid::text AS saved_connectors,"
-            . " to_regclass('" . self::SAVED_CONNECTORS . "')::oid::text AS resolved_connectors");
-        $row = $result === false ? false : pg_fetch_assoc($result);
-        if ($row === false || $row['saved_connectors'] === null || $row['resolved_connectors'] !== $row['saved_connectors']) {
+    /**
+     * Server start time, port, database OID/name and the OIDs of fixed $relations as seen by one connection, a pgsql
+     * connection or a pdo_pgsql PDO. Each relation must exist in public and resolve there unqualified too, so a
+     * shadowing search path is refused. The start time is an epoch so session TimeZone/DateStyle cannot change it, and
+     * columns are read by position so PDO name-case or null attributes cannot change the comparison.
+     */
+    private static function databaseIdentity(\PgSql\Connection|\PDO $connection, array $relations): array {
+        $columns = '';
+        foreach (array_values($relations) as $relation) {
+            $columns .= ", to_regclass('public." . $relation . "')::oid::text, to_regclass('" . $relation . "')::oid::text";
+        }
+        $query = "SELECT extract(epoch FROM pg_postmaster_start_time())::text, current_setting('port'),"
+            . " current_database()::text, (SELECT oid::text FROM pg_database WHERE datname = current_database())" . $columns;
+        if ($connection instanceof \PDO) {
+            $statement = @$connection->query($query);
+            $row = $statement === false ? false : $statement->fetch(\PDO::FETCH_NUM);
+            if ($statement !== false) {
+                $statement->closeCursor();
+            }
+        } else {
+            $result = @pg_query($connection, $query);
+            $row = $result === false ? false : pg_fetch_row($result);
+        }
+        if (!is_array($row) || count($row) !== 4 + 2 * count($relations)) {
             throw new RuntimeException();
+        }
+        foreach ($row as $index => $value) {
+            if (!is_string($value) || $value === '' || ($index >= 4 && $index % 2 === 1 && $value !== $row[$index - 1])) {
+                throw new RuntimeException();
+            }
         }
         return $row;
     }
 
-    private static function guardIdentity(string $database): array {
+    private static function guardIdentity(string $database, array $relations): array {
         $connection = self::connect($database);
         try {
-            return self::databaseIdentity($connection);
+            return self::databaseIdentity($connection, $relations);
         } finally {
             pg_close($connection);
         }
