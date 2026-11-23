@@ -43,6 +43,56 @@ GRANT CONNECT ON DATABASE __DATABASE__ TO __ROLE__;
 GRANT USAGE ON SCHEMA public TO __ROLE__;
 GRANT SELECT ON public.synth_key_references TO __ROLE__;
 """
+# CHEVO (CHIM Evolution) owns this view in its own migration; its database name is configured per installation, so
+# enrollment is explicit and checks the Doctrine record of CHEVO's badge migration. The view must be exactly
+# SELECT id, label, shared_key_id FROM public.core_api_badge: an unfiltered, untransformed projection, compared with the
+# server's own deparsed definition (PostgreSQL 15 qualifies the columns, 16+ does not; search_path pg_catalog makes the
+# schema explicit), so a WHERE, join, alias, expression or option is refused even if it names only those columns. No row
+# security may filter it. The metadata role may only read through the view: never api_key, no writes, no ownership.
+CHEVO_REFERENCES = 'chevo_key_references'
+CHEVO_RESERVED = frozenset(('postgres', 'template0', 'template1', SYNTH_DATABASE))
+CHEVO_PRIVILEGE_CHECK = """
+        OR has_column_privilege('__ROLE_NAME__', badge, 'api_key', 'SELECT')
+        OR has_table_privilege('__ROLE_NAME__', badge, 'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+        OR has_any_column_privilege('__ROLE_NAME__', badge, 'INSERT, UPDATE, REFERENCES')
+        OR has_table_privilege('__ROLE_NAME__', refs, 'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+        OR has_any_column_privilege('__ROLE_NAME__', refs, 'INSERT, UPDATE, REFERENCES')
+        OR pg_has_role('__ROLE_NAME__', (SELECT relowner FROM pg_class WHERE oid = badge), 'USAGE')
+        OR pg_has_role('__ROLE_NAME__', (SELECT relowner FROM pg_class WHERE oid = refs), 'USAGE')"""
+CHEVO_REFERENCE_SQL = """SET LOCAL search_path = pg_catalog;
+DO $check$ DECLARE
+    badge oid := to_regclass('public.core_api_badge');
+    refs oid := to_regclass('public.chevo_key_references');
+BEGIN
+    IF to_regclass('public.doctrine_migration_versions') IS NULL
+        OR NOT EXISTS (SELECT 1 FROM public.doctrine_migration_versions WHERE version = 'Chevo\\Migrations\\Version20261027132500')
+        OR NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = badge AND relkind = 'r' AND NOT relrowsecurity AND NOT relforcerowsecurity)
+        OR (SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'core_api_badge'
+            AND ((column_name, data_type) IN (('id','integer'),('label','text'))
+                OR (column_name = 'shared_key_id' AND data_type = 'uuid' AND is_nullable = 'YES'))) <> 3
+        OR NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = refs AND relkind = 'v' AND reloptions IS NULL)
+        OR (SELECT count(*) FROM pg_attribute WHERE attrelid = refs AND attnum > 0 AND NOT attisdropped) <> 3
+        OR (SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'chevo_key_references'
+            AND (column_name, data_type) IN (('id','integer'),('label','text'),('shared_key_id','uuid'))) <> 3
+        OR regexp_replace(btrim(pg_get_viewdef(refs)), '\\s+', ' ', 'g') NOT IN (
+            'SELECT core_api_badge.id, core_api_badge.label, core_api_badge.shared_key_id FROM public.core_api_badge;',
+            'SELECT id, label, shared_key_id FROM public.core_api_badge;')
+        OR EXISTS (SELECT 1 FROM pg_rewrite WHERE ev_class = refs AND rulename <> '_RETURN')""" + CHEVO_PRIVILEGE_CHECK + """ THEN
+        RAISE EXCEPTION 'Unsupported CHEVO key reference view';
+    END IF;
+END $check$;
+GRANT CONNECT ON DATABASE __DATABASE__ TO __ROLE__;
+GRANT USAGE ON SCHEMA public TO __ROLE__;
+GRANT SELECT ON public.chevo_key_references TO __ROLE__;
+DO $granted$ DECLARE
+    badge oid := to_regclass('public.core_api_badge');
+    refs oid := to_regclass('public.chevo_key_references');
+BEGIN
+    IF NOT has_table_privilege('__ROLE_NAME__', refs, 'SELECT')""" + CHEVO_PRIVILEGE_CHECK + """ THEN
+        RAISE EXCEPTION 'Unsupported CHEVO key reference grants';
+    END IF;
+END $granted$;
+"""
 # SOULKILLER migration 049 owns this table; preparation only checks it and grants these reference columns.
 SAVED_CONNECTOR_SQL = """DO $check$ BEGIN
     IF to_regclass('public.ex_schema_migrations') IS NULL OR to_regclass('public.ex_saved_connectors') IS NULL
@@ -109,12 +159,18 @@ def sql(database, query):
     return result.stdout.strip()
 
 
-def products():
-    """Reuse Core's root-owned component/database registry instead of guessing product roots."""
+def access_policy():
+    """Core's root-owned component/database registry."""
     trusted_file(ACCESS)
     spec = importlib.util.spec_from_loader('keys_access', importlib.machinery.SourceFileLoader('keys_access', ACCESS))
     policy = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(policy)
+    return policy
+
+
+def products():
+    """Reuse Core's root-owned component/database registry instead of guessing product roots."""
+    policy = access_policy()
     return [{'id': name, 'database': policy.DB_PRODUCTS[name], 'path': Path(policy.ACCESS_ROOTS[name]['path'])}
             for name in PRODUCTS if name in policy.DB_PRODUCTS and name in policy.ACCESS_ROOTS
             and Path(policy.ACCESS_ROOTS[name]['path']).is_dir()]
@@ -150,8 +206,10 @@ def registered():
     return value['products']
 
 
-def prepare_legacy(soulkiller_only=False):
-    """Install nullable references and least-privilege CAS functions, then atomically register every participating DB."""
+def prepare_legacy(soulkiller_only=False, chevo_database=None):
+    """Install nullable references and least-privilege CAS functions, then atomically register every participating DB.
+    A chevo_database is an explicit CHEVO enrollment: only that consumer is prepared, every other entry is kept."""
+    chevo_only = chevo_database is not None
     ready = run('guard-ready', {})
     if not ready['ok']:
         raise Refusal('Update CHIM 4 key management before enabling legacy references')
@@ -161,11 +219,11 @@ def prepare_legacy(soulkiller_only=False):
     role = env.get('CHIM_SHARED_DB_USER', '')
     if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,62}', role):
         raise Refusal('Shared database role is not configured')
-    if not soulkiller_only:
+    if not soulkiller_only and not chevo_only:
         trusted_file(LEGACY_SQL)
     entries = {p['id']: p for p in registered()}
     warnings = []
-    for product in ([] if soulkiller_only else products()):
+    for product in ([] if soulkiller_only or chevo_only else products()):
         manifest = product['path'] / 'lib/core/shared_keys.json'
         if not manifest.is_file():
             warnings.append(PRODUCTS[product['id']] + ': update the shared-key adapter; existing keys remain unchanged')
@@ -180,8 +238,13 @@ def prepare_legacy(soulkiller_only=False):
         sql(product['database'], 'BEGIN; SET LOCAL lock_timeout=2000; SET LOCAL statement_timeout=10000;\n'
             + LEGACY_SQL.read_text().replace('__ROLE__', '"' + role + '"') + '\nCOMMIT;')
         entries[product['id']] = {'id': product['id'], 'database': product['database'], 'tables': tables}
-    soulkiller_prepared = prepare_soulkiller(role, entries, warnings)
-    prepare_synth(role, entries, warnings)
+    if chevo_only:
+        chevo_prepared = prepare_chevo(role, env, entries, warnings, chevo_database)
+    else:
+        soulkiller_prepared = prepare_soulkiller(role, entries, warnings)
+        prepare_synth(role, entries, warnings)
+        # Re-grants an enrolled CHEVO database only; enrollment itself is never implicit.
+        prepare_chevo(role, env, entries, warnings, None)
     if not REGISTRY.parent.is_dir():
         REGISTRY.parent.mkdir(mode=0o755)
     for directory in (REGISTRY.parent, *REGISTRY.parent.parents):
@@ -206,7 +269,10 @@ def prepare_legacy(soulkiller_only=False):
     finally:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
-    prepared = not soulkiller_only or bool(soulkiller_prepared)
+    if chevo_only:
+        prepared = chevo_prepared
+    else:
+        prepared = not soulkiller_only or bool(soulkiller_prepared)
     return {'ok': prepared, 'outcome': 'prepared' if prepared else 'not_prepared', 'warnings': warnings}
 
 
@@ -294,6 +360,41 @@ def prepare_synth(role, entries, warnings):
                         else 'SYNTH: update SYNTH and run its database migrations for shared-key support; existing keys remain unchanged')
         return
     entries['synth'] = {'id': 'synth', 'database': SYNTH_DATABASE, 'tables': [SYNTH_REFERENCES]}
+
+
+def prepare_chevo(role, env, entries, warnings, requested):
+    """Enroll the requested CHEVO database, or re-grant the enrolled one when requested is None. Never changes its schema.
+    Returns True once the metadata role reads its reference view and the entry is set; an existing entry is never dropped."""
+    prior = entries.get('chevo')
+    database = requested if requested is not None else (prior or {}).get('database')
+    if database is None:
+        return False
+    if not isinstance(database, str) or not re.fullmatch(r'[a-z_][a-z0-9_]{0,62}', database):
+        raise Refusal('Invalid CHEVO database')
+    if requested is not None:
+        if prior and prior['database'] != requested:
+            raise Refusal('A registered server database changed; preserve and repair its existing references first')
+        others = {entry.get('database') for name, entry in entries.items() if name != 'chevo'}
+        others.update(access_policy().DB_PRODUCTS.values())
+        if (requested in CHEVO_RESERVED or requested in others or requested.startswith('custom_')
+                or requested == env.get('CHIM_SHARED_DB_NAME')):
+            raise Refusal('This database belongs to another server; enter the database CHEVO is configured to use')
+    try:
+        # Check existence from a maintenance database: connecting to a missing database would fail like any other error.
+        if sql('template1', "SELECT 1 FROM pg_database WHERE datname = '" + database + "';") != '1':
+            raise Refusal('CHEVO database is not installed')
+        sql(database, 'BEGIN; SET LOCAL lock_timeout=2000; SET LOCAL statement_timeout=10000;\n'
+            + CHEVO_REFERENCE_SQL.replace('__DATABASE__', '"' + database + '"').replace('__ROLE_NAME__', role)
+            .replace('__ROLE__', '"' + role + '"') + '\nCOMMIT;')
+        if not run('guard-ready', {'database': database, 'product': 'chevo'})['ok']:
+            raise Refusal('CHEVO metadata role cannot read key references')
+    except (Refusal, subprocess.TimeoutExpired):
+        # A registered database that can no longer be scanned keeps its entry, so deletion fails closed.
+        warnings.append('CHEVO key references are unavailable; existing references stay protected' if prior
+                        else 'CHEVO: update CHEVO and run its database migrations for shared-key support; existing keys remain unchanged')
+        return False
+    entries['chevo'] = {'id': 'chevo', 'database': database, 'tables': [CHEVO_REFERENCES]}
+    return True
 
 
 def legacy_status():
@@ -525,6 +626,11 @@ def run(verb, payload):
     if verb in ('prepare-legacy', 'prepare-soulkiller'):
         with migration_lock():
             return prepare_legacy(soulkiller_only=verb == 'prepare-soulkiller')
+    if verb == 'prepare-chevo':
+        if not isinstance(payload, dict) or set(payload) != {'database'} or not isinstance(payload['database'], str):
+            raise Refusal('Invalid CHEVO enrollment request')
+        with migration_lock():
+            return prepare_legacy(chevo_database=payload['database'])
     if verb not in OPERATIONS or not isinstance(payload, dict):
         raise Refusal('Unsupported operation; update the launcher')
     trusted_file(BRIDGE)

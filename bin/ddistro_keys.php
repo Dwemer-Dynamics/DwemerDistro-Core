@@ -105,7 +105,7 @@ try {
         'delete' => ['key_id', 'revision'],
         'bind' => ['connection_id', 'revision', 'key_id'],
         'import-environment' => ['connection_id', 'provider'],
-        'guard-ready' => ['database'],
+        'guard-ready' => ['database', 'product'],
         'save-connection' => ['connection_id','revision','secret'],
         'reveal-connection' => ['connection_id','revision'],
         'read-key' => ['key_id','reveal'],
@@ -199,12 +199,18 @@ try {
             throw new RuntimeException('Shared key guard is not supported');
         }
         if (!defined('DistroSharedKeys::CAPABILITIES')
-            || !in_array('saved_connector_binding', DistroSharedKeys::CAPABILITIES, true)) {
+            || !in_array('saved_connector_binding', DistroSharedKeys::CAPABILITIES, true)
+            || (($request['product'] ?? null) === 'chevo' && !in_array('chevo_badge_binding', DistroSharedKeys::CAPABILITIES, true))) {
             throw new RuntimeException('Shared key bridge is not supported');
+        }
+        if (isset($request['product']) && ($request['product'] !== 'chevo' || !is_string($request['database'] ?? null))) {
+            throw new InvalidArgumentException();
         }
         if (isset($request['database'])) {
             if (!is_string($request['database'])) throw new InvalidArgumentException();
-            if ($request['database'] === 'synth') {
+            if (($request['product'] ?? null) === 'chevo') {
+                DistroSharedKeys::checkChevoDatabase($request['database']);
+            } elseif ($request['database'] === 'synth') {
                 DistroSharedKeys::checkSynthDatabase();
             } else {
                 DistroSharedKeys::checkSavedConnectorDatabase($request['database']);
