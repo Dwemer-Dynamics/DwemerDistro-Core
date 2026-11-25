@@ -25,6 +25,33 @@ The older native and advanced connection/import operations remain available for 
 
 ## Rollout
 
+### PostgreSQL 17 bundle
+
+The pin uses ChimServer commit `804e501154de8353da50c05872700809499a0f31`, which includes
+reviewed shared-store manifests for PostgreSQL 15 and 17. It does not enable the separate
+ChimServer application schema on PostgreSQL 17. Existing keys and the installer SQL are unchanged.
+
+Reproduce the code-only artifact with:
+
+```sh
+python3 tools/build_shared_key_runtime.py /path/to/ChimServer \
+  dwemer-shared-keys-3513d9a5bede.tar.gz dwemer-shared-keys-804e501154de.tar.gz
+```
+
+The previous archive must match its published checksum. The builder reads canonical Git blobs,
+keeps the verified previous installer SQL, and refuses changed shared migrations. It never reads
+an installed database, configuration or encryption key. The resulting SHA-256 is
+`17605cad8fb79b216d9854a0859924828657caa364d34d6a10a8a605aecdcf35`.
+
+Release prerequisite: publish that exact artifact under `shared-keys-804e501154de` before
+merging the new pin. Preparing this change does not publish the release asset.
+
+`sudo ddistro_keys check-ready` verifies an existing store through the runtime account, without
+setup, provider requests or returned key metadata. An unconfigured fresh image is allowed;
+lost configuration for an initialized store is refused. Updates and completed PostgreSQL
+maintenance check readiness. A failure after database cutover keeps the serving database
+and reports the key-runtime failure; it never automatically reverts accepted writes.
+
 `etc/shared-key-runtime.json` pins the ChimServer runtime bundle by source commit and SHA-256; `update.sh` installs it with `install_shared_keys --install-runtime` (runtime only). Afterwards run full setup once, from the launcher API Keys tab or `sudo /usr/local/bin/install_shared_keys`, to apply the schema and runtime permissions. There is no conversion step: the shared migration changes the schema only, existing encrypted keys stay encrypted and readable, and only newly saved or replaced keys are stored as plain text. Keep the existing encryption key while encrypted keys or older backups exist.
 
 ## SOULKILLER saved connectors

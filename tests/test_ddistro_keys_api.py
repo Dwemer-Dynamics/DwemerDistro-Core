@@ -26,6 +26,32 @@ def load(name):
 
 
 api, dash = load('ddistro_keys_api'), load('ddistro_dashboard_keys')
+
+
+class Readiness(unittest.TestCase):
+    """Maintenance checks must not run setup or return saved-key metadata."""
+    def test_readiness_never_provisions_and_drops_metadata(self):
+        keys = load('ddistro_keys')
+        with patch.object(keys, 'environment', return_value={'CHIM_SHARED_DB_NAME': 'fixture'}), \
+                patch.object(keys, 'trusted_file'), patch.object(keys, 'ensure_global_runtime') as setup, \
+                patch.object(keys, 'invoke', return_value={'ok': True, 'outcome': 'listed',
+                                                         'data': {'keys': ['private']}}) as invoke:
+            self.assertEqual(keys.run('check-ready', {}), {'ok': True, 'outcome': 'ready'})
+            invoke.assert_called_once_with('global-status', {})
+            setup.assert_not_called()
+            invoke.return_value = {'ok': False, 'outcome': 'unavailable'}
+            with self.assertRaises(keys.Refusal):
+                keys.check_ready()
+
+    def test_empty_image_is_optional_but_lost_configuration_is_not(self):
+        keys = load('ddistro_keys')
+        with patch.object(keys, 'environment', return_value={}), patch.object(keys.Path, 'exists', return_value=False), \
+                patch.object(keys, 'invoke') as invoke:
+            self.assertEqual(keys.check_ready()['outcome'], 'not_configured')
+            invoke.assert_not_called()
+        with patch.object(keys, 'environment', return_value={}), patch.object(keys.Path, 'exists', return_value=True):
+            with self.assertRaises(keys.Refusal):
+                keys.check_ready()
 KEY = '11111111-2222-4333-8444-555555555555'
 OTHER = '99999999-2222-4333-8444-555555555555'
 TOKEN = 'reign-token-' + 'x' * 30

@@ -385,6 +385,9 @@ CURRENT_STEP="installing the Assistant runtime"
 # Install the immutable credential library without provisioning operator keys into redistributable images.
 CURRENT_STEP="installing the shared keys runtime"
 /usr/local/bin/install_shared_keys --install-runtime 7<&- || exit 1
+# Do not provision keys into images; verify configured stores without setup or exposing metadata.
+CURRENT_STEP="checking shared keys on the current database"
+/usr/local/bin/ddistro_keys check-ready 7<&- >/dev/null || exit 1
 # Enable installed shared-key adapters only after their central deletion guard is ready; never import user keys here.
 if [ "${DDISTRO_KEYS_IMAGE_BUILD:-}" != 1 ] && ! /usr/local/bin/ddistro_keys prepare-legacy >/dev/null; then
     printf "${YELLOW}[WARNING] Shared API Keys setup is not ready. Existing keys are preserved; update CHIM 4 and the server adapters, then retry Update Distro.${NC}\n"

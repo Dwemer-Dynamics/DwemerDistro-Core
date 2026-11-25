@@ -617,7 +617,22 @@ def ensure_global_runtime():
         raise Refusal('Global key setup is unavailable; update the distro and retry. Existing keys are preserved.')
 
 
+def check_ready():
+    """Check an existing store as its runtime account without setup, writes or public key metadata."""
+    if not environment().get('CHIM_SHARED_DB_NAME'):
+        if Path('/var/lib/dwemerdistro/shared-keys/initialized.json').exists():
+            raise Refusal('Shared API Keys configuration is missing; restore it before retrying.')
+        return {'ok': True, 'outcome': 'not_configured'}
+    trusted_file(BRIDGE)
+    response = invoke('global-status', {})
+    if response.get('ok') is not True or response.get('outcome') != 'listed':
+        raise Refusal('Shared API Keys cannot read the current database. Update the key runtime and retry; existing keys are preserved.')
+    return {'ok': True, 'outcome': 'ready'}
+
+
 def run(verb, payload):
+    if verb == 'check-ready':
+        return check_ready()
     if verb in ('native-status', 'save-direct', 'create-direct', 'reveal-direct'):
         return native_request(verb, payload)
     if verb == 'sync':
@@ -670,7 +685,7 @@ def main(argv):
     try:
         if os.geteuid() != 0 or len(argv) != 2:
             raise Refusal('Root-local operation required')
-        raw = sys.stdin.buffer.read(16385) if argv[1] not in ('status', 'native-status', 'global-status', 'sync', 'prepare-legacy', 'prepare-soulkiller') else b'{}'
+        raw = sys.stdin.buffer.read(16385) if argv[1] not in ('status', 'native-status', 'global-status', 'check-ready', 'sync', 'prepare-legacy', 'prepare-soulkiller') else b'{}'
         if len(raw) > 16384:
             raise Refusal('Request too large')
         response = run(argv[1], json.loads(raw))

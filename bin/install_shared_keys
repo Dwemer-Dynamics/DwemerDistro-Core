@@ -236,6 +236,8 @@ def main():
                 configuration = b''.join(Path(p).read_bytes() for p in ('/etc/chim4-s5.env','/etc/chim4-dialogue.env','/etc/chim4-tts.env',str(CONFIG)) if Path(p).is_file())
                 marker.write_text(hashlib.sha256(configuration + digest.encode()).hexdigest() + '\n')
                 marker.chmod(0o600)
+            # Setup markers are not proof that the running database still matches this library.
+            keys.check_ready()
     print(json.dumps({'ok': True, 'runtime_ready': True, 'store_checked': not args.install_runtime}))
 
 

@@ -1426,6 +1426,14 @@ if __name__ == "__main__":
                     state = json.loads(STATE.read_text())
                     state.pop("retry_auto", None)
                     phase(state, "rolled-back")
+                # Outside upgrade's rollback handling: accepted PG17 writes must never be discarded
+                # because an application library is incompatible. Report failure and keep PG17 serving.
+                if args.action in ("auto", "upgrade"):
+                    check = subprocess.run(['/usr/local/bin/ddistro_keys', 'check-ready'],
+                                           capture_output=True, timeout=45)
+                    if check.returncode:
+                        raise ValueError('Database maintenance finished, but Shared API Keys is not ready. '
+                                         'Update the key runtime and retry; the serving database was kept')
         except Exception as error:
             if args.action == "cleanup-preview":
                 print(json.dumps({"eligible": False, "bytes": 0, "reason": str(error)}))
