@@ -136,6 +136,7 @@ KEY = '11111111-2222-4333-8444-555555555555'
 OTHER = '99999999-2222-4333-8444-555555555555'
 TOKEN = 'reign-token-' + 'x' * 30
 ROUTER = 'https://openrouter.ai:443'
+PLOOFY = 'https://ploofy.ai:443'  # the adapter's catalog default, not a library-pinned origin
 
 
 class FakeKeys:
@@ -149,7 +150,7 @@ class FakeKeys:
         if verb == 'global-status':
             return {'ok': True, 'outcome': 'listed', 'data': {'providers': {
                 'openrouter': {'origin': ROUTER}, 'custom_openai': {'origin': None},
-                'anthropic': {'origin': 'https://api.anthropic.com:443'}}, 'keys': [
+                'anthropic': {'origin': 'https://api.anthropic.com:443'}, 'ploofy': {'origin': PLOOFY}}, 'keys': [
                 {'key_id': KEY, 'provider': 'openrouter', 'label': 'Reign', 'preview': 'sk-...abcd',
                  'revision': self.revision, 'configured': True, 'origin': ROUTER},
                 {'key_id': OTHER, 'provider': 'anthropic', 'label': 'Other', 'preview': '...zz',
@@ -227,6 +228,23 @@ class Socket(unittest.TestCase):
         self.assertEqual(self.call('create', create)['outcome'], 'invalid')
         made = self.call('create', dict(create, provider='openrouter'))
         self.assertEqual((made['outcome'], made['key']['origin']), ('created', ROUTER))
+
+    def test_ploofy_create_accepts_default_and_explicit_origins_only_for_ploofy(self):
+        sent = []
+        invoke = self.keys.invoke
+        self.keys.invoke = lambda verb, payload: (sent.append(dict(payload)) if verb == 'global-save' else None)             or invoke(verb, payload)
+        clients = {'reign': {'sha256': hashlib.sha256(TOKEN.encode()).hexdigest(), 'providers': ['ploofy', 'anthropic']}}
+        with patch.object(api, 'load_clients', return_value=clients):
+            create = {'provider': 'ploofy', 'label': 'x', 'origin': None, 'secret': 'abc'}
+            made = self.call('create', create)
+            self.assertEqual((made['outcome'], made['key']['origin']), ('created', PLOOFY))
+            for origin in (PLOOFY, 'https://eu.ploofy.example:443'):  # passed through for the adapter to validate
+                made = self.call('create', dict(create, origin=origin))
+                self.assertEqual((made['outcome'], made['key']['origin']), ('created', origin))
+            fixed = self.call('create', dict(create, provider='anthropic', origin='https://api.anthropic.com:443'))
+            self.assertEqual(fixed, {'ok': False, 'outcome': 'invalid', 'fields': ['origin']})
+        self.assertEqual([p.get('origin') for p in sent], [None, PLOOFY, 'https://eu.ploofy.example:443'])
+        self.assertNotIn('origin', sent[0])  # omitted, so the adapter supplies its default
 
     def test_bracketed_ipv6_loopback_origin_is_listed_resolved_and_created(self):
         loopback, local = 'http://[::1]:1234', '22222222-2222-4333-8444-555555555555'

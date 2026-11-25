@@ -12,6 +12,16 @@ use ChimServer\Core\ApiKeyManager\ApiKeysService;
 use ChimServer\Core\SettingsManager\SettingsManager;
 use ChimServer\Core\SettingsManager\SettingsRegistry;
 
+// Distro defaults for providers the library leaves open (null origin). Only applied when no origin is supplied;
+// explicit origins still go through the library's validation unchanged.
+const DISTRO_DEFAULT_ORIGINS = ['ploofy' => 'https://ploofy.ai:443'];
+
+function defaultOrigin(mixed $provider): ?string {
+    // Only while the library leaves the provider open; a pinned library origin always wins.
+    if (!is_string($provider) || !isset(DISTRO_DEFAULT_ORIGINS[$provider], ApiKeyManager::PROVIDERS[$provider])) return null;
+    return ApiKeyManager::PROVIDERS[$provider]['origin'] === null ? DISTRO_DEFAULT_ORIGINS[$provider] : null;
+}
+
 /** Save one connection without changing another connection that happens to share its old encrypted key. */
 function saveConnectionKey(ApiKeyManager $keys, SettingsManager $settings, #[\SensitiveParameter] array $request): array {
     $id = $request['connection_id'];
@@ -147,7 +157,7 @@ try {
             $result=$keys->updateKey($request['key_id'],$request['revision'],$changes['label']??null,$changes['secret']??null);
         } else {
             if(array_diff(array_keys($request),['provider','label','origin','secret'])!==[]) throw new InvalidArgumentException();
-            $result=$keys->createKey($request['provider']??null,$request['label']??null,$request['origin']??null,$request['secret']??null);
+            $result=$keys->createKey($request['provider']??null,$request['label']??null,$request['origin']??defaultOrigin($request['provider']??null),$request['secret']??null);
         }
         if(in_array($result['outcome'],['created','updated','unchanged'],true) && $result['data']!==null) {
             $preview=readStoredKey($keys,$result['data']['key_id'],false);
@@ -162,6 +172,8 @@ try {
     } elseif ($operation === 'global-status') {
         $result=$keys->listKeys();
         $result['data']['providers']=ApiKeyManager::PROVIDERS;
+        foreach($result['data']['providers'] as $name=>&$definition) $definition['origin']??=defaultOrigin($name);
+        unset($definition);
         if($result['outcome']==='listed') {
             foreach($result['data']['keys'] as &$key) {
                 $preview=readStoredKey($keys,$key['key_id'],false);

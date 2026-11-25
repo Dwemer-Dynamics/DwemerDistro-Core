@@ -12,7 +12,7 @@ Saved values appear as first four + ******** + last four characters. Values of e
 
 - `global-status`: global key metadata, masked previews and provider catalog. No legacy or per-connection rows, no complete secrets.
 - `global-save {key_id,revision,label,secret}`: revision-checked in-place rotation/rename. Unchanged label plus blank secret is a no-op.
-- `global-save {provider,label,origin,secret}`: create a new global key.
+- `global-save {provider,label,origin,secret}`: create a new global key. Ploofy defaults to `https://ploofy.ai:443` in the catalog and when a new key omits `origin` (or sends null); an explicit origin is still validated by ApiKeyManager as supplied.
 - `global-reveal {key_id,revision}`: explicit readback, refusing stale revisions.
 
 Only the root-local fixed CLI exposes these operations. Secrets travel over bounded stdin/private captured stdout, never command arguments, environment or logging callbacks. Storage and validation stay in ChimServer ApiKeyManager; all persistent SQL stays in DBManager. New and replaced keys are stored as plain text. Rows sealed by older runtimes are never converted: they stay sealed and readable with the existing encryption key until an edit replaces the secret, which keeps the ID and references. A metadata-only shared migration extends the allowed provider names without rewriting existing key rows. Existing IDs and references are retained. Unknown write outcomes require reload, without automatic retries. Busy operations exclude distro maintenance and block launcher close.
