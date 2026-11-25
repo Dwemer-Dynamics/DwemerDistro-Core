@@ -231,8 +231,10 @@ def main():
             digest = (RUNTIME / '.bundle-sha256').read_text().strip()
             configuration = b''.join(Path(p).read_bytes() for p in ('/etc/chim4-s5.env','/etc/chim4-dialogue.env','/etc/chim4-tts.env',str(CONFIG)) if Path(p).is_file())
             fingerprint = hashlib.sha256(configuration + digest.encode()).hexdigest()
+            setup_ran = False
             if not marker.exists() or marker.read_text().strip() != fingerprint:
                 ensure_store(os.environ.get('DDISTRO_POSTGRES_PORT', '5432'), environment)
+                setup_ran = True
                 configuration = b''.join(Path(p).read_bytes() for p in ('/etc/chim4-s5.env','/etc/chim4-dialogue.env','/etc/chim4-tts.env',str(CONFIG)) if Path(p).is_file())
                 marker.write_text(hashlib.sha256(configuration + digest.encode()).hexdigest() + '\n')
                 marker.chmod(0o600)
@@ -241,7 +243,20 @@ def main():
                 keys.check_ready()
             except keys.Refusal as error:
                 # Refusals carry no credentials or SQL; keep them instead of the generic failure.
-                raise RuntimeError(str(error)) from None
+                refusal = str(error)
+                # A matching marker skipped setup. Retry its schema and grant steps once, only for a configured
+                # store, so this never creates a store or changes credentials, and the marker is left as it is.
+                if setup_ran or not environment.get('CHIM_SHARED_DB_NAME'):
+                    raise RuntimeError(refusal) from None
+                try:
+                    ensure_store(os.environ.get('DDISTRO_POSTGRES_PORT', '5432'), environment)
+                except Exception as repair:
+                    detail = str(repair) if type(repair) is RuntimeError else 'Shared-key setup failed; existing credentials were preserved'
+                    raise RuntimeError(refusal + ' Setup was retried and did not complete: ' + detail) from None
+                try:
+                    keys.check_ready()
+                except keys.Refusal as error:
+                    raise RuntimeError(str(error) + ' Setup was retried, and the store is still not ready.') from None
     print(json.dumps({'ok': True, 'runtime_ready': True, 'store_checked': not args.install_runtime}))
 
 

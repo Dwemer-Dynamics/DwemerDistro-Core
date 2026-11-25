@@ -1294,6 +1294,42 @@ class SharedKeysReadiness(unittest.TestCase):
         self.journal("active", "missing-tool-17-id")
         with patch.object(m.subprocess, "run", side_effect=FileNotFoundError("ddistro_keys")):
             self.assertIn("The readiness check could not run.", m.shared_keys_warning("17-id"))
+        # SIGTERM/SIGHUP during the optional check raise KeyboardInterrupt; that only warns.
+        self.journal("active", "interrupted-17-id")
+        with patch.object(m.subprocess, "run", side_effect=KeyboardInterrupt("maintenance interrupted")):
+            self.assertIn("The readiness check was interrupted.", m.shared_keys_warning("17-id"))
+
+    def test_cleanup_failure_after_cutover_warns_then_keeps_the_failure(self):
+        failure = ValueError("PostgreSQL 17 is serving, but cleanup stopped: busy")
+
+        def cutover_then_cleanup_fails(automatic=False):
+            self.journal("active")
+            raise failure
+
+        refused = subprocess.CompletedProcess([], 1, stdout=json.dumps({"ok": False, "error": "Lost config."}))
+        with patch.object(m, "upgrade", side_effect=cutover_then_cleanup_fails), \
+             patch.object(m.subprocess, "run", return_value=refused) as check, \
+             patch.object(m, "rollback", side_effect=AssertionError("rollback")), \
+             patch.object(m.sys, "stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaises(ValueError) as raised:
+                m.upgrade_and_check_keys(False)
+        self.assertIs(raised.exception, failure)
+        check.assert_called_once()
+        self.assertIn("Shared API Keys is not ready. Lost config.", stderr.getvalue())
+        # Failures before any new cutover, including cleanup-only retries, are not checked.
+        with patch.object(m, "automatic_upgrade", side_effect=failure), \
+             patch.object(m.subprocess, "run", side_effect=AssertionError("checked")), \
+             patch.object(m.sys, "stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaises(ValueError) as raised:
+                m.upgrade_and_check_keys(True)
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(stderr.getvalue(), "")
+        # A completed cutover with cleanup still warns and succeeds.
+        with patch.object(m, "upgrade", side_effect=lambda automatic=False: self.journal("active", "next-17-id")), \
+             patch.object(m.subprocess, "run", return_value=refused), \
+             patch.object(m.sys, "stderr", new_callable=io.StringIO) as stderr:
+            self.assertIsNone(m.upgrade_and_check_keys(False))
+        self.assertIn("Shared API Keys is not ready.", stderr.getvalue())
 
 
 if __name__ == "__main__":

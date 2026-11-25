@@ -74,13 +74,64 @@ class Readiness(unittest.TestCase):
             with patch.object(install.os, 'geteuid', return_value=0), patch.object(install, 'STATE', state), \
                     patch.object(install, 'RUNTIME', runtime), patch.object(install, 'CONFIG', Path(temp) / 'env'), \
                     patch.object(install, 'trusted'), patch.object(install, 'install_runtime'), \
-                    patch.object(install, 'ensure_store'), patch.object(install.sys, 'argv', ['install_shared_keys']), \
+                    patch.object(install, 'ensure_store') as setup, patch.object(install.sys, 'argv', ['install_shared_keys']), \
                     patch.object(install.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), \
                     patch.object(install.importlib.machinery, 'SourceFileLoader') as loader, \
                     patch.object(type(state), 'stat', return_value=root_dir):
                 loader.return_value.load_module.return_value = keys
                 with self.assertRaisesRegex(RuntimeError, '^Shared API Keys cannot read the current database.$'):
                     install.main()
+                setup.assert_called_once()  # setup already ran this time, so it is not retried
+
+                # A matching marker skips setup; a healthy store is not set up again.
+                keys.environment = lambda: {'CHIM_SHARED_DB_NAME': 'fixture'}
+                keys.check_ready = lambda: None
+                with patch('builtins.print'):
+                    install.main()  # stale marker: setup runs and records the fingerprint
+                    setup.reset_mock()
+                    install.main()
+                setup.assert_not_called()
+                marker = (state / 'initialized.json').read_text()
+
+                # A matching marker with an unready configured store retries setup once, then checks again.
+                refusals = [Refusal('Not ready.')]
+
+                def refuse_once():
+                    if refusals:
+                        raise refusals.pop()
+
+                keys.check_ready = refuse_once
+                with patch('builtins.print'):
+                    install.main()
+                setup.assert_called_once()
+                self.assertEqual((state / 'initialized.json').read_text(), marker)
+                setup.reset_mock()
+                keys.check_ready = refuse
+                with self.assertRaisesRegex(RuntimeError, 'cannot read the current database. Setup was retried, '
+                                                          'and the store is still not ready.$'):
+                    install.main()
+                setup.assert_called_once()
+                setup.reset_mock()
+                setup.side_effect = RuntimeError('Shared-key database setup failed; existing credentials were preserved')
+                with self.assertRaisesRegex(RuntimeError, 'Setup was retried and did not complete: Shared-key database '
+                                                          'setup failed; existing credentials were preserved$'):
+                    install.main()
+                setup.assert_called_once()
+                self.assertEqual((state / 'initialized.json').read_text(), marker)
+
+                # Without a configured store, a retry could create one, so the refusal stands.
+                setup.reset_mock()
+                setup.side_effect = None
+                keys.environment = dict
+                (state / 'initialized.json').write_text('stale\n')
+                keys.check_ready = lambda: None
+                with patch('builtins.print'):
+                    install.main()
+                setup.reset_mock()
+                keys.check_ready = refuse
+                with self.assertRaisesRegex(RuntimeError, '^Shared API Keys cannot read the current database.$'):
+                    install.main()
+                setup.assert_not_called()
 KEY = '11111111-2222-4333-8444-555555555555'
 OTHER = '99999999-2222-4333-8444-555555555555'
 TOKEN = 'reign-token-' + 'x' * 30

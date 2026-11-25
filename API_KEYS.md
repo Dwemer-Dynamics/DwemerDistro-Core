@@ -53,9 +53,14 @@ PostgreSQL 15 and 17 and prints a warning with the reason when keys are not read
 updates continue. `ddistro_pg17_maintenance auto` and `upgrade` check only after they cut over
 to PostgreSQL 17 in that run; held, current, unsupported and cleanup-only runs are not checked.
 An unready store after cutover prints a warning, keeps PostgreSQL 17 serving and never reverts
-accepted writes; the maintenance itself still succeeds. Recover with full setup from the
+accepted writes; the maintenance itself still succeeds. If staging cleanup fails after that
+cutover, the warning still prints and the maintenance reports the cleanup failure. An interrupted
+check only warns. Recover with full setup from the
 launcher API Keys tab or `sudo /usr/local/bin/install_shared_keys`, which reports the readiness
-refusal instead of a generic setup failure.
+refusal instead of a generic setup failure. If setup was skipped because it already ran for the
+same configuration and library, full setup retries its schema and grant steps once for a
+configured store, then checks again. It never creates a store or changes credentials, and reports
+the refusal if the store is still not ready.
 
 `etc/shared-key-runtime.json` pins the ChimServer runtime bundle by source commit and SHA-256; `update.sh` installs it with `install_shared_keys --install-runtime` (runtime only). Afterwards run full setup once, from the launcher API Keys tab or `sudo /usr/local/bin/install_shared_keys`, to apply the schema and runtime permissions. There is no conversion step: the shared migration changes the schema only, existing encrypted keys stay encrypted and readable, and only newly saved or replaced keys are stored as plain text. Keep the existing encryption key while encrypted keys or older backups exist.
 
