@@ -48,9 +48,14 @@ merging the new pin. Preparing this change does not publish the release asset.
 
 `sudo ddistro_keys check-ready` verifies an existing store through the runtime account, without
 setup, provider requests or returned key metadata. An unconfigured fresh image is allowed;
-lost configuration for an initialized store is refused. Updates and completed PostgreSQL
-maintenance check readiness. A failure after database cutover keeps the serving database
-and reports the key-runtime failure; it never automatically reverts accepted writes.
+lost configuration for an initialized store is refused. Update Distro checks readiness on
+PostgreSQL 15 and 17 and prints a warning with the reason when keys are not ready; other server
+updates continue. `ddistro_pg17_maintenance auto` and `upgrade` check only after they cut over
+to PostgreSQL 17 in that run; held, current, unsupported and cleanup-only runs are not checked.
+An unready store after cutover prints a warning, keeps PostgreSQL 17 serving and never reverts
+accepted writes; the maintenance itself still succeeds. Recover with full setup from the
+launcher API Keys tab or `sudo /usr/local/bin/install_shared_keys`, which reports the readiness
+refusal instead of a generic setup failure.
 
 `etc/shared-key-runtime.json` pins the ChimServer runtime bundle by source commit and SHA-256; `update.sh` installs it with `install_shared_keys --install-runtime` (runtime only). Afterwards run full setup once, from the launcher API Keys tab or `sudo /usr/local/bin/install_shared_keys`, to apply the schema and runtime permissions. There is no conversion step: the shared migration changes the schema only, existing encrypted keys stay encrypted and readable, and only newly saved or replaced keys are stored as plain text. Keep the existing encryption key while encrypted keys or older backups exist.
 

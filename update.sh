@@ -386,8 +386,14 @@ CURRENT_STEP="installing the Assistant runtime"
 CURRENT_STEP="installing the shared keys runtime"
 /usr/local/bin/install_shared_keys --install-runtime 7<&- || exit 1
 # Do not provision keys into images; verify configured stores without setup or exposing metadata.
+# An unready store only affects API keys, so it warns rather than stopping unrelated server updates.
 CURRENT_STEP="checking shared keys on the current database"
-/usr/local/bin/ddistro_keys check-ready 7<&- >/dev/null || exit 1
+if ! KEYS_READY="$(/usr/local/bin/ddistro_keys check-ready 7<&-)"; then
+    KEYS_REASON="$(printf '%s' "$KEYS_READY" | /usr/bin/python3 -c 'import json, sys
+error = json.load(sys.stdin).get("error")
+print(error if isinstance(error, str) else "")' 2>/dev/null)"
+    printf "${YELLOW}[WARNING] Shared API Keys is not ready: %s Server updates continue and existing keys are preserved. After this update, run full setup from the launcher API Keys tab or sudo /usr/local/bin/install_shared_keys.${NC}\n" "${KEYS_REASON:-the readiness check failed.}"
+fi
 # Enable installed shared-key adapters only after their central deletion guard is ready; never import user keys here.
 if [ "${DDISTRO_KEYS_IMAGE_BUILD:-}" != 1 ] && ! /usr/local/bin/ddistro_keys prepare-legacy >/dev/null; then
     printf "${YELLOW}[WARNING] Shared API Keys setup is not ready. Existing keys are preserved; update CHIM 4 and the server adapters, then retry Update Distro.${NC}\n"

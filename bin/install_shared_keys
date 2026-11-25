@@ -237,7 +237,11 @@ def main():
                 marker.write_text(hashlib.sha256(configuration + digest.encode()).hexdigest() + '\n')
                 marker.chmod(0o600)
             # Setup markers are not proof that the running database still matches this library.
-            keys.check_ready()
+            try:
+                keys.check_ready()
+            except keys.Refusal as error:
+                # Refusals carry no credentials or SQL; keep them instead of the generic failure.
+                raise RuntimeError(str(error)) from None
     print(json.dumps({'ok': True, 'runtime_ready': True, 'store_checked': not args.install_runtime}))
 
 

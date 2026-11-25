@@ -1091,5 +1091,210 @@ class RequestLogs(unittest.TestCase):
             self.assertIn("--confirm-preview", run.stderr)
 
 
+class StandaloneFreshInstall(unittest.TestCase):
+    """A fresh install's only PG17, with no migration journal and no PG15, is current and pins request logs."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+        conf, data = self.base / "etc", self.base / "lib"
+        paths = {"ROOT": self.base / "root", "STATE": self.base / "root" / "state.json", "CONF": conf, "DATA": data,
+                 "OLD": conf / "15" / "main", "OLD_DATA": data / "15" / "main", "NEW": conf / "17" / "dwemer",
+                 "NEW_DATA": data / "17" / "dwemer"}
+        for key, value in paths.items():
+            patcher = patch.object(m, key, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        m.log = None
+        self.cluster("main")
+
+    def cluster(self, name):
+        for tree in (m.CONF, m.DATA, m.ROOT):
+            shutil.rmtree(tree, ignore_errors=True)
+        m.ROOT.mkdir()
+        self.conf, self.data = m.CONF / "17" / name, m.DATA / "17" / name
+        self.conf.mkdir(parents=True)
+        self.data.mkdir(parents=True)
+        (self.conf / "start.conf").write_text("auto\n")
+        (self.data / "PG_VERSION").write_text("17\n")
+        self.registration = {"data_directory": str(self.data), "port": "5432"}
+
+    def status(self, running=(), serves=False, served=None, identity="17id", state="shut down"):
+        served = f"17|{self.data}|17id" if served is None else served
+        with patch.object(m, "registered_setting", side_effect=lambda _name, key: self.registration[key]), \
+             patch.object(m, "running", side_effect=lambda version, _d: version in running), \
+             patch.object(m, "socket_serves", return_value=serves), \
+             patch.object(m, "controldata", return_value={"Database system identifier": identity,
+                                                          "Database cluster state": state}), \
+             patch.object(m, "query", return_value=served) as query, \
+             patch.object(m, "verify_active", side_effect=ValueError("PG15 path")):
+            try:
+                return m.automatic_status(), query.called
+            except ValueError as error:
+                return str(error), query.called
+
+    def test_a_standalone_17_main_or_17_dwemer_is_current_and_other_layouts_unsupported(self):
+        for name in ("main", "dwemer"):
+            self.cluster(name)
+            self.assertEqual(self.status(), ("current", False), name)
+            self.assertEqual(self.status(state="in production"), ("current", False), name)
+            self.assertEqual(self.status(serves=True), ("current", True), name)
+            self.assertEqual(self.status(running=(17,)), ("current", True), name)
+        # A live server must be this cluster from this data directory; a stopped one must start next.
+        for kwargs in ({"serves": True, "served": "17|/srv/other|17id"}, {"serves": True, "served": f"17|{self.data}|other"},
+                       {"serves": True, "served": f"15|{self.data}|17id"}):
+            self.assertRegex(self.status(**kwargs)[0], "does not serve this distro's PostgreSQL 17", kwargs)
+        self.assertRegex(self.status(state="in archive recovery")[0], "would not start")
+        (self.conf / "start.conf").write_text("disabled\n")
+        self.assertRegex(self.status()[0], "would not start")
+        stage = "dwemer-stage-" + "a" * 32
+        layouts = {
+            "PG15 configuration": lambda: m.OLD.mkdir(parents=True),
+            "an empty PG15 data directory": lambda: m.OLD_DATA.mkdir(parents=True),
+            "a second cluster": lambda: (m.CONF / "17" / "other").mkdir(),
+            "another cluster name": lambda: (self.conf.rename(self.conf.with_name("x")), self.data.rename(self.data.with_name("x"))),
+            "a linked data directory": lambda: (self.data.rename(self.base / "moved"), self.data.symlink_to(self.base / "moved")),
+            "another port": lambda: self.registration.update(port="5433"),
+            "another registered data directory": lambda: self.registration.update(data_directory="/srv/pg"),
+            "not PG17 data": lambda: (self.data / "PG_VERSION").write_text("16\n"),
+            "an archived migration journal": lambda: (m.ROOT / (stage + ".json")).write_text("{}"),
+            "a staging copy": lambda: (m.DATA / stage).mkdir(),
+        }
+        for label, change in layouts.items():
+            self.cluster("main")
+            change()
+            self.assertEqual(self.status(), ("unsupported", False), label)
+
+    def test_stopped_dashboard_recovery_copies_beside_the_standalone_cluster_are_allowed(self):
+        def copy(suffix, version="17\n"):
+            path = self.data.with_name(self.data.name + suffix)
+            path.mkdir()
+            (path / "PG_VERSION").write_text(version)
+            return path
+
+        for name in ("main", "dwemer"):
+            self.cluster(name)
+            copy(".before-recovery-20260101-120000")
+            copy(".rejected-recovery-20260102-130000")
+            self.assertEqual(self.status(), ("current", False), name)
+        layouts = {
+            "a malformed timestamp": lambda: copy(".before-recovery-2026010-120000"),
+            "a trailing suffix": lambda: copy(".before-recovery-20260101-120000.old"),
+            "another cluster's copy": lambda: (self.data.parent / "dwemer.before-recovery-20260101-120000").mkdir(),
+            "an unknown directory": lambda: copy(".backup"),
+            "a staging-like sibling": lambda: copy(".rejected-recovery-20260101-120000-x"),
+            "a PG16 copy": lambda: copy(".before-recovery-20260101-120000", "16\n"),
+            "a copy without PG_VERSION": lambda: (self.data.parent / "main.before-recovery-20260101-120000").mkdir(),
+            "a linked copy": lambda: (self.data.parent / "main.before-recovery-20260101-120000").symlink_to(self.data),
+            "a file copy": lambda: (self.data.parent / "main.before-recovery-20260101-120000").write_text(""),
+            "a registered copy": lambda: (copy(".before-recovery-20260101-120000"),
+                                          (m.CONF / "17" / "main.before-recovery-20260101-120000").mkdir()),
+        }
+        for label, change in layouts.items():
+            self.cluster("main")
+            change()
+            self.assertEqual(self.status(), ("unsupported", False), label)
+        # A running copy is a live alternate cluster.
+        self.cluster("main")
+        live = copy(".before-recovery-20260101-120000")
+        with patch.object(m, "running", side_effect=lambda _v, directory: Path(directory) == live):
+            self.assertIsNone(self.with_registration(m.standalone_cluster))
+        with patch.object(m, "running", side_effect=ValueError("status")):
+            self.assertIsNone(self.with_registration(m.standalone_cluster))
+        with patch.object(m, "running", return_value=False):
+            self.assertEqual(self.with_registration(m.standalone_cluster), ("main", self.data))
+        # Migration journals still decide, even with recovery copies present.
+        m.STATE.write_text(json.dumps({"phase": "rolled-back", "work": str(m.DATA / TAG), "donor_id": "15id"}))
+        self.assertRegex(self.status()[0], "PG15 path")
+
+    def with_registration(self, call):
+        with patch.object(m, "registered_setting", side_effect=lambda _name, key: self.registration[key]):
+            return call()
+
+    def test_a_pg15_or_journaled_distro_never_takes_the_standalone_path(self):
+        # The original 15/main keeps its own check, even beside a PostgreSQL 17 cluster.
+        m.OLD_DATA.mkdir(parents=True)
+        (m.OLD_DATA / "PG_VERSION").write_text("15\n")
+        self.assertRegex(self.status()[0], "PG15 path")
+        shutil.rmtree(m.CONF / "15", ignore_errors=True)
+        shutil.rmtree(m.DATA / "15")
+        # A migration journal always decides; its guards are never replaced by standalone recognition.
+        m.STATE.write_text(json.dumps({"phase": "rolled-back", "work": str(m.DATA / TAG), "donor_id": "15id"}))
+        self.assertRegex(self.status()[0], "PG15 path")
+        m.STATE.write_text(json.dumps({"phase": "active", "cleaned": True, "work": str(m.DATA / TAG),
+                                       "candidate_id": "17id", "donor_id": "15id"}))
+        self.assertRegex(self.status()[0], "differs from the maintenance journal")
+
+    def test_request_logs_pin_the_standalone_cluster(self):
+        def guard(served, identity="17id", **state):
+            if state:
+                m.STATE.write_text(json.dumps(state))
+            replies = {"concat_ws": served, "pg_database": "1"}
+            with patch.object(m, "registered_setting", side_effect=lambda _name, key: self.registration[key]), \
+                 patch.object(m, "socket_serves", return_value=True), \
+                 patch.object(m, "cluster_id", side_effect=lambda version, directory: {
+                     (17, str(self.data)): identity}.get((version, str(directory)), "other")), \
+                 patch.object(m, "query_db", side_effect=lambda _db, sql: next(v for k, v in replies.items() if k in sql)):
+                try:
+                    m.request_log_guard()
+                    return True
+                except ValueError:
+                    return False
+
+        self.assertTrue(guard(f"17|{self.data}|17id"))
+        self.assertFalse(guard(f"17|{self.data}|other"))
+        self.assertFalse(guard(f"17|{m.NEW_DATA}|17id"))
+        self.assertFalse(guard(f"15|{m.OLD_DATA}|17id"))
+        self.cluster("dwemer")
+        self.assertTrue(guard(f"17|{m.NEW_DATA}|17id"))
+        # Not recognised (another port) falls back to the ordinary PG15 check, which this server fails.
+        self.registration.update(port="5433")
+        self.assertFalse(guard(f"17|{m.NEW_DATA}|17id"))
+        # A journal keeps the migration's own identity: an active one without a candidate fails closed.
+        self.registration.update(port="5432")
+        self.assertFalse(guard(f"17|{m.NEW_DATA}|17id", phase="active"))
+
+
+class SharedKeysReadiness(unittest.TestCase):
+    """Only a cutover by this run checks shared keys, and an unready store warns without failing or rolling back."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state = patch.object(m, "STATE", Path(temp.name) / "state.json")
+        state.start()
+        self.addCleanup(state.stop)
+
+    def journal(self, phase, candidate="17-id"):
+        m.STATE.write_text(json.dumps({"phase": phase, "candidate_id": candidate}))
+
+    def test_runs_without_a_new_cutover_are_not_checked(self):
+        with patch.object(m.subprocess, "run", side_effect=AssertionError("checked")), \
+             patch.object(m, "rollback", side_effect=AssertionError("rollback")):
+            self.assertIsNone(m.shared_keys_warning(None))  # unsupported or failed before any journal
+            self.journal("rolled-back")
+            self.assertIsNone(m.shared_keys_warning(m.serving_candidate()))  # held on PG15
+            self.journal("active")
+            self.assertIsNone(m.shared_keys_warning(m.serving_candidate()))  # current or cleanup-only
+
+    def test_cutover_reports_the_refusal_and_keeps_pg17(self):
+        before = m.serving_candidate()
+        self.journal("active")
+        refused = subprocess.CompletedProcess([], 1, stdout=json.dumps({"ok": False, "error": "Lost config."}))
+        with patch.object(m.subprocess, "run", return_value=refused) as check, \
+             patch.object(m, "rollback", side_effect=AssertionError("rollback")):
+            warning = m.shared_keys_warning(before)
+        self.assertEqual(check.call_args.args[0], ["/usr/local/bin/ddistro_keys", "check-ready"])
+        self.assertIn("PostgreSQL 17 is serving and was kept, but Shared API Keys is not ready. Lost config.", warning)
+        self.assertEqual(json.loads(m.STATE.read_text())["phase"], "active")
+        self.journal("active", "retried-17-id")
+        with patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="{}")):
+            self.assertIsNone(m.shared_keys_warning("17-id"))
+        self.journal("active", "missing-tool-17-id")
+        with patch.object(m.subprocess, "run", side_effect=FileNotFoundError("ddistro_keys")):
+            self.assertIn("The readiness check could not run.", m.shared_keys_warning("17-id"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import tempfile
 import time
@@ -1479,7 +1480,10 @@ class Journal(unittest.TestCase):
                  "PG17_STATE": self.base / "pg17.json", "POLICY": self.base / "policy-rc.d",
                  "POLICY_ASIDE": self.base / "root" / "policy.saved", "CLOSED_OPEN": self.base / "root" / "closed-open.json",
                  "MACHINE_ID": self.base / "machine-id", "FRESH_IMAGE": self.base / "fresh-image",
-                 "NEW_CONF": self.base / "conf17"}
+                 "NEW_CONF": self.base / "conf17", "PG_CONF": self.base / "etc-postgresql",
+                 "PG_DATA": self.base / "lib-postgresql", "PG17_ROOT": self.base / "pg17-root",
+                 # A standalone binding rebinds these; each test starts from the migrated defaults.
+                 "NEW_DATA": m.NEW_DATA, "PG17_SERVICE": m.PG17_SERVICE}
         for key, value in paths.items():
             patcher = patch.object(m, key, value)
             patcher.start()
@@ -1873,7 +1877,7 @@ class Journal(unittest.TestCase):
         (m.NEW_CONF / "start.conf").write_text("auto\n")
         runs = []
         self.start(self.offline() + [
-            patch.object(m, "pg17_journal", return_value=(self.PG17_JOURNAL, [])),
+            patch.object(m, "pg_cluster", return_value=(self.PG17_JOURNAL, [])),
             patch.object(m, "dpkg_status_digest", return_value="d"), patch.object(m, "apt_sources", return_value=[]),
             patch.object(m, "static_problems", return_value=[]), patch.object(m, "installed_packages", return_value={}),
             patch.object(m, "php_snapshot", return_value={}), patch.object(m, "service_running", return_value=False),
@@ -1893,6 +1897,202 @@ class Journal(unittest.TestCase):
         # A cancel restores the start.conf and starts nothing, since nothing was running.
         m.unfence(state)
         self.assertEqual(((m.NEW_CONF / "start.conf").read_text(), runs, m.FENCE.exists()), ("auto\n", [], False))
+
+    STANDALONE_ID = "7400000000000000017"
+
+    @staticmethod
+    def no_pg15(major, _directory):
+        if major != 17:
+            raise AssertionError("a standalone install has no PG15 to probe")
+        return False
+
+    def standalone(self, name="main"):
+        """A fresh install's only PostgreSQL, a stopped 17/<name> registered at its data directory on port
+        5432, with no PG15 and no PG17 migration journal. `run` records commands without running them."""
+        for tree in (m.PG_CONF, m.PG_DATA, m.PG17_ROOT):
+            shutil.rmtree(tree, ignore_errors=True)
+        conf, data = m.PG_CONF / "17" / name, m.PG_DATA / "17" / name
+        conf.mkdir(parents=True)
+        data.mkdir(parents=True)
+        (conf / "start.conf").write_text("auto\n")
+        (data / "PG_VERSION").write_text("17\n")
+        self.registration = {"data_directory": str(data), "port": "5432"}
+        self.runs = []
+        self.start([patch.object(m, "OLD_CONF", m.PG_CONF / "15" / "main"),
+                    patch.object(m, "OLD_DATA", m.PG_DATA / "15" / "main"),
+                    patch.object(m, "registered_setting", side_effect=lambda _name, key: self.registration[key]),
+                    self.control(identity=self.STANDALONE_ID), patch.object(m, "stop_private_pg17"), patch.object(m, "note"),
+                    patch.object(m, "socket_serves", return_value=False), patch.object(m, "mount_points", return_value=[]),
+                    patch.object(m, "pg_running", side_effect=self.no_pg15),
+                    patch.object(m, "run", side_effect=lambda *a, **k: self.runs.append(" ".join(map(str, a))))])
+        return conf, data
+
+    def test_only_a_single_registered_17_main_or_17_dwemer_is_standalone(self):
+        self.start([patch.object(m, "os_release", return_value={"ID": "debian", "VERSION_ID": "12"})])
+        for name in ("main", "dwemer"):
+            conf, data = self.standalone(name)
+            self.assertEqual(m.status_report()["state"], "needed", name)
+            cluster, problems = m.pg_cluster()
+            self.assertEqual((cluster, problems, m.NEW_CONF, m.NEW_DATA, m.PG17_SERVICE),
+                             ((name, self.STANDALONE_ID), [], conf, data, f"postgresql@17-{name}"))
+            self.assertEqual(m.pg_layout(cluster), [])
+        stage = "dwemer-stage-" + "a" * 32
+
+        def linked(_conf, data):
+            data.rename(self.base / "elsewhere")
+            data.symlink_to(self.base / "elsewhere")
+
+        refusals = {
+            "PG15 data": lambda c, d: (m.PG_DATA / "15" / "main").mkdir(parents=True),
+            "PG15 configuration": lambda c, d: (m.PG_CONF / "15" / "main").mkdir(parents=True),
+            "a second cluster": lambda c, d: (m.PG_CONF / "17" / "other").mkdir(),
+            "another cluster name": lambda c, d: (c.rename(c.with_name("custom")), d.rename(d.with_name("custom"))),
+            "a linked data directory": linked,
+            "another port": lambda c, d: self.registration.update(port="5433"),
+            "another registered data directory": lambda c, d: self.registration.update(data_directory="/srv/pg"),
+            "a PG15 data directory": lambda c, d: (d / "PG_VERSION").write_text("15\n"),
+            "an archived migration": lambda c, d: (m.PG17_ROOT.mkdir(), (m.PG17_ROOT / (stage + ".json")).write_text("{}")),
+            "a staging copy": lambda c, d: (m.PG_DATA / stage).mkdir(),
+        }
+        for label, change in refusals.items():
+            change(*self.standalone())
+            report = m.status_report()
+            self.assertEqual((report["state"], [r["code"] for r in report["reasons"]]), ("deferred", ["pg17-not-current"]),
+                             label)
+        # A migration journal is never set aside for a standalone reading: its own guards decide.
+        self.standalone()
+        m.PG17_STATE.write_text(json.dumps(self.PG17_JOURNAL))
+        report = m.status_report()
+        self.assertEqual((report["state"], report["reasons"][0]["code"]), ("deferred", "pg17-identity"))
+
+    def test_stopped_dashboard_recovery_copies_beside_a_standalone_cluster_are_allowed(self):
+        self.start([patch.object(m, "os_release", return_value={"ID": "debian", "VERSION_ID": "12"})])
+
+        def copy(data, suffix, version="17\n"):
+            path = data.with_name(data.name + suffix)
+            path.mkdir()
+            (path / "PG_VERSION").write_text(version)
+            return path
+
+        for name in ("main", "dwemer"):
+            conf, data = self.standalone(name)
+            copy(data, ".before-recovery-20260101-120000")
+            copy(data, ".rejected-recovery-20260102-130000")
+            self.assertEqual(m.standalone_name(), (name, ""), name)
+            self.assertEqual(m.status_report()["state"], "needed", name)
+            cluster, problems = m.pg_cluster()
+            self.assertEqual((cluster, problems, m.NEW_DATA), ((name, self.STANDALONE_ID), [], data))
+            self.assertEqual(m.pg_layout(cluster), [])
+        stamp = ".before-recovery-20260101-120000"
+        refusals = {
+            "a malformed timestamp": lambda c, d: copy(d, ".before-recovery-20260101-12000"),
+            "a trailing suffix": lambda c, d: copy(d, stamp + ".old"),
+            "another cluster's copy": lambda c, d: (d.parent / ("dwemer" + stamp)).mkdir(),
+            "an unknown directory": lambda c, d: copy(d, ".backup"),
+            "a PG16 copy": lambda c, d: copy(d, stamp, "16\n"),
+            "a copy without PG_VERSION": lambda c, d: (d.parent / ("main" + stamp)).mkdir(),
+            "a linked copy": lambda c, d: (d.parent / ("main" + stamp)).symlink_to(d),
+            "a registered copy": lambda c, d: (copy(d, stamp), (c.parent / ("main" + stamp)).mkdir()),
+        }
+        for label, change in refusals.items():
+            change(*self.standalone())
+            self.assertIsNone(m.standalone_name()[0], label)
+            report = m.status_report()
+            self.assertEqual((report["state"], [r["code"] for r in report["reasons"]]), ("deferred", ["pg17-not-current"]),
+                             label)
+        # A running copy is a live alternate cluster; an unreadable status is refused too.
+        _conf, data = self.standalone()
+        live = copy(data, stamp)
+        with patch.object(m, "pg_running", side_effect=lambda _major, directory: Path(directory) == live):
+            self.assertRegex(m.standalone_name()[1], "is running")
+        with patch.object(m, "pg_running", side_effect=ValueError("status")):
+            self.assertIsNone(m.standalone_name()[0])
+        # A migration journal still decides with recovery copies present.
+        m.PG17_STATE.write_text(json.dumps(self.PG17_JOURNAL))
+        report = m.status_report()
+        self.assertEqual((report["state"], report["reasons"][0]["code"]), ("deferred", "pg17-identity"))
+
+    def prepare_standalone(self, name):
+        conf, data = self.standalone(name)
+        plan_id = "c" * 32
+        self.start([patch.object(m, "PLAN", m.ROOT / "plan.json"), patch.object(m, "dpkg_status_digest", return_value="d"),
+                    patch.object(m, "apt_sources", return_value=[]), patch.object(m, "static_problems", return_value=[]),
+                    patch.object(m, "installed_packages", return_value={}), patch.object(m, "php_snapshot", return_value={}),
+                    patch.object(m, "service_running", return_value=False), patch.object(m, "cuda_layout", return_value=None),
+                    patch.object(m, "stock_preferences", return_value=(None, [])),
+                    patch.object(m, "collation_problems", return_value=[]), patch.object(m, "retained_problems", return_value=[]),
+                    patch.object(m, "inventory_digest", return_value="i"), patch.object(m, "guarded_digests", return_value={}),
+                    patch.object(m, "pg17_seal", return_value=[self.STANDALONE_ID, "0/1", "now", "shut down"]),
+                    patch.object(m, "private_pg17", return_value=m.PRIVATE_SOCKET),
+                    patch.object(m, "pg_inventory", return_value={"databases": [], "retained": [], "objects": {}, "extensions": {}}),
+                    patch.object(m.os, "sync", create=True)])
+        m.PLAN.write_text(json.dumps({"plan_id": plan_id, "created": time.time(), "dpkg_status": "d", "args": [],
+                                      "plan_digest": "p", "php_map": {}, "venvs": []}))
+        self.assertEqual(m.prepare(plan_id)["result"], "fenced")
+        return conf, data, m.load_state()
+
+    def test_a_standalone_fence_binds_its_cluster_and_every_resume_proves_it_again(self):
+        conf, data, state = self.prepare_standalone("main")
+        # Its own journal binds the name and identity; no PG15 donor or PG17 migration journal is invented.
+        self.assertEqual({k: state[k] for k in ("pg_layout", "pg17_name", "pg17_candidate_id", "pg15_id", "pg17_donor_id")},
+                         {"pg_layout": "standalone", "pg17_name": "main", "pg17_candidate_id": self.STANDALONE_ID,
+                          "pg15_id": None, "pg17_donor_id": None})
+        self.assertFalse(os.path.lexists(m.PG17_STATE))
+        self.assertEqual(((conf / "start.conf").read_text(), self.runs), ("manual\n", []))
+        # A resume in a new process starts from the defaults and selects the journaled cluster.
+        m.NEW_CONF, m.NEW_DATA, m.PG17_SERVICE = self.base / "conf17", Path("/var/lib/postgresql/17/dwemer"), "x"
+        self.assertEqual((m.check_fence(state, state["token"]), m.NEW_DATA), ([], data))
+        (m.PG_DATA / "15" / "main").mkdir(parents=True)
+        self.assertEqual([p["code"] for p in m.check_fence(state, state["token"])], ["pg17-identity"])
+        shutil.rmtree(m.PG_DATA / "15")
+        # Cancel restores the start setting and restarts what served, by its own name.
+        state["pg17_was_running"] = True
+        m.save_state(state)
+        result = m.cancel()
+        self.assertEqual((result["restore"]["running"], self.runs, (conf / "start.conf").read_text()),
+                         (["postgresql@17-main"], ["pg_ctlcluster --skip-systemctl-redirect 17 main start"], "auto\n"))
+        # A changed identity, a renamed binding or a migration journal that appeared start nothing.
+        cancelled = m.load_state()
+        for label, journal, change in (("identity", {}, lambda: self.control(identity="7400000000000000099")),
+                                       ("name", {"pg17_name": "dwemer"}, contextlib.nullcontext),
+                                       ("migration journal", {}, lambda: patch.object(m, "PG17_STATE", self.base / "journal"))):
+            self.runs.clear()
+            (self.base / "journal").write_text(json.dumps(self.PG17_JOURNAL))
+            with change():
+                m.save_state(dict(cancelled, **journal, restore=m.restore_plan(cancelled, [])))
+                restore = m.cancel()["restore"]
+            self.assertEqual(([p["code"] for p in restore["problems"]], restore["pending"], self.runs),
+                             (["pg17-identity"], True, []), label)
+        # A migrated journal is never satisfied by a standalone disk, and an unknown layout is refused.
+        migrated = {k: v for k, v in cancelled.items() if k not in ("pg_layout", "pg17_name")}
+        m.save_state(dict(migrated, restore=m.restore_plan(migrated, [])))
+        self.assertEqual([p["code"] for p in m.cancel()["restore"]["problems"]], ["pg17-not-current"])
+        m.save_state(dict(cancelled, pg_layout="guessed"))
+        with self.assertRaisesRegex(ValueError, "unrecognised PostgreSQL layout"):
+            m.cancel()
+        self.assertEqual(self.runs, [])
+
+    def test_verify_of_a_standalone_upgrade_needs_no_pg15_and_refuses_a_changed_layout(self):
+        self.standalone("dwemer")
+        self.journal(phase="upgraded", pg_layout="standalone", pg17_name="dwemer", pg17_candidate_id=self.STANDALONE_ID,
+                     pg15_id=None, php={}, venvs=[], guarded={}, inventory_digest="i", seal=[self.STANDALONE_ID])
+        m.FENCE.write_text("fence\n")
+        with patch.object(m, "source_problems", return_value=[]), patch.object(m, "apt_sources", return_value=[]), \
+             patch.object(m, "trixie_preference_problems", return_value=[]), \
+             patch.object(m, "os_release", return_value={"ID": "debian", "VERSION_ID": "13"}), \
+             patch.object(m, "output", return_value=""), patch.object(m, "stale_processes", return_value=[]), \
+             patch.object(m.subprocess, "run") as run, patch.object(m, "private_pg17", return_value=m.PRIVATE_SOCKET), \
+             patch.object(m, "pg_inventory", return_value={"objects": {}, "extensions": {}, "databases": []}), \
+             patch.object(m, "inventory_digest", return_value="i"), patch.object(m, "dpkg_status_digest", return_value="v"), \
+             patch.object(m, "pg17_seal", return_value=[self.STANDALONE_ID, "0/9", "later", "shut down"]), \
+             patch.object(m.os, "sync", create=True):
+            run.return_value.returncode = 0
+            self.assertEqual((m.verify()["result"], m.NEW_DATA), ("verified", m.PG_DATA / "17" / "dwemer"))
+            (m.PG_DATA / "15" / "main").mkdir(parents=True)
+            with self.assertRaises(m.Deferred) as raised:
+                m.verify()
+        self.assertEqual([r["code"] for r in raised.exception.reasons], ["pg17-identity"])
+        self.assertTrue(m.FENCE.exists())
 
     def test_cli_validates_upgrade_modes_before_anything_runs(self):
         for argv in (["status", "--prepare"], ["release", "--cancel"], ["upgrade"], ["upgrade", "--prepare", "--cancel"],

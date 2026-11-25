@@ -52,6 +52,35 @@ class Readiness(unittest.TestCase):
         with patch.object(keys, 'environment', return_value={}), patch.object(keys.Path, 'exists', return_value=True):
             with self.assertRaises(keys.Refusal):
                 keys.check_ready()
+
+    @unittest.skipIf(importlib.util.find_spec('fcntl') is None, 'install_shared_keys targets Linux')
+    def test_setup_keeps_the_readiness_refusal(self):
+        install = load('install_shared_keys')
+
+        class Refusal(Exception):
+            pass
+
+        def refuse():
+            raise Refusal('Shared API Keys cannot read the current database.')
+
+        keys = types.SimpleNamespace(Refusal=Refusal, environment=dict, check_ready=refuse)
+        with tempfile.TemporaryDirectory() as temp:
+            state, runtime = Path(temp) / 'state', Path(temp) / 'runtime'
+            runtime.mkdir()
+            state.mkdir()
+            (runtime / '.bundle-sha256').write_text('digest\n')
+            (state / 'initialized.json').write_text('stale\n')
+            root_dir = types.SimpleNamespace(st_uid=0, st_mode=0o40700)
+            with patch.object(install.os, 'geteuid', return_value=0), patch.object(install, 'STATE', state), \
+                    patch.object(install, 'RUNTIME', runtime), patch.object(install, 'CONFIG', Path(temp) / 'env'), \
+                    patch.object(install, 'trusted'), patch.object(install, 'install_runtime'), \
+                    patch.object(install, 'ensure_store'), patch.object(install.sys, 'argv', ['install_shared_keys']), \
+                    patch.object(install.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), \
+                    patch.object(install.importlib.machinery, 'SourceFileLoader') as loader, \
+                    patch.object(type(state), 'stat', return_value=root_dir):
+                loader.return_value.load_module.return_value = keys
+                with self.assertRaisesRegex(RuntimeError, '^Shared API Keys cannot read the current database.$'):
+                    install.main()
 KEY = '11111111-2222-4333-8444-555555555555'
 OTHER = '99999999-2222-4333-8444-555555555555'
 TOKEN = 'reign-token-' + 'x' * 30
