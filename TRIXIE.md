@@ -20,12 +20,32 @@ Everything below is checked by `preflight`; anything else defers with a reason a
 
 - Debian 12 amd64 without foreign architectures, a healthy dpkg database, no held packages, no APT pins other than the stock pin file below, and no existing `policy-rc.d`.
 - `/etc/wsl.conf` neither enables systemd (`systemd` absent or `false`, quoted or not) nor runs a `[boot]` command other than exactly `/usr/local/bin/initialize_fresh_distro`. `/etc/wsl.conf` is also one of the guarded files `verify` compares.
-- PG17 current: the PG17 journal is `active` with staging cleaned, and `17/dwemer` on disk is the cluster it recorded (`pg_controldata` system identifier equal to the journal's `candidate_id`, and the configuration's `dwemer-maintenance-id` marker naming the journal's staging run; otherwise `pg17-identity`). Exactly the clusters `15/main` (retained, stopped, `start.conf` `disabled`) and `17/dwemer`, with no linked paths, mounts or tablespaces under them.
+- PG17 current: the PG17 journal is `active` with staging cleaned, and `17/dwemer` on disk is the cluster it recorded (`pg_controldata` system identifier equal to the journal's `candidate_id`, and the configuration's `dwemer-maintenance-id` marker naming the journal's staging run; otherwise `pg17-identity`). Exactly the clusters `15/main` (retained, stopped, `start.conf` `disabled`) and `17/dwemer`, with no linked paths, mounts or tablespaces under them. Or, for a fresh install that never migrated, a [standalone PostgreSQL 17](#a-standalone-postgresql-17).
 - Every database uses C, POSIX or C.UTF-8 with the libc provider, and no column uses another collation. Text ordering of other locales can change with glibc 2.36 to 2.41 or ICU 72 to 76, so their indexes need a reviewed `REINDEX`.
 - Closed databases (`datallowconn` false): see [Closed databases](#closed-databases). `template0` and the template1 copy that `ensure_postgres_utf8` retained are supported; any other closed database defers.
 - APT sources are Debian archive suites, PGDG, the distribution-independent GitHub CLI repository, the stock testing line below, or the [vendor feeds](#vendor-feeds) Core's own installers add, each recognised by its [source identity](#source-identity). Any other third-party or rolling source (another `testing`, `sid`, `forky` line, any deb822 testing stanza, a vendor entry in any other form) defers as unknown.
 - PostgreSQL may be serving or, as after a reopened distro, stopped: see [A stopped PG17](#a-stopped-pg17).
 - No installed package is newer than every Trixie build of the same name (`apt-ahead-of-trixie`, typically a package taken from testing). APT never downgrades, so such a package would remain a foreign build on Debian 13.
+
+### A standalone PostgreSQL 17
+
+Fresh installer images ship one PostgreSQL 17 cluster, `17/main` or `17/dwemer`, with no PG15 donor and no PG17 migration journal. Core recognises that layout only when the PG17 migration journal is absent. Even then, all of the following must hold:
+
+- No archived migration (`dwemer-stage-*`) exists in `/var/lib/dwemerdistro/pg17-maintenance`.
+- No PG15 configuration or data exists.
+- `/etc/postgresql` holds only `17` with one cluster, `main` or `dwemer`, and `/var/lib/postgresql` holds only that one versioned data directory, with no staging copy.
+- Beside that data directory, `/var/lib/postgresql/17` holds nothing but Dashboard cluster recovery copies named exactly `<name>.before-recovery-YYYYMMDD-HHMMSS` or `<name>.rejected-recovery-YYYYMMDD-HHMMSS`, each an unlinked, unregistered, stopped directory with `PG_VERSION` `17`. They are left as they are.
+- No path is linked.
+- The data directory's `PG_VERSION` is `17`.
+- `pg_conftool` reports that data directory and port 5432 for the cluster.
+
+Anything else is not standalone. It defers as `pg17-not-current`, and the migrated rules above still apply. A PG17 migration journal is never set aside in favour of this reading. A missing PG15 is accepted only for a recognised standalone cluster.
+
+A standalone cluster uses the same checks as a migrated one: `start.conf` `auto` or `manual`, no mounts or tablespaces, a primary's stopped state or the same live socket check, private inspection and the fence seal. It has no maintenance marker and no PG15 guard. Its identity comes from its own `pg_control`.
+
+`upgrade --prepare` records `pg_layout: standalone`, the cluster name (`pg17_name`) and its system identifier (`pg17_candidate_id`, which must match the fence seal) in the Debian 13 journal. It records `pg15_id` and `pg17_donor_id` as `null`. It writes no PG17 migration journal and invents no donor. A journal without `pg_layout` predates this support and is the migrated layout. A journal with an unrecognised layout or name is refused.
+
+Every later step re-derives the cluster from that journal, never from what it finds on disk. The capture-token check, `verify`, and the restore after `upgrade --cancel` or `release` all prove again that it is still the only standalone cluster under that name, with that identity. They refuse with `pg17-identity`, starting nothing, if a PG15 cluster, another cluster or a PG17 migration journal appeared, or the name or identity changed. PG17 is started as `pg_ctlcluster 17 <name> start`, and the restore reports it as `postgresql@17-<name>`.
 
 ### Source identity
 
@@ -224,6 +244,7 @@ When the fence lifts (`upgrade --cancel`, a `prepare` that defers after fencing,
 - the WSL registration (`WSL_DISTRO_NAME`) carries `-TrixieRecovery-`, the Launcher's proof copy or the failed disk it keeps after a restore;
 - the PG17 journal is not `active` and cleaned, or `17/dwemer` is not its marked candidate or not the system identifier recorded at the fence;
 - PG15 runs or its `start.conf` is not `disabled`, another server answers on the application socket, or a closed database may still be open.
+- for a [standalone PostgreSQL 17](#a-standalone-postgresql-17), the two rules above are replaced. The journaled `17/<name>` must still be the only standalone cluster, with the system identifier recorded at the fence. It is started as `17 <name>`.
 
 The command's reply carries `restore` (`pending`, `pg17`, `services`, `running`, `failed`, `problems`) and `status` reports `restore_pending: true` while one is pending. A failed start, a refusal above or a crash after the phase changed never fails the command and never reopens the fence: rerun the same command (`upgrade --cancel` on a `cancelled` journal, `release` on a `current` one), which starts only what is still stopped, or start the distro normally. Neither suggests the recovery copy: once the fence has lifted, writes may have been admitted. A journal cancelled by an earlier Core records no restore and starts nothing; a normal start covers it.
 

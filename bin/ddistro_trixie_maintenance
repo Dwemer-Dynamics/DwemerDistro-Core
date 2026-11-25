@@ -866,6 +866,122 @@ def pg17_journal():
     return state, problems
 
 
+STANDALONE_NAMES = ("main", "dwemer")
+RECOVERY_COPY = r"\.(?:before|rejected)-recovery-[0-9]{8}-[0-9]{6}"
+
+
+class Standalone(tuple):
+    """A fresh install's only PostgreSQL, 17/<name>, and its pg_control identity. A distinct type, so no
+    JSON journal can pass for one."""
+
+    name = property(lambda self: self[0])
+    candidate_id = property(lambda self: self[1])
+
+
+def use_cluster(name):
+    """Point the PG17 paths at the standalone 17/<name>. The migrated layout keeps the module defaults."""
+    global NEW_CONF, NEW_DATA, PG17_SERVICE
+    NEW_CONF, NEW_DATA, PG17_SERVICE = PG_CONF / "17" / name, PG_DATA / "17" / name, f"postgresql@17-{name}"
+
+
+def registered_setting(name, key):
+    """A 17/<name> setting as postgresql-common resolves it, or None when it is not set or unreadable."""
+    try:
+        result = subprocess.run(["pg_conftool", "-s", "17", name, "show", key], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.decode(errors="replace").strip() if result.returncode == 0 else None
+
+
+def standalone_name():
+    """(name, why not) for the fresh-install layout, from files and registration only. With no PG17
+    migration journal or archived migration, no PostgreSQL 15 and no staging copy, the only registered
+    cluster must be a plain 17/main or 17/dwemer whose data directory holds PG_VERSION 17 and is
+    registered at that path on port 5432. Several, linked or unregistered clusters are refused. Stopped
+    PG_VERSION 17 recovery copies Dashboard cluster recovery keeps beside the data directory are allowed."""
+    def plain_dir(path):
+        return not path.is_symlink() and path.is_dir() and Path(os.path.realpath(path)) == path
+
+    try:
+        if os.path.lexists(PG17_STATE) or PG17_ROOT.is_dir() and any(
+                entry.startswith("dwemer-stage-") for entry in os.listdir(PG17_ROOT)):
+            return None, "a PostgreSQL 17 migration is recorded"
+        if os.path.lexists(OLD_CONF) or os.path.lexists(OLD_DATA):
+            return None, "PostgreSQL 15 is present"
+        if not plain_dir(PG_CONF) or not plain_dir(PG_DATA):
+            return None, f"{PG_CONF} or {PG_DATA} is missing or linked"
+        held = os.listdir(PG_DATA)
+        if sorted(os.listdir(PG_CONF)) != ["17"] or [entry for entry in held if entry.isdigit()] != ["17"] or any(
+                "dwemer-stage-" in entry for entry in held):
+            return None, "PostgreSQL holds versions, clusters or staging copies other than one PostgreSQL 17 cluster"
+        names = os.listdir(PG_CONF / "17")
+        if len(names) != 1 or names[0] not in STANDALONE_NAMES or names[0] not in os.listdir(PG_DATA / "17"):
+            return None, "the only cluster must be 17/main or 17/dwemer, with its data directory beside it"
+        name = names[0]
+        data = PG_DATA / "17" / name
+        # Dashboard cluster recovery keeps <name>.before-recovery-* and <name>.rejected-recovery-* beside it.
+        copies = [PG_DATA / "17" / entry for entry in os.listdir(PG_DATA / "17") if entry != name]
+        if any(not re.fullmatch(re.escape(name) + RECOVERY_COPY, copy.name) for copy in copies):
+            return None, f"{PG_DATA / '17'} holds directories other than 17/{name} and its recovery copies"
+        if not all(plain_dir(path) for path in (PG_CONF / "17", PG_CONF / "17" / name, PG_DATA / "17", data, *copies)):
+            return None, f"17/{name} or a recovery copy is linked"
+        for directory in (data, *copies):
+            version = directory / "PG_VERSION"
+            if version.is_symlink() or not version.is_file() or version.read_text().strip() != "17":
+                return None, f"{directory} is not a PostgreSQL 17 data directory"
+    except (OSError, UnicodeDecodeError) as error:
+        return None, f"the PostgreSQL layout could not be read ({error})"
+    try:
+        live = [copy.name for copy in copies if pg_running(17, copy)]
+    except (OSError, ValueError) as error:
+        return None, f"a recovery copy's state could not be read ({error})"
+    if live:
+        return None, f"the recovery copy {live[0]} is running"
+    if registered_setting(name, "data_directory") != str(data) or registered_setting(name, "port") != "5432":
+        return None, f"17/{name} is not registered with data directory {data} on port 5432"
+    return name, ""
+
+
+def pg_cluster():
+    """(cluster, problems) for the PG17 this upgrade carries. A PG17 migration journal selects the
+    migrated layout and returns that journal with every guard. Only without one is a standalone
+    fresh-install cluster recognised (see standalone_name), bound, and returned with its identity."""
+    if os.path.lexists(PG17_STATE):
+        return pg17_journal()
+    name, why = standalone_name()
+    if name is None:
+        return None, [reason("pg17-not-current", "PostgreSQL 17 maintenance has not run. Complete the PG17 upgrade "
+                                                 f"first. This is not a standalone PostgreSQL 17 install: {why}.")]
+    use_cluster(name)
+    try:
+        identity = controldata(17, NEW_DATA)["Database system identifier"]
+    except (OSError, KeyError, subprocess.CalledProcessError):
+        return None, [reason("pg17-identity", f"The pg_control identity of 17/{name} could not be read.")]
+    return Standalone((name, identity)), []
+
+
+def journaled_standalone(state):
+    """True, with the paths bound, when the Debian 13 journal recorded a standalone cluster at the
+    fence. A journal without a layout predates standalone support and is the migrated layout."""
+    layout = state.get("pg_layout", "migrated")
+    if layout == "migrated":
+        return False
+    if layout != "standalone" or state.get("pg17_name") not in STANDALONE_NAMES or not state.get("pg17_candidate_id"):
+        raise ValueError("The Debian 13 upgrade journal records an unrecognised PostgreSQL layout")
+    use_cluster(state["pg17_name"])
+    return True
+
+
+def standalone_problems(state):
+    """The journaled standalone cluster must still be the only, registered 17/<name>, with the recorded identity."""
+    name, why = standalone_name()
+    if name != state["pg17_name"]:
+        return [reason("pg17-identity", f"17/{state['pg17_name']} is no longer this distro's only, standalone "
+                                        f"PostgreSQL cluster: {why or f'17/{name} replaced it'}.")]
+    return pg17_identity_problems(Standalone((name, state["pg17_candidate_id"])))
+
+
 def read_start(directory):
     path = directory / "start.conf"
     if path.is_symlink() or not path.is_file():
@@ -879,23 +995,27 @@ def mount_points():
         return [re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), line.split()[4]) for line in table]
 
 
-def pg_layout():
+def pg_layout(cluster=None):
+    """Exactly the migrated 15/main and 17/dwemer, or for a standalone cluster exactly its own 17/<name>."""
+    standalone = isinstance(cluster, Standalone)
     problems = []
     clusters = sorted(f"{v.name}/{c.name}" for v in PG_CONF.iterdir() if v.is_dir() for c in v.iterdir() if c.is_dir()) \
         if PG_CONF.is_dir() else []
-    if clusters != ["15/main", "17/dwemer"]:
-        problems.append(reason("pg-layout", f"Expected clusters 15/main and 17/dwemer, found {clusters or 'none'}."))
-    if read_start(OLD_CONF) != "disabled":
+    expected = [f"17/{cluster.name}"] if standalone else ["15/main", "17/dwemer"]
+    if clusters != expected:
+        problems.append(reason("pg-layout", f"Expected clusters {' and '.join(expected)}, found {clusters or 'none'}."))
+    if not standalone and read_start(OLD_CONF) != "disabled":
         problems.append(reason("pg15-guard", "The retained PG15 cluster must stay stopped with start.conf 'disabled'."))
     if read_start(NEW_CONF) not in ("auto", "manual"):
-        problems.append(reason("pg-layout", "17/dwemer start.conf is not auto or manual."))
-    for path in (PG_CONF, PG_DATA, OLD_CONF, NEW_CONF, OLD_DATA, NEW_DATA):
+        problems.append(reason("pg-layout", f"17/{NEW_DATA.name} start.conf is not auto or manual."))
+    for path in (PG_CONF, PG_DATA, NEW_CONF, NEW_DATA) if standalone else (PG_CONF, PG_DATA, OLD_CONF, NEW_CONF,
+                                                                            OLD_DATA, NEW_DATA):
         if path.is_symlink() or Path(os.path.realpath(path)) != path:
             problems.append(reason("pg-layout", f"{path} is linked; linked PostgreSQL paths are not supported."))
     points = [p for p in mount_points() if p == str(PG_DATA) or p.startswith(str(PG_DATA) + "/")]
     if points:
         problems.append(reason("pg-layout", f"Mount points under {PG_DATA}: {', '.join(points)}."))
-    for data in (OLD_DATA, NEW_DATA):
+    for data in (NEW_DATA,) if standalone else (OLD_DATA, NEW_DATA):
         tablespaces = data / "pg_tblspc"
         if tablespaces.is_dir() and any(tablespaces.iterdir()):
             problems.append(reason("pg-layout", f"{data} uses external tablespaces."))
@@ -943,7 +1063,16 @@ def socket_serves(directory=PUBLIC_SOCKET):
 
 
 def pg17_identity_problems(journal):
-    """17/dwemer on disk must be the journaled candidate, with the configuration the PG17 migration marked."""
+    """17/dwemer on disk must be the journaled candidate, with the configuration the PG17 migration marked.
+    A standalone cluster (no migration, so no marker) must have the identity it was recognised or fenced with."""
+    if isinstance(journal, Standalone):
+        try:
+            identity = controldata(17, NEW_DATA)["Database system identifier"]
+        except (OSError, KeyError, subprocess.CalledProcessError):
+            identity = None
+        if identity is None or identity != journal.candidate_id:
+            return [reason("pg17-identity", f"17/{journal.name} is not the standalone cluster recorded at the fence.")]
+        return []
     marker = NEW_CONF / "dwemer-maintenance-id"
     try:
         identity = controldata(17, NEW_DATA)["Database system identifier"]
@@ -962,7 +1091,8 @@ def pg17_application_socket(journal):
     the socket is refused by pg_inventory; nothing here starts or changes anything."""
     stop_private_pg17()
     problems = pg17_identity_problems(journal)
-    if pg_running(15, OLD_DATA):
+    # A standalone install has no PG15; its absence is part of recognising it.
+    if not isinstance(journal, Standalone) and pg_running(15, OLD_DATA):
         problems.append(reason("pg15-guard", "The retained PG15 cluster is running."))
     if problems:
         raise Deferred(problems)
@@ -970,7 +1100,7 @@ def pg17_application_socket(journal):
         return PUBLIC_SOCKET
     state = controldata(17, NEW_DATA)["Database cluster state"]
     if state not in STOPPED_STATES:
-        raise Deferred([reason("pg17-identity", f"The stopped 17/dwemer is in state {state!r}, not a primary's.")])
+        raise Deferred([reason("pg17-identity", f"The stopped 17/{NEW_DATA.name} is in state {state!r}, not a primary's.")])
     return None
 
 
@@ -2529,9 +2659,9 @@ def static_problems(packages, entries):
         problems.append(reason("policy-rc.d", f"{POLICY} already exists; another tool controls service starts."))
     if not START_ENV.is_file() or FENCE_GUARD not in START_ENV.read_text(errors="replace"):
         problems.append(reason("core-outdated", "The installed start_env does not honour the upgrade fence. Update Distro first."))
-    _journal, journal_problems = pg17_journal()
-    problems += journal_problems
-    problems += pg_layout()
+    cluster, cluster_problems = pg_cluster()
+    problems += cluster_problems
+    problems += pg_layout(cluster)
     return problems
 
 
@@ -2676,7 +2806,7 @@ def status_report():
         return report
     reasons = []
     try:
-        journal, reasons = pg17_journal()
+        journal, reasons = pg_cluster()
         # Read from the files alone: the journal is trusted only for the cluster now on disk.
         reasons = reasons or pg17_identity_problems(journal)
     except (OSError, ValueError):
@@ -2692,7 +2822,7 @@ def preflight():
     problems = static_problems(packages, entries)
     if problems:
         raise Deferred(problems)
-    inventory = pg17_inventory(pg17_journal()[0])
+    inventory = pg17_inventory(pg_cluster()[0])
     problems = collation_problems(inventory)
     if problems:
         raise Deferred(problems)
@@ -2861,7 +2991,8 @@ def prepare(plan_id):
         raise Deferred(problems)
     if execstack_drift(plan.get("execstack", [])):
         raise Deferred([reason("plan", "A venv file preflight planned to fix changed; run preflight again.")])
-    pg17, _ = pg17_journal()
+    pg17, _ = pg_cluster()
+    standalone = isinstance(pg17, Standalone)
     # A stopped PG17 is proven offline here and inspected privately after the fence below.
     socket = pg17_application_socket(pg17)
     if socket is not None:
@@ -2874,8 +3005,13 @@ def prepare(plan_id):
         "transitions": plan.get("transitions", {}), "auto_marks": plan.get("auto_marks", []),
         "dkms_override": plan.get("dkms_override"), "execstack": plan.get("execstack", []),
         "dpkg_status": plan["dpkg_status"], "preferences": bool(stock_preferences()[0]),
-        "pg15_id": controldata(15, OLD_DATA)["Database system identifier"], "pg17_donor_id": pg17.get("donor_id"),
-        "pg17_candidate_id": pg17.get("candidate_id"), "new_start": read_start(NEW_CONF),
+        # The layout and the cluster's identity are bound here; every later step proves them again.
+        # A standalone install has no PG15 donor and no migration journal, and none is invented.
+        "pg_layout": "standalone" if standalone else "migrated",
+        **({"pg17_name": pg17.name, "pg15_id": None, "pg17_donor_id": None, "pg17_candidate_id": pg17.candidate_id}
+           if standalone else {"pg15_id": controldata(15, OLD_DATA)["Database system identifier"],
+                               "pg17_donor_id": pg17.get("donor_id"), "pg17_candidate_id": pg17.get("candidate_id")}),
+        "new_start": read_start(NEW_CONF),
         "php": php_snapshot(), "running": [name for name in WRITERS if service_running(name)],
         "pg17_was_running": socket is not None, "vendors": vendor_keys(entries), "cuda_layout": cuda_layout(),
     }
@@ -2887,8 +3023,8 @@ def prepare(plan_id):
         run("service", name, "stop")
     atomic(NEW_CONF / "start.conf", "manual\n", 0o644)
     if pg_running(17, NEW_DATA):
-        run("pg_ctlcluster", "--skip-systemctl-redirect", "--mode", "fast", "17", "dwemer", "stop")
-    if pg_running(17, NEW_DATA) or pg_running(15, OLD_DATA):
+        run("pg_ctlcluster", "--skip-systemctl-redirect", "--mode", "fast", "17", NEW_DATA.name, "stop")
+    if pg_running(17, NEW_DATA) or not standalone and pg_running(15, OLD_DATA):
         raise ValueError("PostgreSQL did not stop")
     # The fence record, taken with no client left: roles, databases and, on the private socket
     # only, the contents of the retained closed template.
@@ -2905,6 +3041,8 @@ def prepare(plan_id):
     state["seal"] = pg17_seal()
     if state["seal"][-1] != "shut down":
         raise ValueError("PG17 did not shut down cleanly")
+    if state["seal"][0] != state["pg17_candidate_id"]:
+        raise ValueError("The sealed PG17 is not the cluster recognised before the fence")
     state["guarded"] = guarded_digests()
     save_state(state, "fenced")
     os.sync()
@@ -2913,6 +3051,8 @@ def prepare(plan_id):
 
 def cancel():
     state = load_state()
+    if state:
+        journaled_standalone(state)
     if state and state.get("phase") == "cancelled":
         # Already cancelled: only a restore an earlier cancel left unfinished is completed.
         return cancelled_result(restore_services(state) if restore_pending(state) else state.get("restore"))
@@ -2974,13 +3114,17 @@ def restore_problems(state):
     on the application socket, or a closed database that may still be open."""
     if RECOVERY_REGISTRATION_MARK in os.environ.get("WSL_DISTRO_NAME", ""):
         return [reason("recovery-copy", "This is a recovery copy registration; nothing is started on it.")]
-    journal, problems = pg17_journal()
-    if problems:
-        return problems
-    problems = pg17_identity_problems(journal)
+    standalone = journaled_standalone(state)
+    if standalone:
+        problems = standalone_problems(state)
+    else:
+        journal, problems = pg17_journal()
+        if problems:
+            return problems
+        problems = pg17_identity_problems(journal)
     if not problems and controldata(17, NEW_DATA)["Database system identifier"] != state.get("pg17_candidate_id"):
-        problems.append(reason("pg17-identity", "17/dwemer is not the cluster recorded at the fence."))
-    if read_start(OLD_CONF) != "disabled" or pg_running(15, OLD_DATA):
+        problems.append(reason("pg17-identity", f"17/{NEW_DATA.name} is not the cluster recorded at the fence."))
+    if not standalone and (read_start(OLD_CONF) != "disabled" or pg_running(15, OLD_DATA)):
         problems.append(reason("pg15-guard", "The retained PG15 cluster is running or not disabled."))
     if problems:
         return problems
@@ -3014,7 +3158,7 @@ def restore_services(state):
             try:
                 if name == PG17_SERVICE:
                     if not pg_running(17, NEW_DATA):
-                        run("pg_ctlcluster", "--skip-systemctl-redirect", "17", "dwemer", "start")
+                        run("pg_ctlcluster", "--skip-systemctl-redirect", "17", NEW_DATA.name, "start")
                 elif not service_running(name):
                     run("service", name, "start")
                 running.append(name)
@@ -3041,7 +3185,10 @@ def check_fence(state, token):
         problems.append(reason("capture-token", "The capture token does not match this fence."))
     if not FENCE.is_file():
         problems.append(reason("fence", f"{FENCE} is missing; writers may have run since the capture."))
-    if pg_running(17, NEW_DATA) or pg_running(15, OLD_DATA):
+    standalone = journaled_standalone(state)
+    if standalone:
+        problems += standalone_problems(state)
+    if pg_running(17, NEW_DATA) or not standalone and pg_running(15, OLD_DATA):
         problems.append(reason("fence", "PostgreSQL is running; the recovery copy may be stale."))
     elif pg17_seal() != state["seal"]:
         problems.append(reason("fence", "PG17 changed since the capture."))
@@ -3275,6 +3422,8 @@ def post_upgrade(state):
 
 def upgrade(token, recovery_sha256, recovery_bytes):
     state = load_state()
+    if state:
+        journaled_standalone(state)
     if state and state.get("phase") in ("verified", "current"):
         raise Deferred([reason("journal", f"The upgrade is already {state['phase']}.")])
     if not state or state.get("phase") not in ("fenced", "upgrading", "upgraded"):
@@ -3394,6 +3543,7 @@ def verify():
         raise Deferred([reason("journal", "No completed upgrade to verify.")])
     if state["phase"] == "current":
         return {"result": "current", "next": ""}
+    standalone = journaled_standalone(state)
     # From verified it runs again in full, still fenced, and records a fresh verification.
     problems = source_problems(apt_sources()) + trixie_preference_problems(state.get("vendors", []))
     if state.get("cuda_layout") is not None and cuda_layout() != state["cuda_layout"]:
@@ -3422,11 +3572,15 @@ def verify():
                 problems.append(reason("php-modules", f"PHP {TARGET_PHP} {sapi} lacks modules: {', '.join(missing)}."))
     if subprocess.run(["apache2ctl", "-t"], stdout=log, stderr=log).returncode:
         problems.append(reason("apache", "apache2ctl -t failed."))
-    # PostgreSQL: the PG15 rollback guard, both cluster identities and the PG17 contents.
-    if read_start(OLD_CONF) != "disabled" or pg_running(15, OLD_DATA):
-        problems.append(reason("pg15-guard", "The retained PG15 cluster is not stopped and disabled."))
-    if controldata(15, OLD_DATA)["Database system identifier"] != state["pg15_id"]:
-        problems.append(reason("pg15-guard", "The PG15 cluster identity changed."))
+    # PostgreSQL: the PG15 rollback guard, both cluster identities and the PG17 contents. A standalone
+    # install instead must still be only its journaled 17/<name>, so no PG15 may have appeared.
+    if standalone:
+        problems += standalone_problems(state)
+    else:
+        if read_start(OLD_CONF) != "disabled" or pg_running(15, OLD_DATA):
+            problems.append(reason("pg15-guard", "The retained PG15 cluster is not stopped and disabled."))
+        if controldata(15, OLD_DATA)["Database system identifier"] != state["pg15_id"]:
+            problems.append(reason("pg15-guard", "The PG15 cluster identity changed."))
     if controldata(17, NEW_DATA)["Database system identifier"] != state["seal"][0]:
         problems.append(reason("pg17", "The PG17 cluster identity changed."))
     changed = guarded_changes(state["guarded"])
@@ -3490,6 +3644,7 @@ def release():
     state = load_state()
     if not state or state.get("phase") not in ("verified", "current"):
         raise Deferred([reason("journal", "Only a verified upgrade can be released; run verify first.")])
+    journaled_standalone(state)
     if state["phase"] == "verified":
         # While the fence stands, nothing may have changed since verify. Once it is gone (a crash
         # inside an earlier release) writes were already admitted, so release only completes.

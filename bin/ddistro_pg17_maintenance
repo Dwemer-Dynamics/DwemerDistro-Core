@@ -407,6 +407,83 @@ def verify_registered(state):
     return "stopped"
 
 
+STANDALONE_NAMES = ("main", "dwemer")
+RECOVERY_COPY = r"\.(?:before|rejected)-recovery-[0-9]{8}-[0-9]{6}"
+
+
+def registered_setting(name, key):
+    """A 17/<name> setting as postgresql-common resolves it, or None when it is not set or unreadable."""
+    try:
+        result = subprocess.run(["pg_conftool", "-s", "17", name, "show", key], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def standalone_cluster():
+    """The fresh-install layout as (name, data directory), from files and registration only, else None.
+
+    With no migration journal or archived migration, no PostgreSQL 15 configuration or data and no
+    staging copy, the only registered cluster must be a plain 17/main or 17/dwemer whose data directory
+    holds PG_VERSION 17 and is registered at that path on port 5432. Anything else, including several
+    or linked clusters, is not recognised. Stopped PG_VERSION 17 recovery copies Dashboard cluster recovery
+    keeps beside the data directory are allowed; nothing else is. Its pg_control identity is checked by the caller."""
+    def plain_dir(path):
+        return not path.is_symlink() and path.is_dir() and Path(os.path.realpath(path)) == path
+
+    try:
+        if os.path.lexists(STATE) or any(entry.startswith("dwemer-stage-") for entry in os.listdir(ROOT)):
+            return None
+        if os.path.lexists(OLD) or os.path.lexists(OLD_DATA) or not plain_dir(CONF) or not plain_dir(DATA):
+            return None
+        held = os.listdir(DATA)
+        if sorted(os.listdir(CONF)) != ["17"] or [entry for entry in held if entry.isdigit()] != ["17"] or any(
+                "dwemer-stage-" in entry for entry in held):
+            return None
+        names = os.listdir(CONF / "17")
+        if len(names) != 1 or names[0] not in STANDALONE_NAMES or names[0] not in os.listdir(DATA / "17"):
+            return None
+        name = names[0]
+        data = DATA / "17" / name
+        # Dashboard cluster recovery keeps <name>.before-recovery-* and <name>.rejected-recovery-* beside it.
+        copies = [DATA / "17" / entry for entry in os.listdir(DATA / "17") if entry != name]
+        if any(not re.fullmatch(re.escape(name) + RECOVERY_COPY, copy.name) for copy in copies):
+            return None
+        if not all(plain_dir(path) for path in (CONF / "17", CONF / "17" / name, DATA / "17", data, *copies)):
+            return None
+        for directory in (data, *copies):
+            version = directory / "PG_VERSION"
+            if version.is_symlink() or not version.is_file() or version.read_text().strip() != "17":
+                return None
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        if any(running(17, copy) for copy in copies):
+            return None
+    except (OSError, ValueError):
+        return None
+    if registered_setting(name, "data_directory") != str(data) or registered_setting(name, "port") != "5432":
+        return None
+    return name, data
+
+
+def standalone_identity(name, data):
+    """The standalone cluster's pg_control identity while it serves the application socket from its own
+    data directory, or while it is stopped in a primary's state with an auto or manual start.conf, so
+    start_env starts it next; raises otherwise. Starts nothing."""
+    control = controldata(17, data)
+    identity = control["Database system identifier"]
+    if running(17, data) or socket_serves():
+        served = query(APP_SOCKET, "select concat_ws('|', current_setting('server_version_num')::int / 10000,"
+                                   " current_setting('data_directory'), system_identifier) from pg_control_system()")
+        if served != f"17|{data}|{identity}":
+            raise ValueError("The application socket does not serve this distro's PostgreSQL 17 cluster")
+    elif control["Database cluster state"] not in STOPPED_STATES or start_mode(CONF / "17" / name) not in ("auto", "manual"):
+        raise ValueError(f"PostgreSQL 17/{name} is stopped and would not start as this distro's server; nothing was changed")
+    return identity
+
+
 def ensure_packages():
     needed = (PG / "pg_ctl", PG / "pg_dump", Path("/usr/share/postgresql/17/extension/vector.control"))
     if all(p.is_file() for p in needed):
@@ -788,7 +865,12 @@ def automatic_status():
                 )
         return "needed"
     if not (OLD_DATA / "PG_VERSION").is_file():
-        return "unsupported"
+        # A fresh install's own PostgreSQL 17 has nothing to migrate. Any other layout stays unsupported.
+        standalone = standalone_cluster()
+        if standalone is None:
+            return "unsupported"
+        standalone_identity(*standalone)
+        return "current"
     verify_active(15, OLD_DATA)
     return "needed"
 
@@ -1192,12 +1274,16 @@ def request_log_guard():
     """Refuse while a cluster migration is unfinished, nothing serves CHIM, or the application socket
     serves any cluster but the distro's own; both locks are already held. The served cluster must run
     from the expected PGDATA with that directory's pg_control identity: the journaled PG17 candidate
-    after an upgrade, the journaled PG15 donor after a rollback, or 15/main when nothing was journaled.
+    after an upgrade, the journaled PG15 donor after a rollback, or, when nothing was journaled, 15/main,
+    or a fresh install's standalone 17/main or 17/dwemer (see standalone_cluster) when no PG15 exists.
     The request-log digest repeats this identity, so the locked recheck pins the same cluster."""
     state = json.loads(STATE.read_text()) if STATE.exists() else None
     if state is not None and state.get("phase") in ("staging", "publishing", "checking"):
         raise ValueError("A PostgreSQL 17 upgrade or rollback is unfinished. Run Update Distro first")
-    if state is None:
+    standalone = standalone_cluster() if state is None else None
+    if standalone is not None:
+        major, data, expected = 17, standalone[1], None
+    elif state is None:
         major, data, expected = 15, OLD_DATA, None
     elif state.get("phase") == "active":
         major, data, expected = 17, NEW_DATA, state.get("candidate_id")
@@ -1353,6 +1439,65 @@ def lock_distro():
     return os.fdopen(fd, "rb")
 
 
+def serving_candidate():
+    """The journaled candidate while PG17 serves, else None; compared around auto and upgrade."""
+    if not STATE.exists():
+        return None
+    state = json.loads(STATE.read_text())
+    return state.get("candidate_id") if state.get("phase") == "active" else None
+
+
+def shared_keys_warning(before):
+    """Only after a cutover by this call, describe unready shared keys. Never fails or rolls back PG17."""
+    after = serving_candidate()
+    if after is None or after == before:
+        return None
+    try:
+        check = subprocess.run(["/usr/local/bin/ddistro_keys", "check-ready"], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=45)
+    except (OSError, subprocess.TimeoutExpired):
+        reason = "The readiness check could not run."
+    except KeyboardInterrupt:
+        # SIGTERM/SIGHUP raise this; PG17 is already kept, so an interrupted optional check only warns.
+        reason = "The readiness check was interrupted."
+    else:
+        if check.returncode == 0:
+            return None
+        try:
+            reason = json.loads(check.stdout).get("error")
+        except (ValueError, AttributeError):
+            reason = None
+        if not isinstance(reason, str) or not reason:
+            reason = "The readiness check failed."
+    return ("Warning: PostgreSQL 17 is serving and was kept, but Shared API Keys is not ready. " + reason +
+            " Run Update Distro, then full setup from the launcher API Keys tab or "
+            "sudo /usr/local/bin/install_shared_keys. Existing keys are preserved.")
+
+
+def upgrade_and_check_keys(automatic):
+    """Run auto or upgrade, then warn about shared keys only if this run completed a cutover.
+
+    Outside upgrade's rollback handling: accepted PG17 writes must never be discarded because an application
+    library is incompatible. Held, current, unsupported and cleanup-only runs are not checked; a completed
+    cutover warns and still succeeds. If staging cleanup fails after a cutover, the warning prints first and
+    the original cleanup failure is still raised; a problem producing the warning never replaces it.
+    """
+    before = serving_candidate()
+    try:
+        automatic_upgrade() if automatic else upgrade()
+    except Exception:
+        try:
+            warning = shared_keys_warning(before)
+        except Exception:
+            warning = None
+        if warning:
+            print(warning, file=sys.stderr, flush=True)
+        raise
+    warning = shared_keys_warning(before)
+    if warning:
+        print(warning, file=sys.stderr, flush=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1405,10 +1550,8 @@ if __name__ == "__main__":
                     discard_temporaries()
                 if args.action == "status":
                     print(automatic_status())
-                elif args.action == "auto":
-                    automatic_upgrade()
-                elif args.action == "upgrade":
-                    upgrade()
+                elif args.action in ("auto", "upgrade"):
+                    upgrade_and_check_keys(args.action == "auto")
                 elif args.action == "cleanup-staging":
                     cleanup_staging()
                 elif args.action == "recover":

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "source_commit": "3513d9a5bede55d789cf6a11d94e99b0f5dd2a14",
-  "sha256": "137fca4f4290615da8f50201836b06ea71e30df328b86be3c5ed6762e7e5eefb",
-  "url": "https://github.com/Dwemer-Dynamics/DwemerDistro-Core/releases/download/shared-keys-3513d9a5bede/dwemer-shared-keys-3513d9a5bede.tar.gz"
+  "source_commit": "804e501154de8353da50c05872700809499a0f31",
+  "sha256": "17605cad8fb79b216d9854a0859924828657caa364d34d6a10a8a605aecdcf35",
+  "url": "https://github.com/Dwemer-Dynamics/DwemerDistro-Core/releases/download/shared-keys-804e501154de/dwemer-shared-keys-804e501154de.tar.gz"
 }
