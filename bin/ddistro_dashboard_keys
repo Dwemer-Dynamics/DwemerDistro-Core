@@ -28,6 +28,8 @@ TEST_RESULTS = frozenset(('accepted', 'rejected', 'rate_limited', 'unavailable',
 MAX_REQUEST = 8192
 MAX_KEYS = 256
 MAX_PROVIDERS = 64
+# Providers whose catalog origin is a distro default rather than one pinned by the library.
+DEFAULTED_ORIGINS = frozenset({'ploofy'})
 
 
 def fail(outcome, **extra):
@@ -201,7 +203,10 @@ def save(keys, request, create):
             entry = next((p for p in providers if p['provider'] == request['provider']), None)
             if entry is None:
                 return fail('invalid', fields=['provider'])
-            if entry['needs_origin'] != (request['origin'] is not None):
+            # Ploofy's origin is a distro default (filled in by ddistro_keys.php), not pinned by the library, so an
+            # explicit origin, as older clients had to send, still passes through to ApiKeyManager validation.
+            explicit = request['origin'] is not None
+            if entry['needs_origin'] != explicit and not (explicit and request['provider'] in DEFAULTED_ORIGINS):
                 return fail('invalid', fields=['origin'])
             if request['origin'] is None:
                 del request['origin']
