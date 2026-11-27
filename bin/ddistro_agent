@@ -232,11 +232,13 @@ TOOL_LOGS = {
     "reign": ("server.log", "server-log.jsonl", "llm-log.jsonl", "otel-traces.ndjson"),
     "apache": ("error.log", "other_vhosts_access.log", "stobe_error.log", "dialectic_error.log"),
     "postgres": ("main",),
+    "chevo": ("chim.log", "service.log", "output_to_plugin.log", "output_from_llm.log", "stt.log",
+              "vision.log", "php-errors.log", "php-fpm.log", "apache-error.log", "apache-access.log"),
 }
 TOOL_OPERATIONS = ("inventory", "status", "models", "logs", "health", "performance", "model_options", "update_check")
 # Shared logs, not servers: the schema offers them only as log_source. Threads started before log_source existed were
 # declared product apache/postgres for logs, so tool_argv still accepts that form for logs (and only for logs).
-TOOL_LOG_SOURCES = ("apache", "postgres")
+TOOL_LOG_SOURCES = ("apache", "postgres", "chevo")
 # A flat schema (no oneOf/if-then): the native tool API rejects conditional JSON Schema, so pairing rules are runtime checks.
 TOOL_SPEC = {
     "type": "function", "name": TOOL_NAME,
@@ -260,13 +262,15 @@ TOOL_SPEC = {
                     "description": "a server only. status/health/performance/update_check: optional (omit for all); "
                                    "models: any server; model_options: herika; logs: that server's logs (or use log_source instead)"},
         "log_source": {"type": "string", "enum": list(TOOL_LOG_SOURCES),
-                       "description": "logs only, instead of product: the shared Apache or PostgreSQL logs"},
+                       "description": "logs only, instead of product: Apache, PostgreSQL, or CHIM 4 diagnostics"},
         "log": {"type": "string", "enum": sorted({name for names in TOOL_LOGS.values() for name in names}),
                 "description": "logs only; must belong to product or log_source"},
         "lines": {"type": "integer", "minimum": 1, "maximum": 400,
                   "description": "logs only; default 50; with query or since, the newest matching lines"},
         "query": {"type": "string", "maxLength": 200,
                   "description": "logs only: literal text (not a pattern), case-insensitive, matched in the bounded tail"},
+        "id": {"type": "string", "maxLength": 80,
+               "description": "chevo logs only: exact request, message, chain, session, or LLM log ID"},
         "since": {"type": "string", "maxLength": 20,
                   "description": "logs only: UTC time exactly like 2026-10-20T14:00:00Z; keeps lines dated at or after it"}}},
 }
@@ -2721,12 +2725,12 @@ def tool_argv(arguments):
     """Exact ddistro argv and envelope command for validated ddistro_read arguments."""
     if not isinstance(arguments, dict):
         raise PolicyError(-32602, "arguments must be an object")
-    reject_unknown(arguments, ("operation", "product", "log_source", "log", "lines", "query", "since"))
+    reject_unknown(arguments, ("operation", "product", "log_source", "log", "lines", "query", "since", "id"))
     operation, product = arguments.get("operation"), arguments.get("product")
     if operation not in TOOL_OPERATIONS:
         raise PolicyError(-32602, "operation must be one of " + ", ".join(TOOL_OPERATIONS))
-    if operation != "logs" and any(key in arguments for key in ("log_source", "log", "lines", "query", "since")):
-        raise PolicyError(-32602, "log_source, log, lines, query and since apply only to logs")
+    if operation != "logs" and any(key in arguments for key in ("log_source", "log", "lines", "query", "since", "id")):
+        raise PolicyError(-32602, "log_source, log, lines, query, since and id apply only to logs")
     if operation == "inventory":
         if "product" in arguments:
             raise PolicyError(-32602, "inventory takes no product")
@@ -2772,6 +2776,11 @@ def tool_argv(arguments):
         if "\n" in query:
             raise PolicyError(-32602, "query must be one line of plain text")
         argv += ["--query", query]
+    if "id" in arguments:
+        value = arguments["id"]
+        if product != "chevo" or not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", value):
+            raise PolicyError(-32602, "id requires a valid exact chevo correlation ID")
+        argv += ["--id", value]
     if "since" in arguments:
         since = arguments["since"]
         if not isinstance(since, str) or not TOOL_SINCE.match(since):
