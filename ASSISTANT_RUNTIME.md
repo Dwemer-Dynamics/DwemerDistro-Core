@@ -933,3 +933,14 @@ empty/existing/skipped and neither reads credentials nor takes the serve lock.
 Only an empty account goes through `ddistro_api maintenance` for import. This
 drains an already-running idle API but refuses queued requests and running jobs.
 An existing distro sign-in never restarts the API for credential reuse.
+
+For CHIM 4, use the read-only tool with `operation: "logs"` and
+`log_source: "chevo"`. Set `id` to an exact request, message, chain,
+session or LLM log ID to trace events across the journal. Omit `log` for
+that combined trace, or select an allowlisted name from `log_targets`.
+This reads the sanitized offline export. Full model request and response
+content is accessible through chevo's Request Logs.
+The managed collector uses the distro's www-data account. A manual invocation
+under another account requires permission to the journal and selected runtime
+files. For an install that uses a different service account, use chevo's
+offline exporter directly under that account.

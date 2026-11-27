@@ -26,6 +26,19 @@ def load(name):
 api, agent = load("ddistro_api"), load("ddistro_agent")
 
 
+class DiagnosticLogPolicy(unittest.TestCase):
+    def test_chevo_id_reaches_the_read_only_cli_exactly(self):
+        cli = load("ddistro")
+        identity = "550e8400-e29b-41d4-a716-446655440000"
+        argv = agent.tool_argv({"operation": "logs", "log_source": "chevo", "id": identity})
+        self.assertEqual(argv, ["logs", "chevo", "--lines", "50", "--id", identity])
+        self.assertEqual(cli.parse_command(argv, {})["id"], identity)
+        with self.assertRaises(agent.PolicyError):
+            agent.tool_argv({"operation": "logs", "log_source": "apache", "id": identity})
+        with self.assertRaises(cli.CliError):
+            cli.parse_command(["logs", "chevo", "--id", "/arbitrary/path"], {})
+
+
 class GamePolicy(unittest.TestCase):
     def test_game_workspace_root_is_separate_from_maintenance_tasks(self):
         with patch.object(agent, "open_root_dir", return_value=7) as opened, \

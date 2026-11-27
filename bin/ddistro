@@ -84,7 +84,11 @@ PRODUCTS = {
 ALIASES = {alias: key for key, product in PRODUCTS.items() for alias in product["aliases"]}
 
 # Allowlisted log files per target, first is the default. Nothing outside these roots is read.
+CHEVO_LOGS = ("chim.log", "service.log", "output_to_plugin.log", "output_from_llm.log", "stt.log",
+              "vision.log", "php-errors.log", "php-fpm.log", "apache-error.log", "apache-access.log")
+CHEVO_EXPORT_BYTES = 1024 * 1024
 LOG_SOURCES = {
+    "chevo": ("/var/log/chevo-diagnostics", CHEVO_LOGS),
     "herika": ("/var/www/html/HerikaServer/log", ["chim.log", "output_from_llm.log", "output_to_plugin.log",
                "context_sent_to_llm.log", "debugStream.log", "minai.log", "vision.log"]),
     "lorkhan": ("/var/log/lorkhanserver", ["lorkhan.log", "output_from_llm.log", "output_from_llm_fast.log",
@@ -460,7 +464,7 @@ def cmd_capabilities(opts, ctx):
             {"name": "version", "mutates": False}, {"name": "capabilities", "mutates": False},
             {"name": "products", "mutates": False},
             {"name": "status", "arguments": ["[product]"], "mutates": False},
-            {"name": "logs", "arguments": ["<target>"], "flags": ["--log", "--lines", "--query", "--since"], "mutates": False},
+            {"name": "logs", "arguments": ["<target>"], "flags": ["--log", "--lines", "--query", "--since", "--id"], "mutates": False},
             {"name": "server status", "arguments": ["[product]"], "mutates": False},
             {"name": "server update", "arguments": ["<product>"], "flags": ["--branch", "--force"],
              "mutates": True, "requires_root": True},
@@ -880,8 +884,79 @@ def read_tail(path, lines, query=None, since=None):
     return result
 
 
+def chevo_logs(opts):
+    """Read the chevo export through the same code as Server Logs, without requiring HTTP."""
+    name = opts.get("log")
+    correlation = opts.get("id")
+    if name is not None and name not in CHEVO_LOGS:
+        raise CliError("invalid_argument", "Unknown chevo log. Check capabilities for the fixed names.")
+    if correlation and name is not None and name not in CHEVO_LOGS[:6]:
+        raise CliError("invalid_argument", "This runtime log does not carry a CHIM 4 correlation ID.")
+    # A managed release uses current; an existing standalone Distro installation can use /opt/chevo.
+    script = next((path for path in ("/srv/chevo/current/bin/chevo-diagnostics.php",
+                                    "/opt/chevo/bin/chevo-diagnostics.php") if os.path.isfile(path) and not os.path.islink(path)), None)
+    data = {"target": "chevo", "log": name or ("all" if correlation else CHEVO_LOGS[0]),
+            "available": False, "reason": "missing", "lines": [], "truncated": False}
+    if script is None:
+        return data, "CHIM 4 log export is not installed."
+    php = next((path for path in ("/opt/chevo-runtime/php-8.4.27/bin/php", "/usr/bin/php")
+                if os.access(path, os.X_OK)), None)
+    if php is None:
+        return data, "CHIM 4 log export needs PHP."
+    # The read tool broker runs as root. Application code always runs with the runtime account instead.
+    account = ["/usr/sbin/runuser", "-u", "www-data", "--"] if os.geteuid() == 0 else []
+    argv = ["/usr/bin/timeout", "-k", "1", "5", *account, php, script, "export"]
+    if correlation:
+        argv.append("--id=" + correlation)
+    try:
+        with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL) as process:
+            raw = process.stdout.read(CHEVO_EXPORT_BYTES + 1)
+            if len(raw) > CHEVO_EXPORT_BYTES:
+                process.kill()
+                raise ValueError
+            if process.wait(timeout=7):
+                raise ValueError
+        payload = json.loads(raw)
+        if payload["manifest"]["schema_version"] != 1 or not isinstance(payload["files"], dict):
+            raise ValueError
+        sources = payload["manifest"]["sources"]
+        names = [name] if name else CHEVO_LOGS if correlation else [CHEVO_LOGS[0]]
+        selected = [filename for filename in names if filename in payload["files"]]
+        rows = []
+        for filename in selected:
+            text = payload["files"][filename]
+            if not isinstance(text, str):
+                raise ValueError
+            rows.extend(text.splitlines())
+        if not selected:
+            data["reason"] = "unavailable"
+            return data, "The requested CHIM 4 source is unavailable."
+        def timestamp(line):
+            return json.loads(line)["timestamp"]
+
+        rows.sort(key=timestamp)
+        query, since = opts.get("query"), opts.get("since")
+        if query:
+            rows = [line for line in rows if query.casefold() in line.casefold()]
+        if since:
+            rows = [line for line in rows if timestamp(line)[:19] >= since[:19]]
+        limit = opts.get("lines", DEFAULT_LOG_LINES)
+        data.update(available=True, reason=None, lines=rows[-limit:],
+                    truncated=len(rows) > limit or any(sources.get(item, {}).get("truncated") is True
+                                                       for item in selected))
+        if correlation:
+            data["id"] = correlation
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired):
+        data.update(available=False, reason="unavailable", lines=[])
+        return data, "CHIM 4 log export could not be read."
+    return data, "\n".join(data["lines"]) or "No matching CHIM 4 log entries."
+
+
 def cmd_logs(opts, ctx):
     target = opts["target"]
+    if target == "chevo":
+        return chevo_logs(opts)
     root, names = LOG_SOURCES[target]
     name = opts.get("log") or names[0]
     if name not in names:
@@ -5305,7 +5380,7 @@ def parse_command(rest, ctx):
     if name not in COMMANDS:
         raise CliError("invalid_argument", "Unknown command.\n" + USAGE)
     ctx["command"] = name
-    valued = {"logs": ("--log", "--lines", "--query", "--since"), "server update": ("--branch",),
+    valued = {"logs": ("--log", "--lines", "--query", "--since", "--id"), "server update": ("--branch",),
               "agent home-config-repair": ("--sha256",)}.get(name, ())
     switches = ("--force",) if name == "server update" else ()
     opts, positional, index, args = {}, [], 0, rest[1:]
@@ -5330,7 +5405,9 @@ def parse_command(rest, ctx):
     if not required <= len(positional) <= allowed:
         raise CliError("invalid_argument", f"Wrong number of arguments for {name}.\n" + USAGE)
     if name == "logs":
-        opts["target"] = resolve_product(positional[0], ("apache", "postgres"))
+        opts["target"] = resolve_product(positional[0], ("apache", "postgres", "chevo"))
+        if "id" in opts and (opts["target"] != "chevo" or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", opts["id"])):
+            raise CliError("invalid_argument", "--id requires an exact CHIM 4 correlation ID.")
         if "lines" in opts:
             if not re.match(r"^[0-9]{1,4}\Z", opts["lines"]) or not 1 <= int(opts["lines"]) <= MAX_LOG_LINES:
                 raise CliError("invalid_argument", f"--lines must be between 1 and {MAX_LOG_LINES}.")
